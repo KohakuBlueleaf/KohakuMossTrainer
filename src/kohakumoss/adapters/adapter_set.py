@@ -28,6 +28,21 @@ FORMATS = ("lycoris", "comfy", "merged", "diffusers")
 RAW_TAG = "kohakumoss_adapter_state"
 
 
+def add_bias(linear: nn.Module, value: Tensor) -> None:
+    """Set the linear's bias to `value`, creating it on a bias-less layer (and
+    re-selecting MossLinear's bias / no-bias forward)."""
+    if linear.bias is None:
+        dtype = linear.weight.dtype if linear.weight.numel() else torch.float32
+        param = torch.zeros(value.shape, device=value.device, dtype=dtype)
+        linear.bias = nn.Parameter(param, requires_grad=False)
+    linear.bias.data.copy_(value.to(linear.bias))
+    getattr(linear, "rebind", _noop)()
+
+
+def _noop() -> None:
+    return None
+
+
 def _train_and_rebind(aset, t: Target, mode: bool = True):
     """Module.train for a LyCORIS module whose bound forward depends on the mode."""
     nn.Module.train(t.lyco, mode)
@@ -74,6 +89,7 @@ class LycoAdapterSet:
             self.multiplier,
             self.spec.dora_detach,
             self.spec.module_dropout,
+            race=self.spec.backend == "auto",
         )
         if t.kind != "full":
             t.linear.forward = fn
@@ -257,8 +273,9 @@ class LycoAdapterSet:
                 t.linear.weight.data.copy_(
                     (w + dw.to(w.device)).to(t.linear.weight.dtype)
                 )
-                if bias is not None and db is not None:
-                    t.linear.bias.data.add_(db.to(t.linear.bias))
+                if db is not None:
+                    base_b = 0.0 if bias is None else bias.float().to(db.device)
+                    add_bias(t.linear, base_b + db)
             for n in self.norms:
                 norm_delta.detach(n.module, True, "weight")
                 if n.bias_delta is not None:
@@ -284,6 +301,7 @@ class LycoAdapterSet:
             if t.lyco.org_bias:
                 bias = t.lyco.org_bias[0].to(t.lyco.weight.device)
                 t.linear.bias = nn.Parameter(bias, requires_grad=False)
+            getattr(t.linear, "rebind", _noop)()
         vars(t.linear).pop("forward", None)
         vars(t.lyco).pop("train", None)
         if CHILD in t.linear._modules:

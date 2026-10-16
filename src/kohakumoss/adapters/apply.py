@@ -1,6 +1,7 @@
 """apply(model, spec): build LyCORIS modules on the preset's targets and bind forwards."""
 
 import torch
+from lycoris.kernels import set_compile_dynamic
 from torch import nn
 
 from kohakumoss.adapters.adapter_set import LycoAdapterSet
@@ -46,5 +47,6 @@ def apply(
     device = torch.device(device) if device is not None else compute_device(model)
     for t in targets:
         _place(t, dtype, device)
+    set_compile_dynamic(spec.compile_dynamic)
     backend = pick_backend(device, spec.backend)
     return LycoAdapterSet(model, spec, targets, norms, backend)

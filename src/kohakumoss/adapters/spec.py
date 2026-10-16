@@ -18,6 +18,7 @@ ALGO_ALIASES = {
 }
 MODES = ("bypass", "merge")
 BACKENDS = ("auto", "triton", "tilelang", "compile", "torch")
+COMPILE_DYNAMIC = ("tokens", "static", "dynamic")
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ class AdapterSpec:
     multiplier: float = 1.0
     prefix: str = "lora_unet"
     backend: str = "auto"
+    compile_dynamic: str = "tokens"
     lr_ratio_up: float = 1.0
 
     @property
@@ -59,6 +61,10 @@ class AdapterSpec:
             problems.append(f"ADAPTER_MODE={self.mode!r} not in {MODES}")
         if self.backend not in BACKENDS:
             problems.append(f"adapter backend {self.backend!r} not in {BACKENDS}")
+        if self.compile_dynamic not in COMPILE_DYNAMIC:
+            problems.append(
+                f"LYCORIS_COMPILE_DYNAMIC={self.compile_dynamic!r} not in {COMPILE_DYNAMIC}"
+            )
         if self.dim <= 0 and self.algo not in ("full", "ia3"):
             problems.append(f"DIM must be positive, got {self.dim}")
         if self.dora and self.algo not in ("lora", "locon", "loha", "lokr"):
@@ -106,5 +112,6 @@ def spec_from_knobs(cfg: dict) -> AdapterSpec:
         mode=cfg.get("ADAPTER_MODE", "bypass"),
         train_norms=bool(cfg.get("TRAIN_NORMS", False)),
         backend=(cfg.get("KERNELS", {}) or {}).get("lycoris", "auto"),
+        compile_dynamic=cfg.get("LYCORIS_COMPILE_DYNAMIC", "tokens"),
         lr_ratio_up=float(cfg.get("LORAPLUS_RATIO", 1.0)),
     )

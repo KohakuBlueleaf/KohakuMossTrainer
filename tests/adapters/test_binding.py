@@ -106,7 +106,8 @@ def test_dora_fused_variants(m, mix):
     _, aset = build("dora-out")
     fn = _bind(_target(aset), m=m)
     assert fn.func is fused.dora_forward
-    mix_fn = fn.args[5]
+    assert fn.args[3].func is fused.decompose
+    mix_fn = fn.args[4]
     assert (mix_fn.func if isinstance(mix_fn, partial) else mix_fn) is mix
 
 

@@ -1,6 +1,7 @@
 """Inference-time adapters: load files of any supported format, bypass or merge, undo exactly."""
 
 import json
+from dataclasses import fields as dataclass_fields
 from functools import partial
 
 import torch
@@ -27,6 +28,10 @@ def _dense_add(prev, dw: Tensor, x):
 
 def _dense_add_bias(prev, dw: Tensor, db: Tensor, x):
     return prev(x) + F.linear(x, dw.to(x.dtype), db.to(x.dtype))
+
+
+def _noop() -> None:
+    return None
 
 
 def _lyco_bypass(lyco, multiplier, x):
@@ -109,6 +114,17 @@ class AdapterStack:
         self.forwards: dict[int, tuple[nn.Module, object]] = {}
         self.live: list[nn.Module] = []
         self.sets = []
+        self.created_bias: list[nn.Module] = []
+
+    def _ensure_bias(self, module: nn.Module) -> None:
+        """Give a bias-less linear a zero bias (removed again by remove())."""
+        if module.bias is not None:
+            return
+        dtype = module.weight.dtype if module.weight.numel() else torch.float32
+        zeros = torch.zeros(module.out_features, device=self.device, dtype=dtype)
+        module.bias = nn.Parameter(zeros, requires_grad=False)
+        getattr(module, "rebind", _noop)()
+        self.created_bias.append(module)
 
     def _save_original(self, module: nn.Module, name: str) -> None:
         key = (id(module), name)
@@ -213,6 +229,7 @@ class AdapterStack:
         if self.mode == "merge" and getattr(module, "base", None) is None:
             self._add_to(module, "weight", dw)
             if db is not None:
+                self._ensure_bias(module)
                 self._add_to(module, "bias", db)
             return
         dw, db = dw.to(self.device), None if db is None else db.to(self.device)
@@ -282,7 +299,8 @@ class AdapterStack:
 
     def _add_raw(self, tensors: dict, meta: dict, m: float) -> None:
         """A raw training state: rebuild the adapter set from its spec, then bind or merge."""
-        fields = spec_from_meta(meta)
+        known = {f.name for f in dataclass_fields(AdapterSpec)}
+        fields = {k: v for k, v in spec_from_meta(meta).items() if k in known}
         quiet = {"dropout": 0.0, "rank_dropout": 0.0, "module_dropout": 0.0}
         spec = AdapterSpec(**{**fields, **quiet, "multiplier": m})
         aset = apply(self.model, spec)
@@ -316,7 +334,11 @@ class AdapterStack:
                     vars(module)["forward"] = previous
             for module, name, value in self.originals.values():
                 getattr(module, name).data.copy_(value)
+            for module in self.created_bias:
+                module.bias = None
+                getattr(module, "rebind", _noop)()
         self.originals, self.forwards, self.live, self.sets = {}, {}, [], []
+        self.created_bias = []
 
     unmerge = remove
 

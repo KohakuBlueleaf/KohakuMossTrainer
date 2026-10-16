@@ -7,16 +7,12 @@ forward never inspects mode, multiplier, flags or training state.
 from functools import partial
 
 import torch
-from lycoris.functional.diag_oft import MAX_BLOCK
-from lycoris.functional.lokr import _apply_supported
 from torch import nn
 
 from kohakumoss.adapters import delta as dl
 from kohakumoss.adapters.backend import is_fused
-from kohakumoss.adapters.bind import eager, fused
+from kohakumoss.adapters.bind import eager, fused, kits
 from kohakumoss.adapters.target import Target
-
-MAX_LOHA_RANK = 128
 
 
 def has_scalar_param(lyco) -> bool:
@@ -51,75 +47,71 @@ def _scalared(lyco, unit):
     return partial(fused.with_scalar, lyco, unit) if has_scalar_param(lyco) else unit
 
 
-def _unit(t: Target, backend: str):
+def _unit(t: Target, kit):
     """Fused merge-kernel ΔW builder (base -> ΔW at multiplier 1), or None."""
     lyco = t.lyco
     match t.kind:
         case "locon":
-            return _scalared(lyco, partial(fused.lora_unit, lyco, backend))
-        case "loha" if lyco.lora_dim <= MAX_LOHA_RANK:
-            return _scalared(lyco, partial(fused.loha_unit, lyco, backend))
+            unit = kit.lora_unit(lyco)
+        case "loha":
+            unit = kit.loha_unit(lyco)
         case "lokr" if not lyco.tucker:
-            getters = fused.kron_getters(lyco, cast=False)
-            return _scalared(lyco, partial(fused.lokr_unit, lyco, getters, backend))
+            unit = kit.lokr_unit(lyco)
         case "glora":
-            return _scalared(lyco, partial(fused.glora_unit, lyco, backend))
-    return None
+            unit = partial(fused.glora_unit, lyco, kit.backend)
+        case _:
+            unit = None
+    return None if unit is None else _scalared(lyco, unit)
 
 
 def _added(t: Target, diff):
     lyco = t.lyco
+    if diff is None:
+        return None
     if has_scalar_param(lyco):
         return partial(fused.add_base_scalar, t.linear, lyco, diff)
     return partial(fused.add_base, t.linear, diff)
 
 
-def _fused_bypass(t: Target, backend: str, m: float):
+def _fused_bypass(t: Target, kit, m: float):
     lyco = t.lyco
     match t.kind:
         case "locon":
-            return _added(t, partial(fused.lora_diff, lyco, lyco.scale * m, backend))
-        case "loha" if lyco.lora_dim <= MAX_LOHA_RANK:
-            return _added(t, partial(fused.loha_diff, lyco, lyco.scale * m, backend))
-        case "lokr" if _apply_supported(
-            *fused.kron_factors(lyco, fused.kron_getters(lyco, False)), None
-        ):
-            getters = fused.kron_getters(lyco)
-            diff = partial(fused.lokr_diff, lyco, getters, lyco.scale * m, backend)
-            return _added(t, diff)
-        case "oft" if lyco.block_size <= MAX_BLOCK and m == 1.0:
-            fn = fused.oft_bypass_rescaled if lyco.rescaled else fused.oft_bypass
-            return partial(fn, t.linear, lyco, backend)
+            return _added(t, kit.lora(lyco, lyco.scale * m))
+        case "loha":
+            return _added(t, kit.loha(lyco, lyco.scale * m))
+        case "lokr" if not lyco.tucker:
+            return _added(t, kit.lokr(lyco, lyco.scale * m))
+        case "oft" if m == 1.0:
+            return kit.oft(t.linear, lyco)
         case "boft":
-            fn = fused.boft_bypass_rescaled if lyco.rescaled else fused.boft_bypass
-            return partial(fn, t.linear, lyco, m, backend)
+            return kit.boft(t.linear, lyco, m)
         case "ia3":
             fn = fused.ia3_bypass_in if lyco.train_input else fused.ia3_bypass_out
-            return partial(fn, t.linear, lyco, m, backend)
+            return partial(fn, t.linear, lyco, m, kit.backend)
     return None
 
 
 def _merged(t: Target, unit, m: float):
+    if unit is None:
+        return None
     return partial(fused.merged_forward, t.base_fn, unit, _scale(m), _lin(t))
 
 
-def _fused_merge(t: Target, backend: str, m: float):
+def _fused_merge(t: Target, kit, m: float):
     lyco = t.lyco
     match t.kind:
-        case "oft" if lyco.block_size <= MAX_BLOCK and m == 1.0:
-            fn = fused.oft_unit_rescaled if lyco.rescaled else fused.oft_unit
-            return _merged(t, partial(fn, lyco, backend), 1.0)
+        case "oft" if m == 1.0:
+            return _merged(t, kit.oft_unit(lyco), 1.0)
         case "boft":
-            fn = fused.boft_unit_rescaled if lyco.rescaled else fused.boft_unit
-            return _merged(t, partial(fn, lyco, m, backend), 1.0)
+            return _merged(t, kit.boft_unit(lyco, m), 1.0)
         case "ia3":
-            return _merged(t, partial(fused.ia3_unit, lyco, m, backend), 1.0)
-    unit = _unit(t, backend)
-    return None if unit is None else _merged(t, unit, m)
+            return _merged(t, partial(fused.ia3_unit, lyco, m, kit.backend), 1.0)
+    return _merged(t, _unit(t, kit), m)
 
 
-def _dora(t: Target, backend: str, m: float, use_fused: bool, detach: bool):
-    unit = _unit(t, backend) if use_fused and not detach else None
+def _dora(t: Target, kit, m: float, use_fused: bool, detach: bool):
+    unit = _unit(t, kit) if use_fused and not detach else None
     if unit is not None:
         t.fused = True
         return partial(
@@ -127,8 +119,7 @@ def _dora(t: Target, backend: str, m: float, use_fused: bool, detach: bool):
             t.base_fn,
             t.lyco,
             unit,
-            t.wd_on_out,
-            backend,
+            kit.decompose(t.lyco, t.wd_on_out),
             _mix(m),
             _lin(t),
         )
@@ -158,13 +149,21 @@ def _eager(t: Target, mode: str, m: float):
 
 
 def bind_target(
-    t: Target, mode: str, backend: str, m: float, detach: bool, module_p: float
+    t: Target,
+    mode: str,
+    backend: str,
+    m: float,
+    detach: bool,
+    module_p: float,
+    race: bool = False,
 ):
     """The forward to install on `t.linear` for this mode / backend / multiplier /
     training state.
 
-    Quantized / streamed base storage cannot be merged into, so such layers bind the
-    bypass form whatever `mode` says.
+    With `race` the fused ops are bound to LyCORIS's measured tier race
+    (`bind.kits.Raced`), otherwise to `backend` directly. Quantized / streamed base
+    storage cannot be merged into, so such layers bind the bypass form whatever
+    `mode` says.
     """
     lyco = t.lyco
     lyco.multiplier = m
@@ -181,13 +180,14 @@ def bind_target(
             return partial(
                 eager.delta_bypass, t.linear, lyco.shape, dl.bind_delta(t, m)
             )
+    kit = kits.kit(backend, race)
     if t.wd:
-        fn = _dora(t, backend, m, use_fused, detach)
+        fn = _dora(t, kit, m, use_fused, detach)
     else:
         fn = None
         if use_fused:
             pick = _fused_bypass if mode == "bypass" else _fused_merge
-            fn = pick(t, backend, m)
+            fn = pick(t, kit, m)
         t.fused = fn is not None
         fn = fn or _eager(t, mode, m)
     if module_p > 0 and training:

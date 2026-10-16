@@ -47,19 +47,38 @@ are `MossLinear`, an `nn.Linear`), registers each as the child `lyco` of its lin
 (FSDP sharding and weight streaming see it with its layer), and installs each layer's
 forward once. Per layer the bound forward is one of:
 
-- the LyCORIS fused kernel entry (`lycoris.kernels.autograd.*`) with the backend pinned
-  for the device — `bypass` adds the adapter path to the base output, `merge` builds
-  ΔW with the merge kernel and runs one GEMM;
-- the DoRA path for decomposed algorithms: W' = DoRA(W + ΔW) through `apply_dora`;
-- the LyCORIS module's eager body when dropout is configured or the layer is outside a
-  fused kernel's scope (LoHa rank > 128, LoKr factors above the kernel bound, OFT block
-  > 32).
+- the LyCORIS fused op of the kind — `bypass` adds the adapter path to the base output,
+  `merge` builds ΔW and runs one GEMM;
+- the DoRA path for decomposed algorithms: W' = DoRA(W + ΔW), the decompose step being
+  LyCORIS's `weight_decompose` op;
+- the LyCORIS module's eager body when dropout is configured, on CPU / XPU, or (pinned
+  backend only) where the layer is outside a fused kernel's scope (LoHa rank > 128,
+  LoKr factors above the kernel bound, OFT block > 32).
+
+How a fused op runs depends on `KERNELS.lycoris`:
+
+- `auto` (default): each op is a `bind.race.TierSlot` bound to LyCORIS's measured,
+  precision-gated tier race (`lycoris.kernels.tier`). On the first call of a shape
+  bucket (LyCORIS's token bucket of the flattened rows, activation dtype, grad pattern)
+  the slot asks `tier.best` with the real operands, which races every fused backend of
+  the device, the compile tier, the eager body and the op's exact extras (LoHa's rank
+  product) on a miss of LyCORIS's tuning table, rejects any candidate outside the
+  eager body's error bar against fp64, and records the fastest. The slot keeps that
+  arm; later calls of the bucket are one dict lookup and the arm. A decision LyCORIS
+  holds provisionally (an all-zero reference: freshly zero-initialised factors) is
+  asked again on every call — LyCORIS's own re-race schedule — until it is recorded.
+  Ops outside a fused kernel's scope get LyCORIS's compile or torch tier. IA3 and
+  GLoRA have no tier op and run the device's preferred fused backend.
+- a backend name (`triton` | `tilelang` | `compile` | `torch`): every op calls that
+  backend's kernel (`lycoris.kernels.autograd.*`) directly, with no measurement.
 
 The base output always comes from `MossLinear._impl`, so quantized or streamed base
-storage keeps working. Changing the multiplier (`set_multiplier`) or the base storage
-re-binds; nothing is decided per call. The backend order per device is LyCORIS's
+storage keeps working. Changing the multiplier (`set_multiplier`), the adapter state
+(`load_state_dict`) or the base storage re-binds and builds fresh slots; factor dtypes
+and `requires_grad` flags are part of a slot's bound state, so changing them calls for
+`AdapterSet.bind()`. The device's backend order is LyCORIS's
 (`lycoris.kernels.dispatch.resolve_backend`): tilelang first on sm70/sm75, triton from
-sm80, eager on CPU and XPU. `KERNELS={"lycoris": "<backend>"}` pins one.
+sm80, eager on CPU and XPU.
 
 ## Quantized and streamed bases
 

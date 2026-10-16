@@ -1,4 +1,5 @@
-"""Bound forwards over the LyCORIS fused kernels with a pinned backend.
+"""Bound forwards over the LyCORIS fused kernels with a pinned backend (and the
+forward shells the raced ops of `bind.ops` plug into).
 
 Every function takes its bound state first and the runtime tensor last, so
 `functools.partial` freezes the state at bind time. Variants (scalar parameter or
@@ -149,6 +150,12 @@ def boft_bypass_rescaled(linear, lyco, multiplier, backend, x):
     return y + delta.to(y.dtype)
 
 
+def post_add(linear, delta, x):
+    """y + Δy(y) for a rotation whose Δy is a function of the base output."""
+    y = linear._impl(x)
+    return y + delta(y).to(y.dtype)
+
+
 def ia3_bypass_out(linear, lyco, multiplier, backend, x):
     y = linear._impl(x)
     return ia3_bypass(y, lyco.weight.to(y.dtype), -1, multiplier, False, backend)
@@ -232,8 +239,13 @@ def merged_forward(base_fn, unit, scale, lin, x):
     return lin(x, w + scale(unit(w)).to(x.dtype))
 
 
-def dora_forward(base_fn, lyco, unit, on_out, backend, mix, lin, x):
-    """y = lin(x, mix(W, DoRA(W + ΔW))) through the fused decompose kernel."""
+def decompose(lyco, on_out, backend, merged):
+    """DoRA(W + ΔW) at multiplier 1 through the fused decompose kernel."""
+    return apply_dora(merged, lyco.dora_scale, 1.0, on_out, backend)
+
+
+def dora_forward(base_fn, lyco, unit, decompose, mix, lin, x):
+    """y = lin(x, mix(W, decompose(W + ΔW)))."""
     w = base_fn(lyco.dora_scale.dtype)
     merged = w + unit(w).to(w.dtype)
-    return lin(x, mix(w, apply_dora(merged, lyco.dora_scale, 1.0, on_out, backend)))
+    return lin(x, mix(w, decompose(merged)))
