@@ -33,4 +33,5 @@ RESIDUAL = ("gated_residual",)
 LOSS = ("token_mse",)
 FUSED = ("linear_qk_rope", "linear_situ", "linear_gated_residual")
 OPTIM = ("adamw_step", "adamw8bit_step", "adamw_step_multi")
-ALL = NORM + ROPE + ATTENTION + FFN + RESIDUAL + LOSS + FUSED + OPTIM
+QUANT = ("quant_linear",)
+ALL = NORM + ROPE + ATTENTION + FFN + RESIDUAL + LOSS + FUSED + OPTIM + QUANT
