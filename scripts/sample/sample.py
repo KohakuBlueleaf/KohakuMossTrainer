@@ -90,6 +90,9 @@ def main() -> None:
     ap.add_argument("--adapter-mode", default="merge", choices=("merge", "bypass"))
     ap.add_argument("--residency", default="gpu", choices=("gpu", "offload", "te_once"))
     ap.add_argument("--device", default="cuda")
+    ap.add_argument(
+        "--tune", default="auto", help="kernel tuning: auto | off | prewarm"
+    )
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -112,6 +115,7 @@ def main() -> None:
         residency=args.residency,
         fp16_fix=args.fp16_fix,
         fp16_fix_kwargs=json.loads(args.fp16_fix_kwargs),
+        tune=args.tune,
     )
     result = pipe.generate(
         [it["prompt"] for it in items],

@@ -14,8 +14,10 @@ from kohakumoss import adapters as adapter_api
 from kohakumoss.diffusion.sampling import sample_latents, unpack
 from kohakumoss.encoders import FluxVae, QwenTextEncoder
 from kohakumoss.inference.residency import RESIDENCY
+from kohakumoss.inference.warm import KernelWarm, no_warm
 from kohakumoss.model.io import load_backbone
 from kohakumoss.model.numerics import apply_fp16_fix, output_row_scales
+from kohakumoss_kernels.tuning import tuner
 
 Size = tuple[int, int]
 
@@ -57,9 +59,48 @@ def _component_root(path: Path, variant: str | None, name: str) -> Path:
     raise FileNotFoundError(f"no {name}/ under {path}")
 
 
+def load_transformer(
+    dit: str | Path,
+    dtype: torch.dtype,
+    device: torch.device | str,
+    adapters: Sequence[tuple[str, float]] = (),
+    adapter_mode: str = "merge",
+    fp16_fix: str = "none",
+    fp16_fix_kwargs: dict | None = None,
+    kernels: dict[str, str] | None = None,
+):
+    """Backbone + adapters (merged before a weight fix, bypassed after it with the
+    fold's row scales) + fp16 fix, ops bound last. Returns (backbone, adapter stacks).
+    """
+    fix_kw = dict(fp16_fix_kwargs or {})
+    backbone, _ = load_backbone(
+        dit,
+        device=device,
+        dtype=dtype,
+        kernels=kernels,
+        fp16_fix_eps=fix_kw.get("eps", "stock"),
+    )
+    backbone.eval().requires_grad_(False)
+    stacks = []
+    if adapter_mode == "merge":
+        for file, mult in adapters:
+            stacks.append(adapter_api.load(backbone, file, mult, mode="merge"))
+        apply_fp16_fix(backbone, fp16_fix, **fix_kw)
+    else:
+        apply_fp16_fix(backbone, fp16_fix, **fix_kw)
+        scales = output_row_scales(backbone)
+        for file, mult in adapters:
+            stacks.append(
+                adapter_api.load(backbone, file, mult, mode="bypass", row_scales=scales)
+            )
+    backbone.bind_ops()
+    return backbone, stacks
+
+
 class MossPipeline:
     """Backbone + text encoder + VAE held explicitly; `residency` decides where the
-    encoders live between uses ("gpu" | "offload" | "te_once")."""
+    encoders live between uses ("gpu" | "offload" | "te_once"). An owned model runs
+    under inference_mode and prewarms its kernels for the lengths a call needs."""
 
     def __init__(
         self,
@@ -69,18 +110,26 @@ class MossPipeline:
         device: torch.device | str = "cuda",
         residency: str = "gpu",
         owned: bool = True,
+        tune: str = "auto",
+        adapters: list | None = None,
     ):
         self.backbone = backbone
         self.device = torch.device(device)
         self.place = RESIDENCY[residency](text_encoder, vae, self.device)
         self.residency = residency
+        self.adapters = adapters or []
         self._grad_ctx = torch.inference_mode if owned else torch.no_grad
+        warm = owned and tune != "off" and self.device.type != "cpu"
+        self.warm = KernelWarm(backbone, self.device) if warm else no_warm
+        if owned and self.device.type == "cuda":
+            torch.backends.cuda.preferred_linalg_library("cusolver")
 
     @classmethod
     def from_components(
         cls, backbone, text_encoder=None, vae=None, device=None, residency="gpu"
     ) -> "MossPipeline":
-        """Share already-built modules (the training model): no reload, no_grad only."""
+        """Share already-built modules (the training model): no reload, no_grad only,
+        no prewarm (the trainer owns the kernels)."""
         device = device or next(backbone.parameters()).device
         return cls(backbone, text_encoder, vae, device, residency, owned=False)
 
@@ -100,44 +149,45 @@ class MossPipeline:
         text_dtype: torch.dtype = torch.bfloat16,
         vae_dtype: torch.dtype = torch.float32,
         kernels: dict[str, str] | None = None,
+        tune: str = "auto",
+        text_encoder: bool = True,
+        vae: bool = True,
     ) -> "MossPipeline":
         """`path`: weights root (base/ sft/ subdirs or one pipeline dir). `transformer`
         overrides the DiT weights (single file, HF dir, our checkpoint or an fp16-fix
-        file). `fp16_fix`: none | weights | online | fp32_residual (+ kwargs)."""
+        file). `fp16_fix`: none | weights | online | fp32_residual (+ kwargs).
+        `text_encoder=False` / `vae=False` skip loading them (embeddings / latents in
+        and out)."""
         path = Path(path)
-        fix_kw = dict(fp16_fix_kwargs or {})
+        tuner.set_mode(tune)
         dit = (
             Path(transformer)
             if transformer
             else _component_root(path, variant, "transformer")
         )
-        backbone, _ = load_backbone(
+        backbone, stacks = load_transformer(
             dit,
-            device=device,
-            dtype=dtype,
-            kernels=kernels,
-            fp16_fix_eps=fix_kw.get("eps", "stock"),
+            dtype,
+            device,
+            adapters,
+            adapter_mode,
+            fp16_fix,
+            fp16_fix_kwargs,
+            kernels,
         )
-        backbone.eval().requires_grad_(False)
-        if adapter_mode == "merge":
-            for file, mult in adapters:
-                adapter_api.load(backbone, file, multiplier=mult, mode="merge")
-            apply_fp16_fix(backbone, fp16_fix, **fix_kw)
-        else:
-            apply_fp16_fix(backbone, fp16_fix, **fix_kw)
-            scales = output_row_scales(backbone)
-            for file, mult in adapters:
-                adapter_api.load(
-                    backbone, file, multiplier=mult, mode="bypass", row_scales=scales
-                )
-            backbone.bind_ops()
-        te_root = _component_root(path, variant, "text_encoder")
-        offload = "cpu" if residency == "offload" else "none"
-        te = QwenTextEncoder.from_pretrained(te_root, device, text_dtype, offload)
-        vae = FluxVae.from_pretrained(
-            _component_root(path, variant, "vae"), "cpu", vae_dtype
+        te = None
+        if text_encoder:
+            te_root = _component_root(path, variant, "text_encoder")
+            offload = "cpu" if residency == "offload" else "none"
+            te = QwenTextEncoder.from_pretrained(te_root, device, text_dtype, offload)
+        decoder = None
+        if vae:
+            decoder = FluxVae.from_pretrained(
+                _component_root(path, variant, "vae"), "cpu", vae_dtype
+            )
+        return cls(
+            backbone, te, decoder, device, residency, True, tune, adapters=stacks
         )
-        return cls(backbone, te, vae, device, residency, owned=True)
 
     @contextmanager
     def _eval(self):
@@ -170,17 +220,18 @@ class MossPipeline:
         step_callback: Callable[[int, Tensor], None] | None = None,
     ) -> GenerateResult:
         """One image per prompt; sample i depends only on its prompt, size and seed."""
-        with self._eval():
+        with self._grad_ctx():
             pos, neg = self._embeddings(
                 prompts, negative_prompts, prompt_embeds, negative_embeds, cfg
             )
-            n = len(pos)
-            seeds = list(seeds) if seeds is not None else list(range(n))
-            size_list = [sizes] * n if isinstance(sizes[0], int) else list(sizes)
-            starts = range(0, n, batch)
-            chunks = [slice(s, s + batch) for s in starts]
-            negs = [None] * len(chunks) if neg is None else [neg[c] for c in chunks]
-            convert = OUTPUTS[output]
+        n = len(pos)
+        seeds = list(seeds) if seeds is not None else list(range(n))
+        size_list = [sizes] * n if isinstance(sizes[0], int) else list(sizes)
+        chunks = [slice(s, s + batch) for s in range(0, n, batch)]
+        negs = [None] * len(chunks) if neg is None else [neg[c] for c in chunks]
+        self.warm.ensure(*self._lengths(pos, neg, size_list, chunks, cfg_mode))
+        convert = OUTPUTS[output]
+        with self._eval():
             latents = []
             for chunk, chunk_neg in zip(chunks, negs):
                 res = sample_latents(
@@ -199,6 +250,7 @@ class MossPipeline:
                 )
                 latents += unpack(res.latents, res.hw)
             images = convert(self.place, latents)
+        self.warm.retune()
         settings = dict(
             prompts=list(prompts) if prompts is not None else None,
             negative_prompts=list(negative_prompts) if negative_prompts else None,
@@ -223,6 +275,18 @@ class MossPipeline:
             ),
         )
         return GenerateResult(images, latents, settings)
+
+    @staticmethod
+    def _lengths(pos, neg, sizes, chunks, cfg_mode) -> tuple[int, int]:
+        """(longest joint sample, largest packed forward) in tokens for this call."""
+        neg = neg or pos
+        joint = [
+            (h // 16) * (w // 16) + max(p.shape[0], q.shape[0])
+            for (h, w), p, q in zip(sizes, pos, neg)
+        ]
+        factor = 2 if cfg_mode == "packed" else 1
+        batch = max(factor * sum(joint[c]) for c in chunks)
+        return max(joint), batch
 
     def _embeddings(
         self, prompts, negative_prompts, prompt_embeds, negative_embeds, cfg
