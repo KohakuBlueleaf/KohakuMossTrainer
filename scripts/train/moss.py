@@ -1,0 +1,135 @@
+"""Train MOSS-Image (LyCORIS adapters or full finetune). Every knob is a global below.
+
+kogine run scripts/train/moss.py --config configs/moss/smoke/smoke_tiny.py
+kogine run scripts/train/moss.py --config configs/moss/recipes/recipes_lora_24g_bf16.py --set LR=2e-4
+"""
+
+from kohakumoss.training.entry import run
+
+# ===================== MODEL =====================
+WEIGHTS = (
+    ""  # HF dir (transformer/ + text_encoder/ + vae/) | single .safetensors | "random"
+)
+VARIANT = "base"  # "base" | "sft" | "tiny"
+ARCH_OVERRIDES = {}  # MossArchConfig field overrides
+TEXT_ENCODER = ""  # "" = <WEIGHTS>/text_encoder; path to Qwen3.5 dir
+VAE = ""  # "" = <WEIGHTS>/vae
+TRAIN_TEXT_REFINER = False  # adapters/full FT also on the 2 text-refiner blocks
+
+# ===================== DATA =====================
+DATASETS = (
+    []
+)  # [{"source": "kohya" | "folder" | "jsonl" | "parquet" | "webdataset" | "moss_shard", "path": ..., "weight": 1.0, ...}]
+RESOLUTION_MODE = "pack"  # "pack" | "bucket" | "shifted_square" | "square_crop"
+TARGET_AREA = 1024 * 1024  # pixels
+SIZE_STEP = 16  # pixel multiple (VAE /8 x patchify 2)
+ASPECT_RANGE = (0.25, 4.0)  # min, max width/height
+UPSCALE = "never"  # "never" | "to_area"
+MAX_TOKENS = 16384  # pack mode: joint tokens (image + text) per batch per rank
+BATCH_SIZE = 4  # bucket / square modes: samples per batch per rank
+CAPTION = {"template": "tags", "keep": ["artist"], "shuffle": True, "tag_dropout": 0.0}
+TEXT_DROP = 0.1  # probability a sample uses the empty-prompt embedding
+LATENT_CACHE = "offline"  # "off" | "offline" | "online"
+TEXT_CACHE = "offline"  # "off" | "offline" | "online"
+CACHE_DTYPE = "bf16"  # "bf16" | "fp8"
+CAPTION_VARIANTS = 4  # cached caption renderings per image
+FLIP = False  # horizontal flip augmentation
+NUM_WORKERS = 4
+SEED = 0
+
+# ===================== ADAPTER =====================
+ALGO = "lora"  # "lora" | "locon" | "loha" | "lokr" | "oft" | "boft" | "glora" | "ia3" | "dylora" | "tlora" | "full"
+PRESET = "attn-mlp"  # "attn" | "attn-mlp" | "full-block" | path to LyCORIS-style toml
+DIM = 32
+ALPHA = 32.0
+ALGO_KWARGS = (
+    {}
+)  # e.g. {"factor": 8} for lokr, {"block_size": 32, "constraint": 0.0} for oft
+DORA = False
+DORA_DETACH = True
+DROPOUT = {"input": 0.0, "rank": 0.0, "module": 0.0}
+ADAPTER_MODE = "bypass"  # "bypass" | "merge"
+TRAIN_NORMS = False
+
+# ===================== OBJECTIVE =====================
+TIMESTEP = "moss"  # "moss" | "uniform" | "logit_normal"
+TIMESTEP_KWARGS = {
+    "mu": -1.09,
+    "s": 0.95,
+    "shift": 1.0,
+    "cutoff": 0.95,
+    "uniform_mix": 0.0,
+}
+LOSS = "mse"  # "mse" | "huber" | "masked_mse"
+LOSS_KWARGS = {}
+
+# ===================== OPTIM =====================
+OPTIMIZER = (
+    "adamw"  # "adamw" | "adamw16" | "adamw8bit" | "muon" | "prodigy" | "schedule_free"
+)
+LR = 1e-4
+BETAS = (0.9, 0.95)
+EPS = 1e-8
+WEIGHT_DECAY = 0.01
+WD_RULES = "moss"  # "moss" (no wd on bias/norm/1-D, decay-to-one on last q/k norm) | "none" | "all"
+SCHEDULE = {"mode": "cosine", "warmup": 100, "end": -1}  # AnySchedule config
+GRAD_CLIP = 1.0
+EMA = 0.0  # 0 = off; e.g. 0.9999
+
+# ===================== PRECISION =====================
+PRECISION = "bf16"  # "bf16" | "fp16" | "fp32"
+KEEP_FP32 = ("time_embedding", "shared_block_modulation", "video_head_modulation")
+FOLD = None  # None | float c | "auto" (from the activation probe) | per-layer list
+
+# ===================== MEMORY =====================
+MEMORY_PROFILE = "balanced"  # "speed" | "balanced" | "low" | "minimal" | "auto"
+MEMORY_OVERRIDES = (
+    {}
+)  # any MemoryPlan field, e.g. {"checkpoint": "sub-block", "stream": "ring"}
+
+# ===================== PARALLEL =====================
+PARALLEL = "none"  # "none" | "ddp" | "fsdp" | "pipeline" | "threaded"
+DIST_BACKEND = "auto"  # "auto" (nccl on Linux, gloo on Windows) | "nccl" | "gloo"
+DEVICES = (0,)
+PIPELINE_SCHEDULE = "1f1b"  # "gpipe" | "1f1b" | "interleaved-1f1b" | "zb"
+MICROBATCHES = 4
+
+# ===================== KERNELS =====================
+KERNELS = (
+    {}
+)  # op -> backend, e.g. {"attention_varlen": "triton"}; empty = arch priority
+TUNE = "auto"  # "auto" | "off" | "prewarm"
+COMPILE = "off"  # "off" | "block" | "model"
+
+# ===================== RUNTIME =====================
+DRIVER = "native"  # "native" | "lightning"
+STEPS = 1000
+GRAD_ACC = 1
+OUTPUT_DIR = "runs/moss"
+RUN_NAME = ""
+
+# ===================== LOGGING =====================
+LOGGER = "console"  # "console" | "board" | "wandb"
+LOG_EVERY = 10
+
+# ===================== SAMPLING =====================
+SAMPLE_PROMPTS = []
+SAMPLE_EVERY = 0  # steps; 0 = off
+SAMPLE_STEPS = 50
+SAMPLE_CFG = 3.0
+SAMPLE_SHIFT = 5.0
+SAMPLE_SKIP_LAYERS = (22,)
+SAMPLE_SIZE = (1024, 1024)
+SAMPLE_SEEDS = (0,)
+VALIDATE_EVERY = 0  # steps; 0 = off
+VALIDATION = {}  # {"datasets": [...], "sigmas": [...], "seed": 0}
+
+# ===================== CHECKPOINT / EXPORT =====================
+SAVE_EVERY = 500
+SAVE_MINUTES = 0
+KEEP_LAST = 3
+RESUME = ""  # checkpoint dir | "latest"
+EXPORT_FORMATS = ("comfy",)  # "comfy" | "lycoris" | "merged" | "diffusers"
+
+if __name__ == "__main__":
+    run(globals())

@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kohakumoss"
+version = "0.1.0"
+description = "Finetuning framework for MOSS-Image: LyCORIS algorithms and full finetune, per-arch kernels, fp16/bf16, offload, multi-GPU, Windows + Linux."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Kohaku-Blueleaf" }]
+dependencies = [
+    "torch>=2.13",
+    "numpy",
+    "pillow",
+    "safetensors",
+    "einops",
+    "tqdm",
+    "toml",
+    "kohaku-engine",
+    "anyschedule",
+    "kohakuvault",
+    "lycoris-lora>=4.0",
+]
+
+[project.optional-dependencies]
+kernels = [
+    "tilelang>=0.1.15",
+    "triton-windows>=3.7,<3.9; sys_platform == 'win32'",
+]
+lightning = ["lightning>=2.5"]
+reference = ["diffusers>=0.38", "transformers>=5.3", "accelerate"]
+quant = ["bitsandbytes"]
+board = ["kohakuboard"]
+wandb = ["wandb"]
+dev = ["pytest", "ruff", "black", "lpips"]
+bench = ["matplotlib", "pandas"]
+
+[project.scripts]
+kohakumoss-doctor = "kohakumoss.cli.doctor:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["kohakumoss*", "kohakumoss_kernels*", "kohakumoss_data*"]
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "cpu: runs on CPU only",
+    "cuda: needs a CUDA GPU",
+    "sm70: needs sm70",
+    "sm75: needs sm75",
+    "sm86: needs sm86",
+    "sm89: needs sm89",
+    "sm120: needs sm120",
+    "xpu: needs an Intel XPU",
+    "windows: Windows-specific",
+    "multi_gpu: needs two or more GPUs",
+    "real_weights: needs KOHAKUMOSS_WEIGHTS",
+    "slow: long-running",
+]
