@@ -1,9 +1,10 @@
 """KohakuMoss dataset infrastructure: format, sources, catalog, planning, loading, caches."""
 
 from kohakumoss_data import caption, resolution, sources
-from kohakumoss_data.config import DataConfig
+from kohakumoss_data.cache.writer import CacheWriter
+from kohakumoss_data.config import DataConfig, pipeline_problems
 from kohakumoss_data.dataset import MossDataset
-from kohakumoss_data.loader import Loader, MossHostBatch
+from kohakumoss_data.loader import Loader
 from kohakumoss_data.types import (
     BatchPlan,
     CatalogRow,
@@ -26,15 +27,16 @@ def build_loader(cfg: DataConfig, rank: int = 0, world: int = 1) -> Loader:
 
 __all__ = [
     "BatchPlan",
+    "CacheWriter",
     "CatalogRow",
     "DataConfig",
     "HostBatch",
     "Loader",
     "MossDataset",
-    "MossHostBatch",
     "PlanItem",
     "build_loader",
     "caption",
+    "pipeline_problems",
     "resolution",
     "sources",
 ]

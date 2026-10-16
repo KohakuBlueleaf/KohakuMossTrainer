@@ -60,7 +60,13 @@ class HostBatch:
 
     Image tokens are sample-major and row-major over the latent grid `hw` [B, 2].
     `img_keep[i]` lists the kept grid indices of sample i after random token drop
-    (None = all kept); `latents` then holds only the kept tokens.
+    (None = all kept); cached `latents` then hold only the kept tokens, while `pixels`
+    are the full image (the consumer encodes, then gathers `img_keep`).
+    `text_limit[i]` > 0 caps sample i's text tokens: cached `text` is already capped
+    and `text_len` final; with `prompts` the consumer keeps the first `text_limit`
+    rows after encoding and fills `text_len`.
+    `index` / `rank` locate the plan; `latent_keys` / `text_keys` are each sample's
+    cache keys (empty when that cache is off), used by online write-back.
     """
 
     ids: Tensor
@@ -74,12 +80,21 @@ class HostBatch:
     pixels: list[np.ndarray] | None = None
     prompts: list[str] | None = None
     loss_mask: Tensor | None = None
+    index: int = -1
+    rank: int = 0
+    latent_keys: list[str] = field(default_factory=list)
+    text_keys: list[str] = field(default_factory=list)
+    text_limit: list[int] = field(default_factory=list)
 
     def pin(self) -> "HostBatch":
         for name, value in self.__dict__.items():
             if isinstance(value, Tensor) and not value.is_pinned():
                 setattr(self, name, value.pin_memory())
         return self
+
+    def pin_memory(self) -> "HostBatch":
+        """DataLoader pin-memory hook."""
+        return self.pin()
 
 
 class Source(Protocol):

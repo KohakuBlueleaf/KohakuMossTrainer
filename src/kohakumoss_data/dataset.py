@@ -1,4 +1,4 @@
-"""MossDataset: sources + catalog + captions + planner + caches -> MossHostBatch per index.
+"""MossDataset: sources + catalog + captions + planner + caches -> HostBatch per index.
 
 Everything fixed by the config (cache modes, text-length rule, text-dropout rule,
 decoder, write-back) is bound at construction; `materialize` only calls the bound
@@ -17,13 +17,12 @@ from kohakumoss_data.cache.tensor_cache import LatentCache, TextCache
 from kohakumoss_data.caption.template import build_template
 from kohakumoss_data.config import DataConfig
 from kohakumoss_data.format.catalog import Catalog, read_catalog
-from kohakumoss_data.loader.batch import MossHostBatch
 from kohakumoss_data.loader.decode import Decoder
 from kohakumoss_data.registry import PLANNERS, SOURCES, build
 from kohakumoss_data.resolution.geometry import Geometry
 from kohakumoss_data.resolution.item import keep_indices
 from kohakumoss_data.seeds import rng_of
-from kohakumoss_data.types import PlanItem
+from kohakumoss_data.types import HostBatch, PlanItem
 
 DATASET_KEYS = ("weight", "caption", "loss_weight", "catalog")
 
@@ -64,7 +63,7 @@ def _missing(what: str, script: str, found: list) -> KeyError:
 
 
 class MossDataset:
-    """Pure function `materialize(index, rank, world) -> MossHostBatch`; picklable."""
+    """Pure function `materialize(index, rank, world) -> HostBatch`; picklable."""
 
     def __init__(self, cfg: DataConfig):
         if not cfg.datasets:
@@ -111,9 +110,15 @@ class MossDataset:
 
     def _bind(self) -> None:
         cfg = self.cfg
-        self.text_len = (
-            self._text_len_cached if self.texts.enabled else self._text_len_estimate
-        )
+        if cfg.token_budget not in ("estimate", "exact"):
+            raise ValueError("token_budget must be 'estimate' or 'exact'")
+        if cfg.token_budget == "exact" and cfg.text_cache != "offline":
+            raise ValueError("token_budget='exact' needs text_cache='offline'")
+        self.text_len = {
+            ("estimate", False): self._text_len_estimate,
+            ("estimate", True): self._text_len_cached,
+            ("exact", True): self._text_len_exact,
+        }[(cfg.token_budget, self.texts.enabled)]
         self._drop = (
             partial(draw_drop, cfg.seed, cfg.text_drop) if cfg.text_drop else never_drop
         )
@@ -144,6 +149,7 @@ class MossDataset:
             batching=cfg.batching,
             overlong=cfg.overlong,
             max_tokens=cfg.max_tokens,
+            max_samples=cfg.max_samples,
             batch_size=cfg.batch_size,
             **cfg.planner_kwargs,
         )
@@ -166,6 +172,16 @@ class MossDataset:
         known = self._text_lengths.get(self.texts.key(caption))
         return self.estimate_text_tokens(caption) if known is None else known
 
+    def _text_len_exact(self, row_id: int, variant: int) -> int:
+        caption = self.caption(row_id, variant)
+        known = self._text_lengths.get(self.texts.key(caption))
+        if known is None:
+            raise KeyError(
+                f"token_budget='exact': caption of row {row_id} variant {variant} is "
+                "not in the text cache; run scripts/data/cache_text.py"
+            )
+        return known
+
     def open(self, row_id: int) -> bytes:
         source = self.sources[int(self.catalog.source[row_id])]
         return source.open(self.catalog[row_id].locator)
@@ -175,7 +191,7 @@ class MossDataset:
             self.open(item.row_id), item.crop_ltrb, item.target_hw, item.flip
         )
 
-    def materialize(self, index: int, rank: int = 0, world: int = 1) -> MossHostBatch:
+    def materialize(self, index: int, rank: int = 0, world: int = 1) -> HostBatch:
         """The batch `index` of `rank`: captions, text dropout, cache lookups, decode."""
         items = self.planner.plan(index, rank, world).items
         lf = self.cfg.latent_factor
@@ -186,7 +202,7 @@ class MossDataset:
         ]
         ids = [it.row_id for it in items]
         grid = [(it.target_hw[0] // lf, it.target_hw[1] // lf) for it in items]
-        batch = MossHostBatch(
+        batch = HostBatch(
             ids=torch.tensor(ids, dtype=torch.int64),
             hw=torch.tensor(grid, dtype=torch.int32),
             text_len=torch.zeros(len(items), dtype=torch.int32),
@@ -210,66 +226,66 @@ class MossDataset:
             [t if k is None else t.index_select(0, k) for t, k in zip(found, keeps)]
         )
 
-    def _latent_lookup(self, batch: MossHostBatch, items) -> list:
+    def _latent_lookup(self, batch: HostBatch, items) -> list:
         keys = [self.latents.key(self.catalog[it.row_id], it) for it in items]
         batch.latent_keys = keys
         return [self.latents.get(k) for k in keys]
 
-    def _latents_decode(self, batch: MossHostBatch, items) -> None:
+    def _latents_decode(self, batch: HostBatch, items) -> None:
         batch.pixels = [self.pixels(it) for it in items]
 
-    def _latents_offline(self, batch: MossHostBatch, items) -> None:
+    def _latents_offline(self, batch: HostBatch, items) -> None:
         found = self._latent_lookup(batch, items)
         if any(t is None for t in found):
             raise _missing("latents", "scripts/data/cache_latents.py", found)
         batch.latents = self._gather(found, batch.img_keep)
 
-    def _latents_online(self, batch: MossHostBatch, items) -> None:
+    def _latents_online(self, batch: HostBatch, items) -> None:
         found = self._latent_lookup(batch, items)
         if any(t is None for t in found):
             self._latents_decode(batch, items)
             return
         batch.latents = self._gather(found, batch.img_keep)
 
-    def _text_lookup(self, batch: MossHostBatch, captions: list[str]) -> list:
+    def _text_lookup(self, batch: HostBatch, captions: list[str]) -> list:
         keys = [self.texts.key(c) for c in captions]
         batch.text_keys = keys
         return [self.texts.get(k) for k in keys]
 
-    def _text_prompts(self, batch: MossHostBatch, captions: list[str]) -> None:
+    def _text_prompts(self, batch: HostBatch, captions: list[str]) -> None:
         batch.prompts = captions
 
     @staticmethod
-    def _set_text(batch: MossHostBatch, found: list) -> None:
+    def _set_text(batch: HostBatch, found: list) -> None:
         cut = [t[: limit or None] for t, limit in zip(found, batch.text_limit)]
         batch.text = torch.cat(cut)
         batch.text_len = torch.tensor([t.shape[0] for t in cut], dtype=torch.int32)
 
-    def _text_offline(self, batch: MossHostBatch, captions: list[str]) -> None:
+    def _text_offline(self, batch: HostBatch, captions: list[str]) -> None:
         found = self._text_lookup(batch, captions)
         if any(t is None for t in found):
             raise _missing("text embeddings", "scripts/data/cache_text.py", found)
         self._set_text(batch, found)
 
-    def _text_online(self, batch: MossHostBatch, captions: list[str]) -> None:
+    def _text_online(self, batch: HostBatch, captions: list[str]) -> None:
         found = self._text_lookup(batch, captions)
         if any(t is None for t in found):
             batch.prompts = captions
             return
         self._set_text(batch, found)
 
-    def _write_latents(self, batch: MossHostBatch, latents: torch.Tensor) -> None:
+    def _write_latents(self, batch: HostBatch, latents: torch.Tensor) -> None:
         sizes = (batch.hw[:, 0].long() * batch.hw[:, 1].long()).tolist()
         for key, part in zip(batch.latent_keys, latents.split(sizes)):
             self.latents.put(key, part)
 
-    def _write_text(self, batch: MossHostBatch, text: list[torch.Tensor]) -> None:
+    def _write_text(self, batch: HostBatch, text: list[torch.Tensor]) -> None:
         for key, emb in zip(batch.text_keys, text):
             self.texts.put(key, emb)
 
     def write_back(
         self,
-        batch: MossHostBatch,
+        batch: HostBatch,
         latents: torch.Tensor | None = None,
         text: list[torch.Tensor] | None = None,
     ) -> None:

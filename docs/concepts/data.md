@@ -8,7 +8,7 @@ and the model-side layout (`SeqInfo`) is built by the trainer from `hw` and `tex
 Source.scan() ──▶ CatalogRow ──▶ Catalog ──▶ Planner(seed, rank, world) ──▶ BatchPlan
                                                          │
                      MossDataset.materialize: captions, text dropout, cache lookups,
-                     decode ──▶ MossHostBatch (pinned) ──▶ trainer
+                     decode ──▶ HostBatch (pinned) ──▶ trainer
 ```
 
 ## Sources
