@@ -13,18 +13,18 @@ import torch
 
 from kohakumoss_kernels.hardware.arch import Arch, arch_of
 
-BACKENDS = ("tilelang", "triton", "eager")
+BACKENDS = ("tilelang", "triton", "compile", "eager")
 
 DEFAULT_PRIORITY: dict[str, tuple[str, ...]] = {
-    "sm70": ("tilelang", "eager"),
-    "sm75": ("tilelang", "eager"),
-    "sm80": ("triton", "tilelang", "eager"),
-    "sm86": ("triton", "tilelang", "eager"),
-    "sm89": ("triton", "tilelang", "eager"),
-    "sm90": ("triton", "tilelang", "eager"),
-    "sm100": ("triton", "tilelang", "eager"),
-    "sm120": ("triton", "tilelang", "eager"),
-    "xpu": ("triton", "eager"),
+    "sm70": ("tilelang", "compile", "eager"),
+    "sm75": ("tilelang", "compile", "eager"),
+    "sm80": ("triton", "tilelang", "compile", "eager"),
+    "sm86": ("triton", "tilelang", "compile", "eager"),
+    "sm89": ("triton", "tilelang", "compile", "eager"),
+    "sm90": ("triton", "tilelang", "compile", "eager"),
+    "sm100": ("triton", "tilelang", "compile", "eager"),
+    "sm120": ("triton", "tilelang", "compile", "eager"),
+    "xpu": ("triton", "compile", "eager"),
     "cpu": ("eager",),
 }
 
@@ -91,7 +91,7 @@ def set_priority(arch_name: str, order: tuple[str, ...] | list[str]) -> None:
 
 
 def available(op: str, device: torch.device | str, dtype: torch.dtype, **static):
-    """`{backend: None | reason}` for `op` on `device` — the doctor's view."""
+    """`{backend: None | reason}` for `op` on `device` (the doctor's view)."""
     query = OpQuery(op, arch_of(device), dtype, tuple(sorted(static.items())))
     out: dict[str, str | None] = {}
     for backend in BACKENDS:

@@ -18,6 +18,8 @@ class BaseWeight(Protocol):
 
     def weight(self, dtype: torch.dtype) -> Tensor: ...
 
+    def linear(self, x: Tensor, bias: Tensor | None) -> Tensor: ...
+
     def materialize(self) -> Tensor: ...
 
 
@@ -44,7 +46,9 @@ class Objective(Protocol):
 class Step(Protocol):
     """Driver-independent training step."""
 
-    def __call__(self, batch: DeviceBatch) -> StepOut: ...
+    def __call__(
+        self, batch: DeviceBatch, *, denom: Tensor | None = None, step: int = 0
+    ) -> StepOut: ...
 
 
 class Callback(Protocol):

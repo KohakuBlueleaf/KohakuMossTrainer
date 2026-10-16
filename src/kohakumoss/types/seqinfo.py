@@ -75,12 +75,25 @@ def _plan(lengths: list[int]) -> AttnPlan:
     return AttnPlan(_cu(lengths), max(lengths, default=0), tuple(lengths))
 
 
-def build_seqinfo(hw: Tensor, text_len: Tensor, rope_axes: int = 4) -> SeqInfo:
-    """Host-side SeqInfo from latent grid sizes `hw` [B, 2] and text lengths [B]."""
+def build_seqinfo(
+    hw: Tensor,
+    text_len: Tensor,
+    rope_axes: int = 4,
+    img_keep: list[Tensor | None] | None = None,
+) -> SeqInfo:
+    """Host-side SeqInfo from latent grid sizes `hw` [B, 2] and text lengths [B].
+
+    `img_keep[i]` (sorted int64 indices into sample i's row-major grid, or None for all)
+    keeps only those image tokens; their positions are their original grid positions.
+    """
     hw = hw.to(torch.int64).cpu()
     text_len = text_len.to(torch.int64).cpu()
     batch = hw.shape[0]
-    img_lens = (hw[:, 0] * hw[:, 1]).tolist()
+    keeps = img_keep if img_keep is not None else [None] * batch
+    img_lens = [
+        int(hw[i, 0] * hw[i, 1]) if keeps[i] is None else int(keeps[i].numel())
+        for i in range(batch)
+    ]
     txt_lens = text_len.tolist()
     joint_lens = [a + b for a, b in zip(img_lens, txt_lens)]
 
@@ -91,21 +104,24 @@ def build_seqinfo(hw: Tensor, text_len: Tensor, rope_axes: int = 4) -> SeqInfo:
     for i in range(batch):
         h, w = int(hw[i, 0]), int(hw[i, 1])
         t = txt_lens[i]
+        n = img_lens[i]
         ys, xs = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
         img = torch.zeros(h * w, rope_axes, dtype=torch.float32)
         img[:, 1] = t
         img[:, 2] = ys.flatten().float() - (h - 1) / 2
         img[:, 3] = xs.flatten().float() - (w - 1) / 2
+        if keeps[i] is not None:
+            img = img.index_select(0, keeps[i].to(torch.int64))
         txt = torch.zeros(t, rope_axes, dtype=torch.float32)
         txt[:, 1] = torch.arange(t, dtype=torch.float32)
         pos_joint += [img, txt]
         pos_txt.append(txt)
-        img_in_joint.append(torch.arange(offset, offset + h * w))
-        txt_in_joint.append(torch.arange(offset + h * w, offset + h * w + t))
-        offset += h * w + t
-        seg_img.append(torch.full((h * w,), i, dtype=torch.int32))
+        img_in_joint.append(torch.arange(offset, offset + n))
+        txt_in_joint.append(torch.arange(offset + n, offset + n + t))
+        offset += n + t
+        seg_img.append(torch.full((n,), i, dtype=torch.int32))
         seg_txt.append(torch.full((t,), i, dtype=torch.int32))
-        seg_joint.append(torch.full((h * w + t,), i, dtype=torch.int32))
+        seg_joint.append(torch.full((n + t,), i, dtype=torch.int32))
 
     return SeqInfo(
         batch=batch,

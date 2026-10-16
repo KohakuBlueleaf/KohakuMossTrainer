@@ -58,6 +58,8 @@ Triton-XPU and eager. Windows support is mandatory for sm75 / sm86 / sm89 / sm12
 ### Python Style
 - Target Python 3.10+. Modern hints: `list`, `dict`, `tuple`, `X | None`.
 - Prefer `match-case` over nested `if-elif-else`.
+- Python source and printed messages are ASCII-only (Windows consoles with a non-UTF-8
+  code page fail on non-ASCII text).
 - `black` and `ruff check` over every directory before commit.
 
 ### The architectural rules
@@ -65,6 +67,17 @@ Triton-XPU and eager. Windows support is mandatory for sm75 / sm86 / sm89 / sm12
 **Select, don't dispatch.** Configuration resolves a concrete class or callable once, at
 build time, via `build(spec, REGISTRY)` or `kohakumoss_kernels.registry.resolve(...)`. The
 result is held as a plain attribute and called directly. No per-step `if mode == ...`.
+
+Selection is a cost judgement, not a ban on `if`. Weigh a branch by how often it runs
+and how much it is duplicated: a branch inside a module that is instantiated hundreds of
+times in the model (every adapted linear, every block, every kernel wrapper) runs
+layers x calls times per step and is resolved at bind time into a distinct callable
+(`functools.partial` over a specialised function, a table keyed at bind time) — a kind
+`match`, "multiplier == 1", "has scalar / rescale / bias", an optional tensor that is
+always or never present. A branch the train loop takes once per step, or a one-off in
+build / export code, is negligible and stays a plain `if` when that reads better. A branch
+the same decision repeats in many places is also a selection candidate, for clarity.
+Train/eval differences in high-multiplicity modules re-bind on the mode change.
 
 **The backbone is a pure function.** `MossBackbone(img, text, sigma, seq) -> v`. It knows
 nothing about the loss; objectives live in `kohakumoss.diffusion.objective`.
@@ -82,8 +95,13 @@ computes. Every other backend equals it within the precision bar, forward and ba
 - Every kernel needs a precision check against an fp64 reference in both fp16 and bf16,
   forward and backward, judged in ULP (`tests/_util/precision.py`). Attention adds the
   huge-logit, padded-key and empty-row cases.
-- Every kernel must beat PyTorch (eager composition and `torch.compile` of it) on the arch
-  it targets, measured per op and inside the full step.
+- A kernel is selected only where it is faster than PyTorch on that arch; where it loses
+  to `torch.compile` of the eager composition (typical for FFN / matmul-heavy layers), the
+  op uses the compiled path. The choice is measured and recorded, never guessed per call.
+- Varlen attention must be faster than PyTorch SDPA (flash / mem-efficient). FA4-like
+  designs follow KohakuFA.
+- Precision is at least that of PyTorch / `torch.compile`, or better: MMA outputs stay in
+  fp32 (accumulators, epilogues, LSE), rounded once at the store.
 - fp16 training uses the residual-stream fold (`kohakumoss.model.numerics`), fp32
   accumulators, and the device-flag scaler.
 
@@ -108,6 +126,14 @@ computes. Every other backend equals it within the precision bar, forward and ba
 2. `black` and `ruff`.
 3. Logically separated commits: sentence-case imperative subject, body with the measured
    problem then the change.
+
+### Windows parity
+Most users run Windows, so every single-GPU feature works on Windows. A slower Windows
+implementation is acceptable (offload and other driver/OS-bound paths may use CPU staging
+instead of pinned transfers); "does not work on Windows" is not, unless a written
+justification in `docs/guides/install-windows.md` says why the feature does not matter
+there. Multi-GPU training (DDP, FSDP2, pipeline, threaded) is Linux-only by design.
+Every test that can run on Windows runs there.
 
 ### Public repository
 Everything tracked by git is public. No machine names, hosts, users, local paths,

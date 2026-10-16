@@ -20,17 +20,20 @@ TRAIN_TEXT_REFINER = False  # adapters/full FT also on the 2 text-refiner blocks
 DATASETS = (
     []
 )  # [{"source": "kohya" | "folder" | "jsonl" | "parquet" | "webdataset" | "moss_shard", "path": ..., "weight": 1.0, ...}]
-RESOLUTION_MODE = "pack"  # "pack" | "bucket" | "shifted_square" | "square_crop"
+RESOLUTION_MODE = "resize"  # "resize" (native aspect, area ~= TARGET_AREA) | "bucket" | "shifted_square" | "square_crop"
 TARGET_AREA = 1024 * 1024  # pixels
 SIZE_STEP = 16  # pixel multiple (VAE /8 x patchify 2)
 ASPECT_RANGE = (0.25, 4.0)  # min, max width/height
 UPSCALE = "never"  # "never" | "to_area"
-MAX_TOKENS = 16384  # pack mode: joint tokens (image + text) per batch per rank
-BATCH_SIZE = 4  # bucket / square modes: samples per batch per rank
+BATCHING = "tokens"  # "tokens" (greedy concat to MAX_TOKENS) | "tokens_ffd" | "count" (BATCH_SIZE)
+MAX_TOKENS = 16384  # target joint tokens (image + text) per batch per rank
+OVERLONG = "drop"  # sample longer than MAX_TOKENS: "drop" | "truncate_text" | "drop_tokens" (random image-token drop)
+BATCH_SIZE = 4  # BATCHING="count": samples per batch per rank
 CAPTION = {"template": "tags", "keep": ["artist"], "shuffle": True, "tag_dropout": 0.0}
 TEXT_DROP = 0.1  # probability a sample uses the empty-prompt embedding
 LATENT_CACHE = "offline"  # "off" | "offline" | "online"
 TEXT_CACHE = "offline"  # "off" | "offline" | "online"
+CACHE_DIR = ""  # "" = <dataset>/cache; directory for latent / text vaults
 CACHE_DTYPE = "bf16"  # "bf16" | "fp8"
 CAPTION_VARIANTS = 4  # cached caption renderings per image
 FLIP = False  # horizontal flip augmentation
@@ -46,9 +49,10 @@ ALGO_KWARGS = (
     {}
 )  # e.g. {"factor": 8} for lokr, {"block_size": 32, "constraint": 0.0} for oft
 DORA = False
-DORA_DETACH = True
+DORA_DETACH = False  # True detaches the DoRA norm (eager path only)
 DROPOUT = {"input": 0.0, "rank": 0.0, "module": 0.0}
 ADAPTER_MODE = "bypass"  # "bypass" | "merge"
+LORAPLUS_RATIO = 1.0  # lr ratio of up / down factors (LoRA+); 1.0 = off
 TRAIN_NORMS = False
 
 # ===================== OBJECTIVE =====================
@@ -58,15 +62,18 @@ TIMESTEP_KWARGS = {
     "s": 0.95,
     "shift": 1.0,
     "cutoff": 0.95,
-    "uniform_mix": 0.0,
+    "uniform_mix": 0.01,
 }
 LOSS = "mse"  # "mse" | "huber" | "masked_mse"
 LOSS_KWARGS = {}
+WEIGHTING = "none"  # "none" | "x0" | "eps"
 
 # ===================== OPTIM =====================
 OPTIMIZER = (
     "adamw"  # "adamw" | "adamw16" | "adamw8bit" | "muon" | "prodigy" | "schedule_free"
 )
+OPTIMIZER_KWARGS = {}
+FULL_MODE = "direct"  # ALGO="full": "direct" (train base weights) | "lycoris" (LyCORIS diff)
 LR = 1e-4
 BETAS = (0.9, 0.95)
 EPS = 1e-8
@@ -79,7 +86,8 @@ EMA = 0.0  # 0 = off; e.g. 0.9999
 # ===================== PRECISION =====================
 PRECISION = "bf16"  # "bf16" | "fp16" | "fp32"
 KEEP_FP32 = ("time_embedding", "shared_block_modulation", "video_head_modulation")
-FOLD = None  # None | float c | "auto" (from the activation probe) | per-layer list
+FP16_FIX = "none"  # "none" | "weights" (fold baked into weights) | "online" (runtime factors) | "fp32_residual"
+FP16_FIX_KWARGS = {}  # e.g. {"c": 1 / 16, "s_attn": 1.0, "s_ffn": 1.0, "eps": "stock"}; base needs c = 1/16
 
 # ===================== MEMORY =====================
 MEMORY_PROFILE = "balanced"  # "speed" | "balanced" | "low" | "minimal" | "auto"
@@ -95,9 +103,7 @@ PIPELINE_SCHEDULE = "1f1b"  # "gpipe" | "1f1b" | "interleaved-1f1b" | "zb"
 MICROBATCHES = 4
 
 # ===================== KERNELS =====================
-KERNELS = (
-    {}
-)  # op -> backend, e.g. {"attention_varlen": "triton"}; empty = arch priority
+KERNELS = {}  # op -> backend, e.g. {"attention_varlen": "triton", "lycoris": "torch"}; empty = arch priority
 TUNE = "auto"  # "auto" | "off" | "prewarm"
 COMPILE = "off"  # "off" | "block" | "model"
 
@@ -110,10 +116,12 @@ RUN_NAME = ""
 
 # ===================== LOGGING =====================
 LOGGER = "console"  # "console" | "board" | "wandb"
+PROJECT = "kohakumoss"
 LOG_EVERY = 10
 
 # ===================== SAMPLING =====================
 SAMPLE_PROMPTS = []
+SAMPLE_NEGATIVE = ""
 SAMPLE_EVERY = 0  # steps; 0 = off
 SAMPLE_STEPS = 50
 SAMPLE_CFG = 3.0

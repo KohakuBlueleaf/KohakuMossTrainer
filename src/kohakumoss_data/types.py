@@ -59,6 +59,8 @@ class HostBatch:
     """Packed batch on the host (pinned when a GPU consumes it).
 
     Image tokens are sample-major and row-major over the latent grid `hw` [B, 2].
+    `img_keep[i]` lists the kept grid indices of sample i after random token drop
+    (None = all kept); `latents` then holds only the kept tokens.
     """
 
     ids: Tensor
@@ -66,6 +68,7 @@ class HostBatch:
     text_len: Tensor
     text_drop: Tensor
     weight: Tensor
+    img_keep: list[Tensor | None] | None = None
     latents: Tensor | None = None
     text: Tensor | None = None
     pixels: list[np.ndarray] | None = None

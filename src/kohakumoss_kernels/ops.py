@@ -1,4 +1,6 @@
-"""Op names and their eager signatures — the contract every backend implements.
+"""Op names and their eager signatures: the contract every backend implements.
+
+Segment ids `seg` are nondecreasing (sample-major packing); segment reductions rely on it.
 
     rms_norm(x[N,D], weight[D] | None, eps) -> y[N,D]
     rms_norm_mod(x[N,D], weight[D] | None, shift[B,D] | None, scale[B,D] | None,
@@ -30,4 +32,5 @@ FFN = ("situ_glu",)
 RESIDUAL = ("gated_residual",)
 LOSS = ("token_mse",)
 FUSED = ("linear_qk_rope", "linear_situ", "linear_gated_residual")
-ALL = NORM + ROPE + ATTENTION + FFN + RESIDUAL + LOSS + FUSED
+OPTIM = ("adamw_step", "adamw8bit_step", "adamw_step_multi")
+ALL = NORM + ROPE + ATTENTION + FFN + RESIDUAL + LOSS + FUSED + OPTIM

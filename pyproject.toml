@@ -22,6 +22,9 @@ dependencies = [
     "anyschedule",
     "kohakuvault",
     "lycoris-lora>=4.0",
+    "diffusers>=0.38",
+    "transformers>=5.3",
+    "accelerate",
 ]
 
 [project.optional-dependencies]
@@ -30,8 +33,9 @@ kernels = [
     "triton-windows>=3.7,<3.9; sys_platform == 'win32'",
 ]
 lightning = ["lightning>=2.5"]
-reference = ["diffusers>=0.38", "transformers>=5.3", "accelerate"]
+textenc = ["flash-linear-attention", "causal-conv1d; sys_platform != 'win32'"]
 quant = ["bitsandbytes"]
+parquet = ["pyarrow"]
 board = ["kohakuboard"]
 wandb = ["wandb"]
 dev = ["pytest", "ruff", "black", "lpips"]
@@ -58,6 +62,7 @@ ignore = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 markers = [
     "cpu: runs on CPU only",
     "cuda: needs a CUDA GPU",

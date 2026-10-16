@@ -19,7 +19,8 @@ class PrecisionPolicy:
     scaler: bool = False
     scaler_init: float = 2.0**16
     scaler_growth_interval: int = 2000
-    fold: float | tuple[float, ...] | None = None
+    fp16_fix: str = "none"
+    fp16_fix_kwargs: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class MemoryPlan:
     stream_resident: int = 0
     pinned: bool = True
     optim_state: str = "gpu"
+    grad_offload: bool = False
     fused_step: bool = False
     compile: str = "off"
 

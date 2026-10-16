@@ -37,9 +37,10 @@ class BarResult:
     eager_elem: float
     eager_rms: float
 
-    def ok(self, factor: float, floor_ulp: float) -> bool:
+    def ok(self, factor: float, floor_ulp: float, factor_elem: float | None = None) -> bool:
+        fe = factor if factor_elem is None else factor_elem
         return self.backend_elem <= max(
-            factor * self.eager_elem, floor_ulp
+            fe * self.eager_elem, floor_ulp
         ) and self.backend_rms <= max(factor * self.eager_rms, floor_ulp)
 
 
@@ -60,9 +61,14 @@ def assert_bar(
     factor: float = 1.1,
     floor_ulp: float = 2.0,
     name: str = "",
+    factor_elem: float | None = None,
 ) -> None:
-    """Assert `out` is within the eager-in-dtype precision bar against `ref64`."""
+    """Assert `out` is within the eager-in-dtype precision bar against `ref64`.
+
+    `factor` bounds the RMS metric; `factor_elem` (default `factor`) bounds the
+    elementwise max, which near-zero outputs dominate in reductions.
+    """
     assert torch.isfinite(out).all(), f"{name}: non-finite output"
     assert ref64.abs().max() > 0, f"{name}: reference is all zero"
     res = bar(out, eager, ref64, dtype)
-    assert res.ok(factor, floor_ulp), f"{name}: {res}"
+    assert res.ok(factor, floor_ulp, factor_elem), f"{name}: {res}"

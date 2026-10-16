@@ -25,7 +25,7 @@ class MossLinear(nn.Linear):
     ):
         super().__init__(in_features, out_features, bias, device=device, dtype=dtype)
         self.base: BaseWeight | None = None
-        self._impl = self._dense
+        self._impl = self._dense if bias else self._dense_nobias
 
     def reset_parameters(self) -> None:
         """No-op: the model builder initialises or loads weights."""
@@ -42,17 +42,41 @@ class MossLinear(nn.Linear):
         return self.weight.to(dtype)
 
     def set_base(self, base: BaseWeight | None) -> None:
-        """Attach quantized/streamed storage (or None for the dense parameter)."""
-        self.base = base
-        self._impl = self._dense if base is None else self._stored
+        """Attach quantized/streamed storage, or None to go back to the dense parameter."""
+        self.clear_base()
+        if base is not None:
+            self.base = base
+            self.rebind()
+
+    def clear_base(self) -> None:
+        """Detach any base storage (Module-typed or not) and use the dense parameter."""
+        self._modules.pop("base", None)
+        self.__dict__["base"] = None
+        self.rebind()
+
+    def rebind(self) -> None:
+        """Re-select the forward after a structural change (bias added/removed, base)."""
+        match (self.base is not None, self.bias is not None):
+            case (True, True):
+                self._impl = self._stored
+            case (True, False):
+                self._impl = self._stored_nobias
+            case (False, True):
+                self._impl = self._dense
+            case (False, False):
+                self._impl = self._dense_nobias
 
     def _dense(self, x: Tensor) -> Tensor:
-        bias = None if self.bias is None else self.bias.to(x.dtype)
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, self.weight.to(x.dtype), self.bias.to(x.dtype))
+
+    def _dense_nobias(self, x: Tensor) -> Tensor:
+        return F.linear(x, self.weight.to(x.dtype))
 
     def _stored(self, x: Tensor) -> Tensor:
-        bias = None if self.bias is None else self.bias.to(x.dtype)
-        return F.linear(x, self.base.weight(x.dtype), bias)
+        return self.base.linear(x, self.bias.to(x.dtype))
+
+    def _stored_nobias(self, x: Tensor) -> Tensor:
+        return self.base.linear(x, None)
 
     def forward(self, x: Tensor) -> Tensor:
         return self._impl(x)
