@@ -1,0 +1,164 @@
+"""Caption templates: CatalogRow + seeded generator -> caption string.
+
+Every option (normaliser, dropout, shuffle, json format) is selected into a bound
+function at construction; `render` only calls them. Only the seeded draws vary.
+"""
+
+from functools import partial
+
+import numpy as np
+
+from kohakumoss_data.caption.json_text import make_renderer
+from kohakumoss_data.caption.tags import normalizer
+from kohakumoss_data.registry import CAPTIONS, build
+from kohakumoss_data.types import CatalogRow
+
+
+def _keep_values(row: CatalogRow, keep: tuple[str, ...]) -> list[str]:
+    values = []
+    for name in keep:
+        value = getattr(row, name, None)
+        match value:
+            case None | "":
+                continue
+            case list() | tuple():
+                values.extend(str(v) for v in value)
+            case _:
+                values.append(str(value))
+    return values
+
+
+def _all(items: list, rng: np.random.Generator) -> list:
+    return items
+
+
+def _drop_each(p: float, items: list, rng: np.random.Generator) -> list:
+    return [x for x in items if rng.random() >= p]
+
+
+def _permute(items: list, rng: np.random.Generator) -> list:
+    if len(items) < 2:
+        return items
+    return [items[i] for i in rng.permutation(len(items))]
+
+
+@CAPTIONS.register("tags")
+class TagTemplate:
+    """Tags joined by `joiner`: keep fields first, then `keep_first` fixed tags, then
+    the rest split into groups at `group_sep` tags, each group dropped with
+    `group_dropout`, tags dropped with `tag_dropout`, shuffled when `shuffle`."""
+
+    def __init__(
+        self,
+        keep: tuple[str, ...] = ("artist",),
+        keep_first: int = 0,
+        keep_sep: str = "|||",
+        group_sep: str = "%%",
+        shuffle: bool = True,
+        tag_dropout: float = 0.0,
+        group_dropout: float = 0.0,
+        underscores: bool = True,
+        unescape: bool = True,
+        joiner: str = ", ",
+        prefix: str = "",
+        suffix: str = "",
+    ):
+        self.keep = tuple(keep)
+        self.keep_first = keep_first
+        self.keep_sep = keep_sep
+        self.group_sep = group_sep
+        self.joiner = joiner
+        self.prefix = prefix
+        self.suffix = suffix
+        self._norm = normalizer(underscores, unescape)
+        self._groups = partial(_drop_each, group_dropout) if group_dropout else _all
+        self._tags = partial(_drop_each, tag_dropout) if tag_dropout else _all
+        self._order = _permute if shuffle else _all
+
+    def _split(self, tags: list[str]) -> tuple[list[str], list[list[str]]]:
+        fixed, rest = tags[: self.keep_first], tags[self.keep_first :]
+        if self.keep_sep in rest:
+            cut = rest.index(self.keep_sep)
+            fixed, rest = fixed + rest[:cut], rest[cut + 1 :]
+        groups, current = [], []
+        for tag in rest:
+            if tag == self.group_sep:
+                groups.append(current)
+                current = []
+            else:
+                current.append(tag)
+        groups.append(current)
+        return fixed, groups
+
+    def tag_list(self, row: CatalogRow, rng: np.random.Generator) -> list[str]:
+        fixed, groups = self._split(list(row.tags or []))
+        kept = [self._order(self._tags(g, rng), rng) for g in self._groups(groups, rng)]
+        body = [t for g in self._order(kept, rng) for t in g]
+        head = _keep_values(row, self.keep) + fixed
+        return [self._norm(t) for t in head + body]
+
+    def render(self, row: CatalogRow, rng: np.random.Generator) -> str:
+        return self.prefix + self.joiner.join(self.tag_list(row, rng)) + self.suffix
+
+
+@CAPTIONS.register("nl")
+class NaturalTemplate:
+    """Natural-language caption; keep fields are prepended as `a, b. `; falls back to
+    `fallback` (a tag template) when the row has no `caption_nl`."""
+
+    def __init__(self, keep: tuple[str, ...] = (), fallback: dict | None = None):
+        self.keep = tuple(keep)
+        self.fallback = build(fallback or {"template": "tags"}, CAPTIONS, "template")
+
+    def render(self, row: CatalogRow, rng: np.random.Generator) -> str:
+        if not row.caption_nl:
+            return self.fallback.render(row, rng)
+        head = _keep_values(row, self.keep)
+        lead = (", ".join(head) + ". ") if head else ""
+        return lead + row.caption_nl
+
+
+@CAPTIONS.register("mix")
+class MixTemplate:
+    """Natural language with probability `p_nl` (when present), tags otherwise."""
+
+    def __init__(
+        self, p_nl: float = 0.5, nl: dict | None = None, tags: dict | None = None
+    ):
+        self.p_nl = p_nl
+        self.nl = build(nl or {"template": "nl"}, CAPTIONS, "template")
+        self.tags = build(tags or {"template": "tags"}, CAPTIONS, "template")
+
+    def render(self, row: CatalogRow, rng: np.random.Generator) -> str:
+        if row.caption_nl and rng.random() < self.p_nl:
+            return self.nl.render(row, rng)
+        return self.tags.render(row, rng)
+
+
+@CAPTIONS.register("json")
+class JsonTemplate:
+    """Structured caption from `row.json` plus the listed row fields."""
+
+    def __init__(
+        self,
+        fields: tuple[str, ...] = ("artist", "rating", "tags", "caption_nl"),
+        style: str = "lines",
+        order: tuple[str, ...] = (),
+        field_dropout: float = 0.0,
+        keep: tuple[str, ...] = (),
+    ):
+        self.fields = tuple(fields)
+        self._render = make_renderer(style, order, field_dropout, keep)
+
+    def render(self, row: CatalogRow, rng: np.random.Generator) -> str:
+        data = dict(row.json or {})
+        for name in self.fields:
+            value = getattr(row, name, None)
+            if value not in (None, "", []):
+                data.setdefault(name, value)
+        return self._render(data, rng)
+
+
+def build_template(spec: dict | str | None):
+    """`{"template": name, **kwargs}` -> template instance (default: tags)."""
+    return build(spec or {"template": "tags"}, CAPTIONS, "template")

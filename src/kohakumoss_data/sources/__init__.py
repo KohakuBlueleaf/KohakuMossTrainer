@@ -1,0 +1,23 @@
+"""Dataset sources: enumerate records (header-only) and open image bytes."""
+
+from kohakumoss_data.registry import SOURCES
+from kohakumoss_data.sources import (
+    folder,
+    jsonl,
+    kohya,
+    moss_shard,
+    parquet,
+    synthetic,
+    webdataset,
+)
+
+__all__ = [
+    "SOURCES",
+    "folder",
+    "jsonl",
+    "kohya",
+    "moss_shard",
+    "parquet",
+    "synthetic",
+    "webdataset",
+]
