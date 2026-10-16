@@ -2,6 +2,7 @@
 
 | page | content |
 | --- | --- |
+| [install-windows.md](install-windows.md) | Windows install, toolchain, feature matrix |
 | [first-lora.md](first-lora.md) | train a first LoRA / LyCORIS adapter |
 | [full-finetune.md](full-finetune.md) | full finetune, memory profiles for it |
 | [datasets.md](datasets.md) | preparing data, importing to the dataset format, caching |
