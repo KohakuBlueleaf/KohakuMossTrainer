@@ -1,0 +1,31 @@
+"""Logging sinks, selected through LOGGERS (rank 0; other ranks get NullLogger)."""
+
+from kohakumoss.logging.sinks import BoardLogger, ConsoleLogger, NullLogger, WandbLogger
+from kohakumoss.registry import Registry
+
+LOGGERS = Registry("logger")
+LOGGERS.add(
+    "console", lambda output_dir, name, project, config: ConsoleLogger(output_dir)
+)
+LOGGERS.add("board", BoardLogger)
+LOGGERS.add("wandb", WandbLogger)
+
+
+def build_logger(
+    kind: str, output_dir: str, name: str, project: str, config: dict, is_main: bool
+):
+    if not is_main:
+        return NullLogger()
+    return LOGGERS.get(kind)(
+        output_dir=output_dir, name=name, project=project, config=config
+    )
+
+
+__all__ = [
+    "LOGGERS",
+    "BoardLogger",
+    "ConsoleLogger",
+    "NullLogger",
+    "WandbLogger",
+    "build_logger",
+]
