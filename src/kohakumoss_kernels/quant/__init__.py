@@ -45,7 +45,7 @@ def _dgrad_ref(g: Tensor, q: Tensor, scale: Tensor) -> Tensor:
 
 @functools.cache
 def _compiled(fn: Callable) -> Callable:
-    return torch.compile(fn, dynamic=None)
+    return torch.compile(fn, dynamic=True)
 
 
 PYTORCH_PATHS = ({"impl": "eager"}, {"impl": "compile"})

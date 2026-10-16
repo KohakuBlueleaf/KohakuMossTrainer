@@ -37,7 +37,9 @@ class BarResult:
     eager_elem: float
     eager_rms: float
 
-    def ok(self, factor: float, floor_ulp: float, factor_elem: float | None = None) -> bool:
+    def ok(
+        self, factor: float, floor_ulp: float, factor_elem: float | None = None
+    ) -> bool:
         fe = factor if factor_elem is None else factor_elem
         return self.backend_elem <= max(
             fe * self.eager_elem, floor_ulp

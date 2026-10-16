@@ -2,14 +2,17 @@
 
 import pytest
 import torch
+from torch._dynamo.eval_frame import _debug_get_cache_entry_list
 from torch.utils.checkpoint import checkpoint
 
 from kohakumoss.types.seqinfo import build_seqinfo
 from kohakumoss_kernels import registry
 from kohakumoss_kernels.backends.compile import race
+from kohakumoss_kernels.backends.compile.ops import compiled_op
 from kohakumoss_kernels.backends.compile.prewarm import prewarm_block_ops
 from kohakumoss_kernels.backends.eager import ffn, norm, rope
 from kohakumoss_kernels.tuning import tuner
+from tests._util.negative import must_fail
 
 
 @pytest.fixture
@@ -130,6 +133,96 @@ def test_checkpointed_block_on_fresh_cache(device, fresh):
         _block, ops, xb, mod, seg, pos, bands, use_reentrant=False
     ).float().square().sum().backward()
     torch.testing.assert_close(xb.grad, xe.grad, rtol=2e-2, atol=2e-2)
+
+
+SHAPES = (  # three distinct token counts (31, 57, 115), ending on the first again
+    ([[4, 6]], [7]),
+    ([[4, 6], [3, 5]], [7, 11]),
+    ([[8, 8], [2, 2], [5, 3]], [3, 9, 18]),
+    ([[4, 6]], [7]),
+)
+
+
+def _shape_inputs(hw, text, device, dtype, seed):
+    gen = torch.Generator().manual_seed(seed)
+    seq = build_seqinfo(torch.tensor(hw), torch.tensor(text))
+    x = torch.randn(seq.n_joint, 256, generator=gen).to(device, dtype)
+    mod = (0.1 * torch.randn(len(hw), 256, generator=gen)).to(device)
+    return x, mod, seq.seg_joint.to(device), seq.pos_joint.to(device)
+
+
+def _accumulated_grads(ops, batch, bands):
+    """Two checkpointed blocks per micro-batch; every forward first, then the backwards
+    in reverse, so a recompute runs after later shapes went through the compiled ops."""
+    xs = [b[0].detach().clone().requires_grad_(True) for b in batch]
+    losses = []
+    for x, (_, mod, seg, pos) in zip(xs, batch):
+        h = x
+        for _ in range(2):
+            h = checkpoint(_block, ops, h, mod, seg, pos, bands, use_reentrant=False)
+        losses.append(h.float().square().mean())
+    for loss in reversed(losses):
+        loss.backward()
+    return [x.grad for x in xs]
+
+
+def _compile_arm_steps(device, dynamic) -> dict[str, int]:
+    """Compile arm forced on every op; grads of each step vs the eager specs. Returns
+    the number of compiled graphs per op left on its eager spec's frame."""
+    dtype = torch.float16
+    torch._dynamo.reset()
+    ops = {name: _registered(name, device, dtype) for name in EAGER}
+    arms = {name: op.impls["compile"] for name, op in ops.items()}
+    bands = (1 / (10000.0 ** (torch.arange(16) / 16))).to(device)
+    try:
+        for name, op in ops.items():
+            op.bind("compile")
+            op.impls["compile"] = compiled_op(name, dynamic)
+        for step in range(len(SHAPES)):
+            batch = [
+                _shape_inputs(
+                    *SHAPES[(step + j) % len(SHAPES)], device, dtype, step + j
+                )
+                for j in range(2)
+            ]
+            got = _accumulated_grads(ops, batch, bands)
+            ref = _accumulated_grads(EAGER, batch, bands)
+            for g, r in zip(got, ref):
+                err = (g.float() - r.float()).abs().max() / r.float().abs().max()
+                assert err < 2e-2, f"step {step}: relative grad error {err.item()}"
+        return {
+            name: len(_debug_get_cache_entry_list(fn.__code__))
+            for name, fn in EAGER.items()
+        }
+    finally:
+        for name, op in ops.items():
+            op.impls["compile"] = arms[name]
+        torch._dynamo.reset()
+
+
+def _check_graphs(graphs: dict[str, int]) -> None:
+    """A token-count change never compiles a new graph: one graph per op, two for the
+    ops taking a per-sample tensor (one sample specialises its leading dim to 1)."""
+    per_sample = {"rms_norm_mod", "gated_residual"}
+    for name, n in graphs.items():
+        assert n == (2 if name in per_sample else 1), f"{name}: {n} graphs"
+
+
+@pytest.mark.cuda
+def test_compile_arm_checkpointed_across_shapes(device, fresh):
+    """Registered compile arm (dynamic=True) inside block checkpointing, token count
+    changing every step and across micro-batches whose recomputes run after later
+    shapes: no checkpoint mismatch, eager grads, and no recompile on a new length."""
+    _check_graphs(_compile_arm_steps(device, True))
+
+
+@pytest.mark.cuda
+def test_compile_arm_automatic_dynamic_is_caught(device, fresh):
+    """`dynamic=None` (static first trace, dynamic recompile on the next length) is
+    what lets a recompute meet a different graph than its forward; the graph check
+    above must reject it."""
+    graphs = _compile_arm_steps(device, None)
+    must_fail(lambda: _check_graphs(graphs), "automatic dynamic recompiles")
 
 
 @pytest.mark.cuda

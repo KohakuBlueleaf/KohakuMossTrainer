@@ -42,10 +42,14 @@ COMPILED = tuple(EAGER)
 
 
 @cache
-def compiled_op(name: str) -> Callable:
-    """torch.compile(eager spec of `name`), dynamic shapes, built lazily on first call.
+def compiled_op(name: str, dynamic: bool | None = True) -> Callable:
+    """torch.compile(eager spec of `name`, dynamic=`dynamic`), built lazily on first call.
 
-    Inside an outer torch.compile the eager spec itself is traced (no nested compile).
+    The registered arm is `dynamic=True`: every shape symbolic from the first trace, so a
+    later token count never recompiles the frame into a different graph that a pending
+    checkpoint recompute of an earlier shape would then hit (`dynamic=None` does exactly
+    that: static first, dynamic on the second shape). Inside an outer torch.compile the
+    eager spec itself is traced (no nested compile).
     """
     eager = EAGER[name]
     holder: list = []
@@ -54,7 +58,7 @@ def compiled_op(name: str) -> Callable:
         if torch.compiler.is_compiling():
             return eager(*args)
         if not holder:
-            holder.append(torch.compile(eager, dynamic=True))
+            holder.append(torch.compile(eager, dynamic=dynamic))
         return holder[0](*args)
 
     call.__name__ = f"compiled_{name}"
