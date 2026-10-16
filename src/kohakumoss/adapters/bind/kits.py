@@ -13,7 +13,7 @@ Both expose the same factories; each returns the callable to plug into a
 from functools import partial
 
 from lycoris.functional.diag_oft import MAX_BLOCK
-from lycoris.functional.lokr import _apply_supported
+from lycoris.functional.lokr import apply_supported
 
 from kohakumoss.adapters.bind import fused, ops
 from kohakumoss.adapters.bind.race import TierSlot, flat, static_bucket, token_bucket
@@ -35,7 +35,7 @@ class Pinned:
 
     def lokr(self, lyco, scale):
         raw = fused.kron_factors(lyco, fused.kron_getters(lyco, False))
-        if not _apply_supported(*raw, None):
+        if not apply_supported(*raw, None):
             return None
         return partial(
             fused.lokr_diff, lyco, fused.kron_getters(lyco), scale, self.backend

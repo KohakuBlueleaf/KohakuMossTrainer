@@ -13,8 +13,8 @@ import torch
 from lycoris.functional import boft as f_boft
 from lycoris.functional import diag_oft as f_oft
 from lycoris.functional.general import weight_decompose
-from lycoris.modules.glora import _glora_weight
-from lycoris.modules.ia3 import _ia3_weight
+from lycoris.modules.glora import glora_weight
+from lycoris.modules.ia3 import ia3_weight
 from torch import Tensor
 
 from kohakumoss.adapters.target import Target
@@ -79,13 +79,13 @@ def _boft_rescaled(t: Target, multiplier: float) -> Tensor:
 
 def _unit_ia3(t: Target) -> Tensor:
     lyco = t.lyco
-    return _ia3_weight(t.base_fn(F32), lyco.weight.float(), lyco.train_input, 1.0, True)
+    return ia3_weight(t.base_fn(F32), lyco.weight.float(), lyco.train_input, 1.0, True)
 
 
 def _unit_glora(t: Target) -> Tensor:
     lyco = t.lyco
     parts = (lyco.a1.weight, lyco.a2.weight, lyco.b1.weight, lyco.b2.weight)
-    dw = _glora_weight(t.base_fn(F32), *(p.float() for p in parts), None, lyco.scale)
+    dw = glora_weight(t.base_fn(F32), *(p.float() for p in parts), None, lyco.scale)
     return (dw * lyco.scalar.float()).reshape(lyco.shape)
 
 

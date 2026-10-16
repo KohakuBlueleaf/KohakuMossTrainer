@@ -3,10 +3,10 @@
 A `TierSlot` holds one layer's `Op`. On the first call of a shape bucket it asks
 `lycoris.kernels.tier.best` with the real operands (racing the fused backends, the
 compile tier, the eager body and the op's exact extras on a miss of LyCORIS's table)
-and keeps the picked arm; every later call of that bucket is one dict lookup and the
-bound arm. A pick LyCORIS holds provisionally (an all-zero reference, e.g. freshly
-zero-initialised factors) is not kept: the slot asks again on every call, which is
-LyCORIS's own re-race schedule, until LyCORIS records a decision.
+and keeps the picked arm once `tier.is_settled` says LyCORIS has fixed it for the
+process; every later call of that bucket is one dict lookup and the bound arm.
+LyCORIS fixes a key's tier at its first call (racing it only outside checkpointed
+forwards and backwards), so a checkpoint recompute reruns the arm its forward ran.
 
 The bucket covers what varies per call (token bucket, activation dtype, grad
 pattern); factor shapes, dtypes and grad flags are fixed between `AdapterSet.bind()`
@@ -20,7 +20,7 @@ from functools import partial
 import torch
 from lycoris.kernels import tier
 from lycoris.kernels.plans import tune
-from lycoris.kernels.select import FUSED, call_compiled, choose, device_of
+from lycoris.kernels.select import FUSED, call_compiled
 from torch import Tensor
 
 
@@ -46,12 +46,13 @@ def _torch_body(ref, ref_args, ops: tuple) -> Tensor:
     return ref(*ref_args(ops))
 
 
-def _compiled_body(ref, ref_args, ops: tuple) -> Tensor:
-    """The compiled body; inside an enclosing torch.compile, the body itself."""
+def _compiled_body(ref, ref_args, bypass: bool, ops: tuple) -> Tensor:
+    """The compiled body; inside an enclosing torch.compile, the body itself. A
+    bypass op's activation (ops[0]) has its token axes left dynamic."""
     args = ref_args(ops)
     if torch.compiler.is_compiling():
         return ref(*args)
-    return call_compiled(ref, *args)
+    return call_compiled(ref, *args, token_arg=ops[0] if bypass else None)
 
 
 def body(op: Op, pick: str) -> Callable[[tuple], Tensor]:
@@ -60,8 +61,9 @@ def body(op: Op, pick: str) -> Callable[[tuple], Tensor]:
         return partial(op.fused, pick)
     if pick in op.extras:
         return op.extras[pick]
-    fn = _compiled_body if pick == "compile" else _torch_body
-    return partial(fn, op.ref, op.ref_args)
+    if pick == "compile":
+        return partial(_compiled_body, op.ref, op.ref_args, "bypass" in op.name)
+    return partial(_torch_body, op.ref, op.ref_args)
 
 
 def _on(operands, fn, t: Tensor) -> Tensor:
@@ -96,10 +98,7 @@ def race_args(op: Op, t: Tensor) -> tuple:
 
 def settled(name: str, tensors: tuple, supported: bool) -> bool:
     """LyCORIS keeps its pick for these operands for good (or has nothing to race)."""
-    if choose(tensors, supported, None) not in FUSED or not tune.tuning_enabled():
-        return True
-    with torch.cuda.device(device_of(tensors)):
-        return tune.lookup(tier._key(name, tensors)) is not None
+    return tier.is_settled(name, tensors, supported)
 
 
 def token_bucket(t: Tensor) -> tuple:

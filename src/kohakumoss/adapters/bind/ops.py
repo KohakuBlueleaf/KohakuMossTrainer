@@ -73,7 +73,7 @@ def lora_bypass(lyco, gamma: float) -> Op:
         partial(_lora_operands, lyco),
         static_scale(gamma),
         partial(_lora_fused, gamma),
-        f_locon._bypass_diff,
+        f_locon.eager_bypass_diff,
         partial(_then, (None, gamma, {})),
     )
 
@@ -106,7 +106,7 @@ def loha_bypass(lyco, gamma: float) -> Op:
         partial(_loha_operands, lyco),
         static_scale(gamma),
         partial(_loha_fused, gamma),
-        f_loha._bypass_diff,
+        f_loha.eager_bypass_diff,
         partial(_then, (None, None, gamma, {})),
         extras,
     )
@@ -125,9 +125,9 @@ def lokr_bypass(lyco, scale: float) -> Op:
     return Op(
         "lokr.bypass",
         partial(_kron_operands, lyco, kron_getters(lyco)),
-        f_lokr._apply_supported(*raw, None) and static_scale(scale),
+        f_lokr.apply_supported(*raw, None) and static_scale(scale),
         partial(_kron_fused, scale),
-        f_lokr._kron_bypass,
+        f_lokr.eager_kron_bypass,
         partial(_then, (None, scale, {})),
     )
 
@@ -153,7 +153,7 @@ def oft_bypass(lyco) -> Op:
         partial(_oft_operands, lyco, rescale_getter(lyco)),
         lyco.oft_blocks.shape[-1] <= MAX_BLOCK,
         partial(_oft_fused, lyco),
-        f_oft._bypass_diff,
+        f_oft.eager_bypass_diff,
         partial(_oft_args, lyco),
     )
 
@@ -172,7 +172,7 @@ def boft_bypass(lyco, m: float) -> Op:
         partial(_oft_operands, lyco, rescale_getter(lyco)),
         True,
         partial(_boft_fused, lyco, m),
-        f_boft._bypass_diff,
+        f_boft.eager_bypass_diff,
         partial(_boft_args, lyco, m),
     )
 
@@ -198,7 +198,7 @@ def lora_merge(lyco) -> Op:
         partial(_lora_weights, lyco),
         static_scale(lyco.scale),
         partial(_lora_weight_fused, lyco),
-        f_locon._diff_weight,
+        f_locon.eager_diff_weight,
         partial(_scaled, lyco),
     )
 
@@ -217,7 +217,7 @@ def loha_merge(lyco) -> Op:
         partial(_loha_weights, lyco),
         static_scale(lyco.scale),
         partial(_loha_weight_fused, lyco),
-        f_loha._diff_weight,
+        f_loha.eager_diff_weight,
         partial(_scaled, lyco),
     )
 
@@ -236,9 +236,9 @@ def lokr_merge(lyco) -> Op:
     return Op(
         "lokr.merge",
         partial(_kron_weights, lyco, getters),
-        f_lokr._plain_w2(w2, w2b, None) and static_scale(lyco.scale),
+        f_lokr.plain_w2(w2, w2b, None) and static_scale(lyco.scale),
         partial(_kron_weight_fused, lyco),
-        f_lokr._kron_weight,
+        f_lokr.eager_kron_weight,
         partial(_scaled, lyco),
     )
 
@@ -257,7 +257,7 @@ def oft_merge(lyco) -> Op:
         partial(_oft_operands, lyco, rescale_getter(lyco)),
         lyco.oft_blocks.shape[-1] <= MAX_BLOCK,
         partial(_oft_weight_fused, lyco),
-        f_oft._diff_weight,
+        f_oft.eager_diff_weight,
         partial(_constrained, lyco),
     )
 
@@ -276,7 +276,7 @@ def boft_merge(lyco, m: float) -> Op:
         partial(_oft_operands, lyco, rescale_getter(lyco)),
         True,
         partial(_boft_weight_fused, lyco, m),
-        f_boft._diff_weight,
+        f_boft.eager_diff_weight,
         partial(_boft_weight_args, lyco, m),
     )
 
@@ -298,6 +298,6 @@ def decompose(lyco, on_out: bool) -> Op:
         partial(_dora_operands, lyco),
         True,
         partial(_dora_fused, on_out),
-        f_general._weight_decompose,
+        f_general.eager_weight_decompose,
         partial(_then, (1.0, on_out)),
     )

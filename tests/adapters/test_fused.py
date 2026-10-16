@@ -19,7 +19,6 @@ import torch
 from _adcases import make_spec
 from _adtoy import inputs, perturb, toy
 from lycoris.kernels import tier
-from lycoris.kernels.plans import tune
 
 from kohakumoss.adapters import apply
 from kohakumoss.adapters.backend import pick_backend
@@ -93,14 +92,10 @@ def _slots(fn) -> list[TierSlot]:
 
 
 def _fresh_race(patch, tmp_path):
-    """No tier decision known yet: this process races every op again."""
-    tune._load_table()
-    kept = {k: v for k, v in tune._CACHE.items() if not str(k[1]).startswith("tier.")}
-    patch.setattr(tune, "_CACHE", kept)
+    """No tier decision known yet: this process races every op again (against a
+    scratch table, so the shared one keeps its rows)."""
     patch.setenv("LYCORIS_KERNEL_CACHE_DIR", str(tmp_path))
-    patch.setattr(tier, "_PROVISIONAL", {})
-    patch.setattr(tier, "_REJECTED", {})
-    patch.setattr(tier, "_UNGATED", set())
+    tier.reset("all")
 
 
 @pytest.mark.parametrize("dtype", _dtypes())

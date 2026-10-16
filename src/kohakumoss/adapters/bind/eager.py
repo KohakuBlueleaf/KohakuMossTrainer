@@ -7,7 +7,7 @@ variants are re-bound by the adapter set's train()/eval() hook.
 
 import torch
 import torch.nn.functional as F
-from lycoris.modules.ia3 import _ia3_scale
+from lycoris.modules.ia3 import ia3_scale
 
 
 def module_bypass(lyco, multiplier, x):
@@ -21,11 +21,11 @@ def module_forward(lyco, x):
 
 
 def ia3_out(linear, lyco, multiplier, x):
-    return _ia3_scale(linear._impl(x), lyco.weight.to(x.dtype), multiplier, False)
+    return ia3_scale(linear._impl(x), lyco.weight.to(x.dtype), multiplier, False)
 
 
 def ia3_in(linear, lyco, multiplier, x):
-    return linear._impl(_ia3_scale(x, lyco.weight.to(x.dtype), multiplier, False))
+    return linear._impl(ia3_scale(x, lyco.weight.to(x.dtype), multiplier, False))
 
 
 def dylora_train(linear, lyco, multiplier, x):
