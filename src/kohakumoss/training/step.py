@@ -1,7 +1,9 @@
 """TrainStep (driver-independent) and the HostBatch -> DeviceBatch transfer.
 
 Every build-time condition (cached vs online encoders, loss mask on/off) is bound to a
-callable at construction; the per-step paths carry no configuration branches.
+callable at construction; the per-step paths carry no configuration branches. The one
+per-batch choice is data: an online cache hit arrives with `latents` / `text` set and
+is used as is, a miss arrives with `pixels` / `prompts` and is encoded.
 """
 
 from collections.abc import Callable
@@ -32,23 +34,33 @@ def _cached_text(hb, device) -> tuple[Tensor, Tensor]:
     return _move(hb.text, device), hb.text_len
 
 
-def _cached_latents(hb, device) -> Tensor:
-    return _move(hb.latents, device)
+def _cached_latents(hb, device) -> tuple[Tensor, None]:
+    return _move(hb.latents, device), None
 
 
 def _no_write(hb, latents, text, text_len) -> None:
     return None
 
 
+def cap_text(parts: list[Tensor], limits: list[int]) -> list[Tensor]:
+    """Keep the first `limits[i]` rows of sample i (0 or no limits = all rows)."""
+    if not limits:
+        return parts
+    return [p[: limit or None] for p, limit in zip(parts, limits)]
+
+
 class OnlineText:
-    """Encodes `hb.prompts` (EncodeText); the encoded lengths become `text_len`."""
+    """A cache hit's `hb.text`, else `hb.prompts` encoded (EncodeText) and capped to
+    `hb.text_limit`; the kept lengths become `text_len`."""
 
     def __init__(self, encode: Callable):
         self.encode = encode
 
     @torch.no_grad()
     def __call__(self, hb, device) -> tuple[Tensor, Tensor]:
-        parts = self.encode(hb.prompts)
+        if hb.text is not None:
+            return _cached_text(hb, device)
+        parts = cap_text(self.encode(hb.prompts), hb.text_limit)
         lens = torch.tensor([p.shape[0] for p in parts], dtype=torch.int32)
         return torch.cat(parts, 0).to(device), lens
 
@@ -69,21 +81,26 @@ def gather_kept(latents: Tensor, hw: Tensor, img_keep) -> Tensor:
 
 
 class OnlineLatents:
-    """Encodes `hb.pixels` at the planned latent grid `hb.hw` (EncodeImages), then keeps
-    the token-drop subset `hb.img_keep` of each sample."""
+    """A cache hit's `hb.latents` (already the kept tokens), else `hb.pixels` encoded at
+    the planned latent grid `hb.hw` (EncodeImages) and gathered to the token-drop subset
+    `hb.img_keep`. Returns (kept latents, full-grid encoding or None for a hit)."""
 
     def __init__(self, encode: Callable):
         self.encode = encode
 
     @torch.no_grad()
-    def __call__(self, hb, device) -> Tensor:
+    def __call__(self, hb, device) -> tuple[Tensor, Tensor | None]:
+        if hb.latents is not None:
+            return _cached_latents(hb, device)
         full = self.encode(hb.pixels, hb.hw).to(device)
-        return gather_kept(full, hb.hw, hb.img_keep)
+        return gather_kept(full, hb.hw, hb.img_keep), full
 
 
 class DeviceBatcher:
     """HostBatch -> DeviceBatch: text / latent strategy, mask transfer and cache
-    write-back are bound at construction."""
+    write-back are bound at construction. `on_encoded(hb, full_latents, text,
+    text_len)` sees the full-grid latents of an encoded batch (None for a cache hit)
+    and the kept text rows."""
 
     def __init__(
         self,
@@ -103,8 +120,8 @@ class DeviceBatcher:
 
     def __call__(self, hb) -> DeviceBatch:
         text, text_len = self.text(hb, self.device)
-        latents = self.latents(hb, self.device)
-        self.on_encoded(hb, latents, text, text_len)
+        latents, full = self.latents(hb, self.device)
+        self.on_encoded(hb, full, text, text_len)
         seq = build_seqinfo(hb.hw, text_len, self.rope_axes, img_keep=hb.img_keep).to(
             self.device
         )

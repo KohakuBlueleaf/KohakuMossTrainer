@@ -107,6 +107,78 @@ def prewarm_devices(k: dict, device: torch.device) -> list[torch.device]:
     return [device]
 
 
+def adapter_buckets(batch_max: int, row_bucket: int) -> list[int]:
+    """One row count per LyCORIS token bucket up to `batch_max`'s: powers of two below
+    `row_bucket`, then multiples of `row_bucket`."""
+    if batch_max < row_bucket:
+        top = 1 << max(batch_max - 1, 0).bit_length()
+    else:
+        top = -(-batch_max // row_bucket) * row_bucket
+    out, n = [], 1
+    while n < row_bucket and n <= top:
+        out.append(n)
+        n *= 2
+    return out + [m * row_bucket for m in range(1, top // row_bucket + 1)]
+
+
+# (input requires grad, grad enabled): inner layers, layers fed by frozen inputs, eval
+GRAD_PATTERNS = ((True, True), (False, True), (False, False))
+
+
+class AdapterPrewarm:
+    """Run every adapted layer once per token bucket and grad pattern on scratch
+    inputs, so LyCORIS's tier race decides each bucket outside a checkpointed forward
+    or inference mode. Layers whose base lives in a weight stream are not callable
+    outside their block's stream window and are left to the live race."""
+
+    def __init__(self, targets, dtype: torch.dtype, buckets: list[int], skip: set):
+        self.targets = [t for t in targets if id(t.linear) not in skip]
+        self.dtype = dtype
+        self.buckets = buckets
+
+    def __call__(self, devices: list[torch.device]) -> int:
+        allowed = set(devices)
+        calls = 0
+        for t in self.targets:
+            params = list(t.lyco.parameters())
+            if not params or params[0].device not in allowed:
+                continue
+            for n in self.buckets:
+                for needs_grad, grad in GRAD_PATTERNS:
+                    calls += _run_layer(t.linear, n, params[0].device, self.dtype, needs_grad, grad)
+            for p in params:
+                p.grad = None
+        return calls
+
+
+def _run_layer(linear, n: int, device, dtype, needs_grad: bool, grad: bool) -> int:
+    x = torch.randn(n, linear.in_features, device=device, dtype=dtype)
+    with torch.set_grad_enabled(grad):
+        y = linear(x.requires_grad_(needs_grad))
+        if y.requires_grad:
+            y.float().sum().backward()
+    return 1
+
+
+def streamed_linears(built) -> set[int]:
+    """ids of the modules inside the weight-streamed joint blocks (none without a
+    stream)."""
+    if getattr(built.engines, "stream", None) is None:
+        return set()
+    return {id(m) for block in built.backbone.layers for m in block.modules()}
+
+
+def build_adapter_prewarm(k: dict, built, dtype: torch.dtype):
+    """The adapter tier-race prewarm (a no-op under TUNE='off' or without adapters)."""
+    targets = getattr(built.trainable, "targets", [])
+    if k["TUNE"] == "off" or not targets:
+        return _noop
+    cfg = import_object(I.DATA_CONFIG).from_knobs(k)
+    _, batch = planned_lengths(cfg)
+    buckets = adapter_buckets(batch, import_object(I.LYCORIS_ROW_BUCKET))
+    return AdapterPrewarm(targets, dtype, buckets, streamed_linears(built))
+
+
 class RetuneKernels:
     """Every step: decide raced-op problems first met in this step (outside autograd)."""
 

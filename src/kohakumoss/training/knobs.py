@@ -15,6 +15,7 @@ from kohakumoss.training.optim.factory import OPTIMIZERS
 from kohakumoss.training.precision import DTYPES
 from kohakumoss.types.arch import PRESETS
 from kohakumoss.types.plans import MemoryPlan
+from kohakumoss_data import DataConfig, pipeline_problems
 from kohakumoss_kernels import ops as kernel_ops
 from kohakumoss_kernels.hardware.arch import arch_of
 
@@ -31,13 +32,15 @@ KNOWN = frozenset(
     LOG_EVERY SAMPLE_PROMPTS SAMPLE_EVERY SAMPLE_STEPS SAMPLE_CFG SAMPLE_SHIFT
     SAMPLE_SKIP_LAYERS SAMPLE_SIZE SAMPLE_SEEDS VALIDATE_EVERY VALIDATION SAVE_EVERY
     SAVE_MINUTES KEEP_LAST RESUME EXPORT_FORMATS WEIGHTING OPTIMIZER_KWARGS FULL_MODE
-    SAMPLE_NEGATIVE PROJECT LORAPLUS_RATIO BATCHING OVERLONG""".split()
+    SAMPLE_NEGATIVE PROJECT LORAPLUS_RATIO BATCHING OVERLONG MAX_SAMPLES TOKEN_BUDGET
+    LYCORIS_COMPILE_DYNAMIC""".split()
 )
 OPTIONAL = frozenset()
 CHOICES = {
     "RESOLUTION_MODE": ("resize", "bucket", "shifted_square", "square_crop"),
     "BATCHING": ("tokens", "tokens_ffd", "count"),
     "OVERLONG": ("drop", "truncate_text", "drop_tokens"),
+    "TOKEN_BUDGET": ("estimate", "exact"),
     "UPSCALE": ("never", "to_area"),
     "LATENT_CACHE": ("off", "offline", "online"),
     "TEXT_CACHE": ("off", "offline", "online"),
@@ -132,6 +135,10 @@ def validate(k: dict) -> list[str]:
         p.append("STEPS must be > 0 and GRAD_ACC >= 1")
     if k["LOG_EVERY"] <= 0:
         p.append("LOG_EVERY must be > 0")
+    if not isinstance(k["MAX_SAMPLES"], int) or k["MAX_SAMPLES"] < 0:
+        p.append(
+            f"MAX_SAMPLES must be an int >= 0 (0 = no cap), got {k['MAX_SAMPLES']!r}"
+        )
     if k["GRAD_CLIP"] < 0:
         p.append("GRAD_CLIP must be >= 0 (0 disables clipping)")
     p += _schedule_rules(k)
@@ -211,6 +218,8 @@ def _parallel_rules(k: dict) -> list[str]:
             f"PARALLEL={k['PARALLEL']!r} is Linux-only (pipeline stages need NCCL "
             "point-to-point / CUDA peer streams); on Windows use 'ddp' or 'none'"
         )
+    if k["PARALLEL"] == "pipeline":
+        p += pipeline_problems(DataConfig.from_knobs(k))
     if k["PARALLEL"] in ("pipeline", "threaded") and k["DRIVER"] != "native":
         p.append(f"PARALLEL={k['PARALLEL']!r} runs on DRIVER='native'")
     if k["PARALLEL"] in ("pipeline", "threaded") and (

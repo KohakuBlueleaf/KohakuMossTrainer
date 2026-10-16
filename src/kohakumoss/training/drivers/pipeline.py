@@ -66,21 +66,31 @@ class PipelineDriver(NativeDriver):
         )
 
     def _micro(self, hb, p):
-        """Engine micro-batch: device tensors plus the host layout sizes (the grid of
-        the host batch, text lengths from the host-side text plan)."""
+        """Engine micro-batch: device tensors plus the host layout (the grid and
+        token-drop subset of the host batch, text lengths from the host text plan)."""
         text_len = torch.tensor(p.seq.attn_text.lengths, dtype=torch.int64)
-        return self.micro(p.z, p.text, p.sigma, hb.hw, text_len, p.target, p.weight)
+        return self.micro(
+            p.z,
+            p.text,
+            p.sigma,
+            hb.hw,
+            text_len,
+            p.target,
+            p.weight,
+            img_keep=hb.img_keep,
+        )
 
 
 class PipelineObjective:
-    """Engine loss of one micro-batch: token MSE sum on its image tokens, loss-scaled."""
+    """Engine loss of one micro-batch: token MSE sum on its image tokens (the kept ones
+    under token drop), loss-scaled."""
 
     def __init__(self, token_loss, scaler):
         self.token_loss = token_loss
         self.scaler = scaler
 
     def __call__(self, pred, data):
-        sizes = (data.hw[:, 0] * data.hw[:, 1]).to(torch.int64)
+        sizes = data.img_counts().to(pred.device)
         seg = torch.repeat_interleave(
             torch.arange(len(sizes), device=pred.device), sizes
         )

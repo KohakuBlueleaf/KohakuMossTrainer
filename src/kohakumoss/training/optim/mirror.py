@@ -18,18 +18,22 @@ class _Holder(torch.optim.Optimizer):
 
 
 class MirrorSchedule:
-    """`step()` advances the schedule and copies its lr into every group of `target`."""
+    """`step()` advances the schedule and writes its lr into every group of `target`,
+    each scaled by the group's initial lr ratio to group 0 (LoRA+ up-side groups keep
+    their multiple)."""
 
     def __init__(self, target, schedule: dict, steps: int):
         self.target = target
-        self.holder = _Holder(float(target.param_groups[0]["lr"]))
+        base = float(target.param_groups[0]["lr"])
+        self.ratios = [float(g["lr"]) / base for g in target.param_groups]
+        self.holder = _Holder(base)
         self.schedule = build_schedule(self.holder, schedule, steps)
         self._mirror()
 
     def _mirror(self) -> None:
         lr = self.holder.param_groups[0]["lr"]
-        for group in self.target.param_groups:
-            group["lr"] = lr
+        for group, ratio in zip(self.target.param_groups, self.ratios):
+            group["lr"] = lr * ratio
 
     def step(self) -> None:
         self.schedule.step()

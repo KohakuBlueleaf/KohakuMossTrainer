@@ -82,25 +82,16 @@ def build_cpu_adamw(groups, device, lr, betas, eps, pinned=True, **_):
     return cls(_plain_groups(groups), lr=lr, betas=betas, eps=eps, pinned=pinned)
 
 
-def _single_group(groups) -> tuple[list, float]:
-    """All params of `groups` and the largest weight decay among them (the offload
-    AdamWs hold one group)."""
-    params = [p for g in groups for p in g["params"]]
-    return params, max((g.get("weight_decay", 0.0) for g in groups), default=0.0)
-
-
 @OPTIMIZERS.register("master_adamw")
 def build_master_adamw(groups, device, lr, betas, eps, **_):
-    params, wd = _single_group(groups)
     cls = import_object(MASTER_ADAMW)
-    return cls(params, lr=lr, betas=betas, eps=eps, weight_decay=wd)
+    return cls(_plain_groups(groups), lr=lr, betas=betas, eps=eps, weight_decay=0.0)
 
 
 @OPTIMIZERS.register("host_state_adamw")
 def build_host_state_adamw(groups, device, lr, betas, eps, **_):
-    params, wd = _single_group(groups)
     cls = import_object(HOST_STATE_ADAMW)
-    return cls(params, lr=lr, betas=betas, eps=eps, weight_decay=wd)
+    return cls(_plain_groups(groups), lr=lr, betas=betas, eps=eps, weight_decay=0.0)
 
 
 @OPTIMIZERS.register("prodigy")

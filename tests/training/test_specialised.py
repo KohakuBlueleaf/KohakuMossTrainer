@@ -90,7 +90,7 @@ def test_bundle_scaler_and_writer_selection(tmp_path):
         fused_step=True,
     )
     assert fused.clip_param.func.__name__ == "_clip_param"
-    assert CheckpointManager(tmp_path, 1, is_main=False).save is _no_write
+    assert CheckpointManager(tmp_path, 1, is_main=False)._save is _no_write
     assert last_flags(3) == (False, False, True) and last_flags(1) == (True,)
 
 

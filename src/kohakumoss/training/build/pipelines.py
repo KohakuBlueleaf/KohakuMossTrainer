@@ -40,12 +40,7 @@ def build_engine(k: dict, built, policy, rank: int, world: int, device):
     the planner under TOKEN_BUDGET='exact')."""
     parts = import_object(BACKBONE_PARTS)(built.backbone)
     cfg = built.backbone.cfg
-    shape = import_object(PIPE_SHAPE)(
-        tokens=k["MAX_TOKENS"],
-        max_samples=k["MAX_SAMPLES"],
-        dim=cfg.dim,
-        microbatches=k["MICROBATCHES"],
-    )
+    shape = import_object(PIPE_SHAPE).from_knobs(k, dim=cfg.dim, rope_axes=cfg.rope_axes)
     per_rank = 1 if k["PIPELINE_SCHEDULE"] in ("gpipe", "1f1b") else 2
     bounds = import_object(EVEN_BOUNDS)(cfg.depth, world * per_rank)
     objective = PipelineObjective(built.backbone.ops.token_mse, scaler=None)

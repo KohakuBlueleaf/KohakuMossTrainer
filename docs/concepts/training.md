@@ -33,8 +33,23 @@ max_text_tokens)` (attention segment lengths up to it), the largest batch is
 `MAX_TOKENS` for token batching or `BATCH_SIZE` samples for count batching (block-op
 token buckets 256, 512, ... up to it). `PARALLEL="threaded"` prewarms every stage
 device; multi-process runs broadcast rank 0's tuning tables afterwards. Each step then
-decides, outside autograd, any raced-op problem first met during it. `TUNE="off"` binds
-neither action; CPU devices are skipped (their ops are the untuned eager spec).
+decides, outside autograd, any raced-op problem first met during it. Every adapted
+layer then runs once per LyCORIS token bucket up to the largest batch (powers of two
+below LyCORIS's row bucket, multiples of it above) and per grad pattern (input with /
+without grad, and grad disabled for sampling and validation), so LyCORIS's tier race
+settles before step 0; layers inside weight-streamed blocks race live. All prewarm runs
+before the gradient-sync hooks are installed and leaves no gradient behind. `TUNE="off"`
+binds none of these actions; CPU devices are skipped (their ops are the untuned eager
+spec). On CUDA the linear-algebra backend is cuSOLVER (OFT's Cayley solve).
+
+### Data and online caches
+
+`MAX_SAMPLES` caps samples per token batch (0 = none); `TOKEN_BUDGET="exact"` plans
+with the cached text lengths so `MAX_TOKENS` is a hard bound. With a cache `online`, a
+batch whose keys are all cached arrives encoded and is used as is; otherwise it is
+encoded (latents at the full planned grid, then gathered to the token-drop subset; text
+cut to each sample's `text_limit`) and the full encodings go to the data side's
+background `CacheWriter`, flushed before every checkpoint and closed at the end.
 
 ## Objective
 
@@ -103,7 +118,9 @@ AdamW (also forced when trainable weights stream from host masters). With
 `grad_offload` each gradient leaves the device as soon as it is accumulated and is summed
 in fp32 host memory over the `GRAD_ACC` micro-batches; the host AdamW reads those sums
 directly, a device optimiser gets them back before its step, and with `fused_step` the
-last micro-batch's backward finishes each parameter in place.
+last micro-batch's backward finishes each parameter in place. Every optimiser path keeps
+the parameter groups (weight-decay rules, LoRA+ up-side lr), and the schedule keeps each
+group's lr ratio.
 
 ## Pipeline layouts (Linux)
 
@@ -111,8 +128,11 @@ last micro-batch's backward finishes each parameter in place.
 `PARALLEL="pipeline"` runs one process per stage (torch.distributed pipelining,
 `PIPELINE_SCHEDULE`). A step is `MICROBATCHES` loader batches; every pipeline rank reads
 the same batches and steps only the parameters of its own stages, and checkpoints merge
-the stages on rank 0. Both are rejected on Windows, and sampling / validation callbacks
-are not available in these layouts.
+the stages on rank 0. `pipeline` stages are built for a static micro-batch of
+`MAX_TOKENS` tokens and `MAX_SAMPLES` samples, so it needs token batching,
+`MAX_SAMPLES >= 1`, `TOKEN_BUDGET="exact"` and an offline text cache; token drop is
+supported (each sample's loss covers its kept tokens). Both are rejected on Windows,
+and sampling / validation callbacks are not available in these layouts.
 
 ## EMA
 

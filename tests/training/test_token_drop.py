@@ -58,9 +58,11 @@ def test_positions_are_original_grid_positions():
 def test_online_gather_matches_cached():
     model = random_backbone("tiny", device=DEV, dtype=torch.float32, seed=0)
     hb, full, _ = _dropped_batch(model)
-    hb.pixels = [None, None]
+    cached = hb.latents
+    hb.latents, hb.pixels = None, [None, None]
     online = OnlineLatents(lambda pixels, hw: full)
-    assert torch.equal(online(hb, DEV), hb.latents)
+    kept, encoded = online(hb, DEV)
+    assert torch.equal(kept, cached) and torch.equal(encoded, full)
 
 
 def test_dropped_batch_trains():

@@ -27,8 +27,13 @@ def _no_write(step: int, parts: dict) -> None:
     return None
 
 
+def _nothing() -> None:
+    return None
+
+
 class CheckpointManager:
-    """Owns `<output>/checkpoints/step_XXXXXXXX/` directories."""
+    """Owns `<output>/checkpoints/step_XXXXXXXX/` directories. `before_save` runs on
+    every rank before each save (e.g. flushing the online cache writer)."""
 
     def __init__(
         self,
@@ -36,12 +41,18 @@ class CheckpointManager:
         keep_last: int,
         snapshot_ema: bool = False,
         is_main: bool = True,
+        before_save=_nothing,
     ):
         self.root = Path(output_dir) / "checkpoints"
         self.snap_root = Path(output_dir) / "ema_snapshots"
         self.keep_last = keep_last
         self.snapshot = self._snapshot if snapshot_ema else _no_snapshot
-        self.save = self._write if is_main else _no_write
+        self.before_save = before_save
+        self._save = self._write if is_main else _no_write
+
+    def save(self, step: int, parts: dict) -> Path | None:
+        self.before_save()
+        return self._save(step, parts)
 
     def _write(self, step: int, parts: dict) -> Path:
         """`parts`: trainable, ema, optim, step_rng, state (dicts)."""

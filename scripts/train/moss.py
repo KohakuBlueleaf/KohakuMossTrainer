@@ -29,6 +29,10 @@ BATCHING = "tokens"  # "tokens" (greedy concat to MAX_TOKENS) | "tokens_ffd" | "
 MAX_TOKENS = 16384  # target joint tokens (image + text) per batch per rank
 OVERLONG = "drop"  # sample longer than MAX_TOKENS: "drop" | "truncate_text" | "drop_tokens" (random image-token drop)
 BATCH_SIZE = 4  # BATCHING="count": samples per batch per rank
+MAX_SAMPLES = 0  # cap on samples per token batch; 0 = none (pipeline needs > 0)
+TOKEN_BUDGET = (
+    "estimate"  # "estimate" | "exact" (cached text lengths only; pipeline needs it)
+)
 CAPTION = {"template": "tags", "keep": ["artist"], "shuffle": True, "tag_dropout": 0.0}
 TEXT_DROP = 0.1  # probability a sample uses the empty-prompt embedding
 LATENT_CACHE = "offline"  # "off" | "offline" | "online"
@@ -53,6 +57,7 @@ DORA_DETACH = False  # True detaches the DoRA norm (eager path only)
 DROPOUT = {"input": 0.0, "rank": 0.0, "module": 0.0}
 ADAPTER_MODE = "bypass"  # "bypass" | "merge"
 LORAPLUS_RATIO = 1.0  # lr ratio of up / down factors (LoRA+); 1.0 = off
+LYCORIS_COMPILE_DYNAMIC = "tokens"  # LyCORIS compile tier: "tokens" (one graph per weight shape) | "static" | "dynamic"
 TRAIN_NORMS = False
 
 # ===================== OBJECTIVE =====================
@@ -73,7 +78,9 @@ OPTIMIZER = (
     "adamw"  # "adamw" | "adamw16" | "adamw8bit" | "muon" | "prodigy" | "schedule_free"
 )
 OPTIMIZER_KWARGS = {}
-FULL_MODE = "direct"  # ALGO="full": "direct" (train base weights) | "lycoris" (LyCORIS diff)
+FULL_MODE = (
+    "direct"  # ALGO="full": "direct" (train base weights) | "lycoris" (LyCORIS diff)
+)
 LR = 1e-4
 BETAS = (0.9, 0.95)
 EPS = 1e-8
@@ -87,7 +94,9 @@ EMA = 0.0  # 0 = off; e.g. 0.9999
 PRECISION = "bf16"  # "bf16" | "fp16" | "fp32"
 KEEP_FP32 = ("time_embedding", "shared_block_modulation", "video_head_modulation")
 FP16_FIX = "none"  # "none" | "weights" (fold baked into weights) | "online" (runtime factors) | "fp32_residual"
-FP16_FIX_KWARGS = {}  # e.g. {"c": 1 / 16, "s_attn": 1.0, "s_ffn": 1.0, "eps": "stock"}; base needs c = 1/16
+FP16_FIX_KWARGS = (
+    {}
+)  # e.g. {"c": 1 / 16, "s_attn": 1.0, "s_ffn": 1.0, "eps": "stock"}; base needs c = 1/16
 
 # ===================== MEMORY =====================
 MEMORY_PROFILE = "balanced"  # "speed" | "balanced" | "low" | "minimal" | "auto"
@@ -103,7 +112,9 @@ PIPELINE_SCHEDULE = "1f1b"  # "gpipe" | "1f1b" | "interleaved-1f1b" | "zb"
 MICROBATCHES = 4
 
 # ===================== KERNELS =====================
-KERNELS = {}  # op -> backend, e.g. {"attention_varlen": "triton", "lycoris": "torch"}; empty = arch priority
+KERNELS = (
+    {}
+)  # op -> backend, e.g. {"attention_varlen": "triton", "lycoris": "torch"}; empty = arch priority
 TUNE = "auto"  # "auto" | "off" | "prewarm"
 COMPILE = "off"  # "off" | "block" | "model"
 
