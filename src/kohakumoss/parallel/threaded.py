@@ -1,12 +1,5 @@
-"""Single-process multi-GPU pipeline (no process group): Windows and mixed GPUs.
-
-Stages are contiguous layer ranges placed on different devices of one process.
-Kernel launches are asynchronous per device, so issuing micro-batch k on stage s+1
-while stage s still runs k+1 overlaps without threads; backward uses autograd's
-per-device worker threads. `schedule="async"` additionally runs each micro-batch's
-backward on a helper thread so the next forward is issued concurrently. Stage block
-lists and the schedule are bound at construction.
-"""
+"""Single-process multi-GPU pipeline (no process group): layer ranges on the devices
+of one process. See docs/guides/multi-gpu.md (threaded pipeline)."""
 
 import queue
 import threading

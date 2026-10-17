@@ -1,115 +1,146 @@
-"""Step bench of the real MOSS architecture (random weights) per memory profile:
-time, peak VRAM, tokens/s, and the memory model's estimate next to the measurement.
+"""Step bench of the real MOSS architecture (random weights) per memory profile, run
+through the trainer (`entry.run`: build, forward, backward and the optimiser step,
+synthetic data): step time, tokens/s, peak memory and the memory model's estimate.
+Writes runs/bench/step/<gpu>_<variant>.json. See docs/internals/offload.md.
 
     python scripts/bench/step/step.py --device cuda:0 --profiles balanced,low,minimal
-Writes runs/bench/step/<gpu>_<arch>.json. Trainable parameters are the per-block norm
-weights plus the embedders (adapter-like gradient flow through every block).
 """
 
 import argparse
-import gc
+import ast
 import json
 import os
-import time
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
 import torch
 
-from kohakumoss.model import build_backbone, resolve_config
-from kohakumoss.training.memory.apply import apply_to_backbone
-from kohakumoss.training.memory.estimate import Workload, estimate
+from kohakumoss.offload.accel import default_type
+from kohakumoss.offload.accel import module as accel
+from kohakumoss.training.build.model import workload
+from kohakumoss.training.entry import run
+from kohakumoss.training.memory.estimate import estimate
 from kohakumoss.training.memory.profiles import resolve
-from kohakumoss.types.seqinfo import build_seqinfo
+
+SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "train" / "moss.py"
 
 
-def batch(cfg, tokens: int, text: int, device, dtype):
-    side = int((tokens - text) ** 0.5)
-    seq = build_seqinfo(torch.tensor([[side, side]]), torch.tensor([text])).to(device)
-    img = torch.randn(seq.n_img, cfg.latent_channels, device=device, dtype=dtype)
-    txt = torch.randn(seq.n_txt, cfg.text_dim, device=device, dtype=dtype)
-    sigma = torch.tensor([0.6], device=device)
-    return img, txt, sigma, seq
+def script_defaults() -> dict:
+    """UPPER_CASE assignments of the train script (its knob block)."""
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    out = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
+            if name.isupper():
+                expr = compile(ast.Expression(node.value), str(SCRIPT), "eval")
+                out[name] = eval(expr, {})
+    return out
 
 
-def run_profile(name, args, device, dtype, cfg):
-    gc.collect()
-    torch.cuda.empty_cache()
-    baseline = torch.cuda.memory_allocated(device)
-    build_device = "cpu" if name == "minimal" else device
-    model = build_backbone(cfg, device=build_device, dtype=dtype, init=True)
-    trainable = 0
-    for n, p in model.named_parameters():
-        keep = "norm" in n or n.startswith("video_embedder")
-        p.requires_grad_(keep)
-        trainable += p.numel() if keep else 0
-    plan = resolve(name, args.overrides and json.loads(args.overrides), device=device)
-    torch.cuda.reset_peak_memory_stats(device)
-    apply_to_backbone(model, plan, device, dtype, training=True)
-    model.bind_ops()
-    apply_peak = torch.cuda.max_memory_allocated(device)
-    resident = torch.cuda.memory_allocated(device)
-    torch.cuda.reset_peak_memory_stats(device)
-    data = batch(cfg, args.tokens, args.text, device, dtype)
-    times = []
-    for i in range(args.iters + 1):
-        torch.cuda.synchronize(device)
-        t0 = time.perf_counter()
-        v = model(*data)
-        v.float().square().mean().backward()
-        torch.cuda.synchronize(device)
-        if i:
-            times.append(time.perf_counter() - t0)
-        model.zero_grad(set_to_none=True)
-    med = sorted(times)[len(times) // 2]
-    work = Workload(cfg, args.tokens - args.text, args.text, trainable, compute_bytes=2)
-    est = estimate(work, plan)
-    row = {
-        "profile": name,
-        "plan": {k: v for k, v in plan.__dict__.items() if k != "kernels"},
+def knobs(args, profile: str, out_dir: str) -> dict:
+    """The train script's defaults with the bench's run on top."""
+    k = script_defaults()
+    k.update(
+        WEIGHTS="random",
+        VARIANT=args.variant,
+        ALGO=args.algo,
+        DIM=16,
+        ALPHA=16.0,
+        PRECISION=args.precision,
+        FP16_FIX="online" if args.precision == "fp16" else "none",
+        FP16_FIX_KWARGS={"c": 1 / 16} if args.precision == "fp16" else {},
+        DATASETS=[{"source": "synthetic", "count": 64}],
+        LATENT_CACHE="off",
+        TEXT_CACHE="off",
+        RESOLUTION_MODE="bucket",
+        TARGET_AREA=args.area,
+        BATCHING="count",
+        BATCH_SIZE=1,
+        NUM_WORKERS=0,
+        STEPS=args.iters + 1,
+        LOG_EVERY=1,
+        SAVE_EVERY=0,
+        SAMPLE_EVERY=0,
+        VALIDATE_EVERY=0,
+        EXPORT_FORMATS=(),
+        LOGGER="console",
+        SCHEDULE={"mode": "constant"},
+        MEMORY_PROFILE=profile,
+        MEMORY_OVERRIDES=json.loads(args.overrides) if args.overrides else {},
+        DEVICES=(torch.device(args.device).index or 0,),
+        OUTPUT_DIR=out_dir,
+        RUN_NAME="step",
+    )
+    return k
+
+
+def run_profile(args, profile: str) -> dict:
+    device = torch.device(args.device)
+    with tempfile.TemporaryDirectory() as out:
+        k = knobs(args, profile, out)
+        run(k)
+        lines = (Path(out) / "step" / "metrics.jsonl").read_text().splitlines()
+    rows = [json.loads(x) for x in lines][1:]
+    med = sorted(r["step_time"] for r in rows)[len(rows) // 2]
+    full = args.algo == "full"
+    plan = resolve(profile, k["MEMORY_OVERRIDES"], device, trainable_base=full)
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(args.precision)
+    est = estimate(workload(k, dtype or torch.float32), plan)
+    return {
+        "profile": profile,
+        "measures": "trainer step: forward + backward + optimiser step",
+        "plan": {key: v for key, v in plan.__dict__.items() if key != "kernels"},
         "ms": med * 1e3,
-        "tokens_per_s": args.tokens / med,
-        "peak_GiB": torch.cuda.max_memory_allocated(device) / 1024**3,
-        "resident_GiB": resident / 1024**3,
-        "apply_peak_GiB": apply_peak / 1024**3,
-        "baseline_GiB": baseline / 1024**3,
+        "tokens_per_s": sorted(r["tokens_per_s"] for r in rows)[len(rows) // 2],
+        "peak_GiB": max((r.get("vram_peak_alloc", 0.0) for r in rows), default=0.0),
+        "reserved_GiB": max(
+            (r.get("vram_peak_reserved", 0.0) for r in rows), default=0.0
+        ),
         "estimate_GiB": est.gib(),
     }
-    del model
-    torch.cuda.empty_cache()
-    return row
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--device", default=f"{default_type()}:0")
     ap.add_argument("--variant", default="base")
+    ap.add_argument("--algo", default="lora")
+    ap.add_argument("--precision", default="bf16")
     ap.add_argument("--profiles", default="balanced,low,minimal")
     ap.add_argument("--overrides", default="")
-    ap.add_argument("--tokens", type=int, default=4400)
-    ap.add_argument("--text", type=int, default=300)
+    ap.add_argument("--area", type=int, default=1024 * 1024)
     ap.add_argument("--iters", type=int, default=3)
+    ap.add_argument("--only", default="")
     ap.add_argument("--out", default="runs/bench/step")
-    args = ap.parse_args()
+    args, _ = ap.parse_known_args()
+    if args.only:
+        print("ROW " + json.dumps(run_profile(args, args.only)))
+        return
     device = torch.device(args.device)
-    torch.cuda.set_device(device)
-    major, _ = torch.cuda.get_device_capability(device)
-    dtype = torch.bfloat16 if major >= 8 else torch.float16
-    cfg = resolve_config(args.variant)
     rows = []
     for name in args.profiles.split(","):
-        try:
-            rows.append(run_profile(name, args, device, dtype, cfg))
-        except torch.OutOfMemoryError as err:
-            rows.append({"profile": name, "error": "OOM", "detail": str(err)[:200]})
+        cmd = [sys.executable, __file__, "--only", name] + sys.argv[1:]
+        out = subprocess.run(cmd, capture_output=True, text=True)
+        found = [
+            line[4:] for line in out.stdout.splitlines() if line.startswith("ROW ")
+        ]
+        rows.append(
+            json.loads(found[0])
+            if found
+            else {"profile": name, "error": (out.stdout + out.stderr)[-800:]}
+        )
         print(json.dumps(rows[-1]))
     report = {
-        "gpu": torch.cuda.get_device_name(device),
-        "dtype": str(dtype),
+        "gpu": accel(device).get_device_name(device),
         "args": vars(args),
         "rows": rows,
     }
     os.makedirs(args.out, exist_ok=True)
     path = os.path.join(
-        args.out, f"{report['gpu'].replace(' ', '_')}_{args.variant}.json"
+        args.out, f"{report['gpu'].replace(' ', '_')}_{args.variant}_{args.algo}.json"
     )
     with open(path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=1)

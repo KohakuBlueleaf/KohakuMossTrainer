@@ -14,9 +14,9 @@ from kohakumoss.offload.gpu_adamw import HostStateAdamW, MasterAdamW
 from kohakumoss.training.memory.profiles import resolve
 from kohakumoss.training.memory.session import MemorySession
 from kohakumoss.training.memory.synthetic import SyntheticModel, synthetic_batch
+from tests._shared.tiny import DEVICES
 from tests._util.negative import must_fail
 
-DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.cuda)]
 HP = [
     dict(lr=1e-2, weight_decay=0.1),
     dict(lr=2e-2, weight_decay=0.0, betas=(0.8, 0.95)),

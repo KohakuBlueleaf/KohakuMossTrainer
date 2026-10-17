@@ -1,16 +1,7 @@
-"""Hardware-limit check of memory-knob combinations on a real-size slice.
-
-For each combination (one fresh process each) it measures the step time, the PCIe bytes
-the engines moved, and compares against the bounds: copy time = the largest of H2D bytes
-/ pinned H2D bandwidth, D2H bytes / pinned D2H bandwidth and all bytes / measured
-concurrent (both directions) bandwidth, compute time =
-the same step with everything resident (measured), and the FLOP bound at the measured
-MMA peak. `overlap` = step / max(copy, compute); 1.0 means fully overlapped. The
-compute time of a GRAD_ACC case is the resident case at the same GRAD_ACC when it was
-measured, else the GRAD_ACC=1 resident time scaled linearly.
+"""Hardware-limit check of memory-knob combinations on a real-size slice; writes
+runs/bench/offload/limits_<gpu>.json. See docs/internals/offload.md.
 
     python scripts/bench/offload/limits.py --device cuda:0
-Writes runs/bench/offload/limits_<gpu>.json.
 """
 
 import argparse
@@ -22,10 +13,13 @@ import time
 
 import torch
 
+from kohakumoss.offload.accel import default_type
+from kohakumoss.offload.accel import module as accel
 from kohakumoss.offload.cpu_optim import CPUAdamW
 from kohakumoss.training.memory.profiles import resolve
 from kohakumoss.training.memory.session import MemorySession
 from kohakumoss.training.memory.synthetic import SyntheticModel, synthetic_batch
+from kohakumoss_kernels.hardware.arch import arch_of
 
 MB = 1024 * 1024
 CASES = {
@@ -76,23 +70,23 @@ def bandwidth(device) -> dict[str, float]:
         ("d2h", lambda: host.copy_(gpu, non_blocking=True)),
     ):
         fn()
-        torch.cuda.synchronize(device)
+        accel(device).synchronize(device)
         t0 = time.perf_counter()
         for _ in range(5):
             fn()
-        torch.cuda.synchronize(device)
+        accel(device).synchronize(device)
         out[name] = 5 * 256 * MB / (time.perf_counter() - t0) / 1e9
     gpu2 = torch.empty_like(gpu)
     host2 = torch.empty(n, dtype=torch.float16, pin_memory=True)
-    s1, s2 = torch.cuda.Stream(device), torch.cuda.Stream(device)
-    torch.cuda.synchronize(device)
+    s1, s2 = accel(device).Stream(device), accel(device).Stream(device)
+    accel(device).synchronize(device)
     t0 = time.perf_counter()
     for _ in range(5):
-        with torch.cuda.stream(s1):
+        with accel(device).stream(s1):
             gpu.copy_(host, non_blocking=True)
-        with torch.cuda.stream(s2):
+        with accel(device).stream(s2):
             host2.copy_(gpu2, non_blocking=True)
-    torch.cuda.synchronize(device)
+    accel(device).synchronize(device)
     out["bidir_total"] = 2 * 5 * 256 * MB / (time.perf_counter() - t0) / 1e9
     return out
 
@@ -101,11 +95,11 @@ def mma_peak(device, dtype) -> float:
     a = torch.randn(8192, 8192, device=device, dtype=dtype)
     b = torch.randn(8192, 8192, device=device, dtype=dtype)
     a @ b
-    torch.cuda.synchronize(device)
+    accel(device).synchronize(device)
     t0 = time.perf_counter()
     for _ in range(5):
         a @ b
-    torch.cuda.synchronize(device)
+    accel(device).synchronize(device)
     return 5 * 2 * 8192**3 / (time.perf_counter() - t0) / 1e12
 
 
@@ -156,7 +150,7 @@ def run_case(args, name, device, dtype):
         if s is not None and hasattr(s, "stats")
     ]
     step()
-    torch.cuda.synchronize(device)
+    accel(device).synchronize(device)
 
     def counters():
         h2d = sum(s.stats.get("bytes_h2d", 0) for s in sources)
@@ -167,29 +161,29 @@ def run_case(args, name, device, dtype):
         return h2d, d2h
 
     h0, d0 = counters()
-    torch.cuda.reset_peak_memory_stats(device)
+    accel(device).reset_peak_memory_stats(device)
     times = []
     for _ in range(args.iters):
-        torch.cuda.synchronize(device)
+        accel(device).synchronize(device)
         t0 = time.perf_counter()
         step()
-        torch.cuda.synchronize(device)
+        accel(device).synchronize(device)
         times.append(time.perf_counter() - t0)
     h1, d1 = counters()
     h2d, d2h = (h1 - h0) / args.iters, (d1 - d0) / args.iters
-    for opt in (session.dev_opt, session.host_block_opt):
-        if isinstance(opt, CPUAdamW):
-            n = sum(
-                p.numel() * p.element_size()
-                for g in opt.param_groups
-                for p in g["params"]
-                if p.device.type == "cuda"
-            )
-            h2d, d2h = h2d + n, d2h + n
+    opt = session.dev_opt
+    if isinstance(opt, CPUAdamW):
+        n = sum(
+            p.numel() * p.element_size()
+            for g in opt.param_groups
+            for p in g["params"]
+            if p.device.type != "cpu"
+        )
+        h2d, d2h = h2d + n, d2h + n
     return {
         "case": name,
         "ms": 1e3 * sorted(times)[len(times) // 2],
-        "peak_GiB": torch.cuda.max_memory_allocated(device) / 1024**3,
+        "peak_GiB": accel(device).max_memory_allocated(device) / 1024**3,
         "h2d_GB": h2d / 1e9,
         "d2h_GB": d2h / 1e9,
         "flops": flops_per_step(args, full, acc),
@@ -200,7 +194,7 @@ def run_case(args, name, device, dtype):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--device", default=f"{default_type()}:0")
     ap.add_argument("--blocks", type=int, default=8)
     ap.add_argument("--dim", type=int, default=3072)
     ap.add_argument("--ffn", type=int, default=8192)
@@ -212,12 +206,8 @@ def main():
     ap.add_argument("--out", default="runs/bench/offload")
     args, _ = ap.parse_known_args()
     device = torch.device(args.device)
-    torch.cuda.set_device(device)
-    dtype = (
-        torch.bfloat16
-        if torch.cuda.get_device_capability(device)[0] >= 8
-        else torch.float16
-    )
+    accel(device).set_device(device)
+    dtype = torch.bfloat16 if arch_of(device).has_bf16 else torch.float16
     if args.only:
         print("ROW " + json.dumps(run_case(args, args.only, device, dtype)))
         return
@@ -238,7 +228,8 @@ def main():
     resident = {
         (r["full"], r["acc"]): r
         for r in rows
-        if r.get("case")
+        if "error" not in r
+        and r["case"]
         in ("full/resident/gpu", "full/resident/gpu/acc4", "adapter/resident")
     }
     for r in rows:
@@ -261,7 +252,7 @@ def main():
             f"h2d={r['h2d_GB']:6.2f}GB d2h={r['d2h_GB']:6.2f}GB peak={r['peak_GiB']:5.2f}GiB"
         )
     report = {
-        "gpu": torch.cuda.get_device_name(device),
+        "gpu": accel(device).get_device_name(device),
         "dtype": str(dtype),
         "bandwidth_GBps": bw,
         "mma_TFLOPs": peak,

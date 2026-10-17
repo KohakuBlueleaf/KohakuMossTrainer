@@ -1,11 +1,5 @@
-"""Optimiser step inside backward: each parameter is updated as soon as its gradient is
-accumulated, then its gradient is freed, so only one block's gradients are alive.
-
-There is no global gradient norm in this mode; clipping is per parameter. Under a loss
-scaler a non-finite gradient zeroes that parameter's update and raises `found_inf`.
-The gradient transform (unscale, clip) is composed once at construction; `arm` swaps
-the hook body once per micro-batch.
-"""
+"""Optimiser step inside backward: post-accumulate-grad hooks step each parameter and
+free its gradient. See docs/internals/offload.md (fused step)."""
 
 from collections.abc import Callable, Iterable
 

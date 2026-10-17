@@ -9,8 +9,8 @@ from kohakumoss.training.memory.runners import (
     StageRunner,
     build_runner,
 )
+from tests._shared.tiny import batch, loss_and_grads, make_model, max_diff
 from tests._util.negative import must_fail
-from tests.parallel._common import batch, loss_and_grads, make_model, max_diff
 
 pytestmark = pytest.mark.cpu
 

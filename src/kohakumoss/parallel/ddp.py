@@ -1,11 +1,5 @@
-"""Data parallel: bucketed gradient all-reduce that overlaps backward, or torch DDP.
-
-`GradReducer` sums gradients of the trainable parameters only (LoRA: the adapters),
-launching each bucket's all-reduce as soon as its last gradient is accumulated. The
-loss is normalised by the global token count, so the reduction is a SUM. Each hook is
-bound to its bucket and the per-flat views are carved once; `arm` swaps the hook body
-once per micro-batch.
-"""
+"""Data parallel: bucketed SUM all-reduce of the trainable gradients that overlaps
+backward, or torch DDP. See docs/guides/multi-gpu.md."""
 
 from functools import partial
 

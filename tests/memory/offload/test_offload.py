@@ -12,10 +12,11 @@ from kohakumoss.training.memory.runners import (
     PlainRunner,
     StreamRunner,
 )
+from tests._shared.tiny import DEVICES, batch, loss_and_grads, make_model, max_diff
 from tests._util.negative import must_fail
-from tests.parallel._common import batch, loss_and_grads, make_model, max_diff
 
-TOL = {"cpu": 1e-9, "cuda": 1e-7}
+TOL = {"cpu": 1e-9, "cuda": 1e-7, "xpu": 1e-7}
+ACCELERATORS = DEVICES[1:]
 
 
 def _offload_case(device, inner):
@@ -38,13 +39,12 @@ def test_activation_offload_cpu(inner):
     assert abs(loss - ref_loss) < 1e-12 and max_diff(grads, ref) < 1e-12
 
 
-@pytest.mark.cuda
-def test_activation_offload_cuda_matches():
-    dev = "cuda"
+@pytest.mark.parametrize("dev", ACCELERATORS)
+def test_activation_offload_device_matches(dev):
     (loss, grads), off = _offload_case(dev, PlainRunner())
     ref_loss, ref = loss_and_grads(make_model(dev), batch(dev))
     assert off.stats["packed"] > 0
-    assert abs(loss - ref_loss) < 1e-10 and max_diff(grads, ref) < TOL["cuda"]
+    assert abs(loss - ref_loss) < 1e-10 and max_diff(grads, ref) < TOL[dev]
 
 
 def _all(name, lin):
@@ -78,9 +78,7 @@ def _dense(device, trainable, quant=None):
     return loss_and_grads(model, batch(device), freeze_blocks=not trainable)
 
 
-@pytest.mark.parametrize(
-    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.cuda)]
-)
+@pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("trainable", [False, True])
 def test_weight_stream_matches_dense(device, trainable):
     loss, grads, engine = _stream_case(device, trainable)
@@ -90,9 +88,7 @@ def test_weight_stream_matches_dense(device, trainable):
     assert max_diff(grads, ref) < TOL[device]
 
 
-@pytest.mark.parametrize(
-    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.cuda)]
-)
+@pytest.mark.parametrize("device", DEVICES)
 def test_streamed_quant_base_matches_resident_quant(device):
     loss, grads, _ = _stream_case(device, False, quant="int8")
     ref_loss, ref = _dense(device, False, quant="int8")

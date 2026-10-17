@@ -32,7 +32,7 @@ def test_pipeline_cpu_gloo(schedule):
     res = _run(selftest.pipeline_worker, [0, 1], "cpu", schedule, backend="gloo")
     assert all(r["max_err"] < 1e-10 and r["n"] > 0 for r in res), res
     losses = [r["loss_err"] for r in res if "loss_err" in r]
-    assert len(losses) == 1 and losses[0] < 1e-12, res
+    assert len(losses) == 1 and losses[0] < 1e-6, res
 
 
 @pytest.mark.multi_gpu

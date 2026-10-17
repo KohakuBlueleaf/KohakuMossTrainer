@@ -7,7 +7,13 @@ here from the kept indices, not against `build_seqinfo`.
 import pytest
 import torch
 
-from kohakumoss.parallel.pipeline import MicroBatch, PipeShape, padded_seqinfo
+from kohakumoss.parallel.pipeline import (
+    MicroBatch,
+    PipeShape,
+    StageModule,
+    padded_seqinfo,
+)
+from kohakumoss.training.memory.synthetic import SyntheticModel
 from tests._util.negative import must_fail
 
 pytestmark = pytest.mark.cpu
@@ -115,6 +121,17 @@ def test_pipe_shape_comes_from_the_data_knobs():
 def test_pipe_shape_rejects_knobs_without_hard_bounds(bad):
     with pytest.raises(ValueError, match="pipeline micro-batch shape"):
         PipeShape.from_knobs({**PIPE_KNOBS, **bad}, dim=64)
+
+
+def test_stage_index_is_host_side():
+    """The micro-batch index never reads the passed-through device tensor (a meta
+    tensor here, which has no value to read)."""
+    stage = StageModule(SyntheticModel(16, 32, 2, 4), 0, 2, True, True)
+    stage.set_step([None, None], [None, None])
+    mb = torch.zeros(1, dtype=torch.int64, device="meta")
+    assert [stage._index(mb), stage._index(mb)] == [0, 1]
+    with pytest.raises(RuntimeError, match="beyond"):
+        stage._index(mb)
 
 
 def test_padded_seqinfo_rejects_overflow():

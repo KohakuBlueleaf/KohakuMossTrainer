@@ -1,11 +1,5 @@
-"""Activation offload: saved tensors of a block live in host memory between fwd and bwd.
-
-Each saved tensor above `min_bytes` is copied to (pinned) host memory on a D2H stream
-during forward; in backward the first unpack of block i fetches all of block i's
-packets and prefetches block i-1 on an H2D stream. Parameters and registered storages
-(streamed weight slots) are never offloaded. The device / host-copy / prefetch variant
-is bound once at construction.
-"""
+"""Activation offload: saved tensors of a block live in host memory between forward
+and backward, prefetched per block. See docs/internals/offload.md."""
 
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -13,6 +7,8 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor
+
+from kohakumoss.offload.accel import module, streamed, with_index
 
 
 @dataclass
@@ -40,19 +36,18 @@ class ActivationOffload:
         pinned: bool = True,
         prefetch: bool = True,
     ):
-        self.device = torch.device(device)
-        if self.device.type == "cuda" and self.device.index is None:
-            self.device = torch.device("cuda", torch.cuda.current_device())
+        self.device = with_index(device)
         self.min_bytes = min_bytes
-        self.cuda = self.device.type == "cuda"
+        self.cuda = streamed(self.device)
+        self.dm = module(self.device)
         self.pinned = pinned and self.cuda
         self.skip: set[int] = set()
         self.pending: dict[int, list[Packet]] = {}
         self.current = 0
         self.stats = {"packed_bytes": 0, "kept": 0, "packed": 0}
         if self.cuda:
-            self.d2h_stream = torch.cuda.Stream(self.device)
-            self.h2d_stream = torch.cuda.Stream(self.device)
+            self.d2h_stream = self.dm.Stream(self.device)
+            self.h2d_stream = self.dm.Stream(self.device)
             self._store = self._store_device
             self._load = self._load_device
             self._prefetch = self._fetch if prefetch else _noop
@@ -102,11 +97,11 @@ class ActivationOffload:
 
     def _store_device(self, t: Tensor) -> Packet:
         host = torch.empty(t.shape, dtype=t.dtype, pin_memory=self.pinned)
-        self.d2h_stream.wait_stream(torch.cuda.current_stream(self.device))
-        with torch.cuda.stream(self.d2h_stream):
+        self.d2h_stream.wait_stream(self.dm.current_stream(self.device))
+        with self.dm.stream(self.d2h_stream):
             host.copy_(t, non_blocking=True)
         t.record_stream(self.d2h_stream)
-        ev = torch.cuda.Event()
+        ev = self.dm.Event()
         ev.record(self.d2h_stream)
         return Packet(host, self.current, d2h=ev)
 
@@ -115,12 +110,12 @@ class ActivationOffload:
             if pk.gpu is not None:
                 continue
             self.h2d_stream.wait_event(pk.d2h)
-            with torch.cuda.stream(self.h2d_stream):
+            with self.dm.stream(self.h2d_stream):
                 gpu = torch.empty(
                     pk.host.shape, dtype=pk.host.dtype, device=self.device
                 )
                 gpu.copy_(pk.host, non_blocking=True)
-            ev = torch.cuda.Event()
+            ev = self.dm.Event()
             ev.record(self.h2d_stream)
             pk.gpu, pk.h2d = gpu, ev
 
@@ -129,7 +124,7 @@ class ActivationOffload:
             self.pending.setdefault(pk.block, []).append(pk)
             self._fetch(pk.block)
             self._prefetch(pk.block - 1)
-        cur = torch.cuda.current_stream(self.device)
+        cur = self.dm.current_stream(self.device)
         cur.wait_event(pk.h2d)
         gpu, pk.gpu = pk.gpu, None
         gpu.record_stream(cur)

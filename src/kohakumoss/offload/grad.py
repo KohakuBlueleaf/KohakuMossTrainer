@@ -1,15 +1,6 @@
-"""Gradient offload: each parameter's gradient leaves the device as soon as autograd has
-accumulated it for the current micro-batch, and is summed in fp32 host memory across
-the GRAD_ACC micro-batches. No full-size gradient buffer stays on the device.
-
-Two ways to finish a step:
-- `flush()` after the last micro-batch, then a host optimiser reads `host[p]`
-  (`CPUAdamW.use_host_grads`) or a device optimiser gets the sums with `to_device()`.
-- `arm(last=True, final=step_param)` before the last micro-batch: when a parameter's
-  last gradient is ready on the device, the host sum is added to it (H2D) and
-  `final(p)` steps it right there (GPU optimiser step inside backward).
-The hook body is chosen per micro-batch by `arm`, not per call.
-"""
+"""Gradient offload: per-parameter gradients summed in fp32 host memory across the
+GRAD_ACC micro-batches, finished at `flush()` or inside the last backward
+(`arm(last, final)`). See docs/internals/offload.md."""
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -18,6 +9,7 @@ from functools import partial
 import torch
 from torch import Tensor, nn
 
+from kohakumoss.offload.accel import module, streamed
 from kohakumoss.offload.host_acc import HostAccumulator
 
 
@@ -35,10 +27,11 @@ class _Done:
 
 def _event_after(device: torch.device):
     """An event on `device`'s current stream (host: already complete)."""
-    if device.type != "cuda":
+    if not streamed(device):
         return _Done()
-    ev = torch.cuda.Event()
-    ev.record(torch.cuda.current_stream(device))
+    dm = module(device)
+    ev = dm.Event()
+    ev.record(dm.current_stream(device))
     return ev
 
 
@@ -46,14 +39,15 @@ class _Ring:
     """Device staging for host sums coming back (H2D stream) and the update stream."""
 
     def __init__(self, device: torch.device, largest: int, slots: int = 3):
-        self.h2d = torch.cuda.Stream(device)
-        self.opt = torch.cuda.Stream(device)
+        self.dm = module(device)
+        self.h2d = self.dm.Stream(device)
+        self.opt = self.dm.Stream(device)
         self.buffers = [
             torch.empty(largest, dtype=torch.float32, device=device)
             for _ in range(slots)
         ]
-        cur = torch.cuda.current_stream(device)
-        self.free = [torch.cuda.Event() for _ in range(slots)]
+        cur = self.dm.current_stream(device)
+        self.free = [self.dm.Event() for _ in range(slots)]
         for ev in self.free:
             ev.record(cur)
         self.next = 0
@@ -72,7 +66,7 @@ class GradOffload:
         self.host: dict[nn.Parameter, Tensor] = {}
         self.lanes: dict[int, _Lane] = {}
         self.stats = {"bytes_d2h": 0, "bytes_h2d": 0}
-        self._streams: dict[torch.device, torch.cuda.Stream] = {}
+        self._streams: dict[torch.device, object] = {}
         self.final: Callable | None = None
         self.handles = []
         self._mode = "offload"
@@ -82,7 +76,7 @@ class GradOffload:
         for p in self.params:
             largest[p.device] = max(largest.get(p.device, 0), p.numel())
         for p in self.params:
-            cuda = p.device.type == "cuda"
+            cuda = streamed(p.device)
             host = torch.zeros(p.shape, dtype=torch.float32, pin_memory=pinned and cuda)
             lane = _Lane(host)
             if cuda:
@@ -101,10 +95,10 @@ class GradOffload:
             hook = partial(self._hook, {"offload": offload, "finish": finish})
             self.handles.append(p.register_post_accumulate_grad_hook(hook))
 
-    def _stream(self, device: torch.device) -> torch.cuda.Stream:
+    def _stream(self, device: torch.device):
         stream = self._streams.get(device)
         if stream is None:
-            stream = torch.cuda.Stream(device)
+            stream = module(device).Stream(device)
             self._streams[device] = stream
         return stream
 
@@ -144,23 +138,24 @@ class GradOffload:
     @torch.no_grad()
     def _finish_device(self, lane: _Lane, ring: "_Ring", p: Tensor) -> None:
         g = p.grad
-        ring.opt.wait_stream(torch.cuda.current_stream(g.device))
+        dm = ring.dm
+        ring.opt.wait_stream(dm.current_stream(g.device))
         if lane.filled:
             self.acc.wait(id(p))
             slot, buf = ring.take(g.numel())
             ring.h2d.wait_event(ring.free[slot])
-            with torch.cuda.stream(ring.h2d):
+            with dm.stream(ring.h2d):
                 buf.copy_(lane.host.view(-1), non_blocking=True)
-            ev = torch.cuda.Event()
+            ev = dm.Event()
             ev.record(ring.h2d)
             ring.opt.wait_event(ev)
-            with torch.cuda.stream(ring.opt):
+            with dm.stream(ring.opt):
                 g.add_(buf.view(g.shape))
             ring.free[slot].record(ring.opt)
             lane.consumed = ev
             lane.filled = False
             self.stats["bytes_h2d"] += lane.host.numel() * 4
-        with torch.cuda.stream(ring.opt):
+        with dm.stream(ring.opt):
             self.final(p)
         g.record_stream(ring.opt)
         p.grad = None
@@ -169,7 +164,7 @@ class GradOffload:
         """The compute stream waits for every in-backward update (before the next
         forward reads the parameters)."""
         for device, ring in self.rings.items():
-            torch.cuda.current_stream(device).wait_stream(ring.opt)
+            ring.dm.current_stream(device).wait_stream(ring.opt)
 
     def flush(self) -> None:
         """Land every in-flight copy (call after the last micro-batch's backward)."""

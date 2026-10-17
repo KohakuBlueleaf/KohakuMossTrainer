@@ -1,11 +1,5 @@
-"""Host-side AdamW for device parameters: fp32 masters and moments live in host memory.
-
-Gradients go device -> pinned host (one D2H stream), the update runs on the CPU
-(`torch._fused_adamw_` when available), and the new weights go back host -> device.
-It is a `torch.optim.Optimizer`, so schedules, GradScaler.step and state_dict work;
-`step_param(p)` updates one parameter (fused per-block step). The update kernel and
-each parameter's copy path are bound once.
-"""
+"""Host-side AdamW (`torch.optim.Optimizer`): fp32 masters and moments in host memory,
+update on the CPU, weights copied back to the device. See docs/internals/offload.md."""
 
 import math
 from dataclasses import dataclass
@@ -14,6 +8,8 @@ from functools import partial
 import torch
 from torch import Tensor
 from torch.optim import Optimizer
+
+from kohakumoss.offload.accel import module, streamed
 
 
 def _fused_available() -> bool:
@@ -97,6 +93,8 @@ class _Lane:
 class CPUAdamW(Optimizer):
     """AdamW whose state and fp32 master copy live on the host."""
 
+    handles_decay_to_one = True
+
     def __init__(
         self,
         params,
@@ -116,7 +114,7 @@ class CPUAdamW(Optimizer):
                 self._init(p, group)
 
     def _init(self, p: Tensor, group: dict) -> None:
-        cuda = p.device.type == "cuda"
+        cuda = streamed(p.device)
         pin = self.pinned and cuda
         master = p.detach().to("cpu", torch.float32).clone()
         self.state[p].update(
@@ -130,8 +128,8 @@ class CPUAdamW(Optimizer):
         if cuda:
             if p.device not in self._streams:
                 self._streams[p.device] = (
-                    torch.cuda.Stream(p.device),
-                    torch.cuda.Stream(p.device),
+                    module(p.device).Stream(p.device),
+                    module(p.device).Stream(p.device),
                 )
             d2h, h2d = self._streams[p.device]
             lane = _Lane(grad_host, shadow, None, None, group)
@@ -145,9 +143,12 @@ class CPUAdamW(Optimizer):
         self._lanes[id(p)] = lane
 
     def use_host_grads(self, offload) -> None:
-        """Read gradients from a GradOffload's host fp32 accumulators (no D2H here)."""
+        """Read the gradients of the offloaded parameters from a GradOffload's host fp32
+        accumulators (no D2H here); other parameters keep their own lanes."""
         for group in self.param_groups:
             for p in group["params"]:
+                if p not in offload.host:
+                    continue
                 lane = self._lanes[id(p)]
                 lane.grad_host = offload.host[p]
                 lane.d2h = _already_on_host
@@ -169,6 +170,9 @@ class CPUAdamW(Optimizer):
             group["eps"],
             group["weight_decay"],
         )
+        if group.get("decay_to_one"):
+            k = group["lr"] * group["decay_to_one_coef"]
+            st["master"].sub_(st["master"] - 1.0, alpha=k)
         lane.shadow.copy_(st["master"])
         lane.h2d(p)
 
@@ -186,10 +190,17 @@ class CPUAdamW(Optimizer):
         return loss
 
     @torch.no_grad()
-    def step_param(self, p: Tensor) -> None:
-        """Update one parameter now (its grad must be set)."""
+    def step_param(self, p: Tensor, found_inf: Tensor | None = None) -> None:
+        """Update one parameter now (its grad must be set); skipped when `found_inf`
+        (a 0-d tensor) is nonzero."""
         lane = self._lanes[id(p)]
-        self._update(p, lane, lane.d2h(p))
+        ev = lane.d2h(p)
+        if found_inf is not None and bool(found_inf.item()):
+            return
+        self._update(p, lane, ev)
+
+    def finish(self) -> None:
+        return None
 
 
 def _d2h_host(p: Tensor, lane: _Lane):
@@ -214,15 +225,17 @@ def _h2d_host(p: Tensor, lane: _Lane) -> None:
 
 
 def _d2h_device(p: Tensor, lane: _Lane, stream):
-    stream.wait_stream(torch.cuda.current_stream(p.device))
-    with torch.cuda.stream(stream):
+    dm = module(p.device)
+    stream.wait_stream(dm.current_stream(p.device))
+    with dm.stream(stream):
         lane.grad_host.copy_(p.grad, non_blocking=True)
-    ev = torch.cuda.Event()
+    ev = dm.Event()
     ev.record(stream)
     return ev
 
 
 def _h2d_device(p: Tensor, lane: _Lane, stream) -> None:
-    with torch.cuda.stream(stream):
+    dm = module(p.device)
+    with dm.stream(stream):
         p.data.copy_(lane.shadow, non_blocking=True)
-    torch.cuda.current_stream(p.device).wait_stream(stream)
+    dm.current_stream(p.device).wait_stream(stream)

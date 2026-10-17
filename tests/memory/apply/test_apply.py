@@ -4,10 +4,15 @@ import pytest
 import torch
 
 from kohakumoss.model import random_backbone
+from kohakumoss.offload.activation import ActivationOffload
+from kohakumoss.training.build.model import build_model
+from kohakumoss.training.knobs import resolve_precision
 from kohakumoss.training.memory.apply import apply_inference_plan, apply_to_backbone
 from kohakumoss.training.memory.profiles import resolve
+from kohakumoss.training.precision import build_policy
 from kohakumoss.types.seqinfo import build_seqinfo
 from tests._util.negative import must_fail
+from tests.training.test_entry_smoke import smoke_knobs
 
 pytestmark = pytest.mark.cpu
 SIZE = dict(dim=256, heads=4, ffn_dim=512)
@@ -27,23 +32,52 @@ def _model():
     return random_backbone("tiny", dtype=torch.float32, **SIZE)
 
 
-@torch.no_grad()
-def test_inference_minimal_plan_close_to_dense():
-    ref_model = _model()
-    ref = ref_model(*_inputs(ref_model))
+def _inference(overrides, corrupt=None):
     model = _model()
-    plan = resolve("minimal", device="cpu", inference=True)
+    plan = resolve("minimal", overrides, device="cpu", inference=True)
     engines = apply_inference_plan(plan, "cpu", torch.float32, backbone=model)
+    if corrupt is not None:
+        corrupt(engines)
     model.bind_ops()
-    out = model(*_inputs(model))
+    return model(*_inputs(model)), engines
+
+
+def _swap_blocks(engines) -> None:
+    host = engines.stream.host
+    host[0], host[1] = host[1], host[0]
+
+
+@torch.no_grad()
+def test_inference_minimal_plan_equals_resident_int8():
+    ref, _ = _inference({"stream": "off"})
+    out, engines = _inference(None)
     assert engines.stream is not None and engines.reports["quant"]["layers"] > 0
-    rel = ((out - ref).norm() / ref.norm()).item()
-    assert rel < 5e-2
 
-    def check_unquantized_equality():
-        assert rel < 1e-6
+    def check(got):
+        assert ((got - ref).norm() / ref.norm()).item() < 1e-6
 
-    must_fail(check_unquantized_equality, "int8 base is not bit-equal to dense")
+    check(out)
+    wrong, _ = _inference(None, corrupt=_swap_blocks)
+    must_fail(lambda: check(wrong), "a stream that loads the neighbouring block")
+
+
+def test_trainer_build_excludes_adapters_from_activation_offload(tmp_path):
+    """Adapters bound after the plan are never offloaded (their storages are skipped)."""
+    knobs = smoke_knobs(tmp_path, MEMORY_OVERRIDES={"act_offload": True})
+    policy = build_policy(resolve_precision(knobs), knobs["KEEP_FP32"])
+    built = build_model(knobs, torch.device("cpu"), policy)
+    off = built.engines.offload
+    params = list(built.trainable.trainable_params())
+    assert params
+
+    def check(engine):
+        for p in params:
+            assert engine.pack(p) is p, "trainable parameter would be offloaded"
+
+    off.min_bytes = 0
+    check(off)
+    fresh = ActivationOffload("cpu", min_bytes=0)
+    must_fail(lambda: check(fresh), "offload without the adapter exclusion")
 
 
 def _train_grads(plan_overrides):

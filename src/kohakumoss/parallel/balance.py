@@ -41,7 +41,7 @@ def _sync(device: torch.device) -> None:
 
 def gather_speeds(speed: float, device: torch.device, group=None) -> list[float]:
     """Every rank's measured speed (collective)."""
-    t = torch.tensor([speed], dtype=torch.float64, device=device)
+    t = torch.tensor([speed], dtype=torch.float32, device=device)
     out = [torch.zeros_like(t) for _ in range(dist.get_world_size(group))]
     dist.all_gather(out, t, group=group)
     return [float(x.item()) for x in out]

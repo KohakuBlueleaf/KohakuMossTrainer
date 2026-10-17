@@ -6,6 +6,7 @@ from torch import nn
 
 from kohakumoss.offload.layers import LayerStreamer, find_layer_list, move_except
 from kohakumoss.quant.convert import quantize_torch_linears
+from tests._shared.tiny import DEVICES
 from tests._util.negative import must_fail
 
 
@@ -42,9 +43,7 @@ class _Enc(nn.Module):
         return self.norm(x)
 
 
-@pytest.mark.parametrize(
-    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.cuda)]
-)
+@pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("quant", [None, "int8"])
 @torch.no_grad()
 def test_layer_streamer_matches_resident(device, quant):

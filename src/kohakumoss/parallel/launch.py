@@ -1,11 +1,6 @@
-"""Process launch and process-group init without torchrun (Windows and Linux).
-
-`spawn(fn, plan, *args)` starts one process per device with torch.multiprocessing;
-each calls `fn(env, *args)` after `init_process_group`. The parent owns the TCPStore
-master on an OS-assigned port; workers connect as clients. On Windows the store is
-built with `use_libuv=False` (Windows wheels have no libuv) and the backend is gloo.
-See docs/internals/distributed-windows.md.
-"""
+"""Process launch and process-group init without torchrun: `spawn(fn, plan, *args)`
+runs `fn(env, *args)` in one process per device. See
+docs/internals/distributed-windows.md."""
 
 import os
 import sys

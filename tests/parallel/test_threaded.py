@@ -5,8 +5,8 @@ import torch
 
 from kohakumoss.parallel.threaded import ThreadedPipeline
 from kohakumoss.training.memory.synthetic import synthetic_batch
+from tests._shared.tiny import make_model
 from tests._util.negative import must_fail
-from tests.parallel._common import make_model
 
 DENOM = 64.0
 

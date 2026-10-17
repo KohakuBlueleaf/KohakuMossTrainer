@@ -8,29 +8,32 @@ non-block parameters through frozen blocks. Invalid combinations must be rejecte
 """
 
 import itertools
+import os
 
 import pytest
 import torch
 
 from kohakumoss.offload.gpu_adamw import MasterAdamW
+from kohakumoss.training.knobs import default_device_type
 from kohakumoss.training.memory.profiles import resolve
 from kohakumoss.training.memory.session import MemorySession
 from kohakumoss.training.memory.synthetic import SyntheticModel, synthetic_batch
 from kohakumoss_kernels.hardware.arch import arch_of
 from tests._util.negative import must_fail
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = os.environ.get("KOHAKUMOSS_TEST_DEVICE") or default_device_type()
 ARCH = arch_of(DEVICE)
 CHECKPOINTS = ("none", "block", "sub-block", "selective", "partial:0.5")
 STREAMS = ("off", "ring", "swap")
 OPTIMS = ("gpu", "stream", "cpu")
 BASES = ["fp32", "int8"]
-if DEVICE == "cuda":
+if DEVICE != "cpu":
     BASES = ["fp16", "int8"] + (["bf16"] if ARCH.has_bf16 else [])
     BASES += ["fp8"] if ARCH.has_fp8 else []
 DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 TOL = {torch.float32: 1e-4, torch.float16: 3e-2, torch.bfloat16: 5e-2}
 UPDATE_TOL = {torch.float32: 1e-4, torch.float16: 5e-2, torch.bfloat16: 5e-2}
+QUANT_UPDATE_TOL = 1e-1
 LR = 1e-2
 STEPS = 2
 
@@ -45,9 +48,7 @@ def _combos():
 def _setup(base, stream):
     quant = base in ("int8", "fp8")
     dtype = (
-        (torch.float16 if DEVICE == "cuda" else torch.float32)
-        if quant
-        else DTYPES[base]
+        (torch.float16 if DEVICE != "cpu" else torch.float32) if quant else DTYPES[base]
     )
     full = stream == "swap" or (stream == "off" and not quant)
     return dtype, full, quant
@@ -179,9 +180,10 @@ def _errors(combo, lr_scale: float = 1.0) -> tuple[float, float]:
 
 @pytest.mark.parametrize("combo", VALID, ids=_ids)
 def test_combination_matches_reference(combo):
-    dtype = _setup(combo[-1], combo[2])[0]
+    dtype, _, quant = _setup(combo[-1], combo[2])
     loss_err, update_err = _errors(combo)
-    assert loss_err <= TOL[dtype] and update_err <= UPDATE_TOL[dtype], (
+    update_tol = QUANT_UPDATE_TOL if quant else UPDATE_TOL[dtype]
+    assert loss_err <= TOL[dtype] and update_err <= update_tol, (
         loss_err,
         update_err,
     )

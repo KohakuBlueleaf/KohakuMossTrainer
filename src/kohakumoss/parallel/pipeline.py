@@ -1,12 +1,5 @@
-"""Process-group pipeline parallelism over torch.distributed.pipelining.
-
-Stages are contiguous layer ranges of a `prologue / layers / epilogue` model. Every
-rank draws the same step (same loader seed), so each rank builds the micro-batch
-layouts itself; only `(x, mod, head, mb)` cross stage boundaries. Shapes are static:
-each micro-batch is padded to `tokens` joint tokens and `max_samples` samples with a
-zero-weight padding sample. The first stage reads its inputs by the micro-batch index
-`mb`; the loss runs the epilogue on the last stage. See docs/guides/multi-gpu.md.
-"""
+"""Process-group pipeline parallelism over torch.distributed.pipelining: contiguous
+layer-range stages with static micro-batch shapes. See docs/guides/multi-gpu.md."""
 
 import inspect
 from collections.abc import Callable
@@ -141,9 +134,11 @@ class StageModule(nn.Module):
         self.residual = parts.residual_scale
         self._blocks = tuple((i, self.layers[str(i)]) for i in range(lo, hi))
         self._forward = self._forward_first if first else self._forward_mid
+        self.calls = 0
 
     def set_step(self, seqs: list[SeqInfo], inputs: list[MicroBatch]) -> None:
         self.seqs, self.inputs = seqs, inputs
+        self.calls = 0
 
     def _run(self, x: Tensor, ctx: PartsCtx) -> Tensor:
         run = self.runner.run
@@ -152,10 +147,15 @@ class StageModule(nn.Module):
         return x
 
     def _index(self, mb: Tensor) -> int:
-        """Micro-batch index; out-of-range values only occur in torch's shape-inference
-        pass (uninitialised tensors) and map to micro-batch 0."""
-        k = int(mb.reshape(-1)[0].item())
-        return k if 0 <= k < len(self.seqs) else 0
+        """This forward's micro-batch index (a stage runs its forwards in micro-batch
+        order); host-side, no device read."""
+        k = self.calls
+        if k >= len(self.seqs):
+            raise RuntimeError(
+                f"stage forward {k} beyond {len(self.seqs)} micro-batches"
+            )
+        self.calls = k + 1
+        return k
 
     def forward(self, *args):
         return self._forward(*args)
@@ -223,6 +223,7 @@ class PipelineEngine:
         self.tail = next((m for m in self.modules_ if m.last), None)
         self.objective = objective
         self.denom = 1.0
+        self._losses = 0
         self.targets: list[MicroBatch] = []
         cls = schedule_class(schedule)
         target = stages[0] if schedule in SINGLE else stages
@@ -231,6 +232,8 @@ class PipelineEngine:
         )
 
     def _example(self, first: bool):
+        """Static stage metadata: `(mb,)` into the first stage, else `(x, mod, head,
+        mb)`; the float tensors carry gradients."""
         s, d = self.shape, self.device
         mb = torch.zeros(1, dtype=torch.int64, device=d)
         if first:
@@ -238,19 +241,22 @@ class PipelineEngine:
         x = torch.empty(s.tokens, s.dim, dtype=self.dtype, device=d)
         mod = torch.empty(s.max_samples + 1, 6, s.dim, dtype=torch.float32, device=d)
         head = torch.empty(s.max_samples + 1, 2, s.dim, dtype=torch.float32, device=d)
-        return (x, mod, head, mb)
+        return (x.requires_grad_(), mod.requires_grad_(), head.requires_grad_(), mb)
 
     def _stage(self, mod: StageModule, sid: int, n: int, group):
         kw = {}
         if "input_args" in _STAGE_ARGS:
             kw["input_args"] = self._example(mod.first)
+        if "output_args" in _STAGE_ARGS:
+            kw["output_args"] = self._example(False)
         if "group" in _STAGE_ARGS and group is not None:
             kw["group"] = group
         return pipelining.PipelineStage(mod, sid, n, self.device, **kw)
 
     def _loss(self, output, target) -> Tensor:
         x, mod, head, mb = output
-        k = int(target.reshape(-1)[0].item())
+        k = self._losses
+        self._losses = k + 1
         data, tail = self.targets[k], self.tail
         ctx = tail.ctx(tail.seqs[k], mod, head)
         pred = tail.parts[0].epilogue(x, ctx)[: data.target.shape[0]]
@@ -263,6 +269,7 @@ class PipelineEngine:
         for m in self.modules_:
             m.set_step(seqs, moved)
         self.targets, self.denom = moved, denom
+        self._losses = 0
         index = torch.arange(len(microbatches), device=self.device)
         args = (index,) if self.first else ()
         losses: list[Tensor] = []
@@ -270,7 +277,7 @@ class PipelineEngine:
         self.schedule.step(*args, **kwargs)
         if not self.last:
             return None
-        return torch.stack([v.detach().double() for v in losses]).sum()
+        return torch.stack([v.detach().float() for v in losses]).sum()
 
     def parameters(self):
         for m in self.modules_:

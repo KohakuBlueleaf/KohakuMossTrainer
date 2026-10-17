@@ -5,8 +5,8 @@ import torch
 
 from kohakumoss.offload.cpu_optim import CPUAdamW
 from kohakumoss.offload.fused_step import FusedStep, PerParamOptimizer
+from tests._shared.tiny import DEVICES, batch, make_model
 from tests._util.negative import must_fail
-from tests.parallel._common import batch, make_model
 
 
 def _loss(model, seed):
@@ -64,9 +64,7 @@ def test_fused_step_check_catches_a_hook_that_never_steps():
     must_fail(check, "unarmed fused step")
 
 
-@pytest.mark.parametrize(
-    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.cuda)]
-)
+@pytest.mark.parametrize("device", DEVICES)
 def test_cpu_adamw_matches_adamw(device):
     torch.manual_seed(0)
     a = torch.nn.Parameter(torch.randn(64, 32, device=device))

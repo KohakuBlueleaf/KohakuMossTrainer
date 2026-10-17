@@ -1,17 +1,13 @@
-"""Inference-time layer streaming for large frozen encoders (the 9B text encoder on
-<=16 GB cards): each layer's parameters are on the device only while it runs.
-
-Forward pre-hooks swap layer i's parameter storage to a device ring slot (prefetching
-layer i+1 on a side stream); forward hooks swap it back to the host copy. Layers of
-different structure (e.g. linear- vs full-attention layers) get separate slot pools.
-Per-layer tensor lists, the copy path and the prefetch target are bound at build.
-"""
+"""Inference-time layer streaming for large frozen encoders: each layer's parameters
+are on the device only while it runs. See docs/internals/offload.md."""
 
 from collections.abc import Sequence
 from functools import partial
 
 import torch
 from torch import Tensor, nn
+
+from kohakumoss.offload.accel import module, streamed, with_index
 
 
 def _tensors(module: nn.Module) -> dict[str, Tensor]:
@@ -57,9 +53,10 @@ class _Pool:
         self.held: list[int | None] = [None] * resident
         self.next = 0
         if cuda:
-            cur = torch.cuda.current_stream(device)
-            self.ready = [torch.cuda.Event() for _ in range(resident)]
-            self.free = [torch.cuda.Event() for _ in range(resident)]
+            dm = module(device)
+            cur = dm.current_stream(device)
+            self.ready = [dm.Event() for _ in range(resident)]
+            self.free = [dm.Event() for _ in range(resident)]
             for ev in self.free:
                 ev.record(cur)
 
@@ -79,8 +76,9 @@ class LayerStreamer:
         pinned: bool = True,
     ):
         self.layers = list(layers)
-        self.device = torch.device(device)
-        self.cuda = self.device.type == "cuda"
+        self.device = with_index(device)
+        self.cuda = streamed(self.device)
+        self.dm = module(self.device)
         self.host: list[list[Tensor]] = []
         self.targets: list[list[Tensor]] = []
         self.pool_of: list[_Pool] = []
@@ -102,7 +100,7 @@ class LayerStreamer:
             self.targets.append(list(params.values()))
         self.slot_of: dict[int, int] = {}
         if self.cuda:
-            self.stream = torch.cuda.Stream(self.device)
+            self.stream = self.dm.Stream(self.device)
             self._copy, self._wait, self._free = (
                 self._copy_device,
                 self._wait_device,
@@ -141,7 +139,7 @@ class LayerStreamer:
 
     def _copy_device(self, pool: _Pool, slot: int, src: list[Tensor]) -> None:
         self.stream.wait_event(pool.free[slot])
-        with torch.cuda.stream(self.stream):
+        with self.dm.stream(self.stream):
             for dst, s in zip(pool.slots[slot], src):
                 dst.copy_(s, non_blocking=True)
         pool.ready[slot].record(self.stream)
@@ -150,10 +148,10 @@ class LayerStreamer:
         return None
 
     def _wait_device(self, pool: _Pool, slot: int) -> None:
-        torch.cuda.current_stream(self.device).wait_event(pool.ready[slot])
+        self.dm.current_stream(self.device).wait_event(pool.ready[slot])
 
     def _free_device(self, pool: _Pool, slot: int) -> None:
-        pool.free[slot].record(torch.cuda.current_stream(self.device))
+        pool.free[slot].record(self.dm.current_stream(self.device))
 
     def _prefetch(self, i: int) -> None:
         if i not in self.slot_of:

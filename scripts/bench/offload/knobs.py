@@ -1,9 +1,8 @@
-"""One measured line per VRAM knob, each in isolation, on MOSS-sized synthetic blocks:
-gradient offload + accumulation, checkpoint granularities under accumulation, and
-streaming + gradient offload + checkpointing amortised over a larger token budget.
+"""One measured line per VRAM knob, each in isolation, on MOSS-sized synthetic blocks,
+built through MemorySession (the trainer's optimiser wiring); writes
+runs/bench/offload/knobs_<gpu>.json. See docs/internals/offload.md.
 
     python scripts/bench/offload/knobs.py --device cuda:0
-Writes runs/bench/offload/knobs_<gpu>.json.
 """
 
 import argparse
@@ -15,17 +14,22 @@ import time
 
 import torch
 
-from kohakumoss.offload.cpu_optim import CPUAdamW
-from kohakumoss.offload.grad import GradOffload
-from kohakumoss.offload.stream import WeightStream
-from kohakumoss.training.memory.runners import (
-    CheckpointRunner,
-    StreamRunner,
-    build_runner,
-)
+from kohakumoss.offload.accel import default_type
+from kohakumoss.offload.accel import module as accel
+from kohakumoss.training.memory.profiles import resolve
+from kohakumoss.training.memory.runners import build_runner
+from kohakumoss.training.memory.session import MemorySession
 from kohakumoss.training.memory.synthetic import SyntheticModel, synthetic_batch
+from kohakumoss_kernels.hardware.arch import arch_of
 
 GIB = 1024**3
+FULL_FT = {
+    "gpu_adamw": dict(optim_state="gpu"),
+    "cpu_adamw": dict(optim_state="cpu"),
+    "grad_offload_cpu_adamw": dict(optim_state="cpu", grad_offload=True),
+    "grad_offload_gpu_adamw": dict(optim_state="gpu", grad_offload=True),
+}
+AGGRESSIVE = dict(stream="swap", stream_resident=2, grad_offload=True)
 
 
 def model_and_data(args, device, dtype, tokens):
@@ -36,31 +40,31 @@ def model_and_data(args, device, dtype, tokens):
     return model, data
 
 
-def micro(model, data):
+def loss_of(model, data):
     img, txt, sigma, seq, target = data
-    loss = (model(img, txt, sigma, seq).float() - target.float()).square().mean()
-    loss.backward()
+    return (model(img, txt, sigma, seq).float() - target.float()).square().mean()
 
 
 def measure(name, device, step_fn, tokens, iters, stats=()):
+    dm = accel(device)
     step_fn()
-    torch.cuda.synchronize(device)
-    torch.cuda.reset_peak_memory_stats(device)
+    dm.synchronize(device)
+    dm.reset_peak_memory_stats(device)
     base = {k: s.stats.get(k, 0) for s in stats for k in ("bytes_h2d", "bytes_d2h")}
     times = []
     for _ in range(iters):
-        torch.cuda.synchronize(device)
+        dm.synchronize(device)
         t0 = time.perf_counter()
         step_fn()
-        torch.cuda.synchronize(device)
+        dm.synchronize(device)
         times.append(time.perf_counter() - t0)
     med = sorted(times)[len(times) // 2]
     row = {
         "case": name,
         "ms": med * 1e3,
         "ms_per_1k_tokens": med * 1e6 / tokens,
-        "peak_GiB": torch.cuda.max_memory_allocated(device) / GIB,
-        "resident_GiB": torch.cuda.memory_allocated(device) / GIB,
+        "peak_GiB": dm.max_memory_allocated(device) / GIB,
+        "resident_GiB": dm.memory_allocated(device) / GIB,
         "tokens": tokens,
     }
     for k in ("bytes_h2d", "bytes_d2h"):
@@ -69,37 +73,34 @@ def measure(name, device, step_fn, tokens, iters, stats=()):
     return row
 
 
-def full_ft(args, device, dtype, mode):
-    model, data = model_and_data(args, device, dtype, args.tokens)
-    model.runner = CheckpointRunner("block").bind(model.layers)
-    params = list(model.parameters())
-    stats = []
-    match mode:
-        case "gpu_adamw":
-            opt = torch.optim.AdamW(params, lr=1e-5, foreach=False)
-            before = after = None
-        case "cpu_adamw":
-            opt = CPUAdamW(params, lr=1e-5)
-            before = after = None
-        case "grad_offload_cpu_adamw":
-            off = GradOffload(params)
-            opt = CPUAdamW(params, lr=1e-5)
-            opt.use_host_grads(off)
-            before, after, stats = off.flush, off.zero, [off]
+def _session_case(args, device, dtype, tokens, overrides, name):
+    model, data = model_and_data(args, device, dtype, tokens)
+    plan = resolve(
+        "balanced",
+        {"checkpoint": "block", **overrides},
+        device,
+        trainable_base=True,
+    )
+    session = MemorySession(
+        model, plan, device, dtype, grad_acc=args.accum, trainable_base=True, lr=1e-5
+    )
+    stats = [
+        s
+        for s in (session.engines.stream, session.grads, session.block_opt)
+        if s is not None and hasattr(s, "stats")
+    ]
 
     def step():
-        for _ in range(args.accum):
-            micro(model, data)
-        if before is not None:
-            before()
-        opt.step()
-        opt.zero_grad(set_to_none=True)
-        if after is not None:
-            after()
+        for micro in range(args.accum):
+            session.backward(loss_of(model, data), micro)
+        session.step()
 
-    return measure(
-        f"full_ft/{mode}/acc{args.accum}", device, step, args.tokens, args.iters, stats
-    )
+    return measure(name, device, step, tokens, args.iters, stats)
+
+
+def full_ft(args, device, dtype, mode):
+    name = f"full_ft/{mode}/acc{args.accum}"
+    return _session_case(args, device, dtype, args.tokens, FULL_FT[mode], name)
 
 
 def granularity(args, device, dtype, value):
@@ -110,7 +111,7 @@ def granularity(args, device, dtype, value):
 
     def step():
         for _ in range(args.accum):
-            micro(model, data)
+            loss_of(model, data).backward()
         model.zero_grad(set_to_none=True)
 
     return measure(
@@ -119,40 +120,16 @@ def granularity(args, device, dtype, value):
 
 
 def aggressive(args, device, dtype, tokens):
-    model, data = model_and_data(args, device, dtype, tokens)
-    engine = WeightStream(model.layers, device, resident=2, trainable=True, dtype=dtype)
-    model.runner = StreamRunner(CheckpointRunner("block"), engine).bind(model.layers)
-    resident = [p for p in model.parameters() if p.device.type == "cuda"]
-    off = GradOffload(resident)
-    host_opt = CPUAdamW(list(engine.params.values()), lr=1e-5)
-    dev_opt = CPUAdamW(resident, lr=1e-5)
-    dev_opt.use_host_grads(off)
-
-    def step():
-        for _ in range(args.accum):
-            micro(model, data)
-        engine.flush_grads()
-        off.flush()
-        host_opt.step()
-        dev_opt.step()
-        host_opt.zero_grad(set_to_none=True)
-        off.zero()
-        engine.refresh()
-
-    return measure(
-        f"stream+grad_offload+ckpt/acc{args.accum}",
-        device,
-        step,
-        tokens,
-        args.iters,
-        [engine, off],
-    )
+    name = f"swap+grad_offload+stream_states/{tokens}tok/acc{args.accum}"
+    overrides = {**AGGRESSIVE, "optim_state": "stream"}
+    return _session_case(args, device, dtype, tokens, overrides, name)
 
 
 CASES = {
     "full_ft:gpu_adamw": (full_ft, "gpu_adamw"),
     "full_ft:cpu_adamw": (full_ft, "cpu_adamw"),
     "full_ft:grad_offload_cpu_adamw": (full_ft, "grad_offload_cpu_adamw"),
+    "full_ft:grad_offload_gpu_adamw": (full_ft, "grad_offload_gpu_adamw"),
     "ckpt:none": (granularity, "none"),
     "ckpt:block": (granularity, "block"),
     "ckpt:sub-block": (granularity, "sub-block"),
@@ -165,7 +142,7 @@ CASES = {
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--device", default=f"{default_type()}:0")
     ap.add_argument("--blocks", type=int, default=8)
     ap.add_argument("--dim", type=int, default=3072)
     ap.add_argument("--ffn", type=int, default=8192)
@@ -179,10 +156,10 @@ def main():
     ap.add_argument("--out", default="runs/bench/offload")
     args, rest = ap.parse_known_args()
     device = torch.device(args.device)
+    dm = accel(device)
+    dm.set_device(device)
+    dtype = torch.bfloat16 if arch_of(device).has_bf16 else torch.float16
     if args.only:
-        torch.cuda.set_device(device)
-        major, _ = torch.cuda.get_device_capability(device)
-        dtype = torch.bfloat16 if major >= 8 else torch.float16
         fn, arg = CASES[args.only]
         arg = {"tokens": args.tokens, "big_tokens": args.big_tokens}.get(arg, arg)
         print("ROW " + json.dumps(fn(args, device, dtype, arg)))
@@ -190,15 +167,18 @@ def main():
     rows = []
     for label in args.cases.split(","):
         cmd = [sys.executable, __file__, "--only", label] + sys.argv[1:]
-        out = subprocess.run(cmd, capture_output=True, text=True).stdout
-        found = [line[4:] for line in out.splitlines() if line.startswith("ROW ")]
+        out = subprocess.run(cmd, capture_output=True, text=True)
+        found = [
+            line[4:] for line in out.stdout.splitlines() if line.startswith("ROW ")
+        ]
         rows.append(
-            json.loads(found[0]) if found else {"case": label, "error": out[-400:]}
+            json.loads(found[0])
+            if found
+            else {"case": label, "error": (out.stdout + out.stderr)[-600:]}
         )
         print(json.dumps(rows[-1]))
-    dtype = "bf16" if torch.cuda.get_device_capability(device)[0] >= 8 else "fp16"
     report = {
-        "gpu": torch.cuda.get_device_name(device),
+        "gpu": dm.get_device_name(device),
         "dtype": str(dtype),
         "args": vars(args),
         "rows": rows,

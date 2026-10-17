@@ -1,13 +1,6 @@
-"""Block weight streaming: MossLinear weights live in host memory, a GPU ring holds a few
-blocks, block i+1 (forward) / i-1 (backward) is prefetched on a side stream.
-
-Frozen bases (`trainable=False`) copy host -> device only. Trainable blocks keep fp32
-masters on the host; their gradients go device -> host into pinned staging buffers and
-are added to `param.grad` on the host (`flush_grads`), for a host-side optimiser.
-Streaming requires every streamed block to be checkpointed, so no autograd node holds
-a ring slot across blocks. Copy path (host / pinned / staged), trainable vs frozen and
-the device synchronisation are bound once at construction.
-"""
+"""Block weight streaming: MossLinear weights in host memory, a device ring of a few
+blocks with prefetch on a side stream; trainable blocks keep fp32 host masters. See
+docs/internals/offload.md (weight streaming)."""
 
 from collections.abc import Sequence
 
@@ -17,6 +10,7 @@ from torch import Tensor, nn
 from torch.autograd import Function
 
 from kohakumoss.model.linear import MossLinear
+from kohakumoss.offload.accel import module, streamed, with_index
 from kohakumoss.offload.host_acc import HostAccumulator
 from kohakumoss.quant.weights import QuantWeight, dequantize
 
@@ -130,7 +124,9 @@ class WeightStream:
         if resident < 2:
             raise ValueError("resident must be >= 2")
         self.device = torch.device(device)
-        self.cuda = self.device.type == "cuda"
+        self.device = with_index(self.device)
+        self.cuda = streamed(self.device)
+        self.dm = module(self.device)
         self.pinned = pinned and self.cuda
         self.trainable = trainable
         self.n = len(blocks)
@@ -172,12 +168,12 @@ class WeightStream:
             self.on_grad = self.accumulate
             return
         self.acc = HostAccumulator(self.pinned)
-        self.h2d = torch.cuda.Stream(self.device)
-        self.d2h = torch.cuda.Stream(self.device)
-        cur = torch.cuda.current_stream(self.device)
-        self.ready = [torch.cuda.Event() for _ in range(self.resident)]
-        self.free = [torch.cuda.Event() for _ in range(self.resident)]
-        self.host_ready = [torch.cuda.Event() for _ in range(self.n)]
+        self.h2d = self.dm.Stream(self.device)
+        self.d2h = self.dm.Stream(self.device)
+        cur = self.dm.current_stream(self.device)
+        self.ready = [self.dm.Event() for _ in range(self.resident)]
+        self.free = [self.dm.Event() for _ in range(self.resident)]
+        self.host_ready = [self.dm.Event() for _ in range(self.n)]
         for ev in self.free + self.host_ready:
             ev.record(cur)
         self._copy = self._copy_pinned if self.pinned else self._copy_staged
@@ -252,7 +248,7 @@ class WeightStream:
     def _copy_pinned(self, src: dict, dst: dict, slot: int, index: int) -> None:
         self.h2d.wait_event(self.free[slot])
         self.h2d.wait_event(self.host_ready[index])
-        with torch.cuda.stream(self.h2d):
+        with self.dm.stream(self.h2d):
             for k, t in src.items():
                 dst[k].copy_(t, non_blocking=True)
                 self.stats["bytes_h2d"] += t.numel() * t.element_size()
@@ -261,7 +257,7 @@ class WeightStream:
     def _copy_staged(self, src: dict, dst: dict, slot: int, index: int) -> None:
         self.h2d.wait_event(self.free[slot])
         self.host_ready[index].synchronize()
-        with torch.cuda.stream(self.h2d):
+        with self.dm.stream(self.h2d):
             for k, t in src.items():
                 dst[k].copy_(self._stage(k, t), non_blocking=True)
                 self.stats["bytes_h2d"] += t.numel() * t.element_size()
@@ -280,10 +276,10 @@ class WeightStream:
         return None
 
     def _wait_ready(self, slot: int) -> None:
-        torch.cuda.current_stream(self.device).wait_event(self.ready[slot])
+        self.dm.current_stream(self.device).wait_event(self.ready[slot])
 
     def _record_free(self, slot: int) -> None:
-        self.free[slot].record(torch.cuda.current_stream(self.device))
+        self.free[slot].record(self.dm.current_stream(self.device))
 
     def ensure(self, index: int) -> None:
         """Block `index` is resident and the compute stream waits for its copy."""

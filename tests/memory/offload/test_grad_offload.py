@@ -6,10 +6,8 @@ import torch
 from kohakumoss.offload.cpu_optim import CPUAdamW
 from kohakumoss.offload.grad import GradOffload
 from kohakumoss.training.memory.runners import build_runner
+from tests._shared.tiny import DEVICES, batch, make_model
 from tests._util.negative import must_fail
-from tests.parallel._common import batch, make_model
-
-DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.cuda)]
 
 
 def _loss(model, device, seed):

@@ -125,7 +125,7 @@ def pipeline_worker(env, result_path: str, schedule: str) -> None:
             errs.append((p.grad.cpu() - ref_grads[key].grad).abs().max().item())
     payload = {"max_err": max(errs), "n": len(errs)}
     if loss is not None:
-        payload["loss_err"] = abs(loss.item() - ref_loss.item())
+        payload["loss_err"] = abs(loss.item() - ref_loss.item()) / abs(ref_loss.item())
     _write(result_path, env.rank, payload)
 
 

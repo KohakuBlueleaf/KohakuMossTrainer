@@ -1,16 +1,5 @@
-"""GPU AdamW for streamed (`swap`) blocks, stepped per block inside backward.
-
-On the last micro-batch, when block i's backward starts, its optimiser state (fp32
-master, exp_avg, exp_avg_sq, and the host-accumulated gradient of earlier micro-batches)
-is prefetched into a 2-slot device ring on a side stream. When all of block i's weight
-gradients have arrived, AdamW runs on the device and the new master / moments / compute-
-dtype weights are written back to host memory on another side stream; the next forward's
-H2D of block i waits on that write-back. Earlier micro-batches accumulate gradients on
-the host (WeightStream.accumulate). `resident=True` keeps master and moments on the
-device permanently (only weights and gradients stream). `groups` are torch-style
-parameter groups over the stream's master parameters; each master is updated with its
-own group's hyperparameters.
-"""
+"""GPU AdamW for streamed (`swap`) blocks, stepped per block inside backward of the
+last micro-batch; states streamed or resident. See docs/internals/offload.md."""
 
 import torch
 from torch import Tensor
@@ -23,8 +12,16 @@ def _noop(index: int) -> None:
     return None
 
 
+def _no_transform(g: Tensor) -> None:
+    return None
+
+
 class StreamedAdamW:
-    """Per-block GPU AdamW over a trainable WeightStream."""
+    """Per-block GPU AdamW over a trainable WeightStream. `groups`: torch-style groups
+    over the stream's masters. `transform(g) -> found_inf | None` runs on each summed
+    gradient before its update (unscale / clip; a nonzero found_inf skips it)."""
+
+    handles_decay_to_one = True
 
     def __init__(
         self,
@@ -42,6 +39,7 @@ class StreamedAdamW:
         self.stream = stream
         self.device = stream.device
         self.cuda = stream.cuda
+        self.dm = stream.dm
         self.resident = resident
         self.params = list(stream.params.values())
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
@@ -57,7 +55,11 @@ class StreamedAdamW:
         for key in stream.params:
             self.keys[key[0]].append(key)
         pin = stream.pinned
-        self.steps = {key: 0 for key in stream.params}
+        self.transform = _no_transform
+        self.steps = {
+            key: torch.zeros((), dtype=torch.float32, device=self.device)
+            for key in stream.params
+        }
         self.moments: dict[tuple[int, str], tuple[Tensor, Tensor]] = {}
         self.dev_state: dict[tuple[int, str], tuple[Tensor, Tensor, Tensor]] = {}
         for key, master in stream.params.items():
@@ -85,12 +87,12 @@ class StreamedAdamW:
         self.pending: dict[int, dict[str, Tensor]] = {}
         self.stats = {"bytes_h2d": 0, "bytes_d2h": 0}
         if self.cuda:
-            cur = torch.cuda.current_stream(self.device)
-            self.h2d = torch.cuda.Stream(self.device)
-            self.d2h = torch.cuda.Stream(self.device)
-            self.opt = torch.cuda.Stream(self.device)
-            self.ready = [torch.cuda.Event() for _ in range(self.n_slots)]
-            self.free = [torch.cuda.Event() for _ in range(self.n_slots)]
+            cur = self.dm.current_stream(self.device)
+            self.h2d = self.dm.Stream(self.device)
+            self.d2h = self.dm.Stream(self.device)
+            self.opt = self.dm.Stream(self.device)
+            self.ready = [self.dm.Event() for _ in range(self.n_slots)]
+            self.free = [self.dm.Event() for _ in range(self.n_slots)]
             for ev in self.free:
                 ev.record(cur)
         self._load = self._load_resident if resident else self._load_streamed
@@ -148,7 +150,7 @@ class StreamedAdamW:
             return
         self.h2d.wait_event(self.free[slot])
         self.h2d.wait_event(self.stream.host_ready[index])
-        with torch.cuda.stream(self.h2d):
+        with self.dm.stream(self.h2d):
             for dst, src in copies:
                 dst.copy_(src, non_blocking=True)
                 self.stats["bytes_h2d"] += src.numel() * 4
@@ -170,9 +172,8 @@ class StreamedAdamW:
             g = grads[name].float()
             if acc:
                 g = g + buf[3]
-            step = torch.full((), float(self.steps[key]), device=self.device)
-            self.steps[key] += 1
-            outs.append(self._apply(key, buf, g, step, group))
+            found = self.transform(g)
+            outs.append(self._apply(key, buf, g, self.steps[key], group, found))
         return outs
 
     @torch.no_grad()
@@ -183,17 +184,17 @@ class StreamedAdamW:
         if not self.cuda:
             self._write_back(index, slot, self._update(index, slot, acc, grads))
             return
-        self.opt.wait_stream(torch.cuda.current_stream(self.device))
+        self.opt.wait_stream(self.dm.current_stream(self.device))
         self.opt.wait_event(self.ready[slot])
-        with torch.cuda.stream(self.opt):
+        with self.dm.stream(self.opt):
             outs = self._update(index, slot, acc, grads)
         for g in grads.values():
             g.record_stream(self.opt)
         self._write_back(index, slot, outs)
 
-    def _apply_streamed(self, key, buf, g, step, group):
+    def _apply_streamed(self, key, buf, g, step, group, found):
         master, m, v = buf[0], buf[1], buf[2]
-        fused_adamw(master, g, m, v, step, group)
+        fused_adamw(master, g, m, v, step, group, found)
         weight = master.to(self.stream.host[key[0]][key[1]].dtype)
         host_m, host_v = self.moments[key]
         pairs = [
@@ -204,11 +205,15 @@ class StreamedAdamW:
         ]
         return pairs, weight
 
-    def _apply_resident(self, key, buf, g, step, group):
+    def _apply_resident(self, key, buf, g, step, group, found):
         master, m, v = self.dev_state[key]
-        fused_adamw(master, g, m, v, step, group)
+        fused_adamw(master, g, m, v, step, group, found)
         weight = master.to(self.stream.host[key[0]][key[1]].dtype)
-        return [(self.stream.host[key[0]][key[1]], weight)], weight
+        pairs = [
+            (self.stream.params[key].data, master),
+            (self.stream.host[key[0]][key[1]], weight),
+        ]
+        return pairs, weight
 
     def _write_back(self, index: int, slot: int, outs) -> None:
         if not self.cuda:
@@ -217,7 +222,7 @@ class StreamedAdamW:
                     dst.copy_(src)
             return
         self.d2h.wait_stream(self.opt)
-        with torch.cuda.stream(self.d2h):
+        with self.dm.stream(self.d2h):
             for pairs, weight in outs:
                 for dst, src in pairs:
                     dst.copy_(src, non_blocking=True)
@@ -230,7 +235,7 @@ class StreamedAdamW:
         """After the last micro-batch's backward: drop resident block copies so the next
         forward reloads the updated weights, and clear the consumed host grad sums."""
         if self.cuda:
-            torch.cuda.current_stream(self.device).wait_stream(self.opt)
+            self.dm.current_stream(self.device).wait_stream(self.opt)
             self.h2d.synchronize()
         self.stream.zero_grads()
         self.stream.slot_of.clear()
@@ -242,11 +247,34 @@ class StreamedAdamW:
             self.d2h.synchronize()
 
     def masters(self) -> dict[tuple[int, str], Tensor]:
-        """Current fp32 masters (device copies when resident)."""
+        """Current fp32 masters (the host parameters)."""
         self.synchronize()
-        if self.resident:
-            return {k: s[0] for k, s in self.dev_state.items()}
         return {k: p.detach() for k, p in self.stream.params.items()}
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        return None
+
+    def state_dict(self) -> dict:
+        """Moments and step per stream key (masters are the parameters)."""
+        self.synchronize()
+        out = {}
+        for key in self.stream.params:
+            m, v = self.dev_state[key][1:] if self.resident else self.moments[key]
+            out[f"{key[0]}:{key[1]}"] = (m, v, self.steps[key].clone())
+        return out
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore moments / steps; masters come from the parameters (re-pushed to the
+        resident copies and the streaming weights)."""
+        for key, master in self.stream.params.items():
+            m, v, step = state[f"{key[0]}:{key[1]}"]
+            dst = self.dev_state[key] if self.resident else (None, *self.moments[key])
+            dst[1].copy_(m)
+            dst[2].copy_(v)
+            self.steps[key].fill_(float(step))
+            if self.resident:
+                dst[0].copy_(master.data)
+        self.stream.refresh()
 
 
 __all__ = ["StreamedAdamW"]
