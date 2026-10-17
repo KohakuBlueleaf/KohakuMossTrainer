@@ -67,6 +67,8 @@ class HostBatch:
     rows after encoding and fills `text_len`.
     `index` / `rank` locate the plan; `latent_keys` / `text_keys` are each sample's
     cache keys (empty when that cache is off), used by online write-back.
+    `layout` is the consumer's packed-sequence layout, built off the training thread by a
+    loader transform when the text lengths are already final (None otherwise).
     """
 
     ids: Tensor
@@ -85,6 +87,7 @@ class HostBatch:
     latent_keys: list[str] = field(default_factory=list)
     text_keys: list[str] = field(default_factory=list)
     text_limit: list[int] = field(default_factory=list)
+    layout: object | None = None
 
     def pin(self) -> "HostBatch":
         for name, value in self.__dict__.items():

@@ -1,10 +1,13 @@
-"""Offline latent cache pass for the data config (every geometry and flip of epoch 0).
+"""Offline latent cache pass: every catalog row's centre-crop target (and its flip when
+FLIP is on), for the data config.
 
     kogine run scripts/data/cache_latents.py --config configs/data/data_kohya_style.py \
-        --set IMAGE_ENCODER=<dotted factory returning an EncodeImages callable>
+        --set IMAGE_ENCODER=kohakumoss.encoders.vae_encoder
 
-The factory gets IMAGE_ENCODER_KWARGS; its id must match LATENT_ENCODER_ID so the
-trainer finds the entries. Missing keys only are encoded, so the pass resumes.
+The factory gets IMAGE_ENCODER_KWARGS (for `kohakumoss.encoders.vae_encoder`:
+{"path": <weights>/vae or a pipeline root, "device": "cuda", "dtype": "fp32"}); its id
+must match LATENT_ENCODER_ID so the trainer finds the entries. Missing keys only are
+encoded, so the pass resumes.
 """
 
 import time

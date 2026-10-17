@@ -1,16 +1,18 @@
 """CacheWriter: the trainer's `on_encoded(hb, latents, text, text_len)` hook for online
 caches. It splits a batch's fresh encodings per sample, queues them, and a background
-thread writes them to the vaults, so the training step never waits on storage.
+thread writes them to the vaults; a busy vault (another rank writing) is retried with
+backoff for up to `busy_timeout` seconds.
 
-Only what was encoded this step is written: latents when the batch carried `pixels`,
-text when it carried `prompts`. A sample is written only when its full encoding is
-known: latents arriving as the kept-token subset (token drop) and text arriving cut to
-`text_limit` are skipped, since they are not the cache value of their key.
+Written: latents when the batch carried `pixels` (full-grid encodings only; a kept-token
+subset is skipped), text when it carried `prompts` (a sample cut to `text_limit` is
+skipped). See docs/concepts/data.md.
 """
 
 import queue
 import threading
+import time
 
+import kohakuvault as kv
 from torch import Tensor
 
 from kohakumoss_data.cache.store import TensorStore
@@ -27,7 +29,13 @@ def _nothing(*args) -> list:
 class CacheWriter:
     """Background writer for the online latent / text caches of `dataset`."""
 
-    def __init__(self, dataset, max_pending: int = 8):
+    def __init__(
+        self,
+        dataset,
+        max_pending: int = 8,
+        busy_timeout: float = 600.0,
+        store_retries: int = 4,
+    ):
         self._paths = {}
         self._take_latents = _nothing
         self._take_text = _nothing
@@ -40,9 +48,11 @@ class CacheWriter:
         if dataset.texts.mode == "online":
             self._paths["text"] = (dataset.texts.store.path, dataset.texts.storage)
             self._take_text = self._text_jobs
+        self.busy_timeout = busy_timeout
+        self.store_retries = store_retries
         self._queue: queue.Queue = queue.Queue(maxsize=max_pending)
-        self._done = threading.Event()
         self.written = 0
+        self.busy_waits = 0
         self.error: BaseException | None = None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -82,7 +92,7 @@ class CacheWriter:
 
     def _run(self) -> None:
         stores = {
-            kind: TensorStore(path, storage)
+            kind: TensorStore(path, storage, retries=self.store_retries)
             for kind, (path, storage) in self._paths.items()
         }
         while True:
@@ -90,17 +100,32 @@ class CacheWriter:
             try:
                 if jobs == FLUSH:
                     for store in stores.values():
-                        store.flush()
+                        self._retry(store.flush)
                 elif jobs == STOP:
                     return
                 else:
                     for kind, key, value in jobs:
-                        self._put(stores[kind], key, value.detach().cpu())
+                        cpu = value.detach().cpu()
+                        self._retry(self._put, stores[kind], key, cpu)
                         self.written += 1
             except BaseException as err:
                 self.error = err
             finally:
                 self._queue.task_done()
+
+    def _retry(self, fn, *args) -> None:
+        deadline = time.monotonic() + self.busy_timeout
+        delay = 0.05
+        while True:
+            try:
+                fn(*args)
+                return
+            except kv.DatabaseBusy:
+                if time.monotonic() + delay > deadline:
+                    raise
+                self.busy_waits += 1
+                time.sleep(delay)
+                delay = min(delay * 2, 2.0)
 
     def _put(self, store: TensorStore, key: str, value: Tensor) -> None:
         store.put(key, value)

@@ -22,12 +22,26 @@ from kohakumoss_data.types import BatchPlan
 TextLen = Callable[[int, int], int]
 
 
+def split_weights(weights: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """float32 weights [N] -> (whole repeats int64 [N], fractional part float32 [N])."""
+    weights = np.asarray(weights, dtype=np.float32)
+    floor = np.floor(weights)
+    return floor.astype(np.int64), weights - floor
+
+
+def expected_items(weights: np.ndarray) -> float:
+    """Expected epoch size: exact int64 sum of the whole repeats plus the pairwise
+    float32 sum of the fractional parts."""
+    whole, frac = split_weights(weights)
+    return int(whole.sum()) + float(np.sum(frac, dtype=np.float32))
+
+
 def epoch_order(weights: np.ndarray, seed: int, epoch: int) -> np.ndarray:
     """Row ids of epoch `epoch`: row i appears floor(w_i) times plus once more with
     probability frac(w_i), then the multiset is permuted."""
     rng = rng_of("epoch-order", seed, epoch)
-    whole = np.floor(weights).astype(np.int64)
-    extra = rng.random(len(weights)) < (weights - whole)
+    whole, frac = split_weights(weights)
+    extra = rng.random(len(frac), dtype=np.float32) < frac
     counts = whole + extra
     items = np.repeat(np.arange(len(weights), dtype=np.int64), counts)
     return items[rng.permutation(len(items))]

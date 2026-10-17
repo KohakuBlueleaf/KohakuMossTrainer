@@ -13,9 +13,10 @@ from functools import partial
 import numpy as np
 import torch
 
+from kohakumoss_data.cache.store import LengthTable
 from kohakumoss_data.cache.tensor_cache import LatentCache, TextCache
 from kohakumoss_data.caption.template import build_template
-from kohakumoss_data.config import DataConfig
+from kohakumoss_data.config import DataConfig, resolved_cache_dir
 from kohakumoss_data.format.catalog import Catalog, read_catalog
 from kohakumoss_data.loader.decode import Decoder
 from kohakumoss_data.registry import PLANNERS, SOURCES, build
@@ -81,13 +82,15 @@ class MossDataset:
         self.loss_weight = np.array(
             [float(spec.get("loss_weight", 1.0)) for spec in cfg.datasets]
         )
-        cache_dir = cfg.cache_dir
+        cache_dir = resolved_cache_dir(cfg)
         self.latents = LatentCache(
             os.path.join(cache_dir, "latents.db") if cache_dir else None,
             cfg.latent_cache,
             cfg.latent_encoder_id,
             cfg.cache_dtype,
             str(cfg.background),
+            cfg.resample,
+            cfg.latent_draw,
         )
         self.texts = TextCache(
             os.path.join(cache_dir, "text.db") if cache_dir else None,
@@ -104,7 +107,8 @@ class MossDataset:
             latent_factor=cfg.latent_factor,
         )
         self.decode = Decoder(cfg.background, cfg.resample)
-        self._text_lengths = self.texts.lengths()
+        offline = cfg.text_cache == "offline"
+        self._text_lengths = self.texts.lengths() if offline else LengthTable()
         self._bind()
         self.planner = self._planner()
 
@@ -115,10 +119,11 @@ class MossDataset:
         if cfg.token_budget == "exact" and cfg.text_cache != "offline":
             raise ValueError("token_budget='exact' needs text_cache='offline'")
         self.text_len = {
-            ("estimate", False): self._text_len_estimate,
-            ("estimate", True): self._text_len_cached,
-            ("exact", True): self._text_len_exact,
-        }[(cfg.token_budget, self.texts.enabled)]
+            ("estimate", "off"): self._text_len_estimate,
+            ("estimate", "online"): self._text_len_estimate,
+            ("estimate", "offline"): self._text_len_cached,
+            ("exact", "offline"): self._text_len_exact,
+        }[(cfg.token_budget, cfg.text_cache)]
         self._drop = (
             partial(draw_drop, cfg.seed, cfg.text_drop) if cfg.text_drop else never_drop
         )
@@ -139,7 +144,7 @@ class MossDataset:
 
     def _planner(self):
         cfg = self.cfg
-        return PLANNERS.get(cfg.resolution_mode)(
+        kwargs = dict(
             catalog=self.catalog,
             geometry=self.geometry,
             seed=cfg.seed,
@@ -151,8 +156,9 @@ class MossDataset:
             max_tokens=cfg.max_tokens,
             max_samples=cfg.max_samples,
             batch_size=cfg.batch_size,
-            **cfg.planner_kwargs,
         )
+        kwargs.update(cfg.planner_kwargs)
+        return PLANNERS.get(cfg.resolution_mode)(**kwargs)
 
     def caption(self, row_id: int, variant: int) -> str:
         """Caption variant `variant` of row `row_id` (fixed per seed, row, variant)."""

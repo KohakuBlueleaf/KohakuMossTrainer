@@ -2,7 +2,12 @@
 
 from kohakumoss_data import caption, resolution, sources
 from kohakumoss_data.cache.writer import CacheWriter
-from kohakumoss_data.config import DataConfig, pipeline_problems
+from kohakumoss_data.config import (
+    DataConfig,
+    data_problems,
+    pipeline_problems,
+    resolved_cache_dir,
+)
 from kohakumoss_data.dataset import MossDataset
 from kohakumoss_data.loader import Loader
 from kohakumoss_data.types import (
@@ -13,8 +18,11 @@ from kohakumoss_data.types import (
 )
 
 
-def build_loader(cfg: DataConfig, rank: int = 0, world: int = 1) -> Loader:
-    """The StatefulLoader for `cfg` on `rank` of `world`."""
+def build_loader(
+    cfg: DataConfig, rank: int = 0, world: int = 1, transform=None
+) -> Loader:
+    """The StatefulLoader for `cfg` on `rank` of `world`; `transform` runs on each
+    batch in the worker (see `Loader`)."""
     return Loader(
         MossDataset(cfg),
         rank=rank,
@@ -22,6 +30,7 @@ def build_loader(cfg: DataConfig, rank: int = 0, world: int = 1) -> Loader:
         num_workers=cfg.num_workers,
         prefetch=cfg.prefetch,
         pin_memory=cfg.pin_memory,
+        transform=transform,
     )
 
 
@@ -36,7 +45,9 @@ __all__ = [
     "PlanItem",
     "build_loader",
     "caption",
+    "data_problems",
     "pipeline_problems",
+    "resolved_cache_dir",
     "resolution",
     "sources",
 ]

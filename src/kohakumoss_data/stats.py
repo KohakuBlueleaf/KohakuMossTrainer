@@ -4,15 +4,17 @@ import collections
 
 import numpy as np
 
+from kohakumoss_data.resolution.base import expected_items
+
 
 def catalog_stats(catalog) -> dict:
     """Row count, effective epoch size, pixel/aspect quantiles, alpha share, groups."""
-    area = catalog.w * catalog.h
-    aspect = catalog.w / catalog.h
+    area = (catalog.w * catalog.h).astype(np.float32)
+    aspect = np.divide(catalog.w, catalog.h, dtype=np.float32)
     q = (0.05, 0.25, 0.5, 0.75, 0.95)
     return {
         "rows": len(catalog),
-        "epoch_items": float(catalog.weight.sum()),
+        "epoch_items": expected_items(catalog.weight),
         "megapixels_q": [round(float(v) / 1e6, 3) for v in np.quantile(area, q)],
         "aspect_q": [round(float(v), 3) for v in np.quantile(aspect, q)],
         "alpha_share": float(np.mean([r.has_alpha for r in catalog.rows])),

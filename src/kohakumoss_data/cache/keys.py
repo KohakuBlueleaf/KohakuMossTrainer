@@ -5,9 +5,16 @@ from kohakumoss_data.types import CatalogRow, PlanItem
 
 
 def latent_key(
-    row: CatalogRow, item: PlanItem, encoder_id: str, dtype: str, background: str
+    row: CatalogRow,
+    item: PlanItem,
+    encoder_id: str,
+    dtype: str,
+    background: str,
+    resample: str = "lanczos",
+    draw: str = "mode",
 ) -> str:
-    """Image content hash x encoder x storage dtype x target x crop x flip x background."""
+    """Image content x encoder x storage dtype x target x crop x flip x background
+    (alpha images only) x resample filter x VAE draw (`mode` or `sample`)."""
     content = row.extra.get("hash") or f"{row.locator}:{row.w}x{row.h}"
     return text_hash(
         "latent",
@@ -18,6 +25,8 @@ def latent_key(
         item.crop_ltrb,
         int(item.flip),
         background if row.has_alpha else "",
+        resample,
+        draw,
     )
 
 

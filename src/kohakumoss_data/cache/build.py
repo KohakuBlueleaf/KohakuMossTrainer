@@ -82,5 +82,6 @@ def build_text(
             cache.put(cache.key(caption), emb)
         if progress is not None:
             progress(i + len(chunk))
+    cache.store.write_index()
     cache.store.flush()
     return len(todo)
