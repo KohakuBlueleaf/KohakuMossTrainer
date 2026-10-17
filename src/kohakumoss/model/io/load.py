@@ -7,21 +7,34 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 from safetensors.torch import load_file
-from torch import Tensor
+from torch import Tensor, nn
 
 from kohakumoss.model.backbone import MossBackbone
 from kohakumoss.model.build import DEFAULT_KEEP_FP32, build_backbone
-from kohakumoss.model.io.keymap import (
-    DERIVED,
-    FP16_FIX_KEY,
-    split_fused_qkv,
-    strip_prefix,
+from kohakumoss.model.io.keymap import DERIVED, FP16_FIX_KEY
+from kohakumoss.model.io.source import (
+    INDEX,
+    CheckpointSource,
+    DictSource,
+    ModelKeyView,
+    checkpoint_files,
+    transformer_dir,
 )
 from kohakumoss.model.numerics.fold import adopt_fold
 from kohakumoss.model.opset import OpSet
 from kohakumoss.types.arch import MossArchConfig
 
-INDEX = "diffusion_pytorch_model.safetensors.index.json"
+__all__ = [
+    "INDEX",
+    "LoadReport",
+    "base_keys",
+    "infer_config",
+    "load_backbone",
+    "load_state_into",
+    "read_config",
+    "read_fp16_fix",
+    "read_state",
+]
 
 
 @dataclass
@@ -45,30 +58,14 @@ def base_keys(cfg: MossArchConfig) -> list[str]:
     return list(MossBackbone(cfg, device="meta").state_dict().keys())
 
 
-def _transformer_dir(path: Path) -> Path:
-    if (path / "transformer" / INDEX).is_file() or (path / "transformer").is_dir():
-        return path / "transformer"
-    return path
-
-
 def read_state(
     path: str | Path, device: torch.device | str = "cpu"
 ) -> dict[str, Tensor]:
-    """Tensors of a .safetensors file or an HF transformer dir (sharded or single)."""
-    path = Path(path)
-    if path.is_file():
-        return load_file(str(path), device=str(device))
-    tdir = _transformer_dir(path)
-    if (tdir / INDEX).is_file():
-        index = json.loads((tdir / INDEX).read_text(encoding="utf-8"))
-        state = {}
-        for shard in sorted(set(index["weight_map"].values())):
-            state.update(load_file(str(tdir / shard), device=str(device)))
-        return state
-    files = sorted(tdir.glob("*.safetensors"))
-    if len(files) != 1:
-        raise FileNotFoundError(f"no unique safetensors checkpoint under {tdir}")
-    return load_file(str(files[0]), device=str(device))
+    """Every tensor of a .safetensors file or an HF transformer dir, in memory."""
+    state = {}
+    for f in checkpoint_files(path):
+        state.update(load_file(str(f), device=str(device)))
+    return state
 
 
 def read_fp16_fix(path: str | Path) -> dict | None:
@@ -86,69 +83,84 @@ def read_config(path: str | Path) -> dict | None:
     path = Path(path)
     if path.is_file():
         return None
-    cfg = _transformer_dir(path) / "config.json"
+    cfg = transformer_dir(path) / "config.json"
     return json.loads(cfg.read_text(encoding="utf-8")) if cfg.is_file() else None
 
 
-def infer_config(state: dict[str, Tensor], hf: dict | None = None) -> MossArchConfig:
-    """Architecture from tensor shapes (head_dim from the qk-norm weight)."""
-    sd = split_fused_qkv(_normalise(state)[0])
-    dim = sd["shared_block_modulation.weight"].shape[0] // 6
-    heads = dim // sd["layers.0.q_norm.weight"].shape[0]
-    depth = 1 + max(int(k.split(".")[1]) for k in sd if k.startswith("layers."))
+def _view(state) -> ModelKeyView:
+    if isinstance(state, ModelKeyView):
+        return state
+    return ModelKeyView(DictSource(state) if isinstance(state, dict) else state)
+
+
+def infer_config(state, hf: dict | None = None) -> MossArchConfig:
+    """Architecture from tensor shapes (head_dim from the qk-norm weight); `state` is a
+    state dict, a tensor source or a ModelKeyView (headers only are read)."""
+    view = _view(state)
+    keys = view.keys()
+    dim = view.shape("shared_block_modulation.weight")[0] // 6
+    heads = dim // view.shape("layers.0.q_norm.weight")[0]
+    depth = 1 + max(int(k.split(".")[1]) for k in keys if k.startswith("layers."))
     text_blocks = sum(
         1
-        for k in sd
+        for k in keys
         if k.startswith("text_embedder.blocks.") and k.endswith("qkv.weight")
     )
     return MossArchConfig(
         dim=dim,
         depth=depth,
         heads=heads,
-        ffn_dim=sd["layers.0.proj.ffn_up_gate.weight"].shape[0] // 2,
-        text_dim=sd["text_embedder.proj.weight"].shape[1],
+        ffn_dim=view.shape("layers.0.proj.ffn_up_gate.weight")[0] // 2,
+        text_dim=view.shape("text_embedder.proj.weight")[1],
         text_blocks=text_blocks,
-        latent_channels=sd["video_embedder.weight"].shape[1],
-        freq_dim=sd["time_embedding.0.weight"].shape[1],
+        latent_channels=view.shape("video_embedder.weight")[1],
+        freq_dim=view.shape("time_embedding.0.weight")[1],
         rope_base=float(hf["rope_base"]) if hf else 10000.0,
         negative_skip_layers=(22,) if depth == 42 else (),
     )
 
 
-def _normalise(state: dict[str, Tensor]) -> tuple[dict[str, Tensor], str]:
-    prefix = strip_prefix(list(state))
-    return {k[len(prefix) :]: v for k, v in state.items()}, prefix
+def _assign(model: nn.Module, key: str, value: Tensor) -> None:
+    path, _, name = key.rpartition(".")
+    module = model.get_submodule(path)
+    if name in module._parameters:
+        old = module._parameters[name]
+        module._parameters[name] = nn.Parameter(value, requires_grad=old.requires_grad)
+    else:
+        module._buffers[name] = value
 
 
 def load_state_into(
     model: MossBackbone,
-    state: dict[str, Tensor],
+    state,
     source: str = "",
     strict: bool = True,
     device: torch.device | str | None = None,
 ) -> LoadReport:
-    """Assign `state` into `model` (meta or materialised), each tensor cast to its
-    param's dtype and moved to `device` (default: where it already is)."""
-    sd, prefix = _normalise(state)
-    sd = split_fused_qkv(sd)
+    """Assign a state dict or tensor source into `model` (meta or materialised), one
+    tensor at a time, each cast to its param's dtype and moved to `device` (default:
+    where the source tensor is)."""
+    view = _view(state)
+    names = view.keys()
     expected = base_keys(model.cfg)
     current = model.state_dict()
-    report = LoadReport(source, prefix, len(state))
-    report.missing = [k for k in expected if k not in sd and k not in DERIVED]
-    report.derived = [k for k in DERIVED if k not in sd]
-    report.unexpected = [k for k in sd if k not in current]
+    report = LoadReport(source, view.prefix, view.n_source)
+    have = set(names)
+    report.missing = [k for k in expected if k not in have and k not in DERIVED]
+    report.derived = [k for k in DERIVED if k not in have]
+    report.unexpected = [k for k in names if k not in current]
     if strict and not report.ok:
         raise KeyError(
             f"checkpoint {source}: missing {report.missing[:8]} "
             f"({len(report.missing)}), unexpected {report.unexpected[:8]} "
             f"({len(report.unexpected)})"
         )
-    cast = {}
-    for k in [k for k in sd if k in current and k not in DERIVED]:
-        target = current[k]
-        dst = device if device is not None else sd[k].device
-        cast[k] = sd.pop(k).to(device=dst, dtype=target.dtype)
-    model.load_state_dict(cast, strict=False, assign=True)
+    for k in names:
+        if k not in current or k in DERIVED:
+            continue
+        t = view.get(k)
+        dst = device if device is not None else t.device
+        _assign(model, k, t.to(device=dst, dtype=current[k].dtype))
     return report
 
 
@@ -162,13 +174,14 @@ def load_backbone(
     strict: bool = True,
     fp16_fix_eps: str = "stock",
 ) -> tuple[MossBackbone, LoadReport]:
-    """Build on meta, read on CPU, cast and move tensor by tensor (peak device memory is
-    the model itself), bind ops. An fp16-fix file is recorded as folded (so savers and
-    adapter exports can undo it); `fp16_fix_eps="exact"` uses eps * c^2."""
-    state = read_state(path, "cpu")
-    cfg = cfg or infer_config(state, read_config(path))
+    """Build on meta, then read, cast and move one tensor at a time (host and device
+    peaks are one tensor plus the model), bind ops. An fp16-fix file is recorded as
+    folded (savers and adapter exports undo it); `fp16_fix_eps="exact"` uses eps * c^2.
+    """
+    view = ModelKeyView(CheckpointSource(path))
+    cfg = cfg or infer_config(view, read_config(path))
     model = build_backbone(cfg, device="meta", dtype=dtype, keep_fp32=keep_fp32)
-    report = load_state_into(model, state, str(path), strict, device=device)
+    report = load_state_into(model, view, str(path), strict, device=device)
     model.rope.to(device)
     fix = read_fp16_fix(path)
     if fix is not None:

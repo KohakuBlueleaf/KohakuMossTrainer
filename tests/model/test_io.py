@@ -7,6 +7,8 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from kohakumoss.model import build_backbone, load_backbone, save_diffusers, save_single
+from kohakumoss.model.io import load as load_module
+from kohakumoss.model.io import source as source_module
 from kohakumoss.model.io.load import infer_config, load_state_into, read_state
 from kohakumoss.model.io.save import export_state
 from kohakumoss.model.numerics import fold
@@ -48,6 +50,67 @@ def _load(path, cfg):
 
 def _shape(cfg):
     return cfg.override(negative_skip_layers=())
+
+
+def test_load_streams_tensors(cfg, tmp_path, monkeypatch):
+    """load_backbone never reads a whole file; a fused qkv tensor is read once."""
+    oracle = _oracle(cfg)
+    sd = dict(_official_state(oracle))
+    for i in range(cfg.depth):
+        base = f"layers.{i}.proj"
+        sd[f"{base}.qkv.weight"] = torch.cat(
+            [sd.pop(f"{base}.{n}.weight") for n in "qkv"], 0
+        )
+    save_file(sd, str(tmp_path / "f.safetensors"))
+
+    def whole_file(*args, **kwargs):
+        raise AssertionError("whole-file read")
+
+    monkeypatch.setattr(load_module, "load_file", whole_file)
+    reads = []
+    real_get = source_module.CheckpointSource.get
+
+    def counted(self, key):
+        reads.append(key)
+        return real_get(self, key)
+
+    monkeypatch.setattr(source_module.CheckpointSource, "get", counted)
+    model, _ = _load(tmp_path / "f.safetensors", cfg)
+    _check_against(model, oracle, cfg)
+    assert sorted(reads) == sorted(k for k in sd if k != "rope.bands")
+    must_fail(lambda: read_state(tmp_path / "f.safetensors"), "whole-file read")
+
+
+class _Stored:
+    def __init__(self, dense):
+        self.dense = dense
+        self.shape = dense.shape
+
+    def weight(self, dtype):
+        return self.dense.to(dtype)
+
+    def materialize(self):
+        return self.dense
+
+
+def test_export_state_overrides_and_stored_bases(tiny):
+    fold(tiny, 2.0**-2, "gate")
+    lin = tiny.layers[1].proj["q"]
+    dense = torch.randn_like(lin.weight)
+    lin.set_base(_Stored(dense))
+    merged = torch.randn_like(tiny.video_embedder.weight)
+    out = export_state(tiny, dtype=None, weights={"video_embedder.weight": merged})
+    assert torch.equal(out["layers.1.proj.q.weight"], dense)
+    assert torch.equal(out["video_embedder.weight"], merged * 4)
+    plain = export_state(tiny, dtype=None)
+    must_fail(
+        lambda: _check(torch.equal(plain["video_embedder.weight"], merged * 4)),
+        "weights ignored",
+    )
+
+
+def _check(cond):
+    assert cond
 
 
 def test_hf_single_file(cfg, tmp_path):

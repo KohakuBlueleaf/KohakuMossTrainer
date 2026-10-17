@@ -17,6 +17,14 @@ def _rel(a, b):
     return ((a.double() - b.double()).norm() / b.double().norm()).item()
 
 
+def test_per_block_fold_refuses_keep_fold(tmp_path):
+    model = random_backbone("tiny", seed=9)
+    fold(model, [2.0**-2, 2.0**-5, 2.0**-3, 2.0**-6], "proj")
+    with pytest.raises(ValueError):
+        save_single(model, tmp_path / "x.safetensors", dtype=None, keep_fold=True)
+    save_single(model, tmp_path / "plain.safetensors", dtype=None)
+
+
 def test_fixed_file_roundtrip(tmp_path):
     base = random_backbone("tiny", seed=9)
     original = {k: v.clone() for k, v in base.state_dict().items()}

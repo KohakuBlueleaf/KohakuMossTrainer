@@ -1,10 +1,6 @@
-"""MOSS-Image timestep sampler: discrete sigma grid with a truncated logit-normal pmf.
-
-`S = 1 - sigmoid(Z)`, `Z ~ N(mu, s^2)`, so `F(x) = P(S <= x) = 1 - Phi((log((1-x)/x) - mu)/s)`.
-With cutoff `a`, grid point j (sigma_j = j/T) gets mass
-`(1 - rho) * [F(a j/T) - F(a (j-1)/T)] / F(a) + rho/T`, then `p_full` mass moves to
-sigma = 1 and the static shift maps the grid. A staged table switches parameters by step.
-"""
+"""MOSS-Image timestep sampler: discrete sigma grid with a truncated logit-normal pmf,
+a uniform mix, mass moved to sigma = 1 and a static shift; a staged table switches
+parameters by step. See docs/concepts/training.md (Timestep samplers)."""
 
 import bisect
 import math
@@ -23,13 +19,16 @@ TECH_REPORT_STAGE3 = (
 )
 
 
-def _cdf_s(x: Tensor, mu: float, s: float) -> Tensor:
-    """P(S <= x) for S = 1 - sigmoid(Z), x in [0, 1], float64."""
+def _cdf_sf(x: Tensor, mu: float, s: float) -> tuple[Tensor, Tensor]:
+    """(P(S <= x), P(S > x)) for S = 1 - sigmoid(Z), x in [0, 1], float32; the
+    survival side is its own erfc, not 1 - cdf."""
     x = x.clamp(0.0, 1.0)
-    inner = torch.log1p(-x) - torch.log(x)
-    out = 0.5 * torch.erfc((inner - mu) / (s * math.sqrt(2.0)))
-    out = torch.where(x <= 0, torch.zeros_like(out), out)
-    return torch.where(x >= 1, torch.ones_like(out), out)
+    u = (torch.log1p(-x) - torch.log(x) - mu) / (s * math.sqrt(2.0))
+    cdf, sf = 0.5 * torch.erfc(u), 0.5 * torch.erfc(-u)
+    low, high = x <= 0, x >= 1
+    cdf = torch.where(low, 0.0, torch.where(high, 1.0, cdf))
+    sf = torch.where(low, 1.0, torch.where(high, 0.0, sf))
+    return cdf, sf
 
 
 def moss_pmf(
@@ -40,11 +39,15 @@ def moss_pmf(
     uniform_mix: float,
     p_full: float,
 ) -> Tensor:
-    """pmf [steps] over sigma_j = j/steps, j = 1..steps (float64, sums to 1)."""
+    """pmf [steps] over sigma_j = j/steps, j = 1..steps (float32, sums to 1). Each
+    bin is a difference of cdf values below the median and of survival values above
+    it, so no bin is a difference of two numbers near 1."""
     a = 1.0 if cutoff is None else float(cutoff)
-    j = torch.arange(steps + 1, dtype=torch.float64)
-    cdf = _cdf_s(a * j / steps, mu, s)
-    mass = (cdf[1:] - cdf[:-1]) / cdf[-1].clamp_min(1e-300)
+    j = torch.arange(steps + 1, dtype=torch.float32)
+    cdf, sf = _cdf_sf(a * j / steps, mu, s)
+    lower = cdf[1:] <= 0.5
+    mass = torch.where(lower, cdf[1:] - cdf[:-1], sf[:-1] - sf[1:])
+    mass = mass / cdf[-1].clamp_min(torch.finfo(torch.float32).tiny)
     pmf = (1.0 - uniform_mix) * mass + uniform_mix / steps
     pmf = pmf * (1.0 - p_full)
     pmf[-1] += p_full
@@ -66,9 +69,9 @@ def _stage(steps: int, uniform_mix: float, **kw) -> _Stage:
         kw.get("uniform_mix", uniform_mix),
         kw.get("p_full", 0.0),
     )
-    grid = torch.arange(1, steps + 1, dtype=torch.float64) / steps
-    sigma = shift_table(grid, kw.get("shift", 1.0)).to(torch.float32)
-    cdf = pmf.cumsum(0).to(torch.float32)
+    grid = torch.arange(1, steps + 1, dtype=torch.float32) / steps
+    sigma = shift_table(grid, kw.get("shift", 1.0))
+    cdf = pmf.cumsum(0)
     cdf[-1] = 1.0
     return _Stage(sigma, cdf)
 

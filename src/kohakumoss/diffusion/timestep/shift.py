@@ -12,5 +12,5 @@ def shift_sigma(sigma: Tensor, shift: float) -> Tensor:
 
 
 def shift_table(table: Tensor, shift: float) -> Tensor:
-    """`shift_sigma` applied to a precomputed table in float64."""
-    return shift_sigma(table.to(torch.float64), shift)
+    """`shift_sigma` applied to a precomputed table, in float32."""
+    return shift_sigma(table.to(torch.float32), shift)

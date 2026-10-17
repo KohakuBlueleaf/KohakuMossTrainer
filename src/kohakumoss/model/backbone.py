@@ -7,11 +7,7 @@ import torch
 from torch import Tensor, nn
 
 from kohakumoss.model.block import JointBlock
-from kohakumoss.model.components.embed import (
-    RopeBands,
-    TimeEmbedding,
-    timestep_embedding,
-)
+from kohakumoss.model.components.embed import RopeBands, Sinusoid, TimeEmbedding
 from kohakumoss.model.components.norm import RMSNorm
 from kohakumoss.model.linear import MossLinear
 from kohakumoss.model.opset import OpSet
@@ -48,6 +44,8 @@ class MossBackbone(nn.Module):
         self.runner: BlockRunner = PlainRunner()
         self.stream = StreamPolicy()
         self.fp16_fix = "none"
+        self.cond_dtype: torch.dtype | None = None
+        self._sinusoid = Sinusoid(cfg.freq_dim, cfg.time_scale)
         self._default = self.bind_forward()
 
     def init_weights(self, std: float = 0.02) -> None:
@@ -65,6 +63,15 @@ class MossBackbone(nn.Module):
         self.ops = ops if ops is not None else self.ops
         policy = self.stream
         compute = self.layers[0].proj["q"].weight.dtype
+        device = self.time_embedding[0].weight.device
+        self._fp32_region = partial(torch.autocast, device.type, enabled=False)
+        wide = self.cond_dtype or compute
+        wide = wide if wide in (torch.float16, torch.bfloat16) else None
+        for module in self.conditioning_linears():
+            module.set_input_dtype(wide)
+        self._cond_in = tuple(
+            wide or m.weight.dtype for m in self.conditioning_linears()
+        )
         self._stream_dtype = policy.stream_dtype or compute
         self._video_in = scaler(policy.embed_scale, policy.stream_dtype)
         self._head_cast = caster(compute if policy.stream_dtype is not None else None)
@@ -112,19 +119,24 @@ class MossBackbone(nn.Module):
         self.residual_scale = tuple(scales)
         self._default = self.bind_forward()
 
-    def conditioning(self, sigma: Tensor) -> tuple[Tensor, Tensor]:
-        """Per-sample fp32 modulation [B, 6, D] and head modulation [B, 2, D]."""
-        emb = timestep_embedding(
-            sigma.double() * self.cfg.time_scale, self.cfg.freq_dim
-        )
+    def conditioning_linears(self) -> tuple[MossLinear, ...]:
+        """The KEEP_FP32 linears of the per-sample conditioning."""
         te = self.time_embedding
-        time = te(emb.to(te[0].weight.dtype)).float()
-        mod = self.shared_block_modulation(
-            time.to(self.shared_block_modulation.weight.dtype)
-        ).float()
-        head = self.video_head_modulation(
-            time.to(self.video_head_modulation.weight.dtype)
-        ).float()
+        return (te[0], te[2], self.shared_block_modulation, self.video_head_modulation)
+
+    def conditioning(self, sigma: Tensor) -> tuple[Tensor, Tensor]:
+        """Per-sample fp32 modulation [B, 6, D] and head modulation [B, 2, D], with any
+        enclosing autocast disabled. With a 16-bit trunk (or `cond_dtype`) the linears
+        take 16-bit inputs and accumulate and return fp32; otherwise they run in their
+        own dtype."""
+        d0, d2, dm, dh = self._cond_in
+        te = self.time_embedding
+        with self._fp32_region():
+            emb = self._sinusoid(sigma.float() * self.cfg.time_scale)
+            hidden = te[1](te[0](emb.to(d0)))
+            time = te[2](hidden.to(d2)).float()
+            mod = self.shared_block_modulation(time.to(dm)).float()
+            head = self.video_head_modulation(time.to(dh)).float()
         return mod.unflatten(-1, (6, -1)), head.unflatten(-1, (2, -1))
 
     def embed(self, img: Tensor, text: Tensor, seq: SeqInfo) -> Tensor:

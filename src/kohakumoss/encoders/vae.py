@@ -27,6 +27,21 @@ def unpatchify(z: Tensor) -> Tensor:
     return z.reshape(b, c // 4, 2 * h, 2 * w)
 
 
+DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
+
+
+def vae_encoder(
+    path: str | Path,
+    device: torch.device | str = "cuda",
+    dtype: torch.dtype | str = torch.float32,
+    mode: str = "mode",
+):
+    """EncodeImages factory for the latent cache: the bound `encode_images` of a FluxVae
+    loaded from `path` (dtype "fp32" | "bf16" | "fp16" or a torch dtype)."""
+    dtype = DTYPES[dtype] if isinstance(dtype, str) else dtype
+    return FluxVae.from_pretrained(path, device, dtype, mode).encode_images
+
+
 def to_pixels(image: np.ndarray, device, dtype) -> Tensor:
     """uint8 HWC (RGB) -> [1, 3, H, W] in [-1, 1]."""
     x = torch.from_numpy(np.ascontiguousarray(image)).to(device)

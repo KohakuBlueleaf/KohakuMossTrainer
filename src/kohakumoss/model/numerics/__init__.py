@@ -14,6 +14,7 @@ from kohakumoss.model.numerics.fp16fix import (
     apply_fp16_fix,
     choose_factors,
     clamp_counts,
+    clear_fp16_fix,
 )
 from kohakumoss.model.numerics.keep_fp32 import apply_dtype_policy
 from kohakumoss.model.numerics.saturation import SaturationCounters
@@ -26,6 +27,7 @@ __all__ = [
     "apply_fp16_fix",
     "choose_factors",
     "clamp_counts",
+    "clear_fp16_fix",
     "fold",
     "output_row_scales",
     "unfold",

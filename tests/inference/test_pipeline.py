@@ -90,6 +90,23 @@ def test_generate_outputs_and_settings(tiny64, fake_te):
     assert tiny64.training
 
 
+def test_negative_strings_with_prompt_embeds(tiny64, fake_te):
+    pipe = MossPipeline.from_components(tiny64, fake_te, FakeVae(), device="cpu")
+    pos = fake_te.encode(["a photo of a dog", "x"])
+    negs = ["blurry, low quality", ""]
+    kw = dict(prompt_embeds=pos, sizes=(32, 32), steps=2, seeds=[1, 2])
+    kw.update(output="latent")
+    strings = pipe.generate(negative_prompts=negs, **kw).latents
+    neg = [fake_te.encode([negs[0]])[0], fake_te.empty()]
+    explicit = pipe.generate(negative_embeds=neg, **kw).latents
+    empty = pipe.generate(**kw).latents
+    assert all(torch.equal(a, b) for a, b in zip(strings, explicit))
+    must_fail(
+        lambda: _assert(all(torch.equal(a, b) for a, b in zip(empty, explicit))),
+        "negative strings dropped",
+    )
+
+
 def test_text_once_frees_encoder(tiny64):
     te = FakeTextEncoder(64)
     pipe = MossPipeline(tiny64, te, FakeVae(), device="cpu", residency="te_once")

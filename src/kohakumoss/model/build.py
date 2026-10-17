@@ -6,12 +6,9 @@ from kohakumoss.model.backbone import MossBackbone
 from kohakumoss.model.numerics.keep_fp32 import apply_dtype_policy
 from kohakumoss.model.opset import OpSet
 from kohakumoss.types.arch import PRESETS, MossArchConfig
+from kohakumoss.types.plans import PrecisionPolicy
 
-DEFAULT_KEEP_FP32 = (
-    "time_embedding",
-    "shared_block_modulation",
-    "video_head_modulation",
-)
+DEFAULT_KEEP_FP32 = PrecisionPolicy().keep_fp32
 
 
 def resolve_config(

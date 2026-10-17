@@ -1,14 +1,6 @@
-"""Weight fold: scale the joint and text residual streams by constants, in the weights.
-
-Every reader of a residual stream is an RMSNorm, so scaling every writer by c and every
-reading norm's eps by c^2 leaves the function unchanged. `via="gate"` folds one uniform c
-into the shared modulation's gate rows (joint writers) and the embedders / text writers;
-`pregate=(s_a, s_f)` additionally scales every block's `o` / `ffn_down` by s and the gate
-rows by 1/s (uniform: the gate is shared). `via="proj"` folds a per-block c_l into each
-block's `o` / `ffn_down` and rescales the stream between blocks by c_l / c_{l-1}.
-`eps="stock"` keeps the norm eps (the file then loads unchanged in other runtimes).
-See docs/concepts/numerics.md.
-"""
+"""Weight fold: scale the joint and text residual streams by constants, in the weights
+(`via="gate"` uniform, optional pre-gate scale; `via="proj"` per block; eps exact or
+stock). See docs/concepts/numerics.md."""
 
 from collections.abc import Sequence
 
@@ -55,7 +47,7 @@ def _row_scales(
         case "gate":
             if len(set(cs)) != 1:
                 raise ValueError("via='gate' folds one uniform scale")
-            rows = torch.ones(6 * dim, dtype=torch.float64)
+            rows = torch.ones(6 * dim, dtype=torch.float32)
             rows[2 * dim : 3 * dim] = cs[0] / s_a
             rows[5 * dim : 6 * dim] = cs[0] / s_f
             out["shared_block_modulation.weight"] = rows
@@ -110,11 +102,14 @@ def set_norm_eps(model: MossBackbone, mult: dict[str, float]) -> dict[str, float
 
 
 def _multiply(t: Tensor, s: Tensor | float, inverse: bool) -> Tensor:
+    """t * s (or t / s) in fp32 (or t's wider dtype), rounded once to t's dtype; exact
+    for power-of-two s."""
+    dt = torch.promote_types(t.dtype, torch.float32)
     if isinstance(s, Tensor):
-        s = s.to(device=t.device, dtype=torch.float64)
+        s = s.to(device=t.device, dtype=dt)
         s = s.reshape(-1, *([1] * (t.dim() - 1)))
     m = (1.0 / s) if inverse else s
-    return (t.double() * m).to(t.dtype)
+    return (t.to(dt) * m).to(t.dtype)
 
 
 def _record(model, cs, via, pregate, eps_mode, base_eps) -> None:
@@ -185,18 +180,24 @@ def unfold(model: MossBackbone) -> None:
 
 def unfolded_state_dict(model: MossBackbone) -> dict[str, Tensor]:
     """The state dict as it would be without the fold (affected tensors are copies)."""
-    sd = dict(model.state_dict())
+    return unfold_state(model, dict(model.state_dict()))
+
+
+def unfold_state(model: MossBackbone, sd: dict[str, Tensor]) -> dict[str, Tensor]:
+    """`sd` (keys and space of this model's folded weights) with the fold undone;
+    affected tensors are copies."""
     if model.fold_scales is None:
         return sd
+    out = dict(sd)
     rows = _row_scales(model, model.fold_scales, model.fold_via, model.fold_pregate)
     for name, s in rows.items():
-        sd[name] = _multiply(sd[name], s, inverse=True)
-    return sd
+        out[name] = _multiply(out[name], s, inverse=True)
+    return out
 
 
 def output_row_scales(model: MossBackbone) -> dict[str, Tensor]:
     """Module path -> fp32 per-output-row scale the fold applied to that linear's output;
-    exporters divide an adapter's ΔW rows by it."""
+    exporters divide an adapter's delta W rows by it."""
     if model.fold_scales is None:
         return {}
     out = {}

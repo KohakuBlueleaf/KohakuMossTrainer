@@ -77,17 +77,14 @@ def test_stock_eps_error_shrinks_with_stream_rms(stream, bound):
 
 
 def _big_stream(dtype):
-    """Gates x 2^30: every write and weight fits fp16, the accumulated stream does not
-    (the real model's failure mode). Modulation stays fp32 as in the default policy."""
+    """Gate biases 2^20 (added in fp32 after the 16-bit-input modulation GEMM): every
+    weight and GEMM input fits fp16, the accumulated stream does not."""
     model = _model(torch.float32, keep_fp32=DEFAULT_KEEP_FP32)
     d = model.cfg.dim
     with torch.no_grad():
-        for p in (
-            model.shared_block_modulation.weight,
-            model.shared_block_modulation.bias,
-        ):
-            p[2 * d : 3 * d] *= 2.0**30
-            p[5 * d : 6 * d] *= 2.0**30
+        bias = model.shared_block_modulation.bias
+        bias[2 * d : 3 * d] = 2.0**20
+        bias[5 * d : 6 * d] = 2.0**20
     apply_dtype_policy(model, dtype, DEFAULT_KEEP_FP32)
     model.bind_ops()
     return model

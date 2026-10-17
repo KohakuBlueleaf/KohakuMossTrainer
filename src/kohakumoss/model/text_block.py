@@ -2,9 +2,9 @@
 
 from functools import partial
 
-import torch
 from torch import Tensor, nn
 
+from kohakumoss.model.components.ffn import situ_pair
 from kohakumoss.model.components.norm import RMSNorm
 from kohakumoss.model.linear import MossLinear
 from kohakumoss.model.opset import OpSet
@@ -56,7 +56,7 @@ class TextBlock(nn.Module):
         o = ops.attention(q, k, v, seq.attn_text).flatten(1)
         x = self._attn_out(o, x, None, None, 1.0)
         y = self._cast(ops.rms_norm(x, self.norm2.weight, self.norm2.eps))
-        a = ops.situ_glu(torch.cat((self.ffn_up(y), self.ffn_gate(y)), -1))
+        a = situ_pair(self.ffn_up(y), self.ffn_gate(y))
         return self._ffn_out(a, x, None, None, 1.0)
 
 

@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from kohakumoss.model.components.wide import wide_linear
 from kohakumoss.types.protocols import BaseWeight
 
 
@@ -25,6 +26,7 @@ class MossLinear(nn.Linear):
     ):
         super().__init__(in_features, out_features, bias, device=device, dtype=dtype)
         self.base: BaseWeight | None = None
+        self.input_dtype: torch.dtype | None = None
         self._impl = self._dense if bias else self._dense_nobias
 
     def reset_parameters(self) -> None:
@@ -54,17 +56,38 @@ class MossLinear(nn.Linear):
         self.__dict__["base"] = None
         self.rebind()
 
+    def set_input_dtype(self, dtype: torch.dtype | None) -> None:
+        """`dtype` (fp16 / bf16): run as a `dtype`-input matmul with fp32 accumulation and
+        an fp32 output plus fp32 bias. None: the plain forward in x's dtype."""
+        self.input_dtype = dtype
+        self.rebind()
+
     def rebind(self) -> None:
-        """Re-select the forward after a structural change (bias added/removed, base)."""
-        match (self.base is not None, self.bias is not None):
-            case (True, True):
+        """Re-select the forward after a structural change (bias, base, input dtype)."""
+        match (
+            self.input_dtype is not None,
+            self.base is not None,
+            self.bias is not None,
+        ):
+            case (True, _, True):
+                self._impl = self._wide
+            case (True, _, False):
+                self._impl = self._wide_nobias
+            case (False, True, True):
                 self._impl = self._stored
-            case (True, False):
+            case (False, True, False):
                 self._impl = self._stored_nobias
-            case (False, True):
+            case (False, False, True):
                 self._impl = self._dense
-            case (False, False):
+            case (False, False, False):
                 self._impl = self._dense_nobias
+
+    def _wide_nobias(self, x: Tensor) -> Tensor:
+        w = self.weight if self.base is None else self.base.weight(self.input_dtype)
+        return wide_linear(x, w, self.input_dtype)
+
+    def _wide(self, x: Tensor) -> Tensor:
+        return self._wide_nobias(x) + self.bias.float()
 
     def _dense(self, x: Tensor) -> Tensor:
         return F.linear(x, self.weight.to(x.dtype), self.bias.to(x.dtype))

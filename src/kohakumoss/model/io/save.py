@@ -10,7 +10,9 @@ from torch import Tensor
 from kohakumoss.model.backbone import MossBackbone
 from kohakumoss.model.io.keymap import FP16_FIX_KEY, fuse_qkv
 from kohakumoss.model.io.load import INDEX, base_keys
-from kohakumoss.model.numerics.fold import unfolded_state_dict
+from kohakumoss.model.linear import MossLinear
+from kohakumoss.model.numerics.fold import unfold_state
+from kohakumoss.types.arch import MossArchConfig
 
 
 def fp16_fix_metadata(model: MossBackbone, extra: dict | None = None) -> dict[str, str]:
@@ -34,10 +36,24 @@ def export_state(
     fused_qkv: bool = False,
     prefix: str = "",
     keep_fold: bool = False,
+    weights: dict[str, Tensor] | None = None,
 ) -> dict[str, Tensor]:
-    """Base weights only, cast (rope.bands stays fp32), contiguous on CPU; the fold is
-    undone unless `keep_fold` (the fp16-fix checkpoint)."""
-    sd = dict(model.state_dict()) if keep_fold else unfolded_state_dict(model)
+    """Base weights only, cast (rope.bands stays fp32), contiguous on CPU. Stored
+    (quantized / streamed) bases are materialised dense; `weights` (state keys ->
+    tensors in the model's own folded space, e.g. merged W + delta W) replace the
+    model's entries; then the fold is undone unless `keep_fold` (the fp16-fix
+    checkpoint, which holds a uniform gate fold only: a per-block fold raises)."""
+    if keep_fold and model.fold_scales is not None and model.fold_via != "gate":
+        raise ValueError(
+            f"keep_fold writes a uniform gate fold; this model is folded via "
+            f"{model.fold_via!r} (per-block factors exist only as an online fix)"
+        )
+    sd = dict(model.state_dict())
+    for path, module in model.named_modules():
+        if isinstance(module, MossLinear) and module.base is not None:
+            sd[f"{path}.weight"] = module.base.materialize()
+    sd.update(weights or {})
+    sd = sd if keep_fold else unfold_state(model, sd)
     keys = base_keys(model.cfg)
     out = {}
     for k in keys:
@@ -75,9 +91,18 @@ def save_diffusers(
     shard_bytes: int = 5_000_000_000,
 ) -> None:
     """HF transformer folder: config.json + shards + index (official layout)."""
+    write_diffusers(export_state(model, dtype), out_dir, model.cfg, shard_bytes)
+
+
+def write_diffusers(
+    state: dict[str, Tensor],
+    out_dir: str | Path,
+    cfg: MossArchConfig,
+    shard_bytes: int = 5_000_000_000,
+) -> None:
+    """Shards + index + config.json of `cfg` for a ready state dict (bare keys)."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    state = export_state(model, dtype)
     shards: list[dict[str, Tensor]] = [{}]
     size = 0
     for k, t in state.items():
@@ -96,7 +121,6 @@ def save_diffusers(
     total = sum(t.numel() * t.element_size() for t in state.values())
     index = {"metadata": {"total_size": total}, "weight_map": weight_map}
     (out_dir / INDEX).write_text(json.dumps(index, indent=2), encoding="utf-8")
-    cfg = model.cfg
     config = {
         "_class_name": "MOSSImageTransformer",
         "_diffusers_version": "0.38.0",

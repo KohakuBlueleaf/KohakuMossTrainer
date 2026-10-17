@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 import torch
 from torch import Tensor
 
+from kohakumoss_kernels.backends.eager.attention import remember_bounds
+
 
 @dataclass
 class AttnPlan:
@@ -47,22 +49,54 @@ class SeqInfo:
         return self.n_img + self.n_txt
 
     def to(self, device: torch.device | str, non_blocking: bool = True) -> "SeqInfo":
-        """Copy every tensor to `device`; host-side ints and tuples are kept."""
-        moved = {}
+        """Copy every tensor to `device` (host tensors go as one pinned buffer per dtype,
+        one copy each; the fields become views); host-side ints and tuples are kept."""
+        device = torch.device(device)
+        names, tensors = [], []
         for name, value in self.__dict__.items():
             match value:
                 case Tensor():
-                    moved[name] = value.to(device, non_blocking=non_blocking)
+                    names.append((name, None))
+                    tensors.append(value)
                 case AttnPlan():
-                    moved[name] = AttnPlan(
-                        value.cu_seqlens.to(device, non_blocking=non_blocking),
-                        value.max_seqlen,
-                        value.lengths,
-                        dict(value.extra),
-                    )
-                case _:
-                    moved[name] = value
+                    names.append((name, value))
+                    tensors.append(value.cu_seqlens)
+        moved_tensors = move_tensors(tensors, device, non_blocking)
+        moved = dict(self.__dict__)
+        for (name, plan), t in zip(names, moved_tensors):
+            if plan is None:
+                moved[name] = t
+                continue
+            remember_bounds(t, _bounds(plan.lengths))
+            moved[name] = AttnPlan(t, plan.max_seqlen, plan.lengths, dict(plan.extra))
         return SeqInfo(**moved)
+
+
+def move_tensors(
+    tensors: list[Tensor], device: torch.device, non_blocking: bool = True
+) -> list[Tensor]:
+    """Move host tensors in one copy per dtype (pinned when the target is CUDA)."""
+    if device.type == "cpu" or any(t.device.type != "cpu" for t in tensors):
+        return [t.to(device, non_blocking=non_blocking) for t in tensors]
+    pin = device.type == "cuda"
+    out: list[Tensor | None] = [None] * len(tensors)
+    groups: dict[torch.dtype, list[int]] = {}
+    for i, t in enumerate(tensors):
+        groups.setdefault(t.dtype, []).append(i)
+    for idx in groups.values():
+        flat = torch.cat([tensors[i].reshape(-1) for i in idx])
+        flat = flat.pin_memory() if pin else flat
+        dev = flat.to(device, non_blocking=non_blocking and pin)
+        for i, part in zip(idx, dev.split([tensors[i].numel() for i in idx])):
+            out[i] = part.view(tensors[i].shape)
+    return out
+
+
+def _bounds(lengths) -> list[int]:
+    out = [0]
+    for n in lengths:
+        out.append(out[-1] + int(n))
+    return out
 
 
 def _cu(lengths: list[int]) -> Tensor:

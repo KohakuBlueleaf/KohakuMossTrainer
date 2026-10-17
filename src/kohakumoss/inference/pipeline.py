@@ -1,7 +1,7 @@
 """MossPipeline: text-to-image with the official MOSS sampler over packed batches."""
 
 from collections.abc import Callable, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -53,10 +53,25 @@ OUTPUTS = {"latent": _as_latents, "tensor": _as_tensors, "pil": _as_pil}
 
 
 def _component_root(path: Path, variant: str | None, name: str) -> Path:
+    """`path/variant` when it holds `name`, else `path`, else `path/base`; a named
+    variant must exist. See docs/guides/inference.md."""
+    if variant and not (path / variant).is_dir():
+        raise FileNotFoundError(f"variant {variant!r}: no {path / variant}")
     for root in ((path / variant) if variant else None, path, path / "base"):
         if root is not None and (root / name).is_dir():
             return root
     raise FileNotFoundError(f"no {name}/ under {path}")
+
+
+@contextmanager
+def cusolver_linalg():
+    """cuSOLVER for torch.linalg inside a generate call; the previous choice after."""
+    previous = torch.backends.cuda.preferred_linalg_library()
+    torch.backends.cuda.preferred_linalg_library("cusolver")
+    try:
+        yield
+    finally:
+        torch.backends.cuda.preferred_linalg_library(previous)
 
 
 def load_transformer(
@@ -69,9 +84,9 @@ def load_transformer(
     fp16_fix_kwargs: dict | None = None,
     kernels: dict[str, str] | None = None,
 ):
-    """Backbone + adapters (merged before a weight fix, bypassed after it with the
-    fold's row scales) + fp16 fix, ops bound last. Returns (backbone, adapter stacks).
-    """
+    """Backbone + adapters (merged before a weight fix, bypassed after it) + fp16 fix,
+    ops bound last; adapter deltas always carry the row scales of a fold already in
+    the weights (an fp16-fix file). Returns (backbone, adapter stacks)."""
     fix_kw = dict(fp16_fix_kwargs or {})
     backbone, _ = load_backbone(
         dit,
@@ -83,8 +98,11 @@ def load_transformer(
     backbone.eval().requires_grad_(False)
     stacks = []
     if adapter_mode == "merge":
+        loaded = output_row_scales(backbone)
         for file, mult in adapters:
-            stacks.append(adapter_api.load(backbone, file, mult, mode="merge"))
+            stacks.append(
+                adapter_api.load(backbone, file, mult, mode="merge", row_scales=loaded)
+            )
         apply_fp16_fix(backbone, fp16_fix, **fix_kw)
     else:
         apply_fp16_fix(backbone, fp16_fix, **fix_kw)
@@ -112,17 +130,19 @@ class MossPipeline:
         owned: bool = True,
         tune: str = "auto",
         adapters: list | None = None,
+        sources: dict | None = None,
     ):
         self.backbone = backbone
         self.device = torch.device(device)
         self.place = RESIDENCY[residency](text_encoder, vae, self.device)
         self.residency = residency
         self.adapters = adapters or []
+        self.sources = dict(sources or {})
         self._grad_ctx = torch.inference_mode if owned else torch.no_grad
         warm = owned and tune != "off" and self.device.type != "cpu"
         self.warm = KernelWarm(backbone, self.device) if warm else no_warm
-        if owned and self.device.type == "cuda":
-            torch.backends.cuda.preferred_linalg_library("cusolver")
+        cusolver = owned and self.device.type == "cuda"
+        self._linalg = cusolver_linalg if cusolver else nullcontext
 
     @classmethod
     def from_components(
@@ -167,6 +187,7 @@ class MossPipeline:
             if transformer
             else _component_root(path, variant, "transformer")
         )
+        sources = {"transformer": str(dit)}
         backbone, stacks = load_transformer(
             dit,
             dtype,
@@ -180,6 +201,7 @@ class MossPipeline:
         te = None
         if text_encoder:
             te_root = _component_root(path, variant, "text_encoder")
+            sources["text_encoder"] = str(te_root)
             te_device = torch.device(text_device or device)
             on_cpu = te_device.type == "cpu"
             offload = "cpu" if residency == "offload" and not on_cpu else "none"
@@ -188,11 +210,19 @@ class MossPipeline:
             )
         decoder = None
         if vae:
-            decoder = FluxVae.from_pretrained(
-                _component_root(path, variant, "vae"), "cpu", vae_dtype
-            )
+            vae_root = _component_root(path, variant, "vae")
+            sources["vae"] = str(vae_root)
+            decoder = FluxVae.from_pretrained(vae_root, "cpu", vae_dtype)
         return cls(
-            backbone, te, decoder, device, residency, True, tune, adapters=stacks
+            backbone,
+            te,
+            decoder,
+            device,
+            residency,
+            True,
+            tune,
+            adapters=stacks,
+            sources=sources,
         )
 
     @contextmanager
@@ -200,7 +230,7 @@ class MossPipeline:
         was = self.backbone.training
         self.backbone.eval()
         try:
-            with self._grad_ctx():
+            with self._grad_ctx(), self._linalg():
                 yield
         finally:
             self.backbone.train(was)
@@ -279,6 +309,7 @@ class MossPipeline:
                 if self.backbone.fold_scales is None
                 else self.backbone.fold_scales[0]
             ),
+            sources=dict(self.sources),
         )
         return GenerateResult(images, latents, settings)
 
@@ -297,19 +328,18 @@ class MossPipeline:
     def _embeddings(
         self, prompts, negative_prompts, prompt_embeds, negative_embeds, cfg
     ):
-        if prompt_embeds is not None:
-            pos = list(prompt_embeds)
-        else:
-            texts = list(prompts)
-            if cfg != 1.0 and negative_prompts:
-                texts += [p for p in negative_prompts if p]
-            enc = self.place.encode(texts)
-            pos, extra = enc[: len(prompts)], enc[len(prompts) :]
-            if cfg != 1.0 and negative_prompts and negative_embeds is None:
-                it = iter(extra)
-                negative_embeds = [
-                    next(it) if p else self.place.empty() for p in negative_prompts
-                ]
+        texts = [] if prompt_embeds is not None else list(prompts)
+        encode_neg = cfg != 1.0 and negative_prompts and negative_embeds is None
+        if encode_neg:
+            texts += [p for p in negative_prompts if p]
+        enc = self.place.encode(texts) if texts else []
+        n_pos = 0 if prompt_embeds is not None else len(prompts)
+        pos = list(prompt_embeds) if prompt_embeds is not None else enc[:n_pos]
+        if encode_neg:
+            it = iter(enc[n_pos:])
+            negative_embeds = [
+                next(it) if p else self.place.empty() for p in negative_prompts
+            ]
         if cfg == 1.0:
             return pos, None
         neg = list(negative_embeds) if negative_embeds is not None else None
