@@ -14,6 +14,14 @@ def _subdir(path: Path, name: str) -> Path:
     return path / name if (path / name).is_dir() else path
 
 
+def tokenizer_dir(path: Path) -> Path:
+    """`<path>/tokenizer`, else the sibling `<path>/../tokenizer` of a model dir, else `path`."""
+    for cand in (path / "tokenizer", path.parent / "tokenizer"):
+        if cand.is_dir():
+            return cand
+    return path
+
+
 class QwenTextEncoder:
     """Frozen encoder running on `device`; embeddings land on `output_device` (default
     `device`). `offload="cpu"` keeps weights on CPU and moves them per call."""
@@ -53,9 +61,10 @@ class QwenTextEncoder:
         max_length: int = MAX_LENGTH,
         output_device: torch.device | str | None = None,
     ) -> "QwenTextEncoder":
-        """`path` is a pipeline root (text_encoder/ + tokenizer/) or a model dir."""
+        """`path` is a pipeline root (text_encoder/ + tokenizer/) or a model dir (its
+        sibling tokenizer/ is used when present)."""
         path = Path(path)
-        tok = AutoTokenizer.from_pretrained(str(_subdir(path, "tokenizer")))
+        tok = AutoTokenizer.from_pretrained(str(tokenizer_dir(path)))
         model = AutoModel.from_pretrained(
             str(_subdir(path, "text_encoder")), dtype=dtype
         )
