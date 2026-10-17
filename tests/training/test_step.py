@@ -9,11 +9,13 @@ from kohakumoss.model import random_backbone
 from kohakumoss.training.callbacks.evaluate import FixedSigma
 from kohakumoss.training.precision import autocast_factory, build_policy
 from kohakumoss.training.step import DeviceBatcher, TrainStep
+from kohakumoss_data.seeds import seed_of
 from tests._util.negative import must_fail
 from tests.training._train_fakes import host_batch
 
 pytestmark = pytest.mark.cpu
 DEV = torch.device("cpu")
+NOISE_SEED = seed_of("noise", 7, 0)  # TrainStep(seed=7) on rank 0
 
 
 def _setup(sigma=0.3):
@@ -45,13 +47,14 @@ def _manual(model, batch, sigma, noise_seed, target_fn):
 def test_loss_equals_manual_velocity_mse():
     model, step, batch = _setup(0.3)
     out = step(batch, step.denominator(batch))
-    ref = _manual(model, batch, 0.3, 8, lambda z0, eps: eps - z0)
+    ref = _manual(model, batch, 0.3, NOISE_SEED, lambda z0, eps: eps - z0)
     assert torch.allclose(out.loss, ref, rtol=1e-5)
     model2, step2, batch2 = _setup(0.3)
     out2 = step2(batch2, step2.denominator(batch2))
     must_fail(
         lambda: _close(
-            out2.loss, _manual(model2, batch2, 0.3, 8, lambda z0, eps: z0 - eps)
+            out2.loss,
+            _manual(model2, batch2, 0.3, NOISE_SEED, lambda z0, eps: z0 - eps),
         ),
         "target sign flipped",
     )

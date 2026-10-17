@@ -113,6 +113,7 @@ class Bundle:
         after: Callable[[], None] = _noop,
         reduce_loss: Callable[[Tensor], Tensor] = no_agree,
         grads: Callable[[], list[Tensor]] | None = None,
+        device: torch.device | None = None,
     ):
         self.optimizer = optimizer
         self.schedule = schedule
@@ -127,15 +128,20 @@ class Bundle:
         self.before = before
         self.after = after
         self.reduce_loss = reduce_loss
-        self.post_step = decay_to_one(groups, optimizer)
+        self.post_step = (
+            _noop
+            if getattr(optimizer, "handles_decay_to_one", False)
+            else decay_to_one(groups, optimizer)
+        )
         self.train_mode = train_mode
         self.eval_mode = eval_mode
-        self.device = self.params[0].device
+        self.device = device if device is not None else self.params[0].device
         self._loss = torch.zeros((), device=self.device)
         self.last_loss = float("nan")
         self.last_norm = float("nan")
         self.last_ok = True
         self.skipped = 0
+        self.nonfinite = 0
 
     def backward(self, loss: Tensor) -> None:
         """Accumulate one micro-batch: scaled backward, detached loss kept for logging."""
@@ -167,6 +173,7 @@ class Bundle:
             self.post_step()
         else:
             self.skipped += 1
+            self.nonfinite += 1
         self.after()
         self.schedule.step()
         self.scaler.update(not ok)
@@ -191,6 +198,7 @@ class Bundle:
             "schedule": self.schedule.state_dict(),
             "scaler": self.scaler.state_dict(),
             "skipped": self.skipped,
+            "nonfinite": self.nonfinite,
         }
 
     def load_state_dict(self, state: dict) -> None:
@@ -198,3 +206,4 @@ class Bundle:
         self.schedule.load_state_dict(state["schedule"])
         self.scaler.load_state_dict(state["scaler"])
         self.skipped = state.get("skipped", 0)
+        self.nonfinite = state.get("nonfinite", self.skipped)

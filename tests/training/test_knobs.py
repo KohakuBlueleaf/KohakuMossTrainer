@@ -30,7 +30,9 @@ def runnable(**overrides) -> dict:
         WEIGHTS="random",
         VARIANT="tiny",
         DATASETS=[{"source": "synthetic"}],
-        PRECISION="fp32",
+        LATENT_CACHE="off",
+        TEXT_CACHE="off",
+        PRECISION="auto",
     )
     k.update(overrides)
     return k

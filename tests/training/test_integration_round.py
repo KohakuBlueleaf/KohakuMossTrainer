@@ -6,7 +6,7 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-from kohakumoss.adapters import tlora
+from kohakumoss.adapters.adapter_set import LycoAdapterSet
 from kohakumoss.model import random_backbone
 from kohakumoss.training.entry import run
 from kohakumoss.training.knobs import validate
@@ -40,9 +40,8 @@ def test_fp16_fix_weights_merged_export_is_unfolded(tmp_path):
     )
     run(smoke_knobs(tmp_path, **knobs))
     got = _params(tmp_path / "smoke" / "export" / "smoke-merged.safetensors")
-    device = "cuda" if torch.cuda.is_available() else "cpu"  # the entry's init device
-    ref = random_backbone("tiny", device=device, dtype=torch.float32, seed=0)
-    ref = {k: v.cpu() for k, v in ref.state_dict().items()}
+    ref = random_backbone("tiny", device="cpu", dtype=torch.float32, seed=0)
+    ref = ref.state_dict()  # the entry initialises on the host, then places
     key = "video_embedder.weight"
     assert torch.allclose(got[key].float(), ref[key], rtol=1e-2, atol=1e-3)
 
@@ -76,25 +75,42 @@ def test_grad_offload_host_and_fused(tmp_path):
     assert all(torch.isfinite(v).all() for v in fused.values())
 
 
-def test_tlora_mask_set_every_micro_batch(tmp_path, monkeypatch):
+def test_adapter_step_hooks_every_micro_batch(tmp_path, monkeypatch):
+    """begin_step before every micro-batch forward (with the step index), end_step
+    once after each step's last backward."""
     calls = []
-    real = tlora.set_token_mask
+    begin, end = LycoAdapterSet.begin_step, LycoAdapterSet.end_step
 
-    def spy(sigma, seg, max_rank, **kw):
-        calls.append((sigma.shape[0], seg.shape[0], max_rank))
-        return real(sigma, seg, max_rank, **kw)
+    def spy_begin(self, sigma, seq, step):
+        calls.append(("begin", step))
+        return begin(self, sigma, seq, step)
 
-    monkeypatch.setattr(tlora, "set_token_mask", spy)
+    def spy_end(self):
+        calls.append(("end", None))
+        return end(self)
+
+    monkeypatch.setattr(LycoAdapterSet, "begin_step", spy_begin)
+    monkeypatch.setattr(LycoAdapterSet, "end_step", spy_end)
     state = run(
         smoke_knobs(
             tmp_path, ALGO="tlora", STEPS=2, GRAD_ACC=2, EXPORT_FORMATS=("lycoris",)
         )
     )
-    assert state.step == 2 and len(calls) == 4 and all(c[2] == 4 for c in calls)
+    assert state.step == 2
+    want = [("begin", 0), ("begin", 0), ("end", None)]
+    want += [("begin", 1), ("begin", 1), ("end", None)]
+    assert calls == want, calls
 
 
-def test_pipeline_layouts_rejected_on_windows(monkeypatch):
+def test_multi_gpu_rejected_on_windows(monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
-    for kind in ("pipeline", "threaded"):
+    for kind in ("ddp", "fsdp", "pipeline", "threaded"):
         problems = validate(runnable(PARALLEL=kind, DEVICES=(0, 1), MICROBATCHES=2))
         assert any("Linux-only" in p for p in problems), kind
+    several = validate(runnable(DEVICES=(0, 1)))
+    assert any("Linux-only" in p for p in several), several
+    assert validate(runnable()) == []
+    monkeypatch.setattr(sys, "platform", "linux")
+    for kind in ("ddp", "fsdp", "threaded"):
+        problems = validate(runnable(PARALLEL=kind, DEVICES=(0, 1)))
+        assert not any("Linux-only" in p for p in problems), kind

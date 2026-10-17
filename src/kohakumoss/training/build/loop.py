@@ -1,10 +1,13 @@
 """Loop-side build: objective + step, optimiser bundle, EMA, callbacks, driver."""
 
-from kohakumoss.diffusion.objective import LOSSES, WEIGHTINGS, TokenNormalizer
+import torch.distributed as dist
+
+from kohakumoss.diffusion.objective import WEIGHTINGS, TokenNormalizer
 from kohakumoss.diffusion.timestep import TIMESTEPS
-from kohakumoss.registry import build, import_object
-from kohakumoss.training.build import integration as I
+from kohakumoss.inference.pipeline import MossPipeline
+from kohakumoss.registry import build
 from kohakumoss.training.build.kernels import retune_callbacks
+from kohakumoss.training.build.objective import build_loss, is_masked
 from kohakumoss.training.build.pipelines import filter_groups
 from kohakumoss.training.callbacks import (
     CallbackRunner,
@@ -17,36 +20,35 @@ from kohakumoss.training.callbacks import (
     Validation,
     Vram,
 )
+from kohakumoss.training.callbacks.runner import rank0_decision
 from kohakumoss.training.checkpoint import CheckpointManager
 from kohakumoss.training.drivers import DRIVERS, Parts
 from kohakumoss.training.drivers.pipeline import PipelineDriver, ThreadedDriver
 from kohakumoss.training.ema import build_ema, ema_is_power
-from kohakumoss.training.optim import build_bundle
+from kohakumoss.training.memory.optimizers import build_memory_optim
 from kohakumoss.training.step import (
     DeviceBatcher,
     OnlineLatents,
     OnlineText,
-    TokenMaskHook,
     TrainStep,
     token_counter,
 )
-
-
-def is_masked(k: dict) -> bool:
-    """The loss reads a per-token mask (only `masked_mse` does)."""
-    return k["LOSS"] == "masked_mse"
+from kohakumoss_data import CacheWriter, DataConfig
 
 
 def build_step(
-    k: dict, built, normalizer: TokenNormalizer, autocast, device, sampler=None
+    k: dict,
+    built,
+    normalizer: TokenNormalizer,
+    autocast,
+    device,
+    sampler=None,
+    stream_rank: int = 0,
 ):
-    """TrainStep with the loss, weighting, sampler and mask handling bound."""
+    """TrainStep with the loss, weighting, sampler and mask handling bound; its sigma /
+    noise streams are those of `stream_rank`."""
     masked = is_masked(k)
-    loss = build(
-        {"name": k["LOSS"], "masked": masked, **k["LOSS_KWARGS"]},
-        LOSSES,
-        token_mse=built.backbone.ops.token_mse,
-    )
+    loss = build_loss(k, built)
     sampler = sampler or build(
         {"name": k["TIMESTEP"], **k["TIMESTEP_KWARGS"]}, TIMESTEPS
     )
@@ -60,29 +62,31 @@ def build_step(
         device=device,
         seed=k["SEED"],
         masked=masked,
-        pre_forward=tlora_hook(k),
+        pre_forward=built.trainable.begin_step,
+        rank=stream_rank,
     )
 
 
-TLORA_MASK_KEYS = ("min_rank", "alpha", "max_timestep")
-
-
-def tlora_hook(k: dict):
-    """T-LoRA's per-step rank mask (None for every other algorithm)."""
-    if k["ALGO"] != "tlora":
-        return None
-    kw = {key: k["ALGO_KWARGS"][key] for key in TLORA_MASK_KEYS if key in k["ALGO_KWARGS"]}
-    return TokenMaskHook(import_object(I.TLORA_MASK), int(k["DIM"]), **kw)
-
-
-def build_batcher(k: dict, built, device, writer=None) -> DeviceBatcher:
+def build_batcher(k: dict, built, device, writer=None, dataset=None) -> DeviceBatcher:
     """Cached tensors from the loader, or online encoding with the built encoders when
-    a cache is not 'offline'; `writer` (a CacheWriter) receives every fresh encoding."""
+    a cache is not 'offline'; `writer` (a CacheWriter) receives every fresh encoding.
+    With an `online` cache, fresh encodings are rounded as `dataset`'s cache stores them,
+    so a miss trains on what a later hit returns."""
     kw = {"masked": is_masked(k)}
     if k["TEXT_CACHE"] != "offline":
-        kw["text"] = OnlineText(built.text_encoder.encode)
+        rounding = (
+            {"as_cached": dataset.texts.as_cached}
+            if k["TEXT_CACHE"] == "online" and dataset is not None
+            else {}
+        )
+        kw["text"] = OnlineText(built.text_encoder.encode, **rounding)
     if k["LATENT_CACHE"] != "offline":
-        kw["latents"] = OnlineLatents(built.vae.encode_images)
+        rounding = (
+            {"as_cached": dataset.latents.as_cached}
+            if k["LATENT_CACHE"] == "online" and dataset is not None
+            else {}
+        )
+        kw["latents"] = OnlineLatents(built.vae.encode_images, **rounding)
     if writer is not None:
         kw["on_encoded"] = writer
     return DeviceBatcher(device, built.backbone.cfg.rope_axes, **kw)
@@ -95,53 +99,12 @@ def build_writer(k: dict, loader, writes: bool):
     online = "online" in (k["LATENT_CACHE"], k["TEXT_CACHE"])
     if not (online and writes):
         return None
-    return import_object(I.DATA_CACHE_WRITER)(loader.dataset)
-
-
-def _chain(*fns):
-    fns = tuple(f for f in fns if f is not None)
-
-    def run() -> None:
-        for f in fns:
-            f()
-
-    return run
-
-
-ADAMW_BY_STATE = {
-    "gpu": "adamw",
-    "8bit": "adamw8bit",
-    "cpu": "cpu_adamw",
-    "stream": "host_state_adamw",
-}
-
-
-def _optimizer_name(k: dict, built) -> str:
-    """OPTIMIZER, with `adamw` following the plan's optimiser-state placement (host
-    masters of a trainable weight stream force the host AdamW)."""
-    if k["OPTIMIZER"] != "adamw":
-        return k["OPTIMIZER"]
-    state = "cpu" if built.engines.host_params() else built.plan.optim_state
-    return ADAMW_BY_STATE[state]
-
-
-def _offload_parts(grads, host_optimizer: bool, fused: bool) -> dict:
-    """Bundle hooks for gradient offload: host-optimiser (reads the host sums),
-    device optimiser (sums put back on device before the step), or in-backward finish."""
-    host = list(grads.host.values())
-    match (fused, host_optimizer):
-        case (True, _):
-            return {"after": grads.zero}
-        case (False, True):
-            return {"before": grads.flush, "after": grads.zero, "grads": lambda: host}
-        case _:
-            return {"before": _chain(grads.flush, grads.to_device), "after": grads.zero}
+    return CacheWriter(loader.dataset)
 
 
 def build_optim(k: dict, built, device, policy, hooks, keep: set[int] | None = None):
     """(bundle, accumulate-context) over the trainable groups (restricted to the
-    parameter ids in `keep` for pipeline stages), with the plan's optimiser placement,
-    fused per-parameter steps and gradient offload wired."""
+    parameter ids in `keep` for pipeline stages) under the memory plan's wiring."""
     hyper = {
         "lr": k["LR"],
         "betas": tuple(k["BETAS"]),
@@ -156,60 +119,19 @@ def build_optim(k: dict, built, device, policy, hooks, keep: set[int] | None = N
     )
     if keep is not None:
         groups = filter_groups(groups, keep)
-    optimizer = _optimizer_name(k, built)
-    engines = built.engines
-    plan = built.plan
-    fused = bool(plan.fused_step)
-    params = [p for g in groups for p in g["params"]]
-    host_masters = {id(p) for p in engines.host_params()}
-    device_params = [p for p in params if id(p) not in host_masters]
-    grads = None
-    extra = {}
-    if plan.grad_offload:
-        grads = import_object(I.MEMORY_GRAD_OFFLOAD)(engines, device_params, plan.pinned)
-        extra = _offload_parts(grads, optimizer == "cpu_adamw", fused)
-    bundle = build_bundle(
+    return build_memory_optim(
         groups,
+        built.plan,
+        built.engines,
         device,
-        optimizer,
+        k["OPTIMIZER"],
         hyper,
         k["SCHEDULE"],
         k["STEPS"],
         policy,
         k["GRAD_CLIP"],
-        fused_step=fused,
-        grad_norm=hooks.grad_norm,
-        agree=hooks.agree,
-        before=_chain(hooks.before, engines.before_step, extra.get("before")),
-        after=_chain(engines.after_step, extra.get("after")),
-        reduce_loss=hooks.reduce_loss,
-        grads=extra.get("grads"),
+        hooks,
     )
-    if optimizer == "cpu_adamw" and grads is not None:
-        _host_optimizer(bundle).use_host_grads(grads)
-    if fused and grads is not None:
-        bundle.attach(grads, finishes=True)
-    elif fused:
-        bundle.attach(import_object(I.MEMORY_FUSED)(engines, params, bundle.step_param, 0.0))
-    accumulate = bundle.arm if fused else _offload_arm(grads, hooks.accumulate)
-    return bundle, accumulate
-
-
-def _host_optimizer(bundle):
-    return bundle.shared if hasattr(bundle, "shared") else bundle.optimizer
-
-
-def _offload_arm(grads, accumulate):
-    """Offload this micro-batch's gradients (every micro-batch) and keep the parallel
-    gradient-sync context."""
-    if grads is None:
-        return accumulate
-
-    def arm(last: bool):
-        grads.arm(last, None)
-        return accumulate(last)
-
-    return arm
 
 
 def build_ema_for(k: dict, built, device, names: set[str] | None = None):
@@ -258,18 +180,20 @@ def build_callbacks(
     val_batches,
     checkpoints,
     parts,
+    reduce_loss=None,
 ) -> CallbackRunner:
-    """Every per-step action of the run, with its cadence, in firing order."""
+    """Every per-step action of the run, with its cadence, in firing order;
+    `reduce_loss` is the parallel layout's loss reduction (validation uses it)."""
     every = k["LOG_EVERY"]
     modes = (bundle.eval_mode, bundle.train_mode)
     mode = "full" if k["ALGO"] == "full" else "adapter"
     recompute = getattr(built.plan, "checkpoint", "none") != "none"
     cbs = retune_callbacks(k)
     cbs.append(Throughput(every, built.backbone.cfg, mode, recompute, device))
-    if device.type == "cuda":
+    if device.type in ("cuda", "xpu"):
         cbs.append(Vram(every, device))
     if k["SAMPLE_EVERY"] > 0 and is_main:
-        pipe = import_object(I.PIPELINE).from_components(
+        pipe = MossPipeline.from_components(
             built.backbone, built.text_encoder, built.vae
         )
         cbs.append(
@@ -293,24 +217,48 @@ def build_callbacks(
                 int(k["VALIDATION"].get("seed", 0)),
                 built.backbone,
                 modes,
+                **({} if reduce_loss is None else {"reduce_loss": reduce_loss}),
+                end_step=built.trainable.end_step,
             )
         )
     cbs += [InstabilityDump(output_dir), LogMetrics(every, logger)]
     if k["SAVE_EVERY"] > 0:
         cbs.append(SaveCheckpoint(k["SAVE_EVERY"], checkpoints, parts))
     if k["SAVE_MINUTES"] > 0:
-        cbs.append(TimedCheckpoint(k["SAVE_MINUTES"], checkpoints, parts))
+        agree = (
+            {"agree": rank0_decision}
+            if dist.is_available() and dist.is_initialized()
+            else {}
+        )
+        cbs.append(
+            TimedCheckpoint(
+                k["SAVE_MINUTES"], checkpoints, parts, every=k["LOG_EVERY"], **agree
+            )
+        )
     return CallbackRunner(cbs)
 
 
-def build_checkpoints(k, output_dir, ema, is_main, writer=None) -> CheckpointManager:
-    """Checkpoints; the online cache writer is flushed before each save."""
+def validation_data_config(k: dict):
+    """The validation set's DataConfig: the run's data knobs over VALIDATION['datasets'],
+    every sample conditional (no text dropout)."""
+    return DataConfig.from_knobs(
+        {**k, "DATASETS": k["VALIDATION"]["datasets"], "TEXT_DROP": 0.0}
+    )
+
+
+def build_checkpoints(
+    k, output_dir, ema, is_main, writer=None, rank: int = 0, devices=()
+) -> CheckpointManager:
+    """Checkpoints (RNG kept per rank and per device in `devices`); the online cache
+    writer is flushed before each save."""
     kw = {} if writer is None else {"before_save": writer.flush}
     return CheckpointManager(
         output_dir,
         k["KEEP_LAST"],
         snapshot_ema=ema_is_power(ema),
         is_main=is_main,
+        rank=rank,
+        devices=devices,
         **kw,
     )
 
@@ -340,6 +288,7 @@ def build_driver(
         checkpoints=ckpt,
         parts=parts,
         count_fn=token_counter(is_masked(k)),
+        end_step=parts.trainable.end_step,
     )
     match (k["PARALLEL"], k["DRIVER"]):
         case ("threaded", _):
@@ -348,10 +297,7 @@ def build_driver(
             return PipelineDriver(**common, engine=engine, world=world)
         case (_, "native"):
             return DRIVERS.get("native")(**common, accumulate=accumulate)
-    strategy = "ddp" if k["PARALLEL"] == "ddp" else "auto"
-    return DRIVERS.get("lightning")(
-        **common, devices=len(k["DEVICES"]), strategy=strategy
-    )
+    return DRIVERS.get("lightning")(**common, accumulate=accumulate)
 
 
 def fixed_batches(loader, batcher, count: int) -> list:

@@ -1,1 +1,1 @@
-"""Training build steps (model side and loop side) over the integration entry points."""
+"""Training build steps: model side, loop side, kernel prewarm, parallel layouts."""

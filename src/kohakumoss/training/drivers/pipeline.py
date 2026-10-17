@@ -10,14 +10,11 @@ engine (Linux only).
 import torch
 import torch.distributed as dist
 
-from kohakumoss.registry import import_object
+from kohakumoss.parallel.pipeline import MicroBatch, broadcast_loss
 from kohakumoss.training.drivers.common import Parts
 from kohakumoss.training.drivers.native import NativeDriver
 from kohakumoss.training.state import TrainState
 from kohakumoss.types.step import StepOut
-
-MICRO_BATCH = "kohakumoss.parallel.pipeline.MicroBatch"
-BROADCAST_LOSS = "kohakumoss.parallel.pipeline.broadcast_loss"
 
 
 class ThreadedDriver(NativeDriver):
@@ -51,8 +48,8 @@ class PipelineDriver(NativeDriver):
         super().__init__(*args, **kwargs)
         self.engine = engine
         self.world = world
-        self.micro = import_object(MICRO_BATCH)
-        self.broadcast = import_object(BROADCAST_LOSS)
+        self.micro = MicroBatch
+        self.broadcast = broadcast_loss
 
     def run_group(self, step, group, count, bundle, state: TrainState):
         preps = [step.prepare(self.batcher(hb), state.step) for hb in group]
@@ -82,11 +79,12 @@ class PipelineDriver(NativeDriver):
 
 
 class PipelineObjective:
-    """Engine loss of one micro-batch: token MSE sum on its image tokens (the kept ones
-    under token drop), loss-scaled."""
+    """Engine loss of one micro-batch: the configured token loss (`loss_fn(pred,
+    target, seg, weight, mask)`, as TrainStep calls it) summed over its image tokens
+    (the kept ones under token drop), loss-scaled."""
 
-    def __init__(self, token_loss, scaler):
-        self.token_loss = token_loss
+    def __init__(self, loss_fn, scaler):
+        self.token_loss = loss_fn
         self.scaler = scaler
 
     def __call__(self, pred, data):

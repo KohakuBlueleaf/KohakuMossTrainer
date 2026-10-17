@@ -1,38 +1,23 @@
-"""MemorySession: one MemoryPlan applied to a model plus the optimiser it implies.
-
-Optimiser per `plan.optim_state`:
-- `gpu`: GPU AdamW, states resident (`MasterAdamW`; streamed blocks: `StreamedAdamW`
-  with resident states).
-- `stream`: GPU AdamW, states in host memory streamed per parameter / per block
-  (`HostStateAdamW`; streamed blocks: `StreamedAdamW`).
-- `cpu`: `CPUAdamW` (host update).
-GPU optimisers step inside backward on the last micro-batch whenever `fused_step`,
-`grad_offload` or a `swap` stream is on; otherwise at `step()`. The driver calls
-`backward(loss, micro)` per micro-batch and `step()` once per optimiser step.
-
-`param_groups` are torch-style groups over the model's parameters (taken before the
-session is built; parameters the plan replaces, such as streamed block weights, are
-followed by name). Every group's hyperparameters reach every optimiser path: each group
-is split into its device part and its streamed part, and each part keeps the group's
-lr / betas / eps / weight_decay and extra keys.
-"""
+"""MemorySession: one MemoryPlan applied to a model plus the trainer's optimiser wiring
+(`build_memory_optim`), for benches and tests on models outside the trainer. See
+docs/internals/offload.md (MemorySession and parameter groups)."""
 
 import torch
 from torch import Tensor, nn
 
 from kohakumoss.offload.cpu_optim import CPUAdamW
-from kohakumoss.offload.fused_step import FusedStep
 from kohakumoss.offload.gpu_adamw import HostStateAdamW, MasterAdamW
-from kohakumoss.offload.grad import GradOffload
-from kohakumoss.offload.stream_optim import StreamedAdamW
 from kohakumoss.training.memory.apply import MemoryEngines, apply_to_backbone
-from kohakumoss.types.plans import MemoryPlan
+from kohakumoss.training.memory.optimizers import build_memory_optim
+from kohakumoss.types.plans import MemoryPlan, PrecisionPolicy
 
-DEVICE_OPTIMS = {"gpu": MasterAdamW, "stream": HostStateAdamW, "cpu": CPUAdamW}
+CONSTANT = {"mode": "constant"}
 
 
 class MemorySession:
-    """Engines + optimisers for one training run; see the module docstring."""
+    """Engines + bundle for one run: `backward(loss, micro)` per micro-batch, `step()`
+    per optimiser step. `param_groups` are torch-style groups over the model's
+    parameters as given before the session (replaced parameters followed by name)."""
 
     def __init__(
         self,
@@ -48,16 +33,12 @@ class MemorySession:
         weight_decay: float = 0.01,
         quant_min_features: int = 256,
         param_groups: list[dict] | None = None,
+        grad_clip: float = 0.0,
     ):
-        if plan.optim_state not in DEVICE_OPTIMS:
-            raise ValueError(
-                f"optim_state {plan.optim_state!r} has no session optimiser"
-            )
         self.plan, self.grad_acc = plan, grad_acc
         self.device = torch.device(device)
-        hp = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         names = {id(p): n for n, p in model.named_parameters()}
-        named_groups = (
+        named = (
             None
             if param_groups is None
             else [
@@ -74,81 +55,44 @@ class MemorySession:
             trainable_base=trainable_base,
             quant_min_features=quant_min_features,
         )
-        stream = self.engines.stream
-        streamed = (
-            {id(p) for p in stream.params.values()}
-            if stream is not None and stream.trainable
-            else set()
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        groups = resolve_groups(model, named, defaults)
+        optimizer = "master_adamw" if plan.optim_state == "gpu" else "adamw"
+        policy = PrecisionPolicy(compute=compute_dtype, scaler=False)
+        self.bundle, self.accumulate = build_memory_optim(
+            groups,
+            plan,
+            self.engines,
+            self.device,
+            optimizer,
+            dict(lr=lr, betas=tuple(betas), eps=eps),
+            CONSTANT,
+            1 << 30,
+            policy,
+            grad_clip,
         )
-        dev_groups, block_groups = split_groups(model, named_groups, streamed)
-        self.block_opt = None
-        self.host_block_opt = None
-        if streamed:
-            if plan.optim_state == "cpu":
-                self.host_block_opt = CPUAdamW(block_groups, **hp)
-            else:
-                self.block_opt = StreamedAdamW(
-                    stream,
-                    resident=plan.optim_state == "gpu",
-                    groups=block_groups,
-                    **hp,
-                )
-        dev_params = [p for g in dev_groups for p in g["params"]]
-        self.dev_opt = DEVICE_OPTIMS[plan.optim_state](
-            dev_groups or [{"params": []}], **hp
-        )
-        gpu_opt = plan.optim_state != "cpu"
-        self.in_backward = gpu_opt and (plan.fused_step or plan.grad_offload)
-        self.grads = None
-        self.fused = None
-        if plan.grad_offload:
-            self.grads = GradOffload(dev_params, pinned=plan.pinned)
-            self.engines.grads = self.grads
-            if not gpu_opt:
-                self.dev_opt.use_host_grads(self.grads)
-        elif self.in_backward:
-            self.fused = FusedStep(dev_params, self.dev_opt.step_param)
-            self.engines.fused = self.fused
 
     @property
-    def param_groups(self) -> list[dict]:
-        groups = list(self.dev_opt.param_groups)
-        for opt in (self.block_opt, self.host_block_opt):
-            if opt is not None:
-                groups += opt.param_groups
-        return groups
+    def dev_opt(self):
+        """The optimiser of the device (non-streamed) parameters."""
+        shared = getattr(self.bundle, "shared", None)
+        return shared if shared is not None else getattr(self.bundle, "optimizer", None)
+
+    @property
+    def block_opt(self):
+        return getattr(self.bundle, "blocks", None)
+
+    @property
+    def grads(self):
+        return self.engines.grads
 
     def backward(self, loss: Tensor, micro: int) -> None:
         """Backward of micro-batch `micro` (0-based) of this step."""
-        last = micro == self.grad_acc - 1
-        if self.block_opt is not None:
-            self.block_opt.arm(last)
-        if self.grads is not None:
-            final = self.dev_opt.step_param if self.in_backward else None
-            self.grads.arm(last, final)
-        if self.fused is not None:
-            self.fused.arm(last)
-        loss.backward()
+        with self.accumulate(micro == self.grad_acc - 1):
+            self.bundle.backward(loss)
 
-    @torch.no_grad()
-    def step(self) -> None:
-        """Finish the optimiser step (host-side parts and non-fused updates)."""
-        stream = self.engines.stream
-        if self.host_block_opt is not None:
-            stream.flush_grads()
-            self.host_block_opt.step()
-            self.host_block_opt.zero_grad(set_to_none=True)
-        if self.grads is not None and not self.in_backward:
-            self.grads.flush()
-        if not self.in_backward:
-            self.dev_opt.step()
-            self.dev_opt.zero_grad(set_to_none=True)
-        else:
-            if self.grads is not None:
-                self.grads.finish()
-            if isinstance(self.dev_opt, HostStateAdamW):
-                self.dev_opt.finish()
-        self.engines.after_step()
+    def step(self) -> bool:
+        return self.bundle.step()
 
     def masters(self, model: nn.Module) -> dict[str, Tensor]:
         """fp32 masters of every trainable parameter by name (for checks / checkpoints)."""
@@ -156,55 +100,40 @@ class MemorySession:
             self.block_opt.synchronize()
         if isinstance(self.dev_opt, HostStateAdamW):
             self.dev_opt.synchronize()
-        out = {}
-        block_masters = self.block_opt.masters() if self.block_opt is not None else {}
-        stream = self.engines.stream
-        by_id = {}
-        if stream is not None and stream.trainable:
-            for key, p in stream.params.items():
-                by_id[id(p)] = block_masters.get(key, p.detach())
-        for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            if id(p) in by_id:
-                out[name] = by_id[id(p)].float().cpu()
-            else:
-                out[name] = _master_of(self.dev_opt, p)
-        return out
+        return {
+            name: _master_of(self.dev_opt, p)
+            for name, p in model.named_parameters()
+            if p.requires_grad
+        }
 
 
-def split_groups(
-    model: nn.Module, named_groups: list[dict] | None, streamed: set[int]
-) -> tuple[list[dict], list[dict]]:
-    """(device groups, streamed groups) over the model's current trainable parameters;
-    each keeps its source group's hyperparameters. Every trainable parameter must be in
-    a group (None: one group of all of them)."""
+def resolve_groups(
+    model: nn.Module, named_groups: list[dict] | None, defaults: dict
+) -> list[dict]:
+    """Groups over the model's current trainable parameters, hyperparameters filled
+    from `defaults`; every trainable parameter must be in a group (None: one group)."""
     current = dict(model.named_parameters())
     if named_groups is None:
         named_groups = [{"params": list(current)}]
-    dev, blocks, seen = [], [], set()
+    out, seen = [], set()
     for g in named_groups:
         params = [current[n] for n in g["params"] if n in current]
         params = [p for p in params if p.requires_grad]
         seen.update(id(p) for p in params)
-        for out, part in (
-            (dev, [p for p in params if id(p) not in streamed]),
-            (blocks, [p for p in params if id(p) in streamed]),
-        ):
-            if part:
-                out.append({**g, "params": part})
+        if params:
+            out.append({**defaults, **g, "params": params})
     missing = [n for n, p in current.items() if p.requires_grad and id(p) not in seen]
     if missing:
         raise ValueError(f"trainable parameters in no param group: {missing[:4]}")
-    return dev, blocks
+    return out
 
 
 def _master_of(opt, p: Tensor) -> Tensor:
     match opt:
-        case MasterAdamW():
+        case MasterAdamW() if id(p) in opt.state:
             return opt.state[id(p)][0].detach().float().cpu()
-        case HostStateAdamW():
+        case HostStateAdamW() if id(p) in opt.host:
             return opt.host[id(p)][0].detach().float().cpu().reshape(p.shape)
-        case CPUAdamW():
+        case CPUAdamW() if p in opt.state:
             return opt.state[p]["master"].detach().float().cpu()
     return p.detach().float().cpu()

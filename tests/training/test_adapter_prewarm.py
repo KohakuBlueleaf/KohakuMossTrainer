@@ -2,17 +2,19 @@
 and grad pattern, streamed layers skipped, no gradient left behind; per-group settings
 of the offload AdamWs."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from lycoris.kernels.plans import tune
 
+from kohakumoss.adapters.apply import apply as apply_adapters
+from kohakumoss.adapters.spec import spec_from_knobs
 from kohakumoss.model import random_backbone
-from kohakumoss.registry import import_object
-from kohakumoss.training.build import integration as I
 from kohakumoss.training.build.kernels import (
-    GRAD_PATTERNS,
     AdapterPrewarm,
     adapter_buckets,
+    build_adapter_prewarm,
 )
 from kohakumoss.training.optim import build_bundle
 from kohakumoss.training.precision import build_policy
@@ -40,41 +42,40 @@ def test_adapter_buckets_cover_lycoris_buckets(batch_max):
     must_fail(lambda: _covers(buckets[:-1], batch_max, row), "top bucket missing")
 
 
-def _adapted():
+class _Spy:
+    def __init__(self):
+        self.calls = []
+
+    def prewarm(self, rows, dtype, devices):
+        self.calls.append((list(rows), dtype, list(devices)))
+        return len(rows)
+
+
+def test_prewarm_hands_the_planned_buckets_to_the_trainable_set():
+    k = runnable(MAX_TOKENS=9000, TUNE="auto")
+    spy = _Spy()
+    warm = build_adapter_prewarm(k, SimpleNamespace(trainable=spy), torch.float16)
+    assert isinstance(warm, AdapterPrewarm)
+    warm([DEV])
+    ((rows, dtype, devices),) = spy.calls
+    _covers(rows, 9000, tune.ROW_BUCKET)
+    assert dtype is torch.float16 and devices == [DEV]
+    off = build_adapter_prewarm(
+        {**k, "TUNE": "off"}, SimpleNamespace(trainable=spy), torch.float16
+    )
+    assert not isinstance(off, AdapterPrewarm)
+    must_fail(lambda: _covers(rows[:3], 9000, tune.ROW_BUCKET), "buckets truncated")
+
+
+def test_lycoris_prewarm_leaves_factors_untouched():
     model = random_backbone("tiny", device=DEV, dtype=torch.float32, seed=0)
     model.requires_grad_(False)
     k = runnable(ALGO="lora", DIM=4, ALPHA=4.0)
-    spec = import_object(I.ADAPTERS_SPEC)(k)
-    aset = import_object(I.ADAPTERS_APPLY)(model, spec, dtype=torch.float32, device=DEV)
-    return model, aset
-
-
-def test_every_adapted_layer_runs_each_bucket_and_pattern():
-    model, aset = _adapted()
-    skipped = aset.targets[0]
-    calls: dict[int, list] = {}
-
-    def spy(module, args, out):
-        calls.setdefault(id(module), []).append(
-            (args[0].shape[0], args[0].requires_grad, torch.is_grad_enabled())
-        )
-
-    for t in aset.targets:
-        t.linear.register_forward_hook(spy)
+    aset = apply_adapters(model, spec_from_knobs(k), dtype=torch.float32, device=DEV)
     before = {n: p.detach().clone() for n, p in aset.named_trainable()}
-    buckets = [1, 4, 16]
-    warm = AdapterPrewarm(aset.targets, torch.float32, buckets, {id(skipped.linear)})
-    warm([DEV])
-    want = sorted((n, g, e) for n in buckets for g, e in GRAD_PATTERNS)
-    assert id(skipped.linear) not in calls
-    for t in aset.targets[1:]:
-        assert sorted(calls[id(t.linear)]) == want, t.lora_name
+    AdapterPrewarm(aset, torch.float32, [1, 4, 16])([DEV])
     for name, p in aset.named_trainable():
         assert p.grad is None and torch.equal(p, before[name]), name
-    other = AdapterPrewarm(aset.targets, torch.float32, buckets, set())
-    calls.clear()
-    other([torch.device("meta")])
-    assert calls == {}, "layers on a device outside the prewarm set were run"
 
 
 def _groups(params):

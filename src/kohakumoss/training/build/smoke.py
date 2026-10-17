@@ -14,7 +14,9 @@ from torch import Tensor
 
 
 def _seed(text: str) -> int:
-    return int.from_bytes(hashlib.blake2b(text.encode(), digest_size=8).digest(), "little")
+    return int.from_bytes(
+        hashlib.blake2b(text.encode(), digest_size=8).digest(), "little"
+    )
 
 
 class RandomLatentEncoder:
@@ -33,10 +35,16 @@ class RandomLatentEncoder:
         return self
 
     @torch.no_grad()
-    def encode_images(self, images: Sequence[np.ndarray], hw: Tensor, generator=None) -> Tensor:
+    def encode_images(
+        self, images: Sequence[np.ndarray], hw: Tensor, generator=None
+    ) -> Tensor:
         out = []
         for image, (h, w) in zip(images, hw.tolist()):
-            x = torch.from_numpy(np.ascontiguousarray(image[..., :3])).float().to(self.device)
+            x = (
+                torch.from_numpy(np.ascontiguousarray(image[..., :3]))
+                .float()
+                .to(self.device)
+            )
             x = x.permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
             z = F.adaptive_avg_pool2d(x, (int(h), int(w)))[0]
             out.append((self.proj @ z.flatten(1)).T)
@@ -44,9 +52,12 @@ class RandomLatentEncoder:
 
     @torch.no_grad()
     def decode(self, latents: Tensor) -> Tensor:
-        rgb = torch.einsum(
-            "ck,bchw->bkhw", self.proj, latents.float().to(self.proj.device)
-        ) / self.proj.shape[0]
+        rgb = (
+            torch.einsum(
+                "ck,bchw->bkhw", self.proj, latents.float().to(self.proj.device)
+            )
+            / self.proj.shape[0]
+        )
         return F.interpolate(rgb.tanh(), scale_factor=self.factor, mode="nearest")
 
 
@@ -65,7 +76,11 @@ class RandomTextEncoder:
     def encode(self, prompts: Sequence[str]) -> list[Tensor]:
         out = []
         for prompt in prompts:
-            tokens = ["<bos>"] + [t.strip() for t in prompt.split(",") if t.strip()] + ["<eos>"]
+            tokens = (
+                ["<bos>"]
+                + [t.strip() for t in prompt.split(",") if t.strip()]
+                + ["<eos>"]
+            )
             out.append(torch.stack([self._vec(t) for t in tokens]).to(self.device))
         return out
 

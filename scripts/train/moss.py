@@ -44,17 +44,31 @@ CACHE_DIR = ""  # "" = <dataset>/cache; directory for latent / text vaults
 CACHE_DTYPE = "bf16"  # "bf16" | "fp8"
 CAPTION_VARIANTS = 4  # cached caption renderings per image
 FLIP = False  # horizontal flip augmentation
+CROP = "center"  # "center" | "random" (offline latent caches need "center")
+PLANNER_KWARGS = (
+    {}
+)  # override derived planner arguments, e.g. {"window": 64, "drop_last": True}
+LATENT_ENCODER_ID = "flux2-vae"  # latent cache key: which VAE encoded the vault
+LATENT_DRAW = "mode"  # VAE latent draw, part of the latent cache key: "mode" | "sample"
+TEXT_ENCODER_ID = "qwen3.5-9b"  # text cache key: which text encoder encoded the vault
+BACKGROUND = "white"  # fill colour for transparent images
+RESAMPLE = "lanczos"  # image resize filter
+TEXT_CHARS_PER_TOKEN = 3.5  # caption length estimate when no cached length exists
+TEXT_OVERHEAD_TOKENS = 12  # chat-template tokens added to every caption estimate
+MAX_TEXT_TOKENS = 4096  # cap on a caption's text tokens in planning
+PREFETCH = 2  # batches prefetched per loader worker
+PIN_MEMORY = True  # pin host batches for async H2D copies
 NUM_WORKERS = 4
 SEED = 0
 
 # ===================== ADAPTER =====================
 ALGO = "lora"  # "lora" | "locon" | "loha" | "lokr" | "oft" | "boft" | "glora" | "ia3" | "dylora" | "tlora" | "full"
-PRESET = "attn-mlp"  # "attn" | "attn-mlp" | "full-block" | path to LyCORIS-style toml
+PRESET = "attn-mlp"  # base "attn" | "attn-mlp" | "full-block" | "all", + modifiers "+text-refiner" "+modulation" "+embed"; or a LyCORIS-style toml path
 DIM = 32
 ALPHA = 32.0
 ALGO_KWARGS = (
     {}
-)  # e.g. {"factor": 8} for lokr, {"block_size": 32, "constraint": 0.0} for oft
+)  # e.g. {"factor": 8} for lokr, {"constraint": 0.0} for oft (DIM is the OFT block size)
 DORA = False
 DORA_DETACH = False  # True detaches the DoRA norm (eager path only)
 DROPOUT = {"input": 0.0, "rank": 0.0, "module": 0.0}
@@ -94,7 +108,7 @@ GRAD_CLIP = 1.0
 EMA = 0.0  # 0 = off; e.g. 0.9999
 
 # ===================== PRECISION =====================
-PRECISION = "bf16"  # "bf16" | "fp16" | "fp32"
+PRECISION = "bf16"  # "bf16" | "fp16" | "auto" (bf16 where supported, else fp16; fp32 on CPU) | "fp32" (CPU reference only)
 KEEP_FP32 = ("time_embedding", "shared_block_modulation", "video_head_modulation")
 FP16_FIX = "none"  # "none" | "weights" (fold baked into weights) | "online" (runtime factors) | "fp32_residual"
 FP16_FIX_KWARGS = (
@@ -109,7 +123,9 @@ MEMORY_OVERRIDES = (
 
 # ===================== PARALLEL =====================
 PARALLEL = "none"  # "none" | "ddp" | "fsdp" | "pipeline" | "threaded"
-DIST_BACKEND = "auto"  # "auto" (nccl on Linux, gloo on Windows) | "nccl" | "gloo"
+DIST_BACKEND = (
+    "auto"  # "auto" (nccl on CUDA, xccl on XPU, gloo otherwise) | "nccl" | "gloo"
+)
 DEVICES = (0,)
 PIPELINE_SCHEDULE = "1f1b"  # "gpipe" | "1f1b" | "interleaved-1f1b" | "zb"
 MICROBATCHES = 4

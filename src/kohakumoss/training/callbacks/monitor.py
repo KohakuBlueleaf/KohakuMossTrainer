@@ -57,19 +57,20 @@ class Throughput:
 
 
 class Vram:
-    """Peak allocated / reserved GiB since the last log point (CUDA devices only)."""
+    """Peak allocated / reserved GiB since the last log point (CUDA / XPU devices)."""
 
     def __init__(self, every: int, device):
         self.every = every
         self.device = device
+        self.dm = torch.get_device_module(device)
 
     def on_step_end(self, state: TrainState, out) -> None:
         gib = 1024**3
         state.metrics.update(
-            vram_peak_alloc=torch.cuda.max_memory_allocated(self.device) / gib,
-            vram_peak_reserved=torch.cuda.max_memory_reserved(self.device) / gib,
+            vram_peak_alloc=self.dm.max_memory_allocated(self.device) / gib,
+            vram_peak_reserved=self.dm.max_memory_reserved(self.device) / gib,
         )
-        torch.cuda.reset_peak_memory_stats(self.device)
+        self.dm.reset_peak_memory_stats(self.device)
 
 
 class LogMetrics:
@@ -86,6 +87,7 @@ class LogMetrics:
             "lr": state.lr,
             "loss_scale": state.scale,
             "skipped_steps": float(state.skipped),
+            "nonfinite_steps": float(state.nonfinite),
         }
         for k, v in out.metrics.items():
             metrics[k] = float(v)

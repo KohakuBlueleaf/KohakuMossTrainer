@@ -12,7 +12,8 @@ from kohakumoss_kernels.hardware.arch import arch_of
 
 CHECKPOINT_MODES = ("none", "block", "sub-block", "selective")
 STREAM_MODES = ("off", "ring", "swap")
-BASE_PRECISIONS = ("compute", "bf16", "fp16", "fp32", "fp8", "int8", "quant")
+BASE_PRECISIONS = ("compute", "fp8", "int8", "quant")
+KNOB_FIELDS = {"compile": "COMPILE", "kernels": "KERNELS"}
 OPTIM_STATES = ("gpu", "stream", "8bit", "cpu")
 COMPILE_MODES = ("off", "block", "model")
 
@@ -24,7 +25,6 @@ PROFILES: dict[str, dict] = {
         stream="off",
         optim_state="gpu",
         fused_step=False,
-        compile="block",
     ),
     "balanced": dict(
         checkpoint="block",
@@ -33,7 +33,6 @@ PROFILES: dict[str, dict] = {
         stream="off",
         optim_state="gpu",
         fused_step=False,
-        compile="off",
     ),
     "low": dict(
         checkpoint="block",
@@ -42,7 +41,6 @@ PROFILES: dict[str, dict] = {
         stream="off",
         optim_state="8bit",
         fused_step=True,
-        compile="off",
     ),
     "minimal": dict(
         checkpoint="block",
@@ -53,7 +51,6 @@ PROFILES: dict[str, dict] = {
         optim_state="stream",
         fused_step=True,
         grad_offload=True,
-        compile="off",
     ),
 }
 ORDER = ("speed", "balanced", "low", "minimal")
@@ -115,6 +112,13 @@ def validate(
         problems.append("a quantized base cannot be trained (full FT)")
     if plan.optim_state not in OPTIM_STATES:
         problems.append(f"optim_state {plan.optim_state!r} not in {OPTIM_STATES}")
+    swap = plan.stream == "swap" and trainable_base and not inference
+    if swap and plan.fused_step != (plan.optim_state != "cpu"):
+        problems.append(
+            "stream='swap' steps blocks inside backward with a GPU optim_state "
+            "(fused_step=True) and after backward with optim_state='cpu' "
+            "(fused_step=False)"
+        )
     if plan.compile not in COMPILE_MODES:
         problems.append(f"compile {plan.compile!r} not in {COMPILE_MODES}")
     return problems
@@ -144,6 +148,12 @@ def resolve(
         values["base_precision"] = "compute"
     if trainable_base and "stream" not in overrides and values.get("stream") == "ring":
         values["stream"] = "swap"
+    swap = trainable_base and not inference and values.get("stream") == "swap"
+    gpu_optim = values.get("optim_state", "gpu") != "cpu"
+    if swap and "fused_step" not in overrides:
+        values["fused_step"] = gpu_optim
+    if values.get("grad_offload") and gpu_optim and "fused_step" not in overrides:
+        values["fused_step"] = True
     if inference:
         values.update(checkpoint="none", act_offload=False, fused_step=False)
         values.pop("grad_offload", None)

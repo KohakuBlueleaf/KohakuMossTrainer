@@ -1,8 +1,10 @@
 """Post-hoc EMA (EDM2): combine power-EMA snapshots into an EMA of any sigma_rel.
 
 A power EMA of exponent g taken at step t has averaging profile
-p(tau) = (g+1) tau^g / t^(g+1) on [0, t]. Weights x solve A x = b with
-A_ij = <p_i, p_j> and b_i = <p_i, p_target> in L2 over tau.
+p(tau) = (g+1) tau^g / t^(g+1) on [0, t]. The weights are the least-squares fit of
+p_target by the snapshot profiles in L2 over tau, solved in float32 in the basis of
+unit-norm profiles, whose Gram matrix has a closed form with O(1) terms. See
+docs/concepts/training.md (EMA).
 
     python -m kohakumoss.training.ema.posthoc --run <output_dir> --sigma-rel 0.1 --out ema.safetensors
 """
@@ -18,28 +20,40 @@ from torch import Tensor
 from kohakumoss.training.ema.averagers import gamma_from_sigma_rel
 
 
-def _inner(t_i: float, g_i: float, t_j: float, g_j: float) -> float:
-    lo = min(t_i, t_j)
-    return (
-        (g_i + 1)
-        * (g_j + 1)
-        * lo ** (g_i + g_j + 1)
-        / ((g_i + g_j + 1) * t_i ** (g_i + 1) * t_j ** (g_j + 1))
+def correlation(t_a: Tensor, g_a: Tensor, t_b: Tensor, g_b: Tensor) -> Tensor:
+    """<p_a, p_b> / (|p_a| |p_b|) for power profiles, broadcast, float32:
+    sqrt((2 g_a + 1)(2 g_b + 1)) / (g_a + g_b + 1) * (lo/t_a)^(g_a + 1/2)
+    * (lo/t_b)^(g_b + 1/2), lo = min(t_a, t_b)."""
+    lo = torch.minimum(t_a, t_b)
+    log_c = (
+        0.5 * torch.log((2 * g_a + 1) * (2 * g_b + 1))
+        - torch.log(g_a + g_b + 1)
+        + (g_a + 0.5) * torch.log(lo / t_a)
+        + (g_b + 0.5) * torch.log(lo / t_b)
     )
+    return log_c.exp()
+
+
+def profile_norm(t: Tensor, g: Tensor) -> Tensor:
+    """|p| = (g + 1) / sqrt((2 g + 1) t) in L2 over [0, t]."""
+    return (g + 1) / torch.sqrt((2 * g + 1) * t)
 
 
 def solve_weights(
     snapshots: list[tuple[float, float]], target_t: float, target_gamma: float
 ) -> Tensor:
-    """Least-squares weights for snapshots [(t, gamma)] approximating (target_t, target_gamma)."""
-    n = len(snapshots)
-    a = torch.empty(n, n, dtype=torch.float64)
-    b = torch.empty(n, dtype=torch.float64)
-    for i, (ti, gi) in enumerate(snapshots):
-        b[i] = _inner(ti, gi, target_t, target_gamma)
-        for j, (tj, gj) in enumerate(snapshots):
-            a[i, j] = _inner(ti, gi, tj, gj)
-    return torch.linalg.lstsq(a, b.unsqueeze(-1)).solution.squeeze(-1)
+    """Least-squares weights [n] (float32) for snapshots [(t, gamma)] approximating the
+    profile (target_t, target_gamma): C y = c in the unit-norm basis (SVD solve), then
+    x_i = y_i |p_target| / |p_i|."""
+    f32 = torch.float32
+    t = torch.tensor([s for s, _ in snapshots], dtype=f32)
+    g = torch.tensor([gm for _, gm in snapshots], dtype=f32)
+    tt = torch.tensor(target_t, dtype=f32)
+    gt = torch.tensor(target_gamma, dtype=f32)
+    gram = correlation(t[:, None], g[:, None], t[None, :], g[None, :])
+    rhs = correlation(t, g, tt, gt)
+    y = torch.linalg.lstsq(gram, rhs.unsqueeze(-1), driver="gelsd").solution
+    return y.squeeze(-1) * profile_norm(tt, gt) / profile_norm(t, g)
 
 
 def combine(states: list[dict[str, Tensor]], weights: Tensor) -> dict[str, Tensor]:

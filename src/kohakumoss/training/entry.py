@@ -1,6 +1,8 @@
 """`run(globals())`: validate every knob, build in the fixed order, train, export."""
 
+import contextlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -9,8 +11,8 @@ import torch.distributed as dist
 
 from kohakumoss.diffusion.objective import TokenNormalizer
 from kohakumoss.logging import build_logger
-from kohakumoss.registry import import_object
-from kohakumoss.training.build import integration as I
+from kohakumoss.parallel.fsdp import unsharded
+from kohakumoss.parallel.launch import spawn
 from kohakumoss.training.build.kernels import (
     build_adapter_prewarm,
     build_prewarm,
@@ -26,6 +28,7 @@ from kohakumoss.training.build.loop import (
     build_step,
     build_writer,
     fixed_batches,
+    validation_data_config,
 )
 from kohakumoss.training.build.model import build_model, export
 from kohakumoss.training.build.parallel import build_hooks
@@ -33,22 +36,21 @@ from kohakumoss.training.build.pipelines import (
     build_engine,
     build_threaded,
     local_names,
+    release_nonlocal,
 )
 from kohakumoss.training.callbacks.evaluate import FixedSigma
 from kohakumoss.training.drivers import Parts
+from kohakumoss.training.drivers.fsdp import FsdpParts
 from kohakumoss.training.drivers.pipeline import PipelineParts
-from kohakumoss.training.knobs import check
+from kohakumoss.training.knobs import check, default_device_type, run_name
 from kohakumoss.training.precision import autocast_factory, build_policy
 from kohakumoss.training.state import TrainState
+from kohakumoss.training.step import LayoutTransform
 from kohakumoss.types.plans import ParallelPlan
+from kohakumoss_data import DataConfig, build_loader
+from kohakumoss_kernels.tuning.tuner import set_mode as set_tune_mode
 
-
-def _device_type() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        return "xpu"
-    return "cpu"
+_device_type = default_device_type
 
 
 def run(g: dict):
@@ -62,9 +64,7 @@ def run(g: dict):
             schedule=k["PIPELINE_SCHEDULE"],
             microbatches=k["MICROBATCHES"],
         )
-        return import_object(I.PARALLEL_SPAWN)(
-            worker_env, plan, k, device_type=_device_type()
-        )
+        return spawn(worker_env, plan, k, device_type=_device_type())
     rank = dist.get_rank() if dist.is_initialized() else 0
     world = dist.get_world_size() if dist.is_initialized() else 1
     return worker(k, rank, world)
@@ -109,72 +109,95 @@ def _stages(k: dict, built, policy, rank: int, world: int, device):
     return None, None, None, None
 
 
+def stream_rank(kind: str, rank: int) -> int:
+    """The rank whose data, sigma and noise streams this rank draws: its own under data
+    parallelism, rank 0's under `pipeline` (every stage sees the same micro-batches)."""
+    return 0 if kind == "pipeline" else rank
+
+
 def _snapshot(k: dict) -> dict:
     return json.loads(json.dumps(k, default=str))
+
+
+def deterministic_mode() -> None:
+    """KOHAKUMOSS_DETERMINISTIC=1 (set before the process imports the kernels):
+    torch's deterministic algorithms, a fixed cuBLAS workspace, no cuDNN autotune;
+    the kernels read the same variable. See docs/concepts/training.md."""
+    if os.environ.get("KOHAKUMOSS_DETERMINISTIC") != "1":
+        return
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
 
 
 def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
     """One rank of a run."""
     is_main = rank == 0
+    deterministic_mode()
     device = device or _device(k, rank)
     torch.manual_seed(k["SEED"])  # identical model + adapter init on every rank
-    output_dir = str(Path(k["OUTPUT_DIR"]) / (k["RUN_NAME"] or "run"))
+    output_dir = str(Path(k["OUTPUT_DIR"]) / run_name(k))
     if is_main:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         (Path(output_dir) / "config.json").write_text(
             json.dumps(_snapshot(k), indent=2)
         )
-    import_object(I.KERNEL_TUNE_MODE)(k["TUNE"])
-    if device.type == "cuda":  # MAGMA's batched inverse (OFT Cayley) faults on sm86
+    set_tune_mode(k["TUNE"])
+    if device.type == "cuda":  # cuSOLVER linear algebra, see docs/concepts/training.md
         torch.backends.cuda.preferred_linalg_library("cusolver")
     policy = build_policy(
         k["PRECISION"], k["KEEP_FP32"], k["FP16_FIX"], k["FP16_FIX_KWARGS"]
     )
-    built = build_model(k, device, policy)
+    built = build_model(k, device, policy, world)
     engine, objective, names, keep = _stages(k, built, policy, rank, world, device)
-    # prewarm before the gradient-sync hooks: its scratch backward must not reduce
+    if keep is not None:
+        release_nonlocal(built.backbone, keep)
+    # kernel and adapter prewarm, before the gradient-sync hooks are installed
     warm = prewarm_devices(k, device)
     build_prewarm(k, built.backbone, policy.compute)(warm)
     build_adapter_prewarm(k, built, policy.compute)(warm)
     torch.manual_seed(k["SEED"] + rank)  # per-rank stream for everything after build
     hooks = build_hooks(k["PARALLEL"], built, policy.compute, world)
-    _compile(built.backbone, k["COMPILE"])
+    _compile(built.backbone, built.plan.compile)
     normalizer = TokenNormalizer(hooks.reduce, hooks.world_factor)
     autocast = autocast_factory(policy, device)
-    step = build_step(k, built, normalizer, autocast, device)
+    data_rank = stream_rank(k["PARALLEL"], rank)
+    data_world = 1 if k["PARALLEL"] == "pipeline" else world
+    step = build_step(k, built, normalizer, autocast, device, stream_rank=data_rank)
     bundle, accumulate = build_optim(k, built, device, policy, hooks, keep)
     if objective is not None:
         objective.scaler = bundle.scaler
     ema = build_ema_for(k, built, device, names)
-    data_cfg = import_object(I.DATA_CONFIG).from_knobs(k)
-    data_rank, data_world = (0, 1) if k["PARALLEL"] == "pipeline" else (rank, world)
-    loader = import_object(I.DATA_LOADER)(data_cfg, rank=data_rank, world=data_world)
+    data_cfg = DataConfig.from_knobs(k)
+    layout = LayoutTransform(built.backbone.cfg.rope_axes)
+    loader = build_loader(data_cfg, rank=data_rank, world=data_world, transform=layout)
     writer = build_writer(k, loader, writes=data_rank == rank)
-    batcher = build_batcher(k, built, device, writer)
+    batcher = build_batcher(k, built, device, writer, loader.dataset)
     val_batches = []
     if k["VALIDATE_EVERY"] > 0:
-        val_cfg = import_object(I.DATA_CONFIG).from_knobs(
-            {**k, "DATASETS": k["VALIDATION"]["datasets"]}
+        val_loader = build_loader(
+            validation_data_config(k), rank=rank, world=world, transform=layout
         )
-        val_loader = import_object(I.DATA_LOADER)(val_cfg, rank=rank, world=world)
         val_batches = fixed_batches(
             val_loader,
-            build_batcher(k, built, device),
+            build_batcher(k, built, device, dataset=val_loader.dataset),
             int(k["VALIDATION"].get("batches", 4)),
         )
     logger = build_logger(
         k["LOGGER"],
         output_dir,
-        k["RUN_NAME"] or "run",
+        run_name(k),
         k.get("PROJECT", "kohakumoss"),
         _snapshot(k),
         is_main,
     )
 
     def make_step(sampler: FixedSigma):
-        return build_step(k, built, normalizer, autocast, device, sampler=sampler)
+        return build_step(
+            k, built, normalizer, autocast, device, sampler, stream_rank=data_rank
+        )
 
-    ckpt = build_checkpoints(k, output_dir, ema, is_main, writer)
+    ckpt = build_checkpoints(k, output_dir, ema, is_main, writer, rank, warm)
     parts_args = (built.trainable, ema, bundle, step, loader)
     if k["PARALLEL"] == "pipeline":
         parts = PipelineParts(
@@ -183,6 +206,10 @@ def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
             rank=rank,
             world=world,
             extra=lambda: {"world": world},
+        )
+    elif k["PARALLEL"] == "fsdp":
+        parts = FsdpParts(
+            *parts_args, model=built.backbone, extra=lambda: {"world": world}
         )
     else:
         parts = Parts(*parts_args, extra=lambda: {"world": world})
@@ -198,6 +225,7 @@ def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
         val_batches,
         ckpt,
         parts,
+        reduce_loss=hooks.reduce_loss,
     )
     state = TrainState()
     resume = ckpt.resolve(k["RESUME"])
@@ -209,9 +237,21 @@ def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
     driver.run(step, loader, bundle, ema, state)
     if writer is not None:
         writer.close()
-    if is_main:
-        meta = {"kohakumoss_step": str(state.step), "kohakumoss_algo": str(k["ALGO"])}
-        for path in export(k, built, output_dir, meta):
-            print(f"exported {path}", file=sys.stderr)
+    with full_weights(k["PARALLEL"], built.backbone):
+        if is_main:
+            meta = {
+                "kohakumoss_step": str(state.step),
+                "kohakumoss_algo": str(k["ALGO"]),
+            }
+            for path in export(k, built, output_dir, meta):
+                print(f"exported {path}", file=sys.stderr)
     logger.close()
     return state
+
+
+def full_weights(kind: str, backbone):
+    """Context in which every rank's backbone holds full weights (FSDP2: unsharded on
+    every rank; otherwise nothing to do)."""
+    if kind == "fsdp":
+        return unsharded(backbone)
+    return contextlib.nullcontext()

@@ -11,17 +11,17 @@ import torch
 from torch import Tensor, nn
 
 
-def gamma_from_sigma_rel(sigma_rel: float) -> float:
-    """Solve sigma_rel^2 = (g+1) / ((g+2)^2 (g+3)) for gamma (EDM2, eq. 3)."""
-    t = sigma_rel**-2
-    roots = torch.tensor([1.0, 7.0, 16.0 - t, 12.0 - t], dtype=torch.float64)
-    companion = torch.zeros(3, 3, dtype=torch.float64)
-    companion[0] = -roots[1:] / roots[0]
-    companion[1, 0] = 1.0
-    companion[2, 1] = 1.0
-    eig = torch.linalg.eigvals(companion)
-    real = [float(e.real) for e in eig if abs(float(e.imag)) < 1e-9 and e.real > -1]
-    return max(real)
+def gamma_from_sigma_rel(sigma_rel: float, iters: int = 60) -> float:
+    """Solve sigma_rel^2 = (g+1) / ((g+2)^2 (g+3)) for gamma (EDM2, eq. 3): the largest
+    root of g^3 + 7 g^2 + (16 - t) g + 12 - t, t = sigma_rel^-2, by float32 Newton
+    from g = sqrt(t), right of the root where the cubic is convex and increasing."""
+    t = torch.tensor(sigma_rel, dtype=torch.float32).pow(-2)
+    g = t.sqrt()
+    for _ in range(iters):
+        f = ((g + 7.0) * g + (16.0 - t)) * g + (12.0 - t)
+        df = (3.0 * g + 14.0) * g + (16.0 - t)
+        g = g - f / df
+    return float(g)
 
 
 class NoEMA:
@@ -42,8 +42,34 @@ class NoEMA:
         raise KeyError(tag)
 
 
+CHUNK_NUMEL = 64 * 1024 * 1024  # fp32 elements of converted copies alive at once
+
+
+def _chunks(indices: list[int], sizes: list[int], limit: int) -> list[list[int]]:
+    """Consecutive groups of `indices` whose summed size stays within `limit` (a
+    tensor larger than `limit` is a group of its own)."""
+    out, cur, total = [], [], 0
+    for i in indices:
+        if cur and total + sizes[i] > limit:
+            out.append(cur)
+            cur, total = [], 0
+        cur.append(i)
+        total += sizes[i]
+    return out + ([cur] if cur else [])
+
+
 class _BufferEMA:
-    def __init__(self, named: list[tuple[str, nn.Parameter]], tags, device):
+    """fp32 average buffers. Parameters already fp32 on the buffer's device are lerped
+    in place in one foreach call; the others are converted in chunks of at most
+    `chunk_numel` elements, so one chunk of fp32 copies is alive at a time."""
+
+    def __init__(
+        self,
+        named: list[tuple[str, nn.Parameter]],
+        tags,
+        device,
+        chunk_numel: int = CHUNK_NUMEL,
+    ):
         self.names = [n for n, _ in named]
         self.params = [p for _, p in named]
         self.tags = tuple(tags)
@@ -54,13 +80,31 @@ class _BufferEMA:
             ]
             for tag in self.tags
         }
+        ref = next(iter(self.buffers.values()), [])
+        same = [
+            i
+            for i, (p, b) in enumerate(zip(self.params, ref))
+            if p.dtype == torch.float32 and p.device == b.device
+        ]
+        rest = [i for i in range(len(self.params)) if i not in set(same)]
+        self.direct = same
+        self.converted = _chunks(
+            rest, [p.numel() for p in self.params], max(int(chunk_numel), 1)
+        )
 
     def _lerp(self, tag: str, weight: float) -> None:
         bufs = self.buffers[tag]
-        src = [
-            p.detach().to(b.device, torch.float32) for p, b in zip(self.params, bufs)
-        ]
-        torch._foreach_lerp_(bufs, src, weight)
+        if self.direct:
+            torch._foreach_lerp_(
+                [bufs[i] for i in self.direct],
+                [self.params[i].detach() for i in self.direct],
+                weight,
+            )
+        for chunk in self.converted:
+            src = [
+                self.params[i].detach().to(bufs[i].device, torch.float32) for i in chunk
+            ]
+            torch._foreach_lerp_([bufs[i] for i in chunk], src, weight)
 
     def state_dict(self) -> dict[str, Tensor]:
         return {
@@ -90,9 +134,14 @@ class ConstantEMA(_BufferEMA):
     """ema <- decay * ema + (1 - decay) * p, with optional (1+t)/(10+t) warmup."""
 
     def __init__(
-        self, named, decays: tuple[float, ...], warmup: bool = True, device=None
+        self,
+        named,
+        decays: tuple[float, ...],
+        warmup: bool = True,
+        device=None,
+        chunk_numel: int = CHUNK_NUMEL,
     ):
-        super().__init__(named, [f"ema{d:g}" for d in decays], device)
+        super().__init__(named, [f"ema{d:g}" for d in decays], device, chunk_numel)
         self.decays = tuple(decays)
         rule = _warm_decay if warmup else _fixed_decay
         self.rules = tuple(partial(rule, d) for d in self.decays)
@@ -107,8 +156,16 @@ class ConstantEMA(_BufferEMA):
 class PowerEMA(_BufferEMA):
     """EDM2 power-function EMA per sigma_rel."""
 
-    def __init__(self, named, sigma_rels: tuple[float, ...], device=None):
-        super().__init__(named, [f"power{s:g}" for s in sigma_rels], device)
+    def __init__(
+        self,
+        named,
+        sigma_rels: tuple[float, ...],
+        device=None,
+        chunk_numel: int = CHUNK_NUMEL,
+    ):
+        super().__init__(
+            named, [f"power{s:g}" for s in sigma_rels], device, chunk_numel
+        )
         self.sigma_rels = tuple(sigma_rels)
         self.gammas = tuple(gamma_from_sigma_rel(s) for s in sigma_rels)
 

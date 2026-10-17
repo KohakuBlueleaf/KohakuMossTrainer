@@ -58,6 +58,7 @@ def build_bundle(
             agree=agree,
             clip=grad_clip,
             shared=shared,
+            device=device,
             **{k: v for k, v in hooks.items() if k != "grads"},
         )
     opt = make(groups=groups)
@@ -73,5 +74,6 @@ def build_bundle(
         agree=agree,
         train_mode=train_mode,
         eval_mode=eval_mode,
+        device=device,
         **hooks,
     )

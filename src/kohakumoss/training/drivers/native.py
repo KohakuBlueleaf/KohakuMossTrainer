@@ -1,8 +1,9 @@
-"""Native driver: the plain training loop (default; works with spawn + gloo on Windows).
+"""Native driver: the plain training loop (the default driver).
 
-Everything fixed after build — callbacks and their cadence (CallbackRunner, which also
-carries checkpoint saving), accumulation flags, the token counter, the gradient-sync
-context — is prepared in `__init__`; the loop only branches on the bundle's skip result.
+Everything fixed after build is prepared in `__init__`: callbacks and their cadence
+(CallbackRunner, which also carries checkpoint saving), accumulation flags, the token
+counter and the gradient-sync context. The loop only branches on the bundle's skip
+result.
 """
 
 from collections.abc import Callable
@@ -15,6 +16,7 @@ from kohakumoss.training.drivers.common import (
     account,
     grouped,
     last_flags,
+    loss_count,
     no_accumulate,
     record,
 )
@@ -22,8 +24,13 @@ from kohakumoss.training.state import TrainState
 from kohakumoss.training.step import image_token_count
 
 
+def _nothing() -> None:
+    return None
+
+
 class NativeDriver:
-    """GRAD_ACC host batches per optimiser step, normalised by their global token count."""
+    """GRAD_ACC host batches per optimiser step, normalised by their global token count.
+    `end_step` runs after the step's last backward (the adapter set's `end_step`)."""
 
     def __init__(
         self,
@@ -37,7 +44,9 @@ class NativeDriver:
         parts: Parts,
         accumulate: Callable = no_accumulate,
         count_fn: Callable = image_token_count,
+        end_step: Callable[[], None] = _nothing,
     ):
+        self.end_step = end_step
         self.steps = steps
         self.grad_acc = grad_acc
         self.batcher = batcher
@@ -56,14 +65,17 @@ class NativeDriver:
         out = None
         while state.step < self.steps:
             group = next(groups)
-            count = account(state, group, self.count_fn)
+            count = loss_count(group, self.count_fn)
             out = self.run_group(step, group, count, bundle, state)
+            self.end_step()
+            account(state, group)
             if bundle.step():
                 ema.update(state.step)
             state.step += 1
             record(state, bundle)
             self.runner.run(state, out)
-        self.checkpoints.save(state.step, self.parts(state))
+        if not self.checkpoints.saved(state.step):
+            self.checkpoints.save(state.step, self.parts(state))
         return state
 
     def run_group(self, step, group: list, count: int, bundle, state: TrainState):

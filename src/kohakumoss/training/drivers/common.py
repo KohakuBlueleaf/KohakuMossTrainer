@@ -28,14 +28,16 @@ def last_flags(n: int) -> tuple[bool, ...]:
     return (False,) * (n - 1) + (True,)
 
 
-def account(
-    state: TrainState, group: list, count_fn: Callable = image_token_count
-) -> int:
-    """Add a group's counts to `state`; returns its loss-token count (`count_fn`)."""
-    count = 0
+def loss_count(group: list, count_fn: Callable = image_token_count) -> int:
+    """A group's loss-token count (`count_fn` per host batch)."""
+    return sum(count_fn(hb) for hb in group)
+
+
+def account(state: TrainState, group: list) -> None:
+    """Add a group's sample / token counts to `state`, after its batches were moved to
+    the device (online text encoding fills `text_len` there)."""
     ids = []
     for hb in group:
-        count += count_fn(hb)
         img = image_tokens_per_sample(hb)
         txt = hb.text_len.tolist()
         state.samples += len(img)
@@ -44,7 +46,6 @@ def account(
         state.tokens += sum(img)
         ids += hb.ids.tolist()
     state.batch_ids = ids
-    return count
 
 
 def record(state: TrainState, bundle) -> None:
@@ -54,6 +55,7 @@ def record(state: TrainState, bundle) -> None:
     state.lr = bundle.lr
     state.scale = bundle.scaler.scale
     state.skipped = bundle.skipped
+    state.nonfinite = bundle.nonfinite
 
 
 class Parts:

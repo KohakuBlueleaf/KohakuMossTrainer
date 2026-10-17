@@ -66,8 +66,20 @@ class SampleGrid:
         self.logger.log_images("samples", images, state.step)
 
 
+def _local(t: Tensor) -> Tensor:
+    return t
+
+
+def _nothing() -> None:
+    return None
+
+
 class Validation:
-    """Mean loss over fixed held-out batches at fixed sigmas and seeded noise."""
+    """Mean loss over fixed held-out batches at fixed sigmas and seeded noise.
+
+    Each batch's loss uses the global token denominator; `reduce_loss` sums the ranks'
+    shares (the training loss reduction), so the value is the global per-token mean.
+    """
 
     def __init__(
         self,
@@ -78,7 +90,10 @@ class Validation:
         seed: int,
         model: torch.nn.Module,
         modes: tuple[Callable, Callable],
+        reduce_loss: Callable[[Tensor], Tensor] = _local,
+        end_step: Callable[[], None] = _nothing,
     ):
+        self.end_step = end_step
         self.every = every
         self.batches = batches
         self.sigmas = tuple(sigmas)
@@ -86,18 +101,24 @@ class Validation:
         self.steps = [make_step(FixedSigma(s)) for s in self.sigmas]
         self.model = model
         self.eval_mode, self.train_mode = modes
+        self.reduce_loss = reduce_loss
 
     @torch.no_grad()
     def evaluate(self) -> dict[str, float]:
-        """Per-sigma and mean validation loss with noise reseeded per sigma."""
-        out, total = {}, 0.0
-        for sigma, step in zip(self.sigmas, self.steps):
+        """Per-sigma and mean validation loss with noise reseeded per sigma (one host
+        transfer for all sigmas)."""
+        per_sigma = []
+        for step in self.steps:
             step.noise_gen.manual_seed(self.seed)
-            losses = [float(step(b, step.denominator(b)).loss) for b in self.batches]
-            value = sum(losses) / max(len(losses), 1)
-            out[f"val_loss@{sigma:g}"] = value
-            total += value
-        out["val_loss"] = total / max(len(self.sigmas), 1)
+            total = sum(
+                step(b, step.denominator(b)).loss.float().reshape(1)
+                for b in self.batches
+            )
+            per_sigma.append(self.reduce_loss(total) / max(len(self.batches), 1))
+        self.end_step()
+        values = torch.cat(per_sigma).tolist() if per_sigma else []
+        out = {f"val_loss@{s:g}": v for s, v in zip(self.sigmas, values)}
+        out["val_loss"] = sum(values) / max(len(values), 1)
         return out
 
     def on_step_end(self, state: TrainState, out) -> None:

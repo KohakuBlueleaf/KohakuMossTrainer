@@ -19,6 +19,6 @@ STEPS = 20
 SCHEDULE = {"mode": "cosine", "warmup": 2, "end": -1}
 LOG_EVERY = 1
 SAVE_EVERY = 10
-PRECISION = "fp32"
+PRECISION = "auto"
 OUTPUT_DIR = "runs/smoke"
 RUN_NAME = "tiny"

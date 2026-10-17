@@ -7,6 +7,8 @@ import pytest
 import torch
 
 from kohakumoss.parallel.pipeline import MicroBatch
+from kohakumoss.training.build.objective import build_loss
+from kohakumoss.training.build.pipelines import pipeline_objective
 from kohakumoss.training.drivers.pipeline import PipelineDriver, PipelineObjective
 from kohakumoss.types.seqinfo import build_seqinfo
 from kohakumoss_kernels.backends.eager.loss import token_mse
@@ -54,6 +56,27 @@ def test_objective_uses_kept_token_counts():
         torch.testing.assert_close(got, want)
 
     must_fail(full_grid_ranges, "per-sample ranges from the full grid")
+
+
+@pytest.mark.parametrize("loss", ["huber", "l1"])
+def test_objective_follows_the_configured_loss(loss):
+    built = SimpleNamespace(
+        backbone=SimpleNamespace(ops=SimpleNamespace(token_mse=token_mse))
+    )
+    k = {"LOSS": loss, "LOSS_KWARGS": {}}
+    objective = pipeline_objective(k, built)
+    objective.scaler = SimpleNamespace(scale=1.0)
+    mb = _micro()
+    pred = mb.target + 3.0 * torch.randn_like(mb.target)
+    seg = torch.repeat_interleave(torch.arange(2), torch.tensor([3, 6])).to(torch.int32)
+    want = build_loss(k, built)(pred, mb.target, seg, WEIGHT, None)
+    torch.testing.assert_close(objective(pred, mb), want)
+    must_fail(
+        lambda: torch.testing.assert_close(
+            objective(pred, mb), token_mse(pred, mb.target, seg, WEIGHT, None)
+        ),
+        "pipeline loss fixed to MSE",
+    )
 
 
 def test_driver_micro_carries_img_keep():

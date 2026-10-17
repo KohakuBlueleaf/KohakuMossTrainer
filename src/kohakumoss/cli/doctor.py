@@ -11,19 +11,19 @@ import importlib.metadata as metadata
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 
 import torch
 
-from kohakumoss.training.build.integration import MEMORY_RESOLVE
-from kohakumoss.training.build.model import optional_object
-from kohakumoss_kernels import available
+from kohakumoss.training.memory.profiles import ORDER
+from kohakumoss.training.memory.profiles import resolve as resolve_profile
+from kohakumoss_kernels import available, health, registry
 from kohakumoss_kernels import ops as kernel_ops
 from kohakumoss_kernels.hardware.arch import arch_of
-
-PROFILE_NAMES = ("speed", "balanced", "low", "minimal")
+from kohakumoss_kernels.hardware.toolchain import compilers
 
 PACKAGES = (
     "torch",
@@ -40,6 +40,7 @@ PACKAGES = (
     "bitsandbytes",
 )
 VSWHERE = r"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s'\",;]*|(?<![\w.])/[\w.-]+/[^\s'\",;]*")
 MSVC_GLOB = (
     r"%ProgramFiles%\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe"
 )
@@ -74,10 +75,22 @@ def devices() -> list[dict]:
             )
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         for i in range(torch.xpu.device_count()):
+            props = torch.xpu.get_device_properties(i)
             out.append(
-                {"index": i, "name": torch.xpu.get_device_name(i), "arch": "xpu"}
+                {
+                    "index": i,
+                    "name": props.name,
+                    "arch": "xpu",
+                    "memory_gib": round(props.total_memory / 1024**3, 2),
+                }
             )
     return out
+
+
+def device_kinds() -> list[str]:
+    """One device per accelerator kind present, then cpu (the kernel matrix rows)."""
+    kinds = [k for k in ("cuda", "xpu") if getattr(torch, k).is_available()]
+    return [f"{k}:0" for k in kinds] + ["cpu"]
 
 
 def msvc() -> dict:
@@ -104,6 +117,17 @@ def msvc() -> dict:
     }
 
 
+def _no_paths(text: str) -> str:
+    return PATH_RE.sub("<path>", text)
+
+
+def backend_failures() -> dict[str, str]:
+    """Backends that failed an op here, this process and earlier runs (paths removed)."""
+    out = {k: v["error"] for k, v in registry.recorded_failures().items()}
+    out.update(registry.failures())
+    return {k: _no_paths(v)[:300] for k, v in sorted(out.items())}
+
+
 def kernel_matrix(device: str) -> dict:
     out = {}
     for dtype in (torch.float16, torch.bfloat16):
@@ -115,24 +139,21 @@ def kernel_matrix(device: str) -> dict:
 
 
 def memory_plans(device: str) -> dict:
-    """Each named memory profile resolved for `device` (empty when unavailable)."""
-    resolve = optional_object(MEMORY_RESOLVE)
-    if resolve is None:
-        return {}
+    """Each named memory profile resolved for `device`."""
     out = {}
-    for profile in PROFILE_NAMES:
+    for profile in ORDER:
         try:
-            out[profile] = {
-                k: str(v) for k, v in vars(resolve(profile, device=device)).items()
-            }
+            plan = resolve_profile(profile, device=device)
+            out[profile] = {k: str(v) for k, v in vars(plan).items()}
         except (ValueError, RuntimeError) as err:
             out[profile] = {"error": str(err)}
     return out
 
 
 def report(memory: bool = False) -> dict:
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    extra = {"memory_plans": memory_plans(dev)} if memory else {}
+    kinds = device_kinds()
+    extra = {"memory_plans": memory_plans(kinds[0])} if memory else {}
+    kernels = {dev: kernel_matrix(dev) for dev in kinds}
     return {
         **extra,
         "os": platform.system(),
@@ -142,7 +163,13 @@ def report(memory: bool = False) -> dict:
         "packages": versions(),
         "devices": devices(),
         "msvc": msvc(),
-        "kernels": kernel_matrix(dev),
+        "compilers": {k: _no_paths(v) for k, v in compilers().items()},
+        "kernels": kernels,
+        "backend_health": {
+            k: None if v is None else _no_paths(v)[:300]
+            for k, v in health.health_report().items()
+        },
+        "backend_failures": backend_failures(),
     }
 
 
@@ -158,10 +185,17 @@ def _print(rep: dict) -> None:
         )
     if rep["msvc"]["needed"]:
         print(f"  MSVC: {rep['msvc']}")
-    for dtype, table in rep["kernels"].items():
-        for op, row in table.items():
-            ok = ", ".join(b for b, v in row.items() if v) or "none"
-            print(f"  {dtype:8s} {op:24s} {ok}")
+    for backend, compiler in rep["compilers"].items():
+        print(f"  compiler {backend:15s} {compiler}")
+    for key, why in rep["backend_health"].items():
+        print(f"  health {key:20s} {'ok' if why is None else why}")
+    for key, error in rep["backend_failures"].items():
+        print(f"  FAILED {key}: {error}")
+    for dev, tables in rep["kernels"].items():
+        for dtype, table in tables.items():
+            for op, row in table.items():
+                ok = ", ".join(b for b, v in row.items() if v) or "none"
+                print(f"  {dev:7s} {dtype:8s} {op:24s} {ok}")
 
 
 def main() -> None:
@@ -170,7 +204,14 @@ def main() -> None:
     parser.add_argument(
         "--memory", action="store_true", help="resolve every memory profile"
     )
+    parser.add_argument(
+        "--clear-failures",
+        action="store_true",
+        help="forget recorded backend failures before reporting",
+    )
     args = parser.parse_args()
+    if args.clear_failures:
+        health.clear_failures()
     rep = report(args.memory)
     _print(rep)
     for profile, plan in rep.get("memory_plans", {}).items():

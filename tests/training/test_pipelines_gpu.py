@@ -66,7 +66,8 @@ TOKEN_DROP = {"MAX_TOKENS": 240, "OVERLONG": "drop_tokens"}  # 256-token images
 def test_pipelined_matches_single_device(tmp_path, kind, extra):
     data = _data_knobs(tmp_path, **extra)
     ref = _trained(tmp_path, "ref", data, GRAD_ACC=2)
-    got = _trained(tmp_path, kind, data, PARALLEL=kind, DEVICES=(0, 1))
+    schedule = {"PIPELINE_SCHEDULE": "gpipe"} if kind == "threaded" else {}
+    got = _trained(tmp_path, kind, data, PARALLEL=kind, DEVICES=(0, 1), **schedule)
     assert ref.keys() == got.keys()
     changed = 0
     for key, value in ref.items():

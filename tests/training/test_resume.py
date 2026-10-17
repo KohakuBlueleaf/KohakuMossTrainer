@@ -89,7 +89,7 @@ def test_resume_is_bit_exact(tmp_path):
         "trainable.safetensors",
         "ema.safetensors",
         "optim.pt",
-        "rng.pt",
+        "rng.0.pt",
         "state.json",
     } <= files
 
@@ -101,13 +101,23 @@ def test_resume_without_step_rng_diverges(tmp_path):
 
 
 def test_loss_decreases_on_fixed_batch(tmp_path):
-    model, drv, step, loader, bundle, ema, _, _ = make_run(tmp_path / "c", 1)
+    model, drv, step, loader, _, ema, _, _ = make_run(tmp_path / "c", 1)
+    bundle = build_bundle(
+        FullTrainable(model).param_groups(1e-3, weight_decay=0.0, rules="moss"),
+        DEV,
+        "adamw",
+        {"lr": 1e-3, "betas": (0.9, 0.95), "eps": 1e-8},
+        {"mode": "constant", "end": -1},
+        40,
+        build_policy("fp32", ()),
+        1.0,
+    )
     batch = DeviceBatcher(DEV)(next(iter(loader)))
     losses = []
     denom = step.denominator(batch)
-    for i in range(30):
+    for i in range(40):
         out = step(batch, denom, step=i)
         bundle.backward(out.loss)
         bundle.step()
         losses.append(bundle.last_loss)
-    assert losses[-1] < losses[0]
+    assert sum(losses[-10:]) < sum(losses[:10])  # per-step sigma varies; compare means

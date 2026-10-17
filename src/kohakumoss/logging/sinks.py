@@ -1,6 +1,7 @@
 """Metric sinks (rank 0 only): console + metrics.jsonl, KohakuBoard, wandb."""
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -86,7 +87,8 @@ class BoardLogger(ConsoleLogger):
 
 
 class WandbLogger(ConsoleLogger):
-    """wandb run (offline unless WANDB_MODE says otherwise), plus the console/jsonl sink."""
+    """wandb run, plus the console/jsonl sink. `mode` defaults to WANDB_MODE, else
+    "offline"."""
 
     def __init__(
         self,
@@ -94,11 +96,12 @@ class WandbLogger(ConsoleLogger):
         name: str,
         project: str,
         config: dict,
-        mode: str = "offline",
+        mode: str | None = None,
     ):
         super().__init__(output_dir)
         if wandb is None:
             raise SystemExit("LOGGER='wandb' needs the `wandb` package installed")
+        mode = mode or os.environ.get("WANDB_MODE", "offline")
         self.run = wandb.init(
             project=project, name=name, config=config, dir=output_dir, mode=mode
         )

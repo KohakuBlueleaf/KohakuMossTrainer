@@ -1,9 +1,6 @@
-"""Apply a MemoryPlan to model components, once, at build time (training or inference).
-
-Order on the backbone: quantize the frozen base -> stream block weights -> activation
-offload -> compose the BlockRunner. The caller re-binds ops afterwards
-(`backbone.bind_ops()`, build order in types/api.py).
-"""
+"""Apply a MemoryPlan to model components, once, at build time (training or inference):
+quantize the frozen base -> place / stream block weights -> activation offload -> the
+BlockRunner. The caller re-binds ops afterwards (build order in types/api.py)."""
 
 from dataclasses import dataclass, field
 
@@ -40,25 +37,36 @@ class MemoryEngines:
     grads: GradOffload | None = None
     reports: dict = field(default_factory=dict)
 
+    def _host_step(self) -> bool:
+        """Streamed trainable blocks stepped by a host optimiser (not in backward)."""
+        return (
+            self.stream is not None
+            and self.stream.trainable
+            and self.stream.optimizer is None
+        )
+
     def before_step(self) -> None:
         """Land offloaded / streamed-block gradients on the host before optimiser.step."""
-        if self.stream is not None and self.stream.trainable:
+        if self._host_step():
             self.stream.flush_grads()
         if self.grads is not None:
             self.grads.flush()
 
     def after_step(self) -> None:
-        """Push updated host masters into the streaming copies, clear host grads."""
-        if self.stream is not None and self.stream.trainable:
-            if self.stream.optimizer is None:
-                self.stream.refresh()
-                self.stream.zero_grads()
-            else:
-                self.stream.optimizer.finish()
+        """Push updated host masters into the streaming copies, clear host grads (an
+        in-backward block optimiser finishes itself)."""
+        if self._host_step():
+            self.stream.refresh()
+            self.stream.zero_grads()
         if self.offload is not None:
             self.offload.reset()
         if self.grads is not None:
             self.grads.zero()
+
+    def exclude_params(self, params) -> None:
+        """Never offload these parameters' saved tensors (adapters bound after the plan)."""
+        if self.offload is not None:
+            self.offload.exclude(params)
 
     def host_params(self) -> list[nn.Parameter]:
         """Parameters whose masters live on the host (optimise with a host optimiser)."""
@@ -85,15 +93,17 @@ def apply_to_backbone(
     quant_min_features: int = 256,
 ) -> MemoryEngines:
     """Install quantization, streaming, activation offload and the runner on `backbone`
-    (anything exposing `layers` and `set_runner`). The backbone is already on `device`
-    except for blocks the stream will own."""
+    (anything exposing `layers` and `set_runner`), on any device: weights end on
+    `device` except the streamed block weights, which stay in host memory."""
     engines = MemoryEngines(plan)
     if plan.base_precision in QUANT and not trainable_base:
         accept = default_filter(keep_fp32, quant_min_features)
         engines.reports["quant"] = quantize_model(
             backbone, plan.base_precision, accept, compute_dtype
         )
-        _rebind_quant(backbone, device, compute_dtype)
+    if plan.stream == "off":
+        backbone.to(device)
+    _rebind_quant(backbone, device, compute_dtype)
     if plan.stream != "off":
         move_except(backbone, backbone.layers, device)
         engines.stream = WeightStream(

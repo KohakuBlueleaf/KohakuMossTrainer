@@ -1,7 +1,5 @@
-"""Loop hooks for each PARALLEL kind (the training side of kohakumoss.parallel).
-
-DDP reduces adapter / full grads with a SUM all-reduce, so the global-token loss needs
-no world factor; FSDP2 averages, so the loss carries `world`.
+"""Loop hooks for each PARALLEL kind (the training side of kohakumoss.parallel). DDP
+and FSDP2 both SUM gradients over ranks; the loss is a share of the global-token mean.
 """
 
 import contextlib
@@ -13,7 +11,8 @@ import torch.distributed as dist
 from torch import Tensor
 
 from kohakumoss.diffusion.objective import all_reduce_sum, identity_reduce
-from kohakumoss.registry import import_object
+from kohakumoss.parallel.ddp import GradReducer, broadcast_params
+from kohakumoss.parallel.fsdp import shard
 from kohakumoss.training.drivers import no_accumulate
 from kohakumoss.training.optim.bundle import (
     all_reduce_max,
@@ -21,10 +20,6 @@ from kohakumoss.training.optim.bundle import (
     local_grad_norm,
     no_agree,
 )
-
-GRAD_REDUCER = "kohakumoss.parallel.ddp.GradReducer"
-BROADCAST = "kohakumoss.parallel.ddp.broadcast_params"
-FSDP_SHARD = "kohakumoss.parallel.fsdp.shard"
 
 
 @dataclass
@@ -57,8 +52,8 @@ class _Armed:
 
 def ddp_hooks(params: list) -> ParallelHooks:
     """Bucketed SUM reduce of `params`' grads on the last micro-batch."""
-    import_object(BROADCAST)(params)
-    reducer = import_object(GRAD_REDUCER)(params, average=False)
+    broadcast_params(params)
+    reducer = GradReducer(params, average=False)
     return ParallelHooks(
         reduce=all_reduce_sum,
         world_factor=1,
@@ -75,15 +70,27 @@ def fsdp_grad_norm(grads: list[Tensor]) -> Tensor:
     return norm.full_tensor() if hasattr(norm, "full_tensor") else norm
 
 
+class _GradientSync:
+    """FSDP2 accumulate context: reduce-scatter only on the last micro-batch."""
+
+    def __init__(self, root):
+        self.root = root
+
+    def __call__(self, last: bool):
+        self.root.set_requires_gradient_sync(last)
+        return contextlib.nullcontext()
+
+
 def fsdp_hooks(backbone, compute: torch.dtype, world: int) -> ParallelHooks:
-    """Shard each joint block, then the backbone (FSDP2, fp32 gradient reduction)."""
-    import_object(FSDP_SHARD)(backbone, backbone.layers, param_dtype=compute)
+    """Shard each joint block, then the backbone (FSDP2 SUM of fp32 gradients)."""
+    shard(backbone, backbone.layers, param_dtype=compute)
     return ParallelHooks(
         reduce=all_reduce_sum,
-        world_factor=world,
+        world_factor=1,
         agree=all_reduce_max,
-        reduce_loss=lambda t: reduce_mean_loss(t).div_(world),
+        reduce_loss=reduce_mean_loss,
         grad_norm=fsdp_grad_norm,
+        accumulate=_GradientSync(backbone),
     )
 
 

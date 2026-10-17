@@ -6,13 +6,11 @@ from functools import partial
 import torch
 
 from kohakumoss.model.opset import OpSet
-from kohakumoss.registry import import_object
-from kohakumoss.training.build import integration as I
+from kohakumoss.parallel.parts import BackboneParts
+from kohakumoss.parallel.pipeline import PipelineEngine, PipeShape
+from kohakumoss.parallel.threaded import ThreadedPipeline, even_bounds
+from kohakumoss.training.build.objective import build_loss
 from kohakumoss.training.drivers.pipeline import PipelineObjective
-
-BACKBONE_PARTS = "kohakumoss.parallel.parts.BackboneParts"
-EVEN_BOUNDS = "kohakumoss.parallel.threaded.even_bounds"
-PIPE_SHAPE = "kohakumoss.parallel.pipeline.PipeShape"
 
 
 def _opset_for(policy, kernels: dict, device):
@@ -21,10 +19,10 @@ def _opset_for(policy, kernels: dict, device):
 
 def build_threaded(k: dict, built, policy):
     """ThreadedPipeline over DEVICES, each stage bound to its device's kernels."""
-    parts = import_object(BACKBONE_PARTS)(built.backbone)
+    parts = BackboneParts(built.backbone)
     devices = [torch.device("cuda", i) for i in k["DEVICES"]]
-    schedule = k["PIPELINE_SCHEDULE"] if k["PIPELINE_SCHEDULE"] in ("gpipe", "async") else "gpipe"
-    return import_object(I.THREADED_PIPELINE)(
+    schedule = k["PIPELINE_SCHEDULE"]
+    return ThreadedPipeline(
         parts,
         devices,
         epilogue_modules=parts.epilogue_modules(),
@@ -34,17 +32,23 @@ def build_threaded(k: dict, built, policy):
     )
 
 
+def pipeline_objective(k: dict, built) -> PipelineObjective:
+    """The last stage's loss: LOSS / LOSS_KWARGS, as TrainStep builds it (the scaler
+    is set once the optimiser bundle exists)."""
+    return PipelineObjective(build_loss(k, built), scaler=None)
+
+
 def build_engine(k: dict, built, policy, rank: int, world: int, device):
     """(PipelineEngine for this rank, its objective) with static micro-batch shapes:
     MAX_TOKENS joint tokens and MAX_SAMPLES samples per micro-batch (both hard bounds of
     the planner under TOKEN_BUDGET='exact')."""
-    parts = import_object(BACKBONE_PARTS)(built.backbone)
+    parts = BackboneParts(built.backbone)
     cfg = built.backbone.cfg
-    shape = import_object(PIPE_SHAPE).from_knobs(k, dim=cfg.dim, rope_axes=cfg.rope_axes)
+    shape = PipeShape.from_knobs(k, dim=cfg.dim, rope_axes=cfg.rope_axes)
     per_rank = 1 if k["PIPELINE_SCHEDULE"] in ("gpipe", "1f1b") else 2
-    bounds = import_object(EVEN_BOUNDS)(cfg.depth, world * per_rank)
-    objective = PipelineObjective(built.backbone.ops.token_mse, scaler=None)
-    engine = import_object(I.PIPELINE_ENGINE)(
+    bounds = even_bounds(cfg.depth, world * per_rank)
+    objective = pipeline_objective(k, built)
+    engine = PipelineEngine(
         parts,
         rank,
         world,
@@ -58,6 +62,20 @@ def build_engine(k: dict, built, policy, rank: int, world: int, device):
         per_rank=per_rank,
     )
     return engine, objective
+
+
+def release_nonlocal(backbone, keep: set[int]) -> None:
+    """Move every block and top-level module with no parameter in `keep` (this rank's
+    stages) to host memory."""
+    modules = list(backbone.layers) + [
+        m for m in backbone.children() if m is not backbone.layers
+    ]
+    for module in modules:
+        params = list(module.parameters())
+        if params and not any(id(p) in keep for p in params):
+            module.to("cpu")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def local_names(trainable, engine) -> set[str]:

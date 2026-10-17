@@ -1,12 +1,22 @@
 """Lightning driver: the same TrainStep / OptimBundle under a LightningModule with
-manual optimisation (single device or Lightning DDP)."""
+manual optimisation on this process's one device. Multi-process runs are launched and
+gradient-synced by KohakuMoss (`accumulate` arms each micro-batch, as in the native
+driver); Lightning only drives the loop."""
 
 from collections.abc import Callable
 
 import torch
 
 from kohakumoss.training.callbacks.runner import CallbackRunner
-from kohakumoss.training.drivers.common import Parts, account, grouped, record
+from kohakumoss.training.drivers.common import (
+    Parts,
+    account,
+    grouped,
+    last_flags,
+    loss_count,
+    no_accumulate,
+    record,
+)
 from kohakumoss.training.state import TrainState
 from kohakumoss.training.step import image_token_count
 
@@ -18,13 +28,30 @@ except ImportError:
 _Base = L.LightningModule if L is not None else torch.nn.Module
 
 
+def _nothing() -> None:
+    return None
+
+
 class MossModule(_Base):
     """Wraps the backbone; `training_step` takes one group of GRAD_ACC host batches."""
 
     def __init__(
-        self, backbone, step, bundle, ema, batcher, normalizer, runner, state, count_fn
+        self,
+        backbone,
+        step,
+        bundle,
+        ema,
+        batcher,
+        normalizer,
+        runner,
+        state,
+        count_fn,
+        accumulate,
+        lasts,
+        end_step,
     ):
         super().__init__()
+        self.end_step = end_step
         self.automatic_optimization = False
         self.backbone = backbone
         self.step_fn = step
@@ -35,6 +62,8 @@ class MossModule(_Base):
         self.runner = runner
         self.state = state
         self.count_fn = count_fn
+        self.accumulate = accumulate
+        self.lasts = lasts
 
     def configure_optimizers(self):
         return None
@@ -44,12 +73,16 @@ class MossModule(_Base):
 
     def training_step(self, group, batch_idx):
         state = self.state
-        count = account(state, group, self.count_fn)
+        count = loss_count(group, self.count_fn)
         denom = self.normalizer.denominator(count, self.device)
         out = None
-        for hb in group:
-            out = self.step_fn(self.batcher(hb), denom, state.step)
-            self.bundle.backward(out.loss)
+        for hb, last in zip(group, self.lasts):
+            batch = self.batcher(hb)
+            with self.accumulate(last):
+                out = self.step_fn(batch, denom, state.step)
+                self.bundle.backward(out.loss)
+        self.end_step()
+        account(state, group)
         if self.bundle.step():
             self.ema.update(state.step)
         state.step += 1
@@ -71,10 +104,11 @@ class LightningDriver:
         runner: CallbackRunner,
         checkpoints,
         parts: Parts,
-        devices: int = 1,
-        strategy: str = "auto",
+        accumulate: Callable = no_accumulate,
         count_fn: Callable = image_token_count,
+        end_step: Callable[[], None] = _nothing,
     ):
+        self.end_step = end_step
         if L is None:
             raise SystemExit(
                 "DRIVER='lightning' needs the `lightning` package installed"
@@ -87,9 +121,9 @@ class LightningDriver:
         self.runner = runner
         self.checkpoints = checkpoints
         self.parts = parts
-        self.devices = devices
-        self.strategy = strategy
+        self.accumulate = accumulate
         self.count_fn = count_fn
+        self.lasts = last_flags(grad_acc)
 
     def run(self, step, loader, bundle, ema, state: TrainState) -> TrainState:
         self.runner.reset(state.step)
@@ -103,14 +137,17 @@ class LightningDriver:
             self.runner,
             state,
             self.count_fn,
+            self.accumulate,
+            self.lasts,
+            self.end_step,
         )
         trainer = L.Trainer(
             max_epochs=1,
             limit_train_batches=self.steps - state.step,
             num_sanity_val_steps=0,
             accelerator=self.device.type,
-            devices=self.devices,
-            strategy=self.strategy,
+            devices=_one_device(self.device),
+            strategy="auto",
             precision="32-true",
             logger=False,
             enable_checkpointing=False,
@@ -118,8 +155,14 @@ class LightningDriver:
             use_distributed_sampler=False,
         )
         trainer.fit(module, train_dataloaders=_Groups(loader, self.grad_acc))
-        self.checkpoints.save(state.step, self.parts(state))
+        if not self.checkpoints.saved(state.step):
+            self.checkpoints.save(state.step, self.parts(state))
         return state
+
+
+def _one_device(device: torch.device):
+    """Lightning's `devices` for exactly this process's device."""
+    return [device.index] if device.index is not None else 1
 
 
 class _Groups:

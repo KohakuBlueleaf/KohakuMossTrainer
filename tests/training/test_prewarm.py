@@ -162,13 +162,9 @@ def test_prewarm_binds_raced_ops(tmp_path, monkeypatch):
         k = {"TUNE": "auto", "TARGET_AREA": 256 * 256, "MAX_TOKENS": 1024}
         k.update(PARALLEL="none", DEVICES=(0,), MAX_TEXT_TOKENS=64)
         build_prewarm(k, model, torch.float16)([dev])
-        raced = [
-            getattr(model.ops, n)
-            for n in BLOCK_OPS
-            if isinstance(getattr(model.ops, n), race.RacedOp)
-        ]
-        if not raced:
-            pytest.skip("no raced block ops on this device")
+        bound = [getattr(model.ops, n) for n in BLOCK_OPS]
+        raced = [b.fn for b in bound if isinstance(b.fn, race.RacedOp)]
+        assert raced, [b.backend for b in bound]
         for op in raced:
             assert not op.pending, op.name
             assert tuner.table(dev, op.name).rows, op.name

@@ -1,5 +1,7 @@
 """MOSS timestep sampler against a direct Monte-Carlo of its definition."""
 
+import math
+
 import pytest
 import torch
 
@@ -29,8 +31,58 @@ def max_cdf_gap(p, q):
 )
 def test_pmf_matches_definition(mu, s, cutoff):
     pmf = moss_pmf(1000, mu, s, cutoff, uniform_mix=0.0, p_full=0.0)
-    assert abs(pmf.sum().item() - 1.0) < 1e-9
-    assert max_cdf_gap(pmf, simulate(400_000, mu, s, cutoff)) < 4e-3
+    assert pmf.dtype == torch.float32
+    assert abs(pmf.double().sum().item() - 1.0) < 1e-6
+    assert max_cdf_gap(pmf.double(), simulate(400_000, mu, s, cutoff)) < 4e-3
+
+
+def _pmf64(steps, mu, s, cutoff, uniform_mix, p_full):
+    """The fp64 reference table (test only)."""
+    a = 1.0 if cutoff is None else float(cutoff)
+    x = (a * torch.arange(steps + 1, dtype=torch.float64) / steps).clamp(0.0, 1.0)
+    u = (torch.log1p(-x) - torch.log(x) - mu) / (s * math.sqrt(2.0))
+    cdf = torch.where(x <= 0, 0.0, torch.where(x >= 1, 1.0, 0.5 * torch.erfc(u)))
+    pmf = (1.0 - uniform_mix) * (cdf[1:] - cdf[:-1]) / cdf[-1] + uniform_mix / steps
+    pmf = pmf * (1.0 - p_full)
+    pmf[-1] += p_full
+    return pmf / pmf.sum()
+
+
+def _naive32(steps, mu, s, cutoff):
+    """fp32 with plain cdf differences (bins near cdf ~ 1 lose their digits)."""
+    a = 1.0 if cutoff is None else float(cutoff)
+    x = (a * torch.arange(steps + 1, dtype=torch.float32) / steps).clamp(0.0, 1.0)
+    u = (torch.log1p(-x) - torch.log(x) - mu) / (s * math.sqrt(2.0))
+    cdf = torch.where(x <= 0, 0.0, torch.where(x >= 1, 1.0, 0.5 * torch.erfc(u)))
+    pmf = (cdf[1:] - cdf[:-1]) / cdf[-1]
+    return pmf / pmf.sum()
+
+
+def _close_bins(got, ref) -> None:
+    live = ref > 1e-6
+    rel = ((got.double() - ref).abs() / ref)[live].max().item()
+    assert rel < 3e-4, rel
+    assert (got.double() - ref).abs().max().item() < 1e-6
+
+
+@pytest.mark.parametrize(
+    "mu,s,cutoff,mix,full",
+    [
+        (-1.09, 0.95, 0.95, 0.01, 0.0),
+        (0.0, 1.0, None, 0.0, 0.01),
+        (2.0, 0.6, None, 0, 0),
+    ],
+)
+def test_fp32_table_matches_the_fp64_reference(mu, s, cutoff, mix, full):
+    got = moss_pmf(1000, mu, s, cutoff, mix, full)
+    _close_bins(got, _pmf64(1000, mu, s, cutoff, mix, full))
+
+
+def test_naive_fp32_differences_fail_the_bar():
+    """Mass at low sigma: the upper bins are differences of cdf values near 1."""
+    ref = _pmf64(1000, 2.0, 0.6, None, 0.0, 0.0)
+    _close_bins(moss_pmf(1000, 2.0, 0.6, None, 0.0, 0.0), ref)
+    must_fail(lambda: _close_bins(_naive32(1000, 2.0, 0.6, None), ref), "naive fp32")
 
 
 def test_pmf_wrong_sign_fails():
@@ -57,7 +109,7 @@ def test_uniform_mix_and_full_noise_mass():
     base = moss_pmf(1000, 0.0, 1.0, None, uniform_mix=0.0, p_full=0.0)
     expect = (0.99 * base + 0.01 / 1000) * 0.99
     expect[-1] += 0.01
-    assert torch.allclose(pmf, expect / expect.sum(), atol=1e-12)
+    assert torch.allclose(pmf, expect / expect.sum(), atol=1e-8)
 
 
 def test_shift_and_stage_switch():

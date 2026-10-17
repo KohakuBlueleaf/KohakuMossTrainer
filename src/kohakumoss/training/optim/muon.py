@@ -2,8 +2,8 @@
 
 Groups with `use_muon` take Nesterov momentum then a 5-step Newton-Schulz
 orthogonalisation per chunk (fused qkv / up-gate matrices are split by `splits`),
-scaled by 0.2 * sqrt(max(rows, cols)) so the update RMS matches AdamW's.
-Other groups run AdamW.
+scaled by 0.2 * sqrt(max(rows, cols)). Other groups run AdamW. See
+docs/concepts/training.md.
 """
 
 import math

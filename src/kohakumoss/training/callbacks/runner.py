@@ -7,6 +7,9 @@ order is the order the callbacks were given. Callbacks themselves never check ca
 
 import math
 import time
+from collections.abc import Callable
+
+import torch.distributed as dist
 
 from kohakumoss.training.state import TrainState
 
@@ -57,19 +60,39 @@ class SaveCheckpoint:
         self.checkpoints.save(state.step, self.parts(state))
 
 
+def _own_decision(due: bool) -> bool:
+    return due
+
+
+def rank0_decision(due: bool) -> bool:
+    """Rank 0's decision on every rank (one object broadcast)."""
+    box = [due]
+    dist.broadcast_object_list(box, src=0)
+    return bool(box[0])
+
+
 class TimedCheckpoint:
-    """Every step: write a checkpoint when `minutes` of wall time passed since the last."""
+    """Every `every` steps: write a checkpoint when `minutes` of wall time passed since
+    the last. `agree` makes every rank take rank 0's decision (the save is collective).
+    """
 
-    every = 1
-
-    def __init__(self, minutes: float, checkpoints, parts):
+    def __init__(
+        self,
+        minutes: float,
+        checkpoints,
+        parts,
+        every: int = 1,
+        agree: Callable[[bool], bool] = _own_decision,
+    ):
+        self.every = every
         self.seconds = minutes * 60.0
         self.checkpoints = checkpoints
         self.parts = parts
+        self.agree = agree
         self.last = time.monotonic()
 
     def on_step_end(self, state: TrainState, out) -> None:
         now = time.monotonic()
-        if now - self.last >= self.seconds:
+        if self.agree(now - self.last >= self.seconds):
             self.checkpoints.save(state.step, self.parts(state))
             self.last = now

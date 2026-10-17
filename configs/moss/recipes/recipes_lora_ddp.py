@@ -1,4 +1,4 @@
-"""LoRA with DDP over two GPUs (nccl on Linux, gloo on Windows; adapter-only reduce).
+"""LoRA with DDP over two GPUs (Linux, nccl; adapter-only reduce).
 Mixed fp16-only + bf16 GPUs need PRECISION='fp16'. Drives scripts/train/moss.py.
 
     kogine run scripts/train/moss.py --config configs/moss/recipes/recipes_lora_ddp.py

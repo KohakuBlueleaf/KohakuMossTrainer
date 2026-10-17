@@ -17,6 +17,7 @@ class TrainState:
     ok: bool = True
     lr: float = 0.0
     scale: float = 1.0
-    skipped: int = 0
+    skipped: int = 0  # steps not applied
+    nonfinite: int = 0  # steps with a non-finite gradient or loss
     batch_ids: list = field(default_factory=list)
     metrics: dict = field(default_factory=dict)

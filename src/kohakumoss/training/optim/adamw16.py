@@ -1,7 +1,5 @@
-"""AdamW for 16-bit parameters: fp32 math in registers, 16-bit state, sqrt(v) storage.
-
-Storing sqrt(v) instead of v keeps the second moment representable in fp16 (v ~ g^2
-underflows), and the parameter write-back rounding is selectable (nearest / stochastic /
+"""AdamW for 16-bit parameters: fp32 math in registers, 16-bit state, sqrt(v) stored in
+place of v, and a selectable parameter write-back rounding (nearest / stochastic /
 Kahan). See docs/concepts/training.md.
 """
 

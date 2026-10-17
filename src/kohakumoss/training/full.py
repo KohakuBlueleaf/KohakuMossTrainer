@@ -5,6 +5,7 @@ import re
 import torch
 from torch import Tensor, nn
 
+from kohakumoss.model import save_diffusers
 from kohakumoss.model.io.save import save_single
 from kohakumoss.training.optim.groups import build_param_groups
 
@@ -55,9 +56,22 @@ class FullTrainable:
     def export(
         self, path: str, fmt: str, metadata: dict[str, str], row_scales=None
     ) -> None:
-        """`merged`: bare-key single safetensors of the base weights, fold undone
-        (`row_scales` is for adapter formats and unused here)."""
+        """`merged`: bare-key single safetensors of the base weights, fold undone;
+        `diffusers`: the transformer folder (`row_scales` is for adapter formats and
+        unused here)."""
+        if fmt == "diffusers":
+            save_diffusers(self.model, path)
+            return
         save_single(self.model, path, dtype=self.dtype, metadata=metadata)
+
+    def begin_step(self, sigma: Tensor, seq, step: int) -> None:
+        return None
+
+    def end_step(self) -> None:
+        return None
+
+    def prewarm(self, rows: list[int], dtype: torch.dtype, devices: list) -> int:
+        return 0
 
     @property
     def dtype(self) -> torch.dtype:

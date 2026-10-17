@@ -16,6 +16,7 @@ from kohakumoss.diffusion.objective import TokenNormalizer, noise_latents
 from kohakumoss.types.batch import DeviceBatch
 from kohakumoss.types.seqinfo import build_seqinfo
 from kohakumoss.types.step import StepOut
+from kohakumoss_data.seeds import seed_of
 
 
 def _move(t: Tensor, device) -> Tensor:
@@ -49,19 +50,27 @@ def cap_text(parts: list[Tensor], limits: list[int]) -> list[Tensor]:
     return [p[: limit or None] for p, limit in zip(parts, limits)]
 
 
-class OnlineText:
-    """A cache hit's `hb.text`, else `hb.prompts` encoded (EncodeText) and capped to
-    `hb.text_limit`; the kept lengths become `text_len`."""
+def _as_is(x, *args):
+    return x
 
-    def __init__(self, encode: Callable):
+
+class OnlineText:
+    """A cache hit's `hb.text`, else `hb.prompts` encoded (EncodeText), rounded as the
+    cache stores it (`as_cached`, an online cache's `texts.as_cached`; identity with no
+    cache) and capped to `hb.text_limit`; the kept lengths become `text_len` and fill
+    `hb.text_len`."""
+
+    def __init__(self, encode: Callable, as_cached: Callable = _as_is):
         self.encode = encode
+        self.as_cached = as_cached
 
     @torch.no_grad()
     def __call__(self, hb, device) -> tuple[Tensor, Tensor]:
         if hb.text is not None:
             return _cached_text(hb, device)
-        parts = cap_text(self.encode(hb.prompts), hb.text_limit)
+        parts = cap_text(self.as_cached(self.encode(hb.prompts)), hb.text_limit)
         lens = torch.tensor([p.shape[0] for p in parts], dtype=torch.int32)
+        hb.text_len = lens
         return torch.cat(parts, 0).to(device), lens
 
 
@@ -82,25 +91,46 @@ def gather_kept(latents: Tensor, hw: Tensor, img_keep) -> Tensor:
 
 class OnlineLatents:
     """A cache hit's `hb.latents` (already the kept tokens), else `hb.pixels` encoded at
-    the planned latent grid `hb.hw` (EncodeImages) and gathered to the token-drop subset
-    `hb.img_keep`. Returns (kept latents, full-grid encoding or None for a hit)."""
+    the planned latent grid `hb.hw` (EncodeImages), rounded as the cache stores it
+    (`as_cached(full, hw)`, an online cache's `latents.as_cached`; identity with no
+    cache) and gathered to the token-drop subset `hb.img_keep`. Returns (kept latents,
+    the raw full-grid encoding or None for a hit)."""
 
-    def __init__(self, encode: Callable):
+    def __init__(self, encode: Callable, as_cached: Callable = _as_is):
         self.encode = encode
+        self.as_cached = as_cached
 
     @torch.no_grad()
     def __call__(self, hb, device) -> tuple[Tensor, Tensor | None]:
         if hb.latents is not None:
             return _cached_latents(hb, device)
         full = self.encode(hb.pixels, hb.hw).to(device)
-        return gather_kept(full, hb.hw, hb.img_keep), full
+        kept = gather_kept(self.as_cached(full, hb.hw), hb.hw, hb.img_keep)
+        return kept, full
+
+
+class LayoutTransform:
+    """Loader transform (runs in the worker): sets the batch's `layout` field to its
+    SeqInfo when its text lengths are final (text already encoded: offline cache or
+    online hit); batches whose prompts are encoded on the device keep None."""
+
+    def __init__(self, rope_axes: int = 4):
+        self.rope_axes = rope_axes
+
+    def __call__(self, hb):
+        if hb.prompts is None:
+            hb.layout = build_seqinfo(
+                hb.hw, hb.text_len, self.rope_axes, img_keep=hb.img_keep
+            )
+        return hb
 
 
 class DeviceBatcher:
     """HostBatch -> DeviceBatch: text / latent strategy, mask transfer and cache
     write-back are bound at construction. `on_encoded(hb, full_latents, text,
     text_len)` sees the full-grid latents of an encoded batch (None for a cache hit)
-    and the kept text rows."""
+    and the kept text rows. A batch carrying `layout` (LayoutTransform) uses it; the
+    others get their SeqInfo built here."""
 
     def __init__(
         self,
@@ -122,9 +152,12 @@ class DeviceBatcher:
         text, text_len = self.text(hb, self.device)
         latents, full = self.latents(hb, self.device)
         self.on_encoded(hb, full, text, text_len)
-        seq = build_seqinfo(hb.hw, text_len, self.rope_axes, img_keep=hb.img_keep).to(
-            self.device
-        )
+        layout = hb.layout
+        if layout is None:
+            layout = build_seqinfo(
+                hb.hw, text_len, self.rope_axes, img_keep=hb.img_keep
+            )
+        seq = layout.to(self.device)
         return DeviceBatch(
             ids=hb.ids,
             seq=seq,
@@ -160,20 +193,8 @@ def token_counter(masked: bool) -> Callable:
     return mask_token_count if masked else image_token_count
 
 
-def _no_pre_forward(sigma: Tensor, seq) -> None:
+def _no_pre_forward(sigma: Tensor, seq, step: int) -> None:
     return None
-
-
-class TokenMaskHook:
-    """Per-step T-LoRA rank mask from the batch's sigma (`set_token_mask`)."""
-
-    def __init__(self, set_token_mask: Callable, max_rank: int, **kwargs):
-        self.set_token_mask = set_token_mask
-        self.max_rank = max_rank
-        self.kwargs = kwargs
-
-    def __call__(self, sigma: Tensor, seq) -> None:
-        self.set_token_mask(sigma, seq.seg_joint, self.max_rank, **self.kwargs)
 
 
 def _batch_mask(batch: DeviceBatch) -> Tensor:
@@ -209,7 +230,8 @@ class TrainStep:
     """sigma ~ sampler; z_sigma = (1-sigma) z0 + sigma eps; v = backbone; token loss.
 
     `__call__(batch, denom, step)` takes the global token denominator of the optimiser
-    step; `denominator(batch)` gives the one of a lone batch (validation, tests).
+    step; `denominator(batch)` gives the one of a lone batch (validation, tests). The
+    sigma and noise generators are seeded from `(seed, rank)`.
     """
 
     def __init__(
@@ -224,6 +246,7 @@ class TrainStep:
         seed: int = 0,
         masked: bool = False,
         pre_forward: Callable = None,
+        rank: int = 0,
     ):
         self.pre_forward = pre_forward or _no_pre_forward
         self.backbone = backbone
@@ -235,8 +258,10 @@ class TrainStep:
         self.device = device
         self.mask_of = _batch_mask if masked else _no_mask
         self.count_of = _mask_count if masked else _image_count
-        self.sigma_gen = torch.Generator().manual_seed(seed)
-        self.noise_gen = torch.Generator(device=device).manual_seed(seed + 1)
+        self.sigma_gen = torch.Generator().manual_seed(seed_of("sigma", seed, rank))
+        self.noise_gen = torch.Generator(device=device).manual_seed(
+            seed_of("noise", seed, rank)
+        )
 
     def denominator(self, batch: DeviceBatch) -> Tensor:
         return self.normalizer.denominator(self.count_of(batch), self.device)
@@ -250,7 +275,7 @@ class TrainStep:
             z0.shape, generator=self.noise_gen, device=self.device, dtype=torch.float32
         )
         z_sigma, target = noise_latents(z0, eps, sigma, seq)
-        self.pre_forward(sigma, seq)
+        self.pre_forward(sigma, seq, step)
         weight = self.weighting(sigma, batch.weight.float())
         return Prepared(
             z_sigma, batch.text, sigma, seq, target, weight, self.mask_of(batch)

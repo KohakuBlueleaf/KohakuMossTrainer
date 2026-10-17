@@ -19,6 +19,7 @@ from kohakumoss.training.checkpoint.manager import _no_write
 from kohakumoss.training.drivers.common import last_flags
 from kohakumoss.training.ema import ConstantEMA
 from kohakumoss.training.ema.averagers import _fixed_decay, _warm_decay
+from kohakumoss.training.full import FullTrainable
 from kohakumoss.training.optim import build_bundle
 from kohakumoss.training.optim.bundle import _clip_off
 from kohakumoss.training.precision import DynamicScaler, NoScaler, build_policy
@@ -33,7 +34,9 @@ DEV = torch.device("cpu")
 def _built():
     model = random_backbone("tiny", device=DEV, dtype=torch.float32, seed=0)
     enc = SimpleNamespace(encode=lambda prompts: [], encode_images=lambda i, hw: None)
-    return SimpleNamespace(backbone=model, text_encoder=enc, vae=enc)
+    return SimpleNamespace(
+        backbone=model, text_encoder=enc, vae=enc, trainable=FullTrainable(model)
+    )
 
 
 def test_step_and_batcher_bind_mask_and_encoders():
@@ -45,7 +48,8 @@ def test_step_and_batcher_bind_mask_and_encoders():
     masked = build_step(runnable(LOSS="masked_mse"), built, None, None, DEV)
     assert masked.mask_of is step_mod._batch_mask
     assert masked.count_of is step_mod._mask_count
-    cached = build_batcher(runnable(), built, DEV)
+    offline = runnable(TEXT_CACHE="offline", LATENT_CACHE="offline")
+    cached = build_batcher(offline, built, DEV)
     assert (
         cached.text is step_mod._cached_text and cached.mask is step_mod._no_mask_move
     )

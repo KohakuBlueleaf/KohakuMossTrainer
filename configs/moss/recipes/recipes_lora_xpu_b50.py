@@ -1,4 +1,4 @@
-"""LoRA on an Intel Arc Pro B50 (16 GB, XPU): bf16 only, int8 base, streaming.
+"""LoRA on an Intel Arc Pro B50 (16 GB, XPU): bf16 only, int8 base, the `low` profile.
 Drives scripts/train/moss.py.
 
     kogine run scripts/train/moss.py --config configs/moss/recipes/recipes_lora_xpu_b50.py

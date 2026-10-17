@@ -74,4 +74,5 @@ def test_doctor_json(tmp_path, monkeypatch):
     assert {"os", "python", "packages", "devices", "kernels", "memory_plans"} <= set(
         rep
     )
-    assert "rms_norm_mod" in rep["kernels"]["float16"]
+    assert all("rms_norm_mod" in t["float16"] for t in rep["kernels"].values())
+    assert "cpu" in rep["kernels"]
