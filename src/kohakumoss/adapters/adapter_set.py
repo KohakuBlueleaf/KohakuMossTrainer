@@ -5,25 +5,19 @@ from dataclasses import asdict
 from functools import partial
 
 import torch
-from lycoris.modules.tlora import clear_timestep_mask
 from torch import Tensor, nn
 
+from kohakumoss.adapters import groups
 from kohakumoss.adapters import norms as norm_delta
 from kohakumoss.adapters.bind.select import bind_target, training_dependent
-from kohakumoss.adapters.delta import delta
 from kohakumoss.adapters.export import convert, files
 from kohakumoss.adapters.export.merged import merged_state_dict
+from kohakumoss.adapters.scope import evaluated, perturbed, rebind_owner, slots_of
 from kohakumoss.adapters.spec import AdapterSpec
+from kohakumoss.adapters.steps import StepPlan
 from kohakumoss.adapters.target import CHILD, NormTarget, Target
+from kohakumoss.model.io.save import write_diffusers
 
-NO_DECAY = (
-    "dora_scale",
-    "rescale",
-    "scalar",
-    "lambda_layer",
-    "alpha",
-)
-UP_SIDE = ("lora_up", "hada_w1_a", "hada_w2_a", "lokr_w2_b", "b1", "p_layer", "up_list")
 FORMATS = ("lycoris", "comfy", "merged", "diffusers")
 RAW_TAG = "kohakumoss_adapter_state"
 
@@ -68,18 +62,21 @@ class LycoAdapterSet:
         self.backend = backend
         self.multiplier = spec.multiplier
         self.by_name = {t.lora_name: t for t in targets}
+        self.steps = StepPlan(targets, spec)
         self.bind()
 
     def bind(self) -> None:
         """Install every layer's forward for the current multiplier and training state;
         layers whose forward depends on train()/eval() re-bind through a hook."""
+        spec = self.spec
         for t in self.targets:
             self.bind_one(t)
-            if training_dependent(t, self.spec.module_dropout):
+            if training_dependent(t, spec.module_dropout, spec.dora_detach):
                 vars(t.lyco)["train"] = partial(_train_and_rebind, self, t)
         for n in self.norms:
             for _, d in n.deltas():
                 d.multiplier = self.multiplier
+        rebind_owner(self.model)
 
     def bind_one(self, t: Target) -> None:
         fn = bind_target(
@@ -91,50 +88,73 @@ class LycoAdapterSet:
             self.spec.module_dropout,
             race=self.spec.backend == "auto",
         )
-        if t.kind != "full":
+        if not t.record.owns_weight:
             t.linear.forward = fn
 
     def set_multiplier(self, multiplier: float) -> None:
         self.multiplier = float(multiplier)
         self.bind()
 
+    def begin_step(self, sigma: Tensor, seq, step: int) -> None:
+        """Before a training / validation forward: T-LoRA masks and this microbatch's
+        DyLoRA / module-dropout draws."""
+        self.steps.begin(sigma, seq, step)
+
+    def end_step(self) -> None:
+        """After the step's last backward: masks cleared (full-rank adapters)."""
+        self.steps.end()
+
+    def prewarm(
+        self, rows: list[int], dtype: torch.dtype, devices: list[torch.device]
+    ) -> int:
+        """Race every tier slot on scratch factors over `rows`; returns slot calls."""
+        allowed = set(devices)
+        calls = 0
+        for t in self.targets:
+            params = list(t.lyco.parameters())
+            slots = slots_of(vars(t.linear).get("forward"))
+            if not params or not slots or params[0].device not in allowed:
+                continue
+            with perturbed(t.lyco):
+                for slot in slots:
+                    calls += slot.warm(rows, dtype, params[0].device)
+        return calls
+
     @staticmethod
     def _norm_params(n: NormTarget):
         return [(name, d.w_norm) for name, d in n.deltas()]
 
     def trainable_params(self):
-        for name, p in self.named_trainable():
+        for _, p in self.named_trainable():
             yield p
 
     def named_trainable(self):
+        for full, _, p, _ in self._entries():
+            yield full, p
+
+    def _entries(self):
         for t in self.targets:
             for name, p in t.lyco.named_parameters():
                 if p.requires_grad:
-                    yield f"{t.lora_name}.{name}", p
+                    yield f"{t.lora_name}.{name}", name, p, t.record.up_side
         for n in self.norms:
             for name, p in self._norm_params(n):
                 if p.requires_grad:
-                    yield f"{n.lora_name}.{name}", p
+                    yield f"{n.lora_name}.{name}", name, p, ()
 
-    def param_groups(self, lr: float, weight_decay: float = 0.0, **rules) -> list[dict]:
-        """Groups: decayed / not decayed, and the LoRA+ up side at lr * ratio."""
-        ratio = float(rules.get("lr_ratio_up", self.spec.lr_ratio_up))
-        buckets: dict[tuple[bool, bool], list] = {}
-        for name, p in self.named_trainable():
-            tail = name.split(".", 1)[1]
-            no_decay = p.dim() < 2 or any(tag in tail for tag in NO_DECAY)
-            up = ratio != 1.0 and any(tail.startswith(tag) for tag in UP_SIDE)
-            buckets.setdefault((no_decay, up), []).append(p)
-        groups = []
-        for (no_decay, up), params in sorted(buckets.items()):
-            groups.append(
-                {
-                    "params": params,
-                    "lr": lr * (ratio if up else 1.0),
-                    "weight_decay": 0.0 if no_decay else weight_decay,
-                }
-            )
-        return groups
+    def param_groups(
+        self,
+        lr: float,
+        weight_decay: float = 0.0,
+        rules: str = "moss",
+        use_muon: bool = False,
+        **kw,
+    ) -> list[dict]:
+        """Optimiser groups by weight-decay rule, Muon eligibility and the LoRA+ ratio
+        (`lr_ratio_up`, default the spec's) on each kind's zero-initialised factors."""
+        ratio = float(kw.get("lr_ratio_up", self.spec.lr_ratio_up))
+        entries = list(self._entries())
+        return groups.build(entries, lr, weight_decay, rules, use_muon, ratio)
 
     def state_dict(self) -> dict[str, Tensor]:
         """Raw trainable state (exact resume): every parameter and buffer by name."""
@@ -147,34 +167,37 @@ class LycoAdapterSet:
                 out[f"{n.lora_name}.{name}"] = v.detach().clone()
         return out
 
-    def load_state_dict(self, state: dict[str, Tensor]) -> None:
-        """Copy a `state_dict()` back in place; every key must match a live tensor."""
+    def _live(self) -> dict[str, Tensor]:
         live = {}
         for t in self.targets:
-            for name, v in list(t.lyco.named_parameters()) + list(
-                t.lyco.named_buffers()
-            ):
+            for name, v in nn.Module.state_dict(t.lyco, keep_vars=True).items():
                 live[f"{t.lora_name}.{name}"] = v
         for n in self.norms:
             for name, v in self._norm_params(n):
                 live[f"{n.lora_name}.{name}"] = v
-        missing = [k for k in state if k not in live]
-        if missing:
-            raise KeyError(f"unknown adapter keys: {missing[:8]} ...")
+        return live
+
+    def load_state_dict(self, state: dict[str, Tensor]) -> None:
+        """Copy a `state_dict()` back in place; the keys must match exactly."""
+        live = self._live()
+        unknown = sorted(set(state) - set(live))
+        missing = sorted(set(live) - set(state))
+        if unknown or missing:
+            raise KeyError(
+                f"adapter state mismatch: {len(unknown)} unknown keys "
+                f"{unknown[:4]}, {len(missing)} missing keys {missing[:4]}"
+            )
         with torch.no_grad():
             for key, value in state.items():
                 live[key].copy_(value.to(live[key].device, live[key].dtype))
         self.bind()
 
     def tensors(self, fmt: str, style: str = "lora_unet", row_scales=None) -> dict:
-        """Adapter tensors in `fmt` ('lycoris' | 'comfy') under key `style`.
-
-        `row_scales` is the residual fold's per-output-row scale of each folded layer
-        (model.numerics.output_row_scales); ΔW rows are divided by it.
-        """
-        clear_timestep_mask(0)
+        """Adapter tensors in `fmt` ('lycoris' | 'comfy') under key `style`, evaluated
+        outside training; `row_scales` (a folded model's per-row fold scales) divides
+        each layer's dW rows."""
         out = {}
-        with torch.no_grad():
+        with torch.no_grad(), evaluated(self.targets):
             for t in self.targets:
                 per = convert.native(t) if fmt == "lycoris" else convert.comfy(t)
                 if row_scales and t.path in row_scales:
@@ -212,6 +235,21 @@ class LycoAdapterSet:
         meta.update({k: str(v) for k, v in (extra or {}).items()})
         return meta
 
+    def merged_state(
+        self, dtype: torch.dtype | None = torch.bfloat16, fused_qkv: bool = False
+    ) -> dict[str, Tensor]:
+        """The backbone's export state with every dW merged at the set's multiplier
+        (fold undone by the backbone's own export)."""
+        with evaluated(self.targets):
+            return merged_state_dict(
+                self.model,
+                self.targets,
+                self.norms,
+                self.multiplier,
+                dtype,
+                fused_qkv,
+            )
+
     def export(
         self,
         path: str,
@@ -221,35 +259,22 @@ class LycoAdapterSet:
         dtype: torch.dtype | None = torch.bfloat16,
         row_scales: dict | None = None,
         fused_qkv: bool = False,
-        config: dict | None = None,
     ) -> None:
-        """Write the adapters (lycoris / comfy) or a merged checkpoint (merged / diffusers).
-
-        `row_scales` (from a folded model) is undone so files are in unfolded space.
-        """
+        """Write the adapters (lycoris / comfy; `row_scales` undoes a fold), a merged
+        checkpoint (merged) or a diffusers transformer folder (diffusers); the merged
+        formats need the backbone and undo its fold themselves."""
         if fmt not in FORMATS:
             raise KeyError(f"export format {fmt!r} not in {FORMATS}")
         if fmt in ("lycoris", "comfy"):
             tensors = files.to_storage(self.tensors(fmt, style, row_scales), dtype)
             files.write(path, tensors, self.metadata(fmt, style, metadata))
             return
-        inverse = {k: convert.reciprocal(v) for k, v in (row_scales or {}).items()}
-        state = merged_state_dict(
-            self.model,
-            self.targets,
-            self.norms,
-            self.multiplier,
-            dtype,
-            inverse,
-            fused_qkv,
-        )
-        state = files.to_storage(state, None)
         if fmt == "merged":
-            files.write(
-                path, state, {"kohakumoss_format": "merged", **(metadata or {})}
-            )
-        else:
-            files.write_sharded(path, state, config)
+            state = self.merged_state(dtype, fused_qkv)
+            meta = {"kohakumoss_format": "merged", **(metadata or {})}
+            files.write(path, state, meta)
+            return
+        write_diffusers(self.merged_state(dtype), path, self.model.cfg)
 
     def save_state(self, path: str) -> None:
         """Raw state + the spec as a safetensors file (checkpoints, exact reload)."""
@@ -257,16 +282,17 @@ class LycoAdapterSet:
         files.write(path, files.to_storage(self.state_dict(), None), meta)
 
     def merge_into(self, multiplier: float = 1.0) -> None:
-        """Bake every ΔW into its base weight and detach the adapters."""
+        """Bake every dW (and norm delta) at `multiplier` into its base weight and
+        detach the adapters."""
         stored = [t.path for t in self.targets if t.stored]
         if stored:
             raise RuntimeError(
                 f"cannot merge into quantized/streamed base storage: {stored[:4]}; "
                 "export a merged checkpoint instead"
             )
-        with torch.no_grad():
+        with torch.no_grad(), evaluated(self.targets):
             for t in self.targets:
-                dw, db = delta(t, multiplier)
+                dw, db = t.delta(multiplier)
                 w = t.base_weight(torch.float32)
                 bias = t.base_bias()
                 self._detach(t)
@@ -277,10 +303,13 @@ class LycoAdapterSet:
                     base_b = 0.0 if bias is None else bias.float().to(db.device)
                     add_bias(t.linear, base_b + db)
             for n in self.norms:
+                for _, d in n.deltas():
+                    d.multiplier = multiplier
                 norm_delta.detach(n.module, True, "weight")
                 if n.bias_delta is not None:
                     norm_delta.detach(n.module, True, "bias")
         self.targets, self.by_name, self.norms = [], {}, []
+        rebind_owner(self.model)
 
     def remove(self) -> None:
         """Detach every adapter; the base layers forward as before apply()."""
@@ -291,10 +320,11 @@ class LycoAdapterSet:
             if n.bias_delta is not None:
                 norm_delta.detach(n.module, False, "bias")
         self.targets, self.by_name, self.norms = [], {}, []
+        rebind_owner(self.model)
 
     @staticmethod
     def _detach(t: Target) -> None:
-        if t.kind == "full":
+        if t.record.owns_weight:
             t.lyco.restore()
             weight = t.lyco.org_weight.to(t.lyco.weight.device)
             t.linear.weight = nn.Parameter(weight, requires_grad=False)

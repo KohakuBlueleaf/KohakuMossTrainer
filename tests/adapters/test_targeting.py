@@ -3,7 +3,7 @@
 import pytest
 from _adtoy import toy
 
-from kohakumoss.adapters import AdapterSpec, apply, resolve_preset
+from kohakumoss.adapters import AdapterSpec, apply, presets
 from tests._util.negative import must_fail
 
 pytestmark = pytest.mark.cpu
@@ -74,16 +74,23 @@ def test_toml_preset(tmp_path):
     assert paths == {"layers.0.proj.o"}
 
 
-def test_presets_do_not_leak_between_calls():
-    first, _, _ = _paths({"target_name": [r"layers\.0\.proj\.o$"]})
+def _leak_round():
+    first, _, _ = _paths(
+        {
+            "target_name": [r"layers\.0\.proj\.(o|q)$"],
+            "exclude_name": [r"layers\.0\.proj\.q$"],
+        }
+    )
     second, _, _ = _paths("attn")
-    assert first == {"layers.0.proj.o"} and len(second) == 8
+    assert first == {"layers.0.proj.o"}
+    assert "layers.0.proj.q" in second and len(second) == 8
 
-    def leaked():
-        resolve_preset({"target_name": []}, "lora_unet")
-        assert resolve_preset("attn", "x")[0]["exclude_name"] == ["anything"]
 
-    must_fail(leaked, "every preset key reset explicitly")
+def test_presets_do_not_leak_between_calls(monkeypatch):
+    _leak_round()
+    with monkeypatch.context() as patch:
+        patch.setattr(presets, "PRESET_KEYS_DEFAULT", {})
+        must_fail(_leak_round, "a preset that leaves exclude_name to the previous call")
 
 
 def test_unknown_preset_is_an_error():

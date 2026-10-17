@@ -1,14 +1,11 @@
-"""Bound forwards over the LyCORIS fused kernels with a pinned backend (and the
-forward shells the raced ops of `bind.ops` plug into).
-
-Every function takes its bound state first and the runtime tensor last, so
-`functools.partial` freezes the state at bind time. Variants (scalar parameter or
-not, rescale or not, multiplier 1 or not, bias or not) are separate functions picked
-by `bind.select`; nothing here branches on bound state.
+"""Bound forwards over the LyCORIS fused kernels with a pinned backend, and the
+forward shells the raced ops of `bind.ops` plug into. State first, runtime tensor
+last; one function per variant (see docs/internals/adapter-binding.md).
 """
 
 from functools import partial
 
+import torch
 import torch.nn.functional as F
 from lycoris.kernels.autograd import (
     apply_dora,
@@ -27,6 +24,8 @@ from lycoris.kernels.autograd import (
     lokr_kron_weight,
 )
 from torch import Tensor
+
+from kohakumoss.model.components.wide import wide_linear
 
 
 def _attr(name, lyco, dtype):
@@ -67,6 +66,15 @@ def lin_bias(linear, x: Tensor, w: Tensor) -> Tensor:
 
 def lin_nobias(x: Tensor, w: Tensor) -> Tensor:
     return F.linear(x, w.to(x.dtype))
+
+
+def lin_wide(dtype, x: Tensor, w: Tensor) -> Tensor:
+    """x @ w^T on `dtype` (16-bit) operands, fp32 accumulation and output."""
+    return wide_linear(x, w, dtype)
+
+
+def lin_wide_bias(linear, dtype, x: Tensor, w: Tensor) -> Tensor:
+    return wide_linear(x, w, dtype) + linear.bias.float()
 
 
 def same(t: Tensor) -> Tensor:
@@ -151,7 +159,7 @@ def boft_bypass_rescaled(linear, lyco, multiplier, backend, x):
 
 
 def post_add(linear, delta, x):
-    """y + Δy(y) for a rotation whose Δy is a function of the base output."""
+    """y + dy(y) for a rotation whose dy is a function of the base output."""
     y = linear._impl(x)
     return y + delta(y).to(y.dtype)
 
@@ -234,18 +242,18 @@ def ia3_unit(lyco, multiplier, backend, base):
 
 
 def merged_forward(base_fn, unit, scale, lin, x):
-    """y = lin(x, W + scale(ΔW)) with ΔW from a merge kernel."""
-    w = base_fn(x.dtype)
-    return lin(x, w + scale(unit(w)).to(x.dtype))
+    """y = lin(x, W + scale(dW)): W + dW summed in fp32, rounded once by `lin`."""
+    w = base_fn(torch.float32)
+    return lin(x, w + scale(unit(w)).float())
 
 
 def decompose(lyco, on_out, backend, merged):
-    """DoRA(W + ΔW) at multiplier 1 through the fused decompose kernel."""
+    """DoRA(W + dW) at multiplier 1 through the fused decompose kernel."""
     return apply_dora(merged, lyco.dora_scale, 1.0, on_out, backend)
 
 
 def dora_forward(base_fn, lyco, unit, decompose, mix, lin, x):
-    """y = lin(x, mix(W, decompose(W + ΔW)))."""
+    """y = lin(x, mix(W, decompose(W + dW)))."""
     w = base_fn(lyco.dora_scale.dtype)
     merged = w + unit(w).to(w.dtype)
     return lin(x, mix(w, decompose(merged)))

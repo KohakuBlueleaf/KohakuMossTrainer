@@ -1,7 +1,7 @@
 """LyCORIS kernel tier for one device, chosen once per apply. See docs/concepts/adapters.md."""
 
 import torch
-from lycoris.kernels.dispatch import resolve_backend
+from lycoris.kernels.dispatch import available_backends, resolve_backend
 
 FUSED = ("triton", "tilelang")
 
@@ -9,12 +9,24 @@ FUSED = ("triton", "tilelang")
 def pick_backend(device: torch.device | str, requested: str = "auto") -> str:
     """`triton` | `tilelang` | `compile` | `torch` for adapters on `device`.
 
-    The per-arch order is LyCORIS's (tilelang first on sm70/75, triton from sm80);
-    non-CUDA devices take the eager bodies.
+    `auto` takes LyCORIS's per-arch order on CUDA and the eager bodies elsewhere; a
+    named tier the device cannot run raises ValueError.
     """
     device = torch.device(device)
     if device.type != "cuda":
-        return "torch" if requested == "auto" else requested
+        if requested in ("auto", "torch"):
+            return "torch"
+        if requested == "compile":
+            return requested
+        raise ValueError(
+            f"KERNELS['lycoris']={requested!r} needs a CUDA device; adapters are on "
+            f"{device} (use 'auto', 'torch' or 'compile')"
+        )
+    if requested != "auto" and requested not in available_backends(device):
+        raise ValueError(
+            f"KERNELS['lycoris']={requested!r} is not available on {device}; "
+            f"available: {available_backends(device)}"
+        )
     return resolve_backend(None if requested == "auto" else requested, device)
 
 

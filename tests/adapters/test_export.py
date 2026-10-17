@@ -1,17 +1,19 @@
-"""Exports: ComfyUI evaluates them to the trained ΔW; files are deterministic witnesses."""
+"""Exports: ComfyUI evaluates them to the trained dW; files are deterministic witnesses."""
 
 import hashlib
 import json
 
 import pytest
 import torch
-from _adcases import CASES, build
+from _adcases import CASES, build, make_spec
 from _adref import comfy_weight, lycoris_delta
+from _adtoy import perturb
 from safetensors import safe_open
 from safetensors.torch import load_file
 
-from kohakumoss.adapters.delta import delta
-from kohakumoss.adapters.export.merged import fuse_qkv
+from kohakumoss.adapters import apply
+from kohakumoss.model import random_backbone
+from kohakumoss.model.io.keymap import fuse_qkv as fuse_layers
 from tests._util.negative import must_fail
 
 pytestmark = pytest.mark.cpu
@@ -66,13 +68,27 @@ _TAILS = {
 }  # fmt: skip
 
 
+def fuse_qkv(state: dict, depth: int = 2) -> dict:
+    return fuse_layers(state, depth)
+
+
+def backbone_set(name: str, **override):
+    """A tiny MossBackbone with every adapter tensor randomised."""
+    model = random_backbone("tiny", seed=3)
+    model.requires_grad_(False)
+    aset = apply(model, make_spec(name, **override))
+    perturb(aset)
+    model.eval()
+    return model, aset
+
+
 def _base_state(aset):
     return {f"{t.path}.weight": t.base_weight(torch.float64) for t in aset.targets}
 
 
 def _expected(aset):
     return {
-        f"{t.path}.weight": t.base_weight(torch.float64) + delta(t)[0].double()
+        f"{t.path}.weight": t.base_weight(torch.float64) + t.delta()[0].double()
         for t in aset.targets
     }
 
@@ -145,7 +161,7 @@ def test_native_file_matches_independent_formula(name, tmp_path):
         ref = lycoris_delta(
             t.kind if t.kind != "locon" else "locon", parts, w, w.shape[0]
         )
-        torch.testing.assert_close(delta(t)[0].double(), ref, **TOL)
+        torch.testing.assert_close(t.delta()[0].double(), ref, **TOL)
 
 
 def _sha(path) -> str:
@@ -184,14 +200,14 @@ def test_metadata_records_format_and_args(tmp_path):
 
 @pytest.mark.parametrize("fused", [False, True])
 def test_merged_checkpoint(fused, tmp_path):
-    model, aset = build("lora-norms")
+    model, aset = backbone_set("lora-norms")
     path = tmp_path / "m.safetensors"
     aset.export(str(path), "merged", dtype=torch.float32, fused_qkv=fused)
     state = load_file(str(path))
     assert not any(".lyco." in k for k in state)
     want = _expected(aset)
     if fused:
-        want = fuse_qkv(want)
+        want = fuse_qkv(want, model.cfg.depth)
     for key, value in want.items():
         torch.testing.assert_close(state[key].double(), value.double(), **TOL)
     norm = aset.norms[0]
@@ -204,9 +220,9 @@ def test_merged_checkpoint(fused, tmp_path):
 
 
 def test_diffusers_shards(tmp_path):
-    _, aset = build("lora")
+    model, aset = backbone_set("lora")
     out = tmp_path / "transformer"
-    aset.export(str(out), "diffusers", dtype=torch.float32, config={"dim": 32})
+    aset.export(str(out), "diffusers", dtype=torch.float32)
     index = json.loads(
         (out / "diffusion_pytorch_model.safetensors.index.json").read_text()
     )
@@ -215,7 +231,8 @@ def test_diffusers_shards(tmp_path):
         merged.update(load_file(str(out / name)))
     for key, value in _expected(aset).items():
         torch.testing.assert_close(merged[key].double(), value, **TOL)
-    assert json.loads((out / "config.json").read_text()) == {"dim": 32}
+    config = json.loads((out / "config.json").read_text())
+    assert config["dim"] == model.cfg.dim and config["num_layers"] == model.cfg.depth
 
 
 def test_row_scale_uniform_and_per_row():
@@ -226,7 +243,7 @@ def test_row_scale_uniform_and_per_row():
     rows = torch.linspace(0.5, 1.5, t.lyco.shape[0])
     per_row = aset.tensors("comfy", row_scales={t.path: 1.0 / rows})
     key = f"{t.path}.weight"
-    want = delta(t)[0].double()
+    want = t.delta()[0].double()
     p1 = comfy_patch(base, uniform)[key] - base[key]
     p2 = comfy_patch(base, per_row)[key] - base[key]
     torch.testing.assert_close(p1, want * 0.5, **TOL)

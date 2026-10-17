@@ -1,33 +1,35 @@
 """Inference-time adapters: load files of any supported format, bypass or merge, undo exactly."""
 
 import json
-from dataclasses import fields as dataclass_fields
 from functools import partial
 
+import lycoris.kernels as lyk
 import torch
-import torch.nn.functional as F
 from lycoris.modules import IA3Module, get_module, make_module
 from torch import Tensor, nn
 
 from kohakumoss.adapters.adapter_set import RAW_TAG
 from kohakumoss.adapters.apply import apply, compute_device
-from kohakumoss.adapters.delta import delta, resolve, unit_delta
+from kohakumoss.adapters.backend import pick_backend
+from kohakumoss.adapters.bind.compose import dense_of
 from kohakumoss.adapters.export.convert import row_norm
 from kohakumoss.adapters.formats import group, read, spec_from_meta, stem_index
+from kohakumoss.adapters.kinds import record_of
 from kohakumoss.adapters.network import _DenseWeight, lora_name_of
-from kohakumoss.adapters.spec import AdapterSpec
-from kohakumoss.adapters.target import Target, kind_of
+from kohakumoss.adapters.scope import compute_dtype_of, rebind_owner
+from kohakumoss.adapters.spec import inference_spec
+from kohakumoss.adapters.target import Target
 
 MODES = ("bypass", "merge")
-DENSE_IN_BYPASS = ("full", "dylora")
 
 
-def _dense_add(prev, dw: Tensor, x):
-    return prev(x) + F.linear(x, dw.to(x.dtype))
+def _dense_add(prev, dense, dw: Tensor, x):
+    return prev(x) + dense(x, dw)
 
 
-def _dense_add_bias(prev, dw: Tensor, db: Tensor, x):
-    return prev(x) + F.linear(x, dw.to(x.dtype), db.to(x.dtype))
+def _dense_add_bias(dense, dw: Tensor, db: Tensor, prev, x):
+    y = dense(x, dw)
+    return prev(x) + y + db.to(y.dtype)
 
 
 def _noop() -> None:
@@ -87,33 +89,36 @@ class _Unfolded:
         return False
 
 
-ADDITIVE = ("locon", "loha", "lokr", "tlora")
-COMMUTING = ("oft", "boft", "ia3")
-
-
 class AdapterStack:
     """Adapters loaded for inference; `remove()` restores weights and forwards bit-exactly.
 
-    `row_scales` is the residual fold's per-output-row scale of a folded model
-    (model.numerics.output_row_scales); files hold unfolded ΔW, so their rows are
-    multiplied by it.
+    `row_scales` is the residual fold's per-output-row scale of a folded model; files
+    hold unfolded dW, so their rows are multiplied by it. `undoable=False` keeps no
+    copy of merged weights (a one-way merge; `remove()` then raises).
     """
 
     def __init__(
-        self, model: nn.Module, mode: str = "bypass", row_scales: dict | None = None
+        self,
+        model: nn.Module,
+        mode: str = "bypass",
+        row_scales: dict | None = None,
+        undoable: bool = True,
     ):
         if mode not in MODES:
             raise KeyError(f"mode {mode!r} not in {MODES}")
         self.model = model
         self.mode = mode
+        self.undoable = undoable
         self.device = compute_device(model)
+        self.backend = pick_backend(self.device, "auto")
+        lyk.set_half_matmul(compute_dtype_of(model.modules()))
         self.row_scales = dict(row_scales or {})
         self.modules = dict(model.named_modules())
         self.index = stem_index(model)
         self.originals: dict[tuple[int, str], tuple[nn.Module, str, Tensor]] = {}
         self.forwards: dict[int, tuple[nn.Module, object]] = {}
+        self.earlier: dict[str, list] = {}
         self.live: list[nn.Module] = []
-        self.sets = []
         self.created_bias: list[nn.Module] = []
 
     def _ensure_bias(self, module: nn.Module) -> None:
@@ -128,16 +133,15 @@ class AdapterStack:
 
     def _save_original(self, module: nn.Module, name: str) -> None:
         key = (id(module), name)
-        if key not in self.originals:
+        if self.undoable and key not in self.originals:
             param = getattr(module, name)
             self.originals[key] = (module, name, param.detach().cpu().clone())
 
     def _add_to(self, module: nn.Module, name: str, value: Tensor) -> None:
         self._save_original(module, name)
         param = getattr(module, name)
-        param.data.add_(
-            value.to(device=param.device, dtype=torch.float32).to(param.dtype)
-        )
+        merged = param.float() + value.to(device=param.device, dtype=torch.float32)
+        param.data.copy_(merged.to(param.dtype))
 
     def _chain(self, linear: nn.Module, make) -> None:
         if id(linear) not in self.forwards:
@@ -151,61 +155,83 @@ class AdapterStack:
         tensors, meta = (source, {}) if isinstance(source, dict) else read(source)
         if meta.get(RAW_TAG):
             self._add_raw(tensors, meta, multiplier)
-            return
-        groups, unmatched = group(tensors, self.index)
-        if unmatched:
-            raise KeyError(
-                f"{len(unmatched)} keys match no layer, e.g. {unmatched[:4]}"
-            )
-        ours_comfy = meta.get("kohakumoss_format") == "comfy"
-        for path, parts in groups.items():
-            self._add_layer(path, parts, multiplier, ours_comfy)
+        else:
+            groups, unmatched = group(tensors, self.index)
+            if unmatched:
+                raise KeyError(
+                    f"{len(unmatched)} keys match no layer, e.g. {unmatched[:4]}"
+                )
+            ours_comfy = meta.get("kohakumoss_format") == "comfy"
+            for path, parts in groups.items():
+                self._add_layer(path, parts, multiplier, ours_comfy)
+        rebind_owner(self.model)
+
+    def _add_norm(self, module: nn.Module, parts: dict, m: float) -> None:
+        self._add_to(module, "weight", parts["w_norm"].float() * m)
+        if "b_norm" in parts and getattr(module, "bias", None) is not None:
+            self._add_to(module, "bias", parts["b_norm"].float() * m)
+
+    def _unfolded_base(self, module: nn.Module, path: str) -> Tensor | None:
+        """The layer's current effective weight in unfolded space, when it differs
+        from what its own storage reads (a fold scale, or earlier bypass adapters)."""
+        scale = self.row_scales.get(path)
+        earlier = self.earlier.get(path, [])
+        if scale is None and not earlier:
+            return None
+        w = module.base_weight(torch.float32)
+        if scale is not None:
+            w = w / _rows(scale, w)
+        for dw in earlier:
+            w = w + dw().to(w.device)
+        return w
 
     def _add_layer(self, path: str, parts: dict, m: float, ours_comfy: bool) -> None:
         module = self.modules[path]
         if "w_norm" in parts:
-            self._add_to(module, "weight", parts["w_norm"].float() * m)
-            if "b_norm" in parts and getattr(module, "bias", None) is not None:
-                self._add_to(module, "bias", parts["b_norm"].float() * m)
+            self._add_norm(module, parts, m)
             return
         scale = self.row_scales.get(path)
         if "diff" in parts:
             dw = parts["diff"].float() * m
             db = parts.get("diff_b")
             db = None if db is None else db.float() * m
-            self._add_dense(module, *self._fold(dw, db, scale), 1.0)
+            self._add_dense(path, module, dw, db, scale)
             return
         stored = getattr(module, "base", None) is not None
-        override = None
-        if scale is not None:
-            w = module.base_weight(torch.float32)
-            override = w / _rows(scale, w)
         with _Unfolded(module, None if stored else scale):
-            lyco = self._build(module, path, parts, ours_comfy, override)
-        target = Target(
-            path=path,
-            lora_name=lyco.lora_name,
-            linear=module,
-            lyco=lyco,
-            kind=kind_of(lyco),
-            wd=bool(getattr(lyco, "wd", False)),
-            wd_on_out=bool(getattr(lyco, "wd_on_out", True)),
-            base_override=override,
-        )
-        resolve(target)
-        dense = target.kind in DENSE_IN_BYPASS or (target.kind == "oft" and m != 1.0)
-        if scale is not None and target.kind not in ADDITIVE:
+            lyco = self._build(module, path, parts)
+        override = self._base_for(module, path, lyco, m)
+        if ours_comfy:
+            self._undo_comfy(module, lyco, parts, override)
+        self._attach(path, module, lyco, m, override, scale)
+
+    def _base_for(self, module, path: str, lyco, m: float) -> Tensor | None:
+        """The effective-weight override, built only for a dW that reads its base."""
+        rec = record_of(lyco)
+        reads_base = getattr(lyco, "wd", False) or rec.stacking != "additive"
+        if reads_base or not rec.exact_at(m):
+            return self._unfolded_base(module, path)
+        return None
+
+    def _attach(self, path, module, lyco, m: float, override, scale) -> None:
+        """Merge, chain densely, or chain the module's bypass for one built module."""
+        lyco.kernel_backend = self.backend
+        target = Target(path, lyco.lora_name, module, lyco, override, self.backend)
+        rec = target.record
+        dense = rec.stacking == "dense" or not rec.exact_at(m)
+        if scale is not None and rec.stacking != "additive":
             block = getattr(lyco, "block_size", 1)
-            dense = dense or target.kind not in COMMUTING
-            dense = dense or not _block_uniform(scale, block)
+            uniform = rec.stacking == "commuting" and _block_uniform(scale, block)
+            dense = dense or not uniform
         if self.mode == "merge" or target.wd or dense:
-            dw, db = delta(target, m)
-            self._add_dense(module, *self._fold(dw, db, scale), 1.0)
+            dw, db = target.delta(m)
+            self._add_dense(path, module, dw, db, scale)
             return
         lyco.multiplier = m
         lyco.bypass_mode = True
         self.live.append(lyco)
-        if scale is not None and target.kind in ADDITIVE:
+        self.earlier.setdefault(path, []).append(partial(_first, target.delta_at(m)))
+        if scale is not None and rec.stacking == "additive":
             s = scale.to(self.device).float()
             self._chain(module, lambda prev: partial(_scaled_bypass, prev, lyco, m, s))
             return
@@ -223,29 +249,29 @@ class AdapterStack:
         dw = dw * _rows(scale, dw)
         return dw, None if db is None else db * _rows(scale, db).flatten()
 
-    def _add_dense(self, module: nn.Module, dw: Tensor, db, m: float) -> None:
-        """Merge ΔW into a dense weight, or chain x ΔW^T onto the forward of stored ones."""
-        db = None if db is None else db.float() * m
+    def _add_dense(self, path: str, module: nn.Module, dw: Tensor, db, scale) -> None:
+        """Merge (unfolded dW, db) into a dense weight, or chain x dW^T onto the forward,
+        held once in the compute dtype."""
+        unfolded = dw
+        dw, db = self._fold(dw, db, scale)
         if self.mode == "merge" and getattr(module, "base", None) is None:
             self._add_to(module, "weight", dw)
             if db is not None:
                 self._ensure_bias(module)
                 self._add_to(module, "bias", db)
             return
-        dw, db = dw.to(self.device), None if db is None else db.to(self.device)
+        self.earlier.setdefault(path, []).append(partial(_held, unfolded.float()))
+        dtype = getattr(module, "input_dtype", None) or module.weight.dtype
+        dw = dw.to(self.device, dtype)
+        dense = dense_of(module)
         if db is None:
-            self._chain(module, lambda prev: partial(_dense_add, prev, dw))
-        else:
-            self._chain(module, lambda prev: partial(_dense_add_bias, prev, dw, db))
+            self._chain(module, lambda prev: partial(_dense_add, prev, dense, dw))
+            return
+        db = db.to(self.device, torch.float32)
+        add = partial(_dense_add_bias, dense, dw, db)
+        self._chain(module, lambda prev: partial(add, prev))
 
-    def _build(
-        self,
-        linear: nn.Module,
-        path: str,
-        parts: dict,
-        ours_comfy: bool,
-        override: Tensor | None = None,
-    ):
+    def _build(self, linear: nn.Module, path: str, parts: dict):
         name = lora_name_of("lora_unet", path)
         parts = dict(parts)
         parts.setdefault("alpha", _default_alpha(parts))
@@ -278,56 +304,59 @@ class AdapterStack:
         lyco.to(device=self.device, dtype=torch.float32)
         lyco.requires_grad_(False)
         lyco.eval()
-        if ours_comfy:
-            self._undo_comfy(linear, lyco, parts, override)
         return lyco
 
     def _undo_comfy(self, linear, lyco, parts, override) -> None:
         """Invert the ComfyUI-semantics conversions of our own comfy exports."""
-        kind = kind_of(lyco)
-        if kind in ("oft", "boft") and "alpha" in parts:
-            lyco.constraint = float(parts["alpha"])
-        if getattr(lyco, "wd", False) and lyco.wd_on_out:
-            t = Target("", lyco.lora_name, linear, lyco, kind, True, True)
-            t.set_override(override)
-            resolve(t)
+        t = Target("", lyco.lora_name, linear, lyco, override, self.backend)
+        t.record.from_comfy(lyco, parts)
+        if t.wd and t.wd_on_out:
             w = t.base_weight(torch.float32)
-            dw = unit_delta(t).to(w.device)
+            dw = t.unit_fn().to(w.device)
             eps = torch.finfo(torch.float32).eps
             ratio = (row_norm(w + dw) + eps) / (row_norm(w) + eps)
             lyco.dora_scale.data.mul_(ratio.to(lyco.dora_scale))
 
+    def _stash_forwards(self) -> dict[int, tuple[nn.Module, object]]:
+        out = {}
+        for m in self.model.modules():
+            fwd = vars(m).pop("forward", None)
+            if fwd is not None:
+                out[id(m)] = (m, fwd)
+        return out
+
+    @staticmethod
+    def _unstash(stash: dict) -> None:
+        for m, fwd in stash.values():
+            vars(m)["forward"] = fwd
+
     def _add_raw(self, tensors: dict, meta: dict, m: float) -> None:
-        """A raw training state: rebuild the adapter set from its spec, then bind or merge."""
-        known = {f.name for f in dataclass_fields(AdapterSpec)}
-        fields = {k: v for k, v in spec_from_meta(meta).items() if k in known}
-        quiet = {"dropout": 0.0, "rank_dropout": 0.0, "module_dropout": 0.0}
-        spec = AdapterSpec(**{**fields, **quiet, "multiplier": m})
-        aset = apply(self.model, spec)
-        aset.load_state_dict(tensors)
-        for p in aset.trainable_params():
-            p.requires_grad_(False)
-        for t in aset.targets:
-            t.lyco.eval()
-        if self.mode == "merge":
-            deltas = [(t.linear, *delta(t, m)) for t in aset.targets]
+        """A raw training state: its modules rebuilt from its spec (dropout off, the
+        device's own tier), then stacked like any loaded adapter."""
+        spec = inference_spec(spec_from_meta(meta) or {}, 1.0)
+        stash = self._stash_forwards()
+        try:
+            aset = apply(self.model, spec, device=self.device)
+            aset.load_state_dict(tensors)
+            built = [(t.path, t.linear, t.lyco) for t in aset.targets]
             norm_deltas = [(n.path, n.delta()) for n in aset.norms]
             aset.remove()
-            for linear, dw, db in deltas:
-                self._add_dense(linear, dw, db, 1.0)
-            for path, (dw, db) in norm_deltas:
-                parts = {"w_norm": dw} if db is None else {"w_norm": dw, "b_norm": db}
-                self._add_layer(path, parts, m, False)
-            return
-        for t in aset.targets:
-            self.forwards.setdefault(id(t.linear), (t.linear, None))
-        self.sets.append(aset)
+        finally:
+            self._unstash(stash)
+        for path, linear, lyco in built:
+            lyco.requires_grad_(False)
+            lyco.eval()
+            override = self._base_for(linear, path, lyco, m)
+            self._attach(path, linear, lyco, m, override, None)
+        for path, (dw, db) in norm_deltas:
+            parts = {"w_norm": dw} if db is None else {"w_norm": dw, "b_norm": db}
+            self._add_norm(self.modules[path], parts, m)
 
     def remove(self) -> None:
         """Restore every touched weight and forward exactly."""
+        if not self.undoable:
+            raise RuntimeError("this AdapterStack was loaded with undoable=False")
         with torch.no_grad():
-            for aset in self.sets:
-                aset.remove()
             for module, previous in self.forwards.values():
                 vars(module).pop("forward", None)
                 if previous is not None:
@@ -337,10 +366,19 @@ class AdapterStack:
             for module in self.created_bias:
                 module.bias = None
                 getattr(module, "rebind", _noop)()
-        self.originals, self.forwards, self.live, self.sets = {}, {}, [], []
+        self.originals, self.forwards, self.live, self.earlier = {}, {}, [], {}
         self.created_bias = []
+        rebind_owner(self.model)
 
     unmerge = remove
+
+
+def _first(builder):
+    return builder()[0]
+
+
+def _held(tensor: Tensor) -> Tensor:
+    return tensor
 
 
 def load_adapters(
@@ -348,9 +386,10 @@ def load_adapters(
     adapters: list[tuple[str | dict, float]],
     mode: str = "bypass",
     row_scales: dict | None = None,
+    undoable: bool = True,
 ) -> AdapterStack:
     """Load each (file or tensor dict, multiplier) onto `model` for inference."""
-    stack = AdapterStack(model, mode, row_scales)
+    stack = AdapterStack(model, mode, row_scales, undoable)
     for source, multiplier in adapters:
         stack.add(source, multiplier)
     return stack

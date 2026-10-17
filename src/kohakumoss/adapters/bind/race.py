@@ -1,17 +1,6 @@
-"""Per-layer binding to LyCORIS's measured, precision-gated tier race.
-
-A `TierSlot` holds one layer's `Op`. On the first call of a shape bucket it asks
-`lycoris.kernels.tier.best` with the real operands (racing the fused backends, the
-compile tier, the eager body and the op's exact extras on a miss of LyCORIS's table)
-and keeps the picked arm once `tier.is_settled` says LyCORIS has fixed it for the
-process; every later call of that bucket is one dict lookup and the bound arm.
-LyCORIS fixes a key's tier at its first call (racing it only outside checkpointed
-forwards and backwards), so a checkpoint recompute reruns the arm its forward ran.
-
-The bucket covers what varies per call (token bucket, activation dtype, grad
-pattern); factor shapes, dtypes and grad flags are fixed between `AdapterSet.bind()`
-calls, each of which builds fresh slots.
-"""
+"""Per-layer binding to LyCORIS's measured, precision-gated tier race: a `TierSlot`
+asks `lycoris.kernels.tier.best` once per shape bucket and keeps the arm LyCORIS
+settled on (see docs/internals/adapter-binding.md)."""
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -113,13 +102,52 @@ def static_bucket(t: Tensor) -> tuple:
     return (t.dtype, t.requires_grad, torch.is_grad_enabled())
 
 
-class TierSlot:
-    """Callable(t) -> `op` through the tier LyCORIS picked for t's bucket."""
+TOKEN_PATTERNS = ((True, True), (False, True), (False, False))
+WEIGHT_PATTERNS = ((False, True), (True, True), (False, False))
 
-    def __init__(self, op: Op, bucket: Callable[[Tensor], tuple]):
+
+def _warm_one(slot, t: Tensor, grad: bool) -> int:
+    with torch.set_grad_enabled(grad):
+        y = slot(t)
+        if y.requires_grad:
+            y.float().sum().backward()
+    return 1
+
+
+class TierSlot:
+    """Callable(t) -> `op` through the tier LyCORIS picked for t's bucket.
+
+    `width` is the channel count of a (tokens, channels) operand; `shape` the shape of
+    a fixed operand (a base or merged weight, fp32). `warm` calls the slot on scratch
+    operands of each bucket and grad pattern.
+    """
+
+    def __init__(
+        self,
+        op: Op,
+        bucket: Callable[[Tensor], tuple],
+        width: int | None = None,
+        shape: tuple | None = None,
+    ):
         self.op = op
         self.bucket = bucket
+        self.width = width
+        self.shape = shape
         self.arms: dict[tuple, Callable[[Tensor], Tensor]] = {}
+
+    def warm(self, rows: list[int], dtype: torch.dtype, device) -> int:
+        """Resolve every bucket of `rows` (or the fixed operand) on scratch inputs."""
+        calls = 0
+        if self.width is not None:
+            for n in rows:
+                for needs_grad, grad in TOKEN_PATTERNS:
+                    x = torch.randn(n, self.width, device=device, dtype=dtype)
+                    calls += _warm_one(self, x.requires_grad_(needs_grad), grad)
+            return calls
+        for needs_grad, grad in WEIGHT_PATTERNS:
+            w = torch.randn(self.shape, device=device, dtype=torch.float32)
+            calls += _warm_one(self, w.requires_grad_(needs_grad), grad)
+        return calls
 
     def __call__(self, t: Tensor) -> Tensor:
         run = self.arms.get(self.bucket(t))

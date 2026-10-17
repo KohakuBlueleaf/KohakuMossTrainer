@@ -1,14 +1,17 @@
 """apply(model, spec): build LyCORIS modules on the preset's targets and bind forwards."""
 
+import lycoris.kernels as lyk
 import torch
-from lycoris.kernels import set_compile_dynamic
 from torch import nn
 
 from kohakumoss.adapters.adapter_set import LycoAdapterSet
 from kohakumoss.adapters.backend import pick_backend
 from kohakumoss.adapters.network import build_targets
+from kohakumoss.adapters.scope import compute_dtype_of
 from kohakumoss.adapters.spec import AdapterSpec
 from kohakumoss.adapters.target import CHILD, Target
+
+TIER_MODE = "measured"
 
 
 def compute_device(model: nn.Module) -> torch.device:
@@ -24,8 +27,18 @@ def _place(t: Target, dtype: torch.dtype, device: torch.device) -> None:
     t.lyco.to(device=device, dtype=dtype)
     t.lyco.train(t.linear.training)
     t.linear.add_module(CHILD, t.lyco)
-    if t.kind == "full":
+    if t.record.owns_weight:
         t.lyco.apply_to()
+
+
+def configure_lycoris(spec: AdapterSpec, compute: torch.dtype | None) -> None:
+    """LyCORIS's process-wide kernel modes: the measured, precision-gated tier race,
+    the compile tier's shape mode, the race on or off (TUNE), and every LyCORIS matmul
+    on `compute` (the model's 16-bit dtype) operands with fp32 accumulation."""
+    lyk.set_tier_mode(TIER_MODE)
+    lyk.set_compile_dynamic(spec.compile_dynamic)
+    lyk.set_tuning(spec.tune)
+    lyk.set_half_matmul(compute)
 
 
 def apply(
@@ -38,15 +51,17 @@ def apply(
     problems = spec.validate()
     if problems:
         raise ValueError("; ".join(problems))
+    device = torch.device(device) if device is not None else compute_device(model)
+    backend = pick_backend(device, spec.backend)
     targets, norms = build_targets(model, spec)
     if not targets and not norms:
         raise ValueError(f"preset {spec.preset!r} matched no layer")
-    stored_full = [t.path for t in targets if t.kind == "full" and t.stored]
+    stored_full = [t.path for t in targets if t.record.owns_weight and t.stored]
     if stored_full:
-        raise ValueError(f"ALGO='full' needs a dense base weight: {stored_full[:4]}")
-    device = torch.device(device) if device is not None else compute_device(model)
+        raise ValueError(
+            f"ALGO={spec.algo!r} needs a dense base weight: {stored_full[:4]}"
+        )
     for t in targets:
         _place(t, dtype, device)
-    set_compile_dynamic(spec.compile_dynamic)
-    backend = pick_backend(device, spec.backend)
+    configure_lycoris(spec, compute_dtype_of(model.modules()))
     return LycoAdapterSet(model, spec, targets, norms, backend)

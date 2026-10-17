@@ -13,6 +13,7 @@ from safetensors.torch import load_file
 from torch import Tensor, nn
 
 from kohakumoss.adapters import apply, load_adapters
+from kohakumoss.model import random_backbone
 from tests._util.negative import must_fail
 
 pytestmark = pytest.mark.cpu
@@ -84,6 +85,8 @@ def _adapted(model, name, **kw):
 @pytest.mark.parametrize("mode", ["bypass", "merge"])
 @pytest.mark.parametrize("name", CASES)
 def test_stored_base_matches_dense(name, mode):
+    if name == "tlora" and mode == "merge":
+        pytest.skip("T-LoRA trains in bypass only (AdapterSpec.validate)")
     q, d = quantized_toy(), dense_toy()
     qa = _adapted(q, name, mode=mode)
     _adapted(d, name, mode=mode)
@@ -106,9 +109,33 @@ def test_stored_base_is_really_used():
     must_fail(zero_storage, "outputs must depend on the stored weight")
 
 
+def _store(model):
+    """Every MossLinear of `model` on Int8Storage (empty dense parameter)."""
+    for m in model.modules():
+        if type(m).__name__ == "MossLinear":
+            m.set_base(Int8Storage(m.weight.detach()))
+            m.weight = nn.Parameter(torch.empty(0), requires_grad=False)
+    return model
+
+
+def _dequantized(model):
+    with torch.no_grad():
+        for m in model.modules():
+            if type(m).__name__ == "MossLinear":
+                m.weight.copy_(Int8Storage(m.weight).weight(m.weight.dtype))
+    return model
+
+
+def tiny_pair():
+    """(stored, dense) tiny backbones holding the same dequantized weights."""
+    q = random_backbone("tiny", seed=3).requires_grad_(False)
+    d = random_backbone("tiny", seed=3).requires_grad_(False)
+    return _store(q), _dequantized(d)
+
+
 @pytest.mark.parametrize("name", ["lora", "glora", "dora-out", "oft"])
 def test_merged_export_reads_the_storage(name, tmp_path):
-    q, d = quantized_toy(), dense_toy()
+    q, d = tiny_pair()
     qa, da = _adapted(q, name), _adapted(d, name)
     pq, pd = tmp_path / "q.safetensors", tmp_path / "d.safetensors"
     qa.export(str(pq), "merged", dtype=torch.float32)

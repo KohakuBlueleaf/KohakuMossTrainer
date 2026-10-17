@@ -1,9 +1,5 @@
-"""MOSS target presets, expressed in LyCORIS preset semantics (regex `target_name`).
-
-A preset expression is `base[+modifier...]`, e.g. "attn-mlp+text-refiner". Every
-pattern is matched against module paths relative to the backbone, which are the
-checkpoint key paths (`layers.3.proj.q`, `text_embedder.blocks.0.qkv`, ...).
-"""
+"""MOSS target presets in LyCORIS preset semantics: `base[+modifier...]` expressions
+whose regexes match backbone module paths (`layers.3.proj.q`, ...)."""
 
 import copy
 import os
@@ -66,11 +62,8 @@ def _expression(expr: str) -> tuple[dict, list[str]]:
 
 
 def resolve_preset(preset: str | dict, prefix: str) -> tuple[dict, list[str]]:
-    """(full LyCORIS preset dict, norm path patterns) for an expression, toml or dict.
-
-    Every LyCORIS preset key is set explicitly, because LycorisNetwork keeps presets
-    as class state and a missing key would inherit the previous call's value.
-    """
+    """(full LyCORIS preset dict with every key set, norm path patterns) for an
+    expression, toml or dict. See docs/internals/adapter-kinds.md."""
     match preset:
         case dict():
             body, norms = copy.deepcopy(preset), list(preset.get("norm_name", []))

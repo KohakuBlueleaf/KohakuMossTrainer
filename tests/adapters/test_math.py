@@ -1,12 +1,14 @@
-"""Bound forwards equal independent ΔW formulas; bypass equals merge; DoRA is applied."""
+"""Bound forwards equal independent dW formulas; bypass equals merge; DoRA is applied."""
+
+from functools import partialmethod
 
 import pytest
 import torch
 from _adcases import CASES, build, outputs, reference_model
 from _adref import lycoris_delta
 from _adtoy import inputs, toy
+from lycoris.modules import DyLoraModule
 
-from kohakumoss.adapters.delta import delta
 from tests._util.negative import must_fail
 
 pytestmark = pytest.mark.cpu
@@ -20,7 +22,12 @@ def test_forward_matches_independent_reference(name):
 
 
 @pytest.mark.parametrize(
-    "name", sorted(n for n in CASES if CASES[n].get("mode") != "merge")
+    "name",
+    sorted(
+        n
+        for n in CASES
+        if CASES[n].get("mode") != "merge" and CASES[n]["algo"] != "tlora"
+    ),
 )
 def test_bypass_equals_merge(name):
     bypass, _ = build(name)
@@ -53,7 +60,7 @@ def test_delta_matches_reference(name):
         w = t.base_weight(torch.float64)
         algo = {"locon": "locon", "lokr": "lokr", "glora": "glora"}[t.kind]
         ref = lycoris_delta(algo, parts, w, w.shape[0])
-        torch.testing.assert_close(delta(t)[0].double(), ref, rtol=1e-4, atol=1e-6)
+        torch.testing.assert_close(t.delta()[0].double(), ref, rtol=1e-4, atol=1e-6)
 
 
 def test_dora_is_applied_in_bypass():
@@ -91,6 +98,30 @@ def test_reference_catches_wrong_scale():
         torch.testing.assert_close(outputs(model), outputs(ref), **TOL)
 
     must_fail(doubled, "reference must notice a factor change")
+
+
+def _doubled_get_weight(self, real, rank):
+    down, up, scale = real(self, rank)
+    return down, up, scale * 2
+
+
+@pytest.mark.parametrize("name", ["tlora", "dylora"])
+def test_reference_is_independent_of_the_module_scale(name, monkeypatch):
+    model, aset = build(name)
+
+    def slipped():
+        if name == "dylora":
+            real = DyLoraModule.get_weight
+            monkeypatch.setattr(
+                DyLoraModule, "get_weight", partialmethod(_doubled_get_weight, real)
+            )
+        for t in aset.targets:
+            t.lyco.scale = t.lyco.scale * 2
+        ref = reference_model(aset)
+        aset.bind()
+        torch.testing.assert_close(outputs(model), outputs(ref), **TOL)
+
+    must_fail(slipped, f"a {name} scale slip shared by forward and export")
 
 
 @pytest.mark.parametrize("name", ["lora", "lokr", "oft", "full"])

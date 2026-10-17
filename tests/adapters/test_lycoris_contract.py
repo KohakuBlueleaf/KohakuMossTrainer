@@ -1,4 +1,4 @@
-"""What KohakuMoss relies on from LyCORIS itself, checked against the forward-consistent ΔW.
+"""What KohakuMoss relies on from LyCORIS itself, checked against the forward-consistent dW.
 
 A failure here is a LyCORIS defect (the package is used as-is by the applier).
 """
@@ -10,8 +10,6 @@ from _adtoy import inputs
 from lycoris.modules import IA3Module, get_module, make_module
 from lycoris.modules.tlora import clear_timestep_mask, set_timestep_mask
 
-from kohakumoss.adapters.delta import delta, unit_delta
-
 pytestmark = pytest.mark.cpu
 TOL = dict(rtol=1e-4, atol=1e-6)
 
@@ -21,7 +19,7 @@ def test_lycoris_merged_weight_is_forward_consistent(name):
     _, aset = build(name)
     for t in aset.targets:
         merged, _ = t.lyco.get_merged_weight(1.0)
-        want = t.base_weight(torch.float32) + unit_delta(t)
+        want = t.base_weight(torch.float32) + t.unit_fn()
         torch.testing.assert_close(merged.float(), want, **TOL)
 
 
@@ -58,7 +56,7 @@ def test_lycoris_oft_rescaled_diff_at_multiplier():
     _, aset = build("oft-constraint-rescale")
     for t in aset.targets:
         got = t.lyco.get_diff_weight(0.5)[0].float()
-        torch.testing.assert_close(got, delta(t, 0.5)[0], **TOL)
+        torch.testing.assert_close(got, t.delta(0.5)[0], **TOL)
 
 
 def test_lycoris_dylora_bypass_runs():

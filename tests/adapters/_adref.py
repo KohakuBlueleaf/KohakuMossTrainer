@@ -37,7 +37,7 @@ def _blockdiag_rotate(r: Tensor, w: Tensor) -> Tensor:
 
 
 def _butterfly(r: Tensor, w: Tensor) -> Tensor:
-    """BOFT: stage i pairs rows i·b/2 apart inside groups of 2^i·b, as index permutations."""
+    """BOFT: stage i pairs rows i*b/2 apart inside groups of 2^i*b, as index permutations."""
     m, num, b, _ = r.shape
     rows = w.shape[0]
     half = b // 2
@@ -70,7 +70,7 @@ def _kron_sides(t: dict) -> tuple[Tensor, Tensor, int | None]:
 
 
 def lycoris_delta(algo: str, t: dict, w: Tensor, out_dim: int) -> Tensor:
-    """ΔW of a layer from its native LyCORIS tensors (multiplier 1)."""
+    """dW of a layer from its native LyCORIS tensors (multiplier 1)."""
     w = _d(w)
     match algo:
         case "locon":
@@ -112,6 +112,19 @@ def lycoris_delta(algo: str, t: dict, w: Tensor, out_dim: int) -> Tensor:
             dw = w * (v[None, :] if int(t["on_input"]) else v[:, None])
         case "full":
             dw = _d(t["diff"])
+        case "tlora":
+            r = t["q_layer.weight"].shape[0]
+            cur = (
+                _d(t["p_layer.weight"])
+                * _d(t["lambda_layer"])
+                @ _d(t["q_layer.weight"])
+            )
+            base = _d(t["base_p"]) * _d(t["base_lambda"]) @ _d(t["base_q"])
+            dw = (float(t["alpha"]) / r) * (cur - base)
+        case "dylora":
+            r = t["lora_down.weight"].shape[0]
+            up, down = _d(t["lora_up.weight"]), _d(t["lora_down.weight"])
+            dw = (float(t["alpha"]) / r) * (up @ down.reshape(r, -1))
         case _:
             raise KeyError(algo)
     if "dora_scale" in t:

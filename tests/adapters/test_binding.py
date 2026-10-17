@@ -9,12 +9,15 @@ from functools import partial
 import pytest
 import torch
 from _adcases import build, make_spec
+from lycoris.kernels import MAX_HADA_RANK
 from test_stored_base import quantized_toy
+from torch import nn
 
-from kohakumoss.adapters import apply
-from kohakumoss.adapters import delta as dl
-from kohakumoss.adapters.bind import eager, fused
+from kohakumoss.adapters import apply, scope
+from kohakumoss.adapters import target as target_mod
+from kohakumoss.adapters.bind import dora, eager, fused
 from kohakumoss.adapters.bind.select import bind_target
+from kohakumoss.adapters.kinds import common, other, rotation
 
 pytestmark = pytest.mark.cpu
 JOINT = "layers.0.proj.q"
@@ -25,8 +28,10 @@ def _target(aset, path=JOINT):
     return next(t for t in aset.targets if t.path == path)
 
 
-def _bind(t, mode="bypass", backend="triton", m=1.0, detach=False, module_p=0.0):
-    return bind_target(t, mode, backend, m, detach, module_p)
+def _bind(
+    t, mode="bypass", backend="triton", m=1.0, detach=False, module_p=0.0, race=False
+):
+    return bind_target(t, mode, backend, m, detach, module_p, race=race)
 
 
 @pytest.mark.parametrize(
@@ -63,15 +68,16 @@ def test_rotation_bypass_variants(name, m, want):
 
 
 @pytest.mark.parametrize(
-    "name,inner",
-    [("oft", dl.oft_delta_plain), ("oft-constraint-rescale", dl.oft_delta_rescaled)],
+    "name,rescale",
+    [("oft", rotation._no_rescale), ("oft-constraint-rescale", rotation._rescale)],
 )
-def test_oft_at_a_multiplier_binds_the_delta_builder(name, inner):
+def test_oft_at_a_multiplier_binds_the_delta_builder(name, rescale):
     _, aset = build(name)
     fn = _bind(_target(aset), m=0.5)
     assert fn.func is eager.delta_bypass
-    builder = fn.args[-1]
-    assert builder.func is dl._oft_at and builder.args[-1] is inner
+    builder = fn.args[2]
+    assert builder.func is rotation._oft_unit_at and builder.args[1] is rescale
+    assert fn.args[3] is fused.lin_nobias
 
 
 @pytest.mark.parametrize(
@@ -112,36 +118,51 @@ def test_dora_fused_variants(m, mix):
 
 
 @pytest.mark.parametrize(
-    "name,detach,want",
+    "name,detach,training,want",
     [
-        ("dora-out", True, dl.detached_out),
-        ("dora-in", True, dl.detached_in),
-        ("dora-out", False, dl.dora_merged),
+        ("dora-out", True, True, dora.detached_out),
+        ("dora-in", True, True, dora.detached_in),
+        ("dora-out", False, True, dora.decomposed),
+        ("dora-out", True, False, dora.decomposed),
     ],
 )
-def test_dora_eager_variants(name, detach, want):
+def test_dora_eager_variants(name, detach, training, want):
     _, aset = build(name)
-    fn = _bind(_target(aset), backend="torch", detach=detach)
+    t = _target(aset)
+    nn.Module.train(t.lyco, training)
+    fn = _bind(t, backend="torch", detach=detach)
     assert fn.func is eager.eager_dora
     decompose = fn.args[2]
-    got = decompose.args[0] if decompose.func is dl.detached else decompose.func
+    got = decompose.args[0] if decompose.func is dora.detached else decompose.func
     assert got is want
 
 
-@pytest.mark.parametrize("m,builder", [(1.0, dl._unit_only), (0.5, dl._unit_times)])
+def test_dora_detach_binds_fused_outside_training():
+    _, aset = build("dora-out")
+    t = _target(aset)
+    nn.Module.train(t.lyco, False)
+    assert _bind(t, detach=True).func is fused.dora_forward
+    nn.Module.train(t.lyco, True)
+    assert _bind(t, detach=True).func is eager.eager_dora
+
+
+@pytest.mark.parametrize(
+    "m,builder", [(1.0, common._unit_only), (0.5, common._unit_times)]
+)
 def test_bind_delta_variants(m, builder):
     _, aset = build("lora")
-    assert dl.bind_delta(_target(aset), m).func is builder
+    assert _target(aset).delta_at(m).func is builder
 
 
 def test_bind_delta_dora_and_full():
     _, aset = build("dora-out")
-    one, half = dl.bind_delta(_target(aset), 1.0), dl.bind_delta(_target(aset), 0.5)
-    assert one.func is dl._dora and one.args[1] is dl._same
-    assert half.func is dl._dora and half.args[1].func is dl._times
+    t = _target(aset)
+    one, half = t.delta_at(1.0), t.delta_at(0.5)
+    assert one.func is common._dora and one.args[1] is common._same
+    assert half.func is common._dora and half.args[1].func is common._times
     _, full = build("lora-text", algo="full", mode="merge")
-    assert dl.bind_delta(_target(full, TEXT), 1.0).func is dl._full
-    assert dl.bind_delta(_target(full, JOINT), 1.0).func is dl._full_nobias
+    assert _target(full, TEXT).delta_at(1.0).func is other._full_with_bias
+    assert _target(full, JOINT).delta_at(1.0).func is other._full_without_bias
 
 
 def test_dylora_rebinds_on_train_and_eval():
@@ -168,3 +189,42 @@ def test_stored_base_binds_bypass_for_merge_mode():
     aset = apply(model, make_spec("lora", mode="merge"))
     fn = _bind(_target(aset), mode="merge")
     assert fn.func is fused.add_base
+
+
+@pytest.mark.parametrize("drop", [{"dropout": 0.2}, {"rank_dropout": 0.2}])
+def test_dropout_layers_bind_fused_outside_training(drop):
+    model, aset = build("lora", **drop)
+    t = _target(aset)
+    nn.Module.train(t.lyco, True)
+    assert _bind(t).func is eager.module_bypass
+    nn.Module.train(t.lyco, False)
+    assert _bind(t).func is fused.add_base
+
+
+def test_dropout_layers_rebind_on_train_and_eval():
+    model, aset = build("lora", rank_dropout=0.2)
+    t = _target(aset)
+    model.train()
+    first = vars(t.linear)["forward"]
+    model.eval()
+    assert vars(t.linear)["forward"] is not first
+
+
+def test_wide_loha_has_no_fused_path():
+    _, aset = build("loha", dim=MAX_HADA_RANK + 8)
+    t = _target(aset)
+    assert _bind(t).func is eager.module_bypass
+    raced = _bind(t, race=True)
+    slot = scope.slots_of(raced)[0]
+    assert slot.op.supported is False
+    _, narrow = build("loha")
+    assert scope.slots_of(_bind(_target(narrow), race=True))[0].op.supported
+
+
+def test_base_source_is_selected_once():
+    _, dense = build("lora")
+    t = _target(dense)
+    assert t.base_fn.func is target_mod._dense_base
+    stored = apply(quantized_toy(), make_spec("lora"))
+    s = _target(stored)
+    assert s.base_fn == s.linear.base.weight

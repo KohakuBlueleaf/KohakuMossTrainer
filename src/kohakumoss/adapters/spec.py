@@ -1,33 +1,47 @@
 """AdapterSpec: what to train and how, resolved from the train-script knobs."""
 
+import inspect
 from dataclasses import dataclass, field
 
-ALGO_ALIASES = {
-    "lora": "lora",
-    "locon": "locon",
-    "loha": "loha",
-    "lokr": "lokr",
-    "oft": "diag-oft",
-    "diag-oft": "diag-oft",
-    "boft": "boft",
-    "glora": "glora",
-    "ia3": "ia3",
-    "dylora": "dylora",
-    "tlora": "tlora",
-    "full": "full",
-}
+from lycoris.wrapper import LycorisNetwork
+
+from kohakumoss.adapters.kinds import BY_ALGO, lycoris_algo
+from kohakumoss.adapters.tlora import MASK_KEYS
+
 MODES = ("bypass", "merge")
 BACKENDS = ("auto", "triton", "tilelang", "compile", "torch")
 COMPILE_DYNAMIC = ("tokens", "static", "dynamic")
+RESERVED = {
+    "lora_dim",
+    "alpha",
+    "dropout",
+    "rank_dropout",
+    "module_dropout",
+    "multiplier",
+    "network_module",
+}
+
+
+def _parameters(fn) -> set[str]:
+    kinds = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    sig = inspect.signature(fn)
+    return {n for n, p in sig.parameters.items() if p.kind not in kinds} - {"self"}
+
+
+def accepted_kwargs(algo: str) -> set[str]:
+    """ALGO_KWARGS names the LyCORIS module (or network) of `algo` takes."""
+    module = BY_ALGO[algo].module
+    return (_parameters(module.__init__) | _parameters(LycorisNetwork.__init__)) - {
+        "lora_name",
+        "org_module",
+        "module",
+    }
 
 
 @dataclass(frozen=True)
 class AdapterSpec:
-    """One adapter configuration; `algo_kwargs` go to the LyCORIS module constructor.
-
-    `preset` is a MOSS preset expression ("attn-mlp+text-refiner"), a LyCORIS-style
-    toml path, or a preset dict. `backend` pins the LyCORIS kernel tier.
-    """
+    """One adapter configuration; `algo_kwargs` go to the LyCORIS module constructor
+    (T-LoRA's `mask_*` keys configure its timestep mask instead)."""
 
     algo: str = "lora"
     preset: str | dict = "attn-mlp"
@@ -47,16 +61,27 @@ class AdapterSpec:
     backend: str = "auto"
     compile_dynamic: str = "tokens"
     lr_ratio_up: float = 1.0
+    seed: int = 0
+    tune: bool = True
 
     @property
     def lycoris_algo(self) -> str:
-        return ALGO_ALIASES[self.algo]
+        return lycoris_algo(self.algo)
+
+    @property
+    def record(self):
+        return BY_ALGO[self.algo]
+
+    def mask_kwargs(self) -> dict:
+        """T-LoRA mask settings (min_rank / alpha / max_timestep) from ALGO_KWARGS."""
+        return {MASK_KEYS[k]: v for k, v in self.algo_kwargs.items() if k in MASK_KEYS}
 
     def validate(self) -> list[str]:
         """Every problem with this spec (empty when valid)."""
         problems = []
-        if self.algo not in ALGO_ALIASES:
-            problems.append(f"ALGO={self.algo!r} not in {sorted(ALGO_ALIASES)}")
+        rec = BY_ALGO.get(self.algo)
+        if rec is None:
+            problems.append(f"ALGO={self.algo!r} not in {sorted(BY_ALGO)}")
         if self.mode not in MODES:
             problems.append(f"ADAPTER_MODE={self.mode!r} not in {MODES}")
         if self.backend not in BACKENDS:
@@ -65,24 +90,51 @@ class AdapterSpec:
             problems.append(
                 f"LYCORIS_COMPILE_DYNAMIC={self.compile_dynamic!r} not in {COMPILE_DYNAMIC}"
             )
-        if self.dim <= 0 and self.algo not in ("full", "ia3"):
+        if self.dim <= 0 and not (rec is not None and rec.dimless):
             problems.append(f"DIM must be positive, got {self.dim}")
-        if self.dora and self.algo not in ("lora", "locon", "loha", "lokr"):
-            problems.append(f"DORA applies to lora/locon/loha/lokr, not {self.algo}")
-        if self.algo == "full" and self.mode == "bypass":
-            problems.append(
-                "ALGO='full' trains the weight itself; use ADAPTER_MODE='merge'"
-            )
+        if self.dora and self.dropout > 0:
+            problems.append("DORA ignores input dropout; set DROPOUT['input']=0")
         for name in ("dropout", "rank_dropout", "module_dropout"):
             value = getattr(self, name)
             if not 0.0 <= value < 1.0:
                 problems.append(f"{name}={value} outside [0, 1)")
+        if rec is not None:
+            problems += self._kind_problems(rec)
         return problems
+
+    def _kind_problems(self, rec) -> list[str]:
+        out = []
+        if rec.owns_weight and self.mode == "bypass":
+            out.append(
+                f"ALGO={self.algo!r} trains the weight itself; use ADAPTER_MODE='merge'"
+            )
+        if self.dora and not rec.dora:
+            out.append(f"DORA does not apply to ALGO={self.algo!r}")
+        if rec.token_axis and self.mode == "merge":
+            out.append(
+                "ALGO='tlora' masks ranks per token, which no merged weight expresses; "
+                "use ADAPTER_MODE='bypass'"
+            )
+        return out + self._kwarg_problems()
+
+    def _kwarg_problems(self) -> list[str]:
+        own = set(MASK_KEYS) if self.record.token_axis else set()
+        accepted = accepted_kwargs(self.algo)
+        out = []
+        for key in self.algo_kwargs:
+            if key in own:
+                continue
+            if key in RESERVED:
+                out.append(f"ALGO_KWARGS[{key!r}] is set by its own knob")
+            elif key not in accepted:
+                out.append(f"ALGO_KWARGS[{key!r}] is not a {self.algo} module argument")
+        return out
 
     def module_kwargs(self) -> dict:
         """Constructor kwargs shared by every LyCORIS module of this spec."""
-        kwargs = dict(self.algo_kwargs)
-        kwargs.setdefault("bypass_mode", self.mode == "bypass" and self.algo != "full")
+        kwargs = {k: v for k, v in self.algo_kwargs.items() if k not in MASK_KEYS}
+        bypass = self.mode == "bypass" and not self.record.owns_weight
+        kwargs.setdefault("bypass_mode", bypass)
         if self.dora:
             kwargs["weight_decompose"] = True
             kwargs["wd_on_out"] = self.dora_on_output
@@ -114,4 +166,15 @@ def spec_from_knobs(cfg: dict) -> AdapterSpec:
         backend=(cfg.get("KERNELS", {}) or {}).get("lycoris", "auto"),
         compile_dynamic=cfg.get("LYCORIS_COMPILE_DYNAMIC", "tokens"),
         lr_ratio_up=float(cfg.get("LORAPLUS_RATIO", 1.0)),
+        seed=int(cfg.get("SEED", 0)),
+        tune=cfg.get("TUNE", "auto") != "off",
     )
+
+
+def inference_spec(fields: dict, multiplier: float) -> AdapterSpec:
+    """A saved spec rebuilt for inference / export on any device: no dropout, the
+    device's own kernel tier (a training-time backend pin does not carry over)."""
+    known = set(AdapterSpec.__dataclass_fields__)
+    kept = {k: v for k, v in fields.items() if k in known}
+    quiet = {"dropout": 0.0, "rank_dropout": 0.0, "module_dropout": 0.0}
+    return AdapterSpec(**{**kept, **quiet, "backend": "auto", "multiplier": multiplier})

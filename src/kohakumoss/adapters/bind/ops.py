@@ -1,13 +1,6 @@
-"""The LyCORIS tier ops of each adapter kind, as `race.Op`s over one layer's module.
-
-Each mirrors the `tier.run` call of its `lycoris.functional` entry: the same op name,
-operand tuple, scope test, fused kernel, eager body and exact extras, so the race and
-its recorded decision are the ones LyCORIS makes for that call. `operands(t)` builds
-the operand objects once per call and every arm reads those same objects (the race's
-fp64 gate maps gradients by operand identity). Bypass ops take the (tokens, channels)
-activation — the input for the low-rank kinds, the base output for the rotations —
-with factors cast to its dtype as the modules do; merge ops take the base weight.
-"""
+"""The LyCORIS tier ops of each adapter kind, as `race.Op`s over one layer's module,
+mirroring the `tier.run` calls of `lycoris.functional` (see
+docs/internals/adapter-binding.md)."""
 
 from functools import partial
 
@@ -18,6 +11,7 @@ from lycoris.functional import locon as f_locon
 from lycoris.functional import loha as f_loha
 from lycoris.functional import lokr as f_lokr
 from lycoris.functional.diag_oft import MAX_BLOCK
+from lycoris.kernels import MAX_HADA_RANK
 from lycoris.kernels.autograd import (
     apply_dora,
     boft_bypass_diff,
@@ -55,7 +49,7 @@ def rescale_getter(lyco):
     return _rescale if lyco.rescaled else _no_rescale
 
 
-# Low-rank bypass: Δy of the flattened input.
+# Low-rank bypass: dy of the flattened input.
 
 
 def _lora_operands(lyco, x: Tensor) -> tuple:
@@ -93,6 +87,11 @@ def _loha_fused(gamma, backend: str, ops: tuple) -> Tensor:
     return loha_bypass_diff(*ops, gamma, backend)
 
 
+def hada_rank(lyco) -> int:
+    """The larger hadamard rank of a LoHa module (the fused kernels' scope term)."""
+    return max(lyco.hada_w1_b.shape[0], lyco.hada_w2_b.shape[0])
+
+
 def _rank_product(gamma, ops: tuple) -> Tensor:
     return f_loha.rank_product_bypass(*ops, gamma)
 
@@ -104,7 +103,7 @@ def loha_bypass(lyco, gamma: float) -> Op:
     return Op(
         "loha.bypass",
         partial(_loha_operands, lyco),
-        static_scale(gamma),
+        static_scale(gamma) and hada_rank(lyco) <= MAX_HADA_RANK,
         partial(_loha_fused, gamma),
         f_loha.eager_bypass_diff,
         partial(_then, (None, None, gamma, {})),
@@ -132,7 +131,7 @@ def lokr_bypass(lyco, scale: float) -> Op:
     )
 
 
-# Rotation bypass: Δy of the flattened base output.
+# Rotation bypass: dy of the flattened base output.
 
 
 def _oft_operands(lyco, rescale, t: Tensor) -> tuple:
@@ -177,7 +176,7 @@ def boft_bypass(lyco, m: float) -> Op:
     )
 
 
-# Merge: ΔW at multiplier 1 (BOFT: at the bound multiplier) from the base weight.
+# Merge: dW at multiplier 1 (BOFT: at the bound multiplier) from the base weight.
 
 
 def _scaled(lyco, ops: tuple) -> tuple:
@@ -215,7 +214,7 @@ def loha_merge(lyco) -> Op:
     return Op(
         "loha.merge",
         partial(_loha_weights, lyco),
-        static_scale(lyco.scale),
+        static_scale(lyco.scale) and hada_rank(lyco) <= MAX_HADA_RANK,
         partial(_loha_weight_fused, lyco),
         f_loha.eager_diff_weight,
         partial(_scaled, lyco),

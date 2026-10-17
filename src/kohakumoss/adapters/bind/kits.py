@@ -1,24 +1,15 @@
-"""The two fused kernel kits a layer binds from: pinned backend or LyCORIS's tier race.
-
-`Pinned(backend)` (KERNELS.lycoris names a backend) calls the fused kernels on that
-backend directly. `Raced(backend)` (KERNELS.lycoris = "auto") binds each op to a
-`race.TierSlot`, so the layer runs whichever of the fused backends, the compile tier,
-the eager body or an exact extra LyCORIS measured fastest within its precision bar.
-IA3 and GLoRA have no tier op and take the device's preferred fused backend in both.
-
-Both expose the same factories; each returns the callable to plug into a
-`bind.fused` forward shell, or None where the kit has no path for the layer.
-"""
+"""The two fused kits a layer binds from: `Pinned(backend)` calls one backend's
+kernels directly, `Raced(backend)` binds each op to a `race.TierSlot`. Both expose the
+same factories; each returns the callable for a `bind.fused` shell, or None."""
 
 from functools import partial
 
 from lycoris.functional.diag_oft import MAX_BLOCK
 from lycoris.functional.lokr import apply_supported
+from lycoris.kernels import MAX_HADA_RANK
 
 from kohakumoss.adapters.bind import fused, ops
 from kohakumoss.adapters.bind.race import TierSlot, flat, static_bucket, token_bucket
-
-MAX_LOHA_RANK = 128
 
 
 class Pinned:
@@ -29,7 +20,7 @@ class Pinned:
         return partial(fused.lora_diff, lyco, gamma, self.backend)
 
     def loha(self, lyco, gamma):
-        if lyco.lora_dim > MAX_LOHA_RANK:
+        if ops.hada_rank(lyco) > MAX_HADA_RANK:
             return None
         return partial(fused.loha_diff, lyco, gamma, self.backend)
 
@@ -55,7 +46,7 @@ class Pinned:
         return partial(fused.lora_unit, lyco, self.backend)
 
     def loha_unit(self, lyco):
-        if lyco.lora_dim > MAX_LOHA_RANK:
+        if ops.hada_rank(lyco) > MAX_HADA_RANK:
             return None
         return partial(fused.loha_unit, lyco, self.backend)
 
@@ -77,12 +68,20 @@ class Pinned:
         return partial(fused.decompose, lyco, on_out, self.backend)
 
 
-def _input_slot(op):
-    return partial(flat, TierSlot(op, token_bucket))
+def _input_slot(op, width: int):
+    return partial(flat, TierSlot(op, token_bucket, width=width))
 
 
-def _weight_slot(op):
-    return TierSlot(op, static_bucket)
+def _weight_slot(op, shape: tuple):
+    return TierSlot(op, static_bucket, shape=tuple(shape))
+
+
+def _in(lyco) -> int:
+    return int(lyco.shape[1])
+
+
+def _out(lyco) -> int:
+    return int(lyco.shape[0])
 
 
 class Raced:
@@ -92,37 +91,39 @@ class Raced:
         self.backend = backend
 
     def lora(self, lyco, gamma):
-        return _input_slot(ops.lora_bypass(lyco, gamma))
+        return _input_slot(ops.lora_bypass(lyco, gamma), _in(lyco))
 
     def loha(self, lyco, gamma):
-        return _input_slot(ops.loha_bypass(lyco, gamma))
+        return _input_slot(ops.loha_bypass(lyco, gamma), _in(lyco))
 
     def lokr(self, lyco, scale):
-        return _input_slot(ops.lokr_bypass(lyco, scale))
+        return _input_slot(ops.lokr_bypass(lyco, scale), _in(lyco))
 
     def oft(self, linear, lyco):
-        return partial(fused.post_add, linear, _input_slot(ops.oft_bypass(lyco)))
+        slot = _input_slot(ops.oft_bypass(lyco), _out(lyco))
+        return partial(fused.post_add, linear, slot)
 
     def boft(self, linear, lyco, m):
-        return partial(fused.post_add, linear, _input_slot(ops.boft_bypass(lyco, m)))
+        slot = _input_slot(ops.boft_bypass(lyco, m), _out(lyco))
+        return partial(fused.post_add, linear, slot)
 
     def lora_unit(self, lyco):
-        return _weight_slot(ops.lora_merge(lyco))
+        return _weight_slot(ops.lora_merge(lyco), lyco.shape)
 
     def loha_unit(self, lyco):
-        return _weight_slot(ops.loha_merge(lyco))
+        return _weight_slot(ops.loha_merge(lyco), lyco.shape)
 
     def lokr_unit(self, lyco):
-        return _weight_slot(ops.lokr_merge(lyco))
+        return _weight_slot(ops.lokr_merge(lyco), lyco.shape)
 
     def oft_unit(self, lyco):
-        return _weight_slot(ops.oft_merge(lyco))
+        return _weight_slot(ops.oft_merge(lyco), lyco.shape)
 
     def boft_unit(self, lyco, m):
-        return _weight_slot(ops.boft_merge(lyco, m))
+        return _weight_slot(ops.boft_merge(lyco, m), lyco.shape)
 
     def decompose(self, lyco, on_out):
-        return _weight_slot(ops.decompose(lyco, on_out))
+        return _weight_slot(ops.decompose(lyco, on_out), lyco.shape)
 
 
 def kit(backend: str, race: bool):

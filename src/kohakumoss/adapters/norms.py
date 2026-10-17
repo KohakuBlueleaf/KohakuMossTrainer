@@ -1,8 +1,5 @@
-"""Trained norm deltas: `weight = original + m·w_norm` through a parametrization.
-
-The norm module keeps reading `.weight`, so fused norm kernels see the adapted weight;
-the multiplier scales the delta like every other adapter.
-"""
+"""Trained norm deltas: `weight = original + m * w_norm` through a parametrization
+(the norm keeps reading `.weight`, so fused norm kernels see the adapted weight)."""
 
 import torch
 import torch.nn.utils.parametrize as parametrize
@@ -18,7 +15,7 @@ class NormDelta(nn.Module):
         self.multiplier = 1.0
 
     def forward(self, original: Tensor) -> Tensor:
-        return original + (self.w_norm * self.multiplier).to(original.dtype)
+        return (original.float() + self.w_norm * self.multiplier).to(original.dtype)
 
 
 def attach(module: nn.Module, name: str = "weight") -> NormDelta:

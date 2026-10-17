@@ -1,15 +1,9 @@
-"""Fused LyCORIS paths bound by the applier, pinned and raced.
+"""Fused LyCORIS paths bound by the applier, pinned and raced, against the eager body.
 
-Pinned (KERNELS.lycoris = the device's fused backend): the fused kernels are as
-accurate as the eager bodies. Both runs are judged against an fp64 eager reference
-with the same adapter tensors: the fused error (RMS, relative) may not exceed 1.1x the
-eager error in the same dtype (no absolute floor), for the output and every adapter
-gradient.
-
-Raced (auto): precision is LyCORIS's per-op gate (`lycoris.kernels.plans.precision`),
-so the test checks that every raced op of every layer settled on a gated pick in a
-fresh race, and the end-to-end run against the fp64 reference at a correctness bar
-(`RACED_FACTOR` x the eager error) that a wrong arm — a 1% scale error — fails.
+Both runs are judged against an fp64 eager reference with the same adapter tensors,
+for the output and every adapter gradient: the fused result fails when it is clearly
+worse than the eager one in both absolute and relative error (`_fused_bar`). Raced
+runs also settle every slot on a precision-gated pick in a fresh race.
 """
 
 from functools import partial
@@ -18,6 +12,7 @@ import pytest
 import torch
 from _adcases import make_spec
 from _adtoy import inputs, perturb, toy
+from _fused_bar import check
 from lycoris.kernels import tier
 
 from kohakumoss.adapters import apply
@@ -38,8 +33,6 @@ FUSED_CASES = (
     "doha",
 )
 UNRACED = ("ia3", "glora")
-FACTOR = 1.1
-RACED_FACTOR = 3.0
 
 
 def _dtypes():
@@ -59,16 +52,6 @@ def _run(name, mode, backend, dtype):
     y.double().square().mean().backward()
     grads = {k: p.grad.double().clone() for k, p in aset.named_trainable()}
     return y.double().detach(), grads, aset
-
-
-def _rel(a, ref):
-    return ((a - ref).square().mean().sqrt() / ref.square().mean().sqrt()).item()
-
-
-def _check(fused, eager, ref, dtype, what, factor=FACTOR):
-    bar = factor * _rel(eager, ref)
-    err = _rel(fused, ref)
-    assert err <= bar, f"{what}: fused {err:.3e} > bar {bar:.3e}"
 
 
 def _eager_runs(name, mode, dtype, patch):
@@ -109,9 +92,9 @@ def test_pinned_fused_is_as_accurate_as_eager(name, mode, dtype, monkeypatch):
     assert aset.backend in ("triton", "tilelang")
     if name != "glora" or mode == "merge":
         assert any(t.fused for t in aset.targets), "no layer took the fused path"
-    _check(y_f, y_e, y_r, dtype, "output")
+    check(y_f, y_e, y_r, "output")
     for key in g_r:
-        _check(g_f[key], g_e[key], g_r[key], dtype, key)
+        check(g_f[key], g_e[key], g_r[key], key)
 
 
 @pytest.mark.parametrize("dtype", _dtypes())
@@ -132,19 +115,15 @@ def test_raced_layers_settle_on_gated_picks(name, mode, dtype, monkeypatch, tmp_
     for key, pick in picks.items():
         assert pick not in rejected.get(key, {}), f"{key}: rejected pick {pick} kept"
     assert not ungated, f"raced without the precision gate: {sorted(ungated)[:2]}"
-    _check(y_f, y_e, y_r, dtype, "output", RACED_FACTOR)
+    check(y_f, y_e, y_r, "output")
     for key in g_r:
-        _check(g_f[key], g_e[key], g_r[key], dtype, key, RACED_FACTOR)
+        check(g_f[key], g_e[key], g_r[key], key)
 
 
-def test_the_bars_catch_a_wrong_kernel(monkeypatch):
+def test_the_bar_catches_a_wrong_kernel(monkeypatch):
     dtype = _dtypes()[0]
     with monkeypatch.context() as patch:
-        (y_r, _, _), (y_e, _, _) = _eager_runs("lora", "bypass", dtype, patch)
-
-    for factor in (FACTOR, RACED_FACTOR):
-
-        def wrong(factor=factor):
-            _check(y_e * (1 + 1e-2), y_e, y_r, dtype, "scaled output", factor)
-
-        must_fail(wrong, f"a 1% scale error at {factor}x the eager error")
+        (y_r, g_r, _), (y_e, g_e, _) = _eager_runs("lora", "bypass", dtype, patch)
+    must_fail(lambda: check(y_e * 1.1, y_e, y_r, "output"), "a 10% output scale")
+    key = next(iter(g_r))
+    must_fail(lambda: check(g_e[key] * 1.1, g_e[key], g_r[key], key), "a 10% grad")

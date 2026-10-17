@@ -44,6 +44,8 @@ NATIVE_REF = {
     "boft": "boft",
     "ia3": "ia3",
     "full": "full",
+    "tlora": "tlora",
+    "dylora": "dylora",
 }
 
 
@@ -64,21 +66,16 @@ def build(name: str, seed: int = 0, **override):
 
 
 def reference_model(aset, seed: int = 0):
-    """A plain toy whose weights are W + ΔW from independent formulas over the export."""
+    """A plain toy whose weights are W + dW from independent formulas over the export."""
     ref = toy(seed)
     modules = dict(ref.named_modules())
-    comfy = aset.tensors("comfy", "diffusion_model")
     native = aset.tensors("lycoris")
     with torch.no_grad():
         for t in aset.targets:
             layer = modules[t.path]
             w = layer.weight
-            if t.kind in NATIVE_REF:
-                parts = _parts(native, t.lora_name)
-                dw = lycoris_delta(NATIVE_REF[t.kind], parts, w, w.shape[0])
-            else:
-                parts = _parts(comfy, f"diffusion_model.{t.path}")
-                dw = lycoris_delta("locon", parts, w, w.shape[0])
+            parts = _parts(native, t.lora_name)
+            dw = lycoris_delta(NATIVE_REF[t.kind], parts, w, w.shape[0])
             layer.weight.add_(dw.to(w.dtype))
             if t.kind == "full" and f"{t.lora_name}.diff_b" in native:
                 layer.bias.add_(native[f"{t.lora_name}.diff_b"].to(layer.bias.dtype))
