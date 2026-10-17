@@ -33,7 +33,7 @@ kernels = [
     "triton-windows>=3.7,<3.9; sys_platform == 'win32'",
 ]
 lightning = ["lightning>=2.5"]
-textenc = ["flash-linear-attention", "causal-conv1d; sys_platform != 'win32'"]
+baselines = ["flash-linear-attention", "causal-conv1d; sys_platform != 'win32'"]
 quant = ["bitsandbytes"]
 parquet = ["pyarrow"]
 board = ["kohakuboard"]
@@ -51,6 +51,10 @@ include = ["kohakumoss*", "kohakumoss_kernels*", "kohakumoss_data*"]
 [tool.black]
 line-length = 88
 target-version = ["py310"]
+# black's default exclude minus `build`, which would skip build/ packages under src/
+exclude = '''
+/(\.direnv|\.eggs|\.git|\.hg|\.ipynb_checkpoints|\.mypy_cache|\.nox|\.pytest_cache|\.ruff_cache|\.tox|\.svn|\.venv|\.vscode|__pypackages__|_build|buck-out|dist|venv)/|^/build/
+'''
 
 [tool.ruff]
 line-length = 88
@@ -72,6 +76,7 @@ markers = [
     "sm89: needs sm89",
     "sm120: needs sm120",
     "xpu: needs an Intel XPU",
+    "gpu: needs a CUDA GPU or an Intel XPU",
     "windows: Windows-specific",
     "multi_gpu: needs two or more GPUs",
     "real_weights: needs KOHAKUMOSS_WEIGHTS",

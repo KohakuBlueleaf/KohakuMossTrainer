@@ -91,13 +91,53 @@ The optimiser step runs on the GPU by default, including under every offload kno
   updated weights go back host -> device. `step_param(p)` updates one parameter.
 - All four take torch-style parameter groups; each group's lr / betas / eps /
   weight_decay apply to its parameters, and `param_groups` holds the live dicts a
-  schedule edits.
+  schedule edits. They apply `decay_to_one` groups to their fp32 masters themselves
+  (`handles_decay_to_one`), so the bundle's post-step decay is skipped for them.
 - `FusedStep` registers post-accumulate-grad hooks that step each parameter as soon as its
   gradient is complete and free it, so only one block's gradients are alive.
   `PerParamOptimizer` gives any torch optimiser that per-parameter interface behind a
-  torch-style `param_groups` view for schedules (one view dict per source group). There is no global gradient norm in this mode
-  (clipping is per parameter); under a loss scaler a non-finite gradient zeroes that
-  parameter's update and raises `found_inf`.
+  torch-style `param_groups` view for schedules (one view dict per source group).
+
+### Fused step and non-finite gradients
+
+`FusedStepBundle.step_param(p)` runs one transform per gradient (unscale, a device-side
+finite flag, per-parameter clip) and passes the flag to the update as `found_inf`:
+
+- the offload AdamWs (`MasterAdamW`, `HostStateAdamW`, `StreamedAdamW`) hand it to
+  `torch._fused_adamw_`, which leaves the master, both moments and the step count
+  untouched when it is set; `CPUAdamW` skips the update;
+- a per-parameter torch optimiser built with `fused=True` gets it as `found_inf`; any
+  other per-parameter optimiser sees a zeroed gradient (momentum and weight decay still
+  move it).
+
+A parameter whose gradient is non-finite is therefore not updated; every other parameter
+of that step was already updated in backward and stays updated. The scaler backs off and
+the step is reported non-finite. There is no global gradient norm in this mode.
+
+`step()` first runs the bundle's finishers: the compute stream waits for every side
+stream that updated parameters inside backward (`GradOffload.finish`,
+`HostStateAdamW.finish`, `StreamedAdamW.finish`), before the finite flag is read and
+before the next forward reads the parameters.
+
+### Wiring (`training/memory/optimizers.py`)
+
+`build_memory_optim` is the one place that turns a plan into optimisers, for the trainer
+(`build_optim`) and for `MemorySession` alike:
+
+| plan | device parameters | `swap` block masters | step |
+| --- | --- | --- | --- |
+| `optim_state='gpu'` | `adamw` (torch AdamW; `master_adamw` in MemorySession) | `StreamedAdamW`, resident states | in backward for `swap`, `fused_step` or `grad_offload`; else at `step()` |
+| `optim_state='stream'` | `HostStateAdamW` | `StreamedAdamW`, streamed states | same |
+| `optim_state='8bit'` | bitsandbytes AdamW8bit | (`swap` rejected) | same |
+| `optim_state='cpu'` | `CPUAdamW` | `CPUAdamW` after `flush_grads` | at `step()`; with `fused_step`, device parameters in backward |
+
+`resolve` sets `fused_step` for `swap` with a GPU optim_state (blocks can only step inside
+backward) and for `grad_offload` with a GPU optim_state (otherwise every summed gradient
+comes back to the device before the step, and the peak holds them all), unless
+`fused_step` is overridden; `swap` with a contradicting override is rejected.
+`grad_offload` + `fused_step` + `CPUAdamW` finishes each gradient on the device and the
+host update reads it from there (one extra round trip per parameter); without
+`fused_step` the host update reads the host sums directly.
 
 ## Gradient offload with accumulation
 
@@ -115,13 +155,11 @@ host optimiser reads the sums directly instead (`CPUAdamW.use_host_grads`). Stre
 ## MemorySession and parameter groups
 
 `MemorySession(model, plan, device, dtype, grad_acc, trainable_base, ...,
-param_groups)` applies the plan (`apply_to_backbone`) and builds the optimisers it
-implies: `swap` blocks get `StreamedAdamW` (states resident for `optim_state="gpu"`,
-streamed for `stream`) or `CPUAdamW`; the other trainable parameters get `MasterAdamW`,
-`HostStateAdamW` or `CPUAdamW`. GPU optimisers step inside backward on the last
-micro-batch when `fused_step` or `grad_offload` is on (and always for `swap` blocks);
-otherwise at `step()`. The driver calls `backward(loss, micro)` per micro-batch and
-`step()` once per optimiser step; `masters(model)` returns every fp32 master by name.
+param_groups)` applies the plan (`apply_to_backbone`) and builds its bundle through the
+trainer's `build_memory_optim`, for benches and tests on models outside the trainer
+(the synthetic MOSS-shaped stack). The driver calls `backward(loss, micro)` per
+micro-batch and `step()` once per optimiser step; `masters(model)` returns every fp32
+master by name.
 
 `param_groups` are torch-style groups over the model's parameters as given before the
 session is built (parameters the plan replaces, such as streamed block weights, are
@@ -132,15 +170,26 @@ every optimiser path. Every trainable parameter must be in a group.
 
 ## Combination matrix
 
-`tests/parallel/test_matrix.py` trains the tiny synthetic model for 2 steps under every
-combination of checkpoint (5) x activation offload (2) x stream (3) x gradient offload
-(2) x GRAD_ACC (1, 4) x optimiser state (`gpu`, `stream`, `cpu`) x base precision, and
-compares losses and master updates with a plain `MasterAdamW` reference; invalid
-combinations must be rejected by `resolve` with a message.
-`tests/parallel/test_param_groups.py` does the same against `torch.optim.AdamW` with
-four groups of different lr / weight decay / betas / eps, for each optimiser alone and
-for the session over stream (`off`, `swap`) x optimiser state x gradient offload x
-GRAD_ACC.
+Two matrices, both with a negative case per axis:
+
+- `tests/memory/matrix/test_trainer_matrix.py` runs the real trainer (`entry.run`, tiny
+  MOSS model, synthetic data, 2 steps) over adapter / full FT x stream (`off`; `ring`
+  for adapters, `swap` for full FT) x activation offload x gradient offload x fused step
+  x optimiser state (`gpu`, `stream`, `cpu`) x GRAD_ACC (1, 2), and compares every
+  trainable tensor with the plain run (tolerance 1e-4 of the update, or 20x the plain
+  run's own run-to-run spread on GPUs with non-deterministic kernels). Negatives: a 25%
+  larger LR, the trainable set built before the plan (`swap` blocks untrained), fused
+  CPUAdamW reading host lanes. Combinations the knobs reject (`swap` with a
+  contradicting `fused_step`) must be rejected by `validate`.
+- `tests/memory/matrix/test_session_matrix.py` trains the synthetic MOSS-shaped stack
+  through `MemorySession` under checkpoint (5) x activation offload x stream (3) x
+  gradient offload x GRAD_ACC (1, 4) x optimiser state x base precision (incl. int8 /
+  fp8), against a plain `MasterAdamW` reference; invalid combinations must be rejected
+  by `resolve`.
+
+`tests/memory/offload/test_param_groups.py` checks every optimiser, alone and in the
+session, against `torch.optim.AdamW` with four groups of different lr / weight decay /
+betas / eps.
 
 | device | bases | valid combinations (pass) | rejected |
 | --- | --- | --- | --- |
@@ -285,18 +334,25 @@ MMA peak 90 TFLOP/s (V100 fp16), 175 TFLOP/s (4090 bf16).
   after backward over full-size gradients, while `swap` steps each block inside
   backward; the reference is therefore not a lower bound for in-backward steps.
 
-## Windows
+## Windows and XPU
 
-| feature | Windows |
-| --- | --- |
-| memory profiles, estimate, `auto` planner | works |
-| block runners (all checkpoint modes) | works |
-| activation offload | works |
-| weight streaming, pinned and staged | works |
-| gradient offload + accumulation | works |
-| GPU AdamW (resident, streamed states, streamed blocks), CPUAdamW, fused per-parameter step | works |
-| `MemorySession`, parameter groups, the full combination matrix | works |
-| quantized base (int8 / fp8), streamed quantized base | works (fp8 on sm89) |
-| text-encoder layer streaming | works |
-| inference plans (`apply_inference_plan`) | works |
-| multi-GPU (DDP, FSDP2, pipeline, threaded) | Linux; the spawn launcher and CPU gloo checks run on Windows |
+The engines take their streams and events from the device's module (`offload/accel.py`:
+`torch.cuda` or `torch.xpu`), so CUDA and Intel XPU run the same side-stream paths;
+other devices run the synchronous host paths.
+
+| feature | Windows (CUDA) | XPU (Arc B50, Windows) |
+| --- | --- | --- |
+| memory profiles, estimate, `auto` planner | works | works |
+| block runners (all checkpoint modes) | works | works |
+| activation offload | works | works |
+| weight streaming, pinned and staged | works | works |
+| gradient offload + accumulation | works | works |
+| GPU AdamW (resident, streamed states, streamed blocks), CPUAdamW, fused per-parameter step | works | works |
+| `MemorySession`, parameter groups | works | works |
+| quantized base (int8 / fp8), streamed quantized base | works (fp8 on sm89) | int8 |
+| text-encoder layer streaming | works | works |
+| inference plans (`apply_inference_plan`) | works | works |
+| multi-GPU (DDP, FSDP2, pipeline, threaded) | Linux-only by design (rejected by knob validation) | same |
+
+The XPU column is `tests/memory/offload` on the B50 (activation offload, streaming,
+gradient offload, every optimiser alone and in the session).

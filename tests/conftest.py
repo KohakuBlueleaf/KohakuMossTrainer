@@ -25,6 +25,8 @@ def pytest_collection_modifyitems(config, items):
         marks = {m.name for m in item.iter_markers()}
         if "cuda" in marks and arch is None:
             item.add_marker(pytest.mark.skip(reason="no CUDA GPU"))
+        if "gpu" in marks and arch is None and not has_xpu:
+            item.add_marker(pytest.mark.skip(reason="no CUDA or XPU device"))
         for name, sm in SM_MARKERS.items():
             if name in marks and (arch is None or arch.sm != sm):
                 item.add_marker(pytest.mark.skip(reason=f"needs {name}"))
@@ -46,6 +48,9 @@ def _seed():
 
 @pytest.fixture
 def device():
+    """`KOHAKUMOSS_TEST_DEVICE` (e.g. xpu:1) when set, else CUDA, XPU, CPU."""
+    if os.environ.get("KOHAKUMOSS_TEST_DEVICE"):
+        return torch.device(os.environ["KOHAKUMOSS_TEST_DEVICE"])
     if torch.cuda.is_available():
         return torch.device("cuda")
     if hasattr(torch, "xpu") and torch.xpu.is_available():

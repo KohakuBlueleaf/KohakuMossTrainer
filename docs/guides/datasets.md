@@ -34,8 +34,13 @@ kogine run scripts/data/catalog_build.py --config configs/data/my_data.py
 kogine run scripts/data/cache_text.py --config configs/data/my_data.py \
     --set TEXT_ENCODER=<factory returning an EncodeText callable>
 kogine run scripts/data/cache_latents.py --config configs/data/my_data.py \
-    --set IMAGE_ENCODER=<factory returning an EncodeImages callable>
+    --set IMAGE_ENCODER=kohakumoss.encoders.vae_encoder
 ```
+
+`kohakumoss.encoders.vae_encoder(path, device, dtype)` loads the FLUX.2 VAE (`path` is
+the `vae/` folder or a pipeline root) and returns its bound `encode_images`; set
+`IMAGE_ENCODER_KWARGS = {"path": ..., "device": "cuda", "dtype": "fp32"}` in the data
+config.
 
 Run the text pass first: with text lengths cached, token batching and over-long fits
 use exact text lengths.

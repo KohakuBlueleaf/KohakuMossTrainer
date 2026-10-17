@@ -4,6 +4,10 @@
 `torch.multiprocessing.spawn` and initialises the process group itself; there is no
 `torchrun` dependency.
 
+Multi-GPU training (`PARALLEL` other than `"none"`) is Linux-only by design and knob
+validation rejects it on Windows. On Windows the launcher serves the CPU gloo self-checks
+below.
+
 - **Backend**: `auto` is nccl on Linux CUDA, xccl on XPU when available, gloo otherwise
   (Windows, CPU). gloo all-reduces CUDA tensors through host memory.
 - **Store**: `init="tcp"` builds a `TCPStore` explicitly. The parent process owns the

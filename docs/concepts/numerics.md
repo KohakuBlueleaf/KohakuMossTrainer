@@ -3,9 +3,39 @@
 ## Dtype policy
 
 The trunk runs in the compute dtype (bf16, fp16 or fp32). `time_embedding`,
-`shared_block_modulation` and `video_head_modulation` stay fp32 and run on fp32 inputs;
-RoPE bands are always fp32. Each module's tensors are cast once (kept modules never pass
-through the compute dtype). Eager ops accumulate in at least fp32 and round once.
+`shared_block_modulation` and `video_head_modulation` store fp32 weights and biases; RoPE
+bands are always fp32. Eager ops accumulate in at least fp32 and round once. No model,
+kernel, trainer or inference code computes in fp64; fp64 is the precision reference only
+(`tests/rules/test_no_fp64.py`).
+
+## Conditioning
+
+- **Linears.** With a 16-bit trunk (or `backbone.cond_dtype` set), the four conditioning
+  linears (`time_embedding.0`, `time_embedding.2`, `shared_block_modulation`,
+  `video_head_modulation`) cast input and weight to the 16-bit dtype, multiply with fp32
+  accumulation into an fp32 output, and add the fp32 bias (`MossLinear.set_input_dtype`,
+  bound by `bind_ops`; re-bind after a dtype change). The modulation leaves the GEMM
+  unrounded, so the only 16-bit roundings are the operands, as in every other matmul.
+  The GEMM is `torch.mm(..., out_dtype=float32)` where the backend has it (CUDA fp16;
+  CUDA bf16 on sm80+). Elsewhere (CPU, bf16 on sm70 / sm75) it is an fp32 GEMM of the
+  16-bit-rounded operands: their products are exact in fp32 and the sums are fp32, so
+  it computes the same thing. The extra weight cast reads the fp32 weight once per
+  forward (~0.35 GB at base size), small against a forward's trunk.
+- **Sinusoid.** `cos / sin(t f_k)` for t up to 1000 and `f_k = 10000^(-k/128)` loses
+  ~1e-4 rad in a plain fp32 product (`t f_k` is ~1e3 rad, its fp32 ulp is 6e-5). The fp32
+  sinusoid instead works in turns, `t f_k / 2 pi`: the host splits each `f_k / 2 pi`
+  into a 10-bit head and an fp32 tail, `t` splits into a 14-bit head (multiple of 2^-4)
+  and an exact tail, so `t_hi g_hi` is exact in fp32 and its integer part drops
+  exactly; the small remaining terms are added in fp32 and scaled by 2 pi only after
+  reduction to |turns| < 1. The phase error is ~3e-7 rad (`tests/model/test_conditioning.py`
+  bounds the output at 1e-6 against fp64), and fused multiply-adds only make the exact
+  products more exact.
+
+## Fold arithmetic
+
+The fold multiplies weights in fp32 (or in the tensor's own dtype when wider) and rounds
+once. For a power-of-two c and s the product is exact in every dtype except where a
+folded fp16 value lands in the subnormal range (`tests/model/test_fold_exact.py`).
 
 ## Why fp16 needs a fix
 

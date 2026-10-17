@@ -92,6 +92,17 @@ computes. Every other backend equals it within the precision bar, forward and ba
 ### Numerics rules
 - Reduce in fp32; token counts are int64; per-sample math (time embedding, modulation,
   head modulation) is fp32.
+- **No fp64 anywhere in the trainer, the model, the kernels or inference.** fp64 exists only
+  as the precision reference (tests, `kohakumoss_kernels.precision`, benches, the eager spec
+  run on fp64 inputs). Where fp32 is not precise enough, use compensated fp32 (Kahan / TwoSum
+  pairs, Dekker products, hi/lo splits), never an fp64 tensor or an fp64 register.
+  `tests/rules/test_no_fp64.py` enforces it.
+- **fp32 is for vector operations only.** Every matmul (linear layers incl. the KEEP_FP32
+  conditioning modules, attention QK^T / PV, adapter products, the text encoder) runs on
+  fp16 / bf16 inputs with fp32 accumulation, the GPU default: no fp32 / tf32 matmuls and no
+  hi/lo-split multi-pass MMAs to buy extra precision. fp32 storage (masters, optimizer
+  state) and fp32 element-wise / reduction math are fine. The precision bar compares against
+  PyTorch at this same matmul precision.
 - Every kernel needs a precision check against an fp64 reference in both fp16 and bf16,
   forward and backward, judged in ULP (`tests/_util/precision.py`). Attention adds the
   huge-logit, padded-key and empty-row cases.

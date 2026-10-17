@@ -10,7 +10,7 @@ without renaming.
 | --- | --- |
 | `video_embedder` | Linear 128 -> 3072 (one token per latent pixel of the /16 grid) |
 | `text_embedder` | `proj` Linear 4096 -> 3072, then 2 `TextBlock`s (biased fused `qkv`, qk-norm, RoPE, SiTU FFN, no modulation) |
-| `time_embedding` | sinusoid(1000 sigma, 256, float64) -> Linear -> SiLU -> Linear |
+| `time_embedding` | sinusoid(1000 sigma, 256) -> Linear -> SiLU -> Linear |
 | `shared_block_modulation` | one Linear 3072 -> 6 x 3072 for all 42 blocks: shift_a, scale_a, gate_a, shift_f, scale_f, gate_f |
 | `layers.{0..41}` | joint blocks over `[image ; text]`: RMSNorm + modulation, q/k/v, per-head qk RMSNorm + 4-axis RoPE, attention, gated residual; RMSNorm + modulation, `ffn_up_gate` (first half up, second half gate), SiTU, `ffn_down`, gated residual |
 | `final_norm_video`, `video_head_modulation`, `final_linear_video` | modulated RMSNorm and Linear 3072 -> 128 on the image tokens |
@@ -21,17 +21,25 @@ velocity `noise - x0` at sigma in [0, 1] (sigma = 1 is pure noise).
 ## Calling convention
 
 ```python
-v = backbone(img, text, sigma, seq, skip_layers=frozenset(), segment_skip=None)
+v = backbone(img, text, sigma, seq)                       # every block runs
+
+skip = backbone.bind_forward(skip_layers=(22,))           # bound once
+v = skip(img, text, sigma, seq)                           # block 22 skipped for all samples
+
+cfg = backbone.bind_forward(segment_skip_layers=(22,))    # bound once
+v = cfg(img, text, sigma, seq, mask)                      # skipped where mask[b] is True
 ```
 
 - `img` [N_img, 128] and `text` [N_txt, 4096] are packed (see `seqinfo.md`); `sigma` is
   fp32 [B].
-- `skip_layers` skips blocks for every sample; `segment_skip` maps a block index to a bool
-  [B] of samples that skip it. Packed CFG uses the latter for the negative-branch skip of
-  block 22: the block's gates are zeroed for those samples, which leaves their stream
-  exactly as skipping the block would.
-- Time embedding, shared modulation and head modulation are computed per sample in fp32;
-  those modules stay fp32 (`KEEP_FP32`).
+- `bind_forward` resolves the block plan once (re-bind after a fold or fp16-fix change).
+  With `segment_skip_layers`, one bool mask [B] applies to every listed block: their
+  gates are zeroed for the flagged samples, which leaves those samples' stream exactly as
+  skipping the blocks would. Packed CFG uses this for the negative-branch skip of block 22.
+- Time embedding, shared modulation and head modulation are computed per sample in fp32
+  with any enclosing autocast disabled; those modules store fp32 weights (`KEEP_FP32`).
+  On a 16-bit trunk their linears run on 16-bit inputs with fp32 accumulation and an fp32
+  output (`docs/concepts/numerics.md`, Conditioning). The timestep sinusoid is fp32.
 
 ## Ops and runners
 

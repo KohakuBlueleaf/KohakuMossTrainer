@@ -73,18 +73,30 @@ patchify 2); `hw` in a batch is the latent grid (pixels / 16).
 | `shifted_square` | same, seeded crop position |
 
 `ASPECT_RANGE` bounds w/h (images outside are cropped to the bound). `UPSCALE="never"`
-keeps images smaller than the target at their native size. `crop` is `center` or
-`random`; an offline latent cache needs `center`.
+keeps images smaller than the target at their native size. `DataConfig.crop` is
+`center` (default) or `random`; an offline latent cache needs `center`.
 
 `BATCHING` decides which samples share a batch:
 
 | mode | rule |
 | --- | --- |
 | `tokens` (default) | walk the seeded sample order, adding samples (image + text tokens) while the batch stays <= `MAX_TOKENS`; the sample that would exceed it starts the next batch |
-| `tokens_ffd` | first-fit-decreasing per window of `planner_kwargs["window"]` (256) samples into `MAX_TOKENS` bins (denser batches, order shuffled) |
-| `count` | `BATCH_SIZE` consecutive samples (trailing partial batch dropped unless `drop_last=False`) |
+| `tokens_ffd` | first-fit-decreasing per window of 256 samples into `MAX_TOKENS` bins (denser batches, order shuffled) |
+| `count` | `BATCH_SIZE` consecutive samples (trailing partial batch dropped) |
 
-`planner_kwargs["max_samples"]` additionally caps the samples per token batch.
+`MAX_SAMPLES` additionally caps the samples per token batch (0 = no cap).
+`TOKEN_BUDGET="exact"` takes every caption length from the offline text cache, so
+`MAX_TOKENS` is a hard bound; a static pipeline micro-batch shape (`MAX_TOKENS`,
+`MAX_SAMPLES`) needs it (`kohakumoss_data.pipeline_problems` lists what is missing).
+
+Every `DataConfig` field except `latent_factor` is a train-script knob of the same
+name in upper case (`DataConfig.from_knobs`), including `CROP`, `PLANNER_KWARGS`
+(`window`, `drop_last`, ...; these override the planner arguments derived from the
+other knobs), `LATENT_ENCODER_ID`, `TEXT_ENCODER_ID`, `LATENT_DRAW` (also the VAE draw
+used for online encoding), `BACKGROUND`, `RESAMPLE`, `TEXT_CHARS_PER_TOKEN`,
+`TEXT_OVERHEAD_TOKENS`, `MAX_TEXT_TOKENS`, `PREFETCH` and `PIN_MEMORY`.
+`kohakumoss_data.data_problems(cfg)` lists every value that would make
+`MossDataset(cfg)` fail.
 
 `OVERLONG` decides what happens to a single sample longer than `MAX_TOKENS`:
 
@@ -101,11 +113,13 @@ prompts plus `img_keep` / `text_limit`; the trainer encodes, then gathers / cuts
 
 Each epoch is a seeded permutation of the weighted row multiset (row i appears
 floor(w) times, plus once more with probability frac(w)); each occurrence gets a
-seeded crop / flip / caption variant / keep draw. Text tokens come from the text
-cache when it has the caption, otherwise from `ceil(chars / text_chars_per_token) +
-text_overhead_tokens` (so budgets are exact only with a text cache). Global batch
-`g = index * world + rank`, so ranks never share a batch, and batch `index` of
-`rank` is a pure function of the seed.
+seeded crop / flip / caption variant / keep draw. Text tokens for planning come from
+the offline text cache when it has the caption, otherwise (and always with
+`TEXT_CACHE="online"` or `"off"`) from `ceil(chars / text_chars_per_token) +
+text_overhead_tokens`. An online cache grows during the run, so planning never reads
+it: the plan is a pure function of the data, the seed and the knobs, and a restart or
+resume maps every index to the same samples. Global batch `g = index * world + rank`,
+so ranks never share a batch.
 
 ## Loader
 
@@ -115,6 +129,12 @@ them in order, so the stream is the same for any worker count. Resume state is
 `{seed, start}`. Workers use `spawn` on every OS, so the dataset (sources, catalog,
 templates, caches) is pickled by value; file handles reopen lazily per process.
 
+`Loader(transform=...)` / `build_loader(cfg, rank, world, transform=...)` (a picklable
+callable or a dotted path) runs on every batch inside the worker, before the
+DataLoader pins it. The trainer passes `kohakumoss.training.step.LayoutTransform`,
+which builds the batch's SeqInfo there (when the text lengths are final) and attaches
+it as `hb.layout`, so the layout is not built on the training thread.
+
 Text dropout (`TEXT_DROP`) is decided per (seed, index, rank, slot) before lengths are
 known: a dropped sample's caption is `""`, and its embedding is the cached empty
 prompt.
@@ -122,16 +142,36 @@ prompt.
 ## Caches
 
 `LATENT_CACHE` and `TEXT_CACHE` are `off | offline | online`; both live in `CACHE_DIR`
-(`latents.db`, `text.db`, KohakuVault). Keys:
+(`latents.db`, `text.db`, KohakuVault). An empty `CACHE_DIR` resolves to `<path>/cache`
+of the first dataset with a `path` (its folder when the path is a file or a glob)
+(`kohakumoss_data.resolved_cache_dir`); the trainer and the cache scripts use the same
+rule. Keys:
 
 - latent: content identity x encoder id x storage dtype x target size x crop box x
-  flip x background (alpha images only)
+  flip x background (alpha images only) x resample filter x VAE draw
+  (`latent_draw`, `mode` or `sample`)
 - text: rendered caption x encoder id x storage dtype
 
 `offline` raises on a miss (run the cache scripts first); `online` returns pixels /
-prompts plus `latent_keys` / `text_keys` so the trainer can encode and `put` the
-results; `off` always returns pixels / prompts. Storage dtype `bf16` or `fp8` (e4m3
-with a per-tensor scale, about 7% max relative error, half the bytes).
+prompts plus `latent_keys` / `text_keys` so the trainer can encode and write the
+results back; `off` always returns pixels / prompts. Storage dtype `bf16`, `fp16`,
+`fp32` or `fp8` (e4m3 with a per-tensor fp32 scale `absmax / 448`, about 7% max
+relative error, half the bytes of bf16).
+
+A cache hit returns the stored (rounded) value. `LatentCache.as_cached` /
+`TextCache.as_cached` round a fresh encoding exactly the same way, on its device, so
+an online run trains on identical values whether a sample hits or misses.
+
+Online write-back is `CacheWriter`, the trainer's `on_encoded` hook: it queues each
+batch's fresh encodings and a background thread writes them. Only full values are
+written: full-grid latents (a kept-token subset is not the value of its key) and text
+that was not cut by `text_limit`. Every rank of a multi-process run writes the same
+vault; a busy vault is retried with backoff (up to `busy_timeout`, 600 s) instead of
+failing the run.
+
+The text cache's lengths are read through a packed length table (`idx:lengths`, 20
+bytes per entry, binary-searched) that the text cache pass writes at its end; a vault
+without the table is scanned once at startup.
 
 Sizes at MOSS shapes: a 1 MP latent is 64 x 64 x 128 bf16 = 1 MiB; a text embedding is
 L x 4096 bf16 = 8 KiB per token, so a 300-token caption is ~2.4 MiB per variant.

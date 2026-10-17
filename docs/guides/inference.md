@@ -30,8 +30,21 @@ out.images[0].save("cat.png")
 - **Packed CFG** (`cfg_mode="packed"`, default): the conditional and unconditional samples
   of a batch run in one packed forward; `two_pass` runs them as two forwards with half
   the tokens each.
-- **Per-sample determinism**: sample i depends only on its prompt, size and seed, not on
-  which other samples share its batch.
+- **Per-sample determinism**: sample i's noise and math depend only on its prompt, size
+  and seed, not on which other samples share its batch — up to kernel rounding. On CPU
+  in fp64 batch composition changes nothing measurable; on CUDA in bf16 the packed token
+  count changes GEMM / attention problem shapes and therefore rounding, about 1e-3
+  relative after 4 steps on the tiny model (`tests/inference/test_determinism_cuda.py`).
+  Bitwise-identical samples need the same batch composition.
+- **Weights root**: `variant` names a subfolder of `path` that must exist. Each
+  component comes from `path/variant` when it holds it, else from `path`, else from
+  `path/base` (the SFT folder carries only the transformer); the folders used are in
+  `out.settings["sources"]`.
+- **Embeddings in**: `prompt_embeds` skips encoding the prompts; `negative_prompts`
+  strings are still encoded unless `negative_embeds` is given.
+- **Linear algebra**: an owned CUDA pipeline selects cuSOLVER (OFT's batched Cayley
+  inverse) for the duration of each `generate` call and restores the previous backend
+  after it.
 - **Residency**: `gpu` keeps the text encoder and VAE on the device; `offload` parks both
   on CPU between uses; `te_once` encodes every prompt in the first call and frees the
   text encoder.

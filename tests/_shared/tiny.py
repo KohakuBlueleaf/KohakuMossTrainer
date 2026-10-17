@@ -1,9 +1,15 @@
-"""Shared helpers: a synthetic model, a batch, and a loss+grads snapshot."""
+"""Shared helpers: a synthetic model, a batch, a loss+grads snapshot, device params."""
 
+import pytest
 import torch
 
 from kohakumoss.training.memory.synthetic import SyntheticModel, synthetic_batch
 
+DEVICES = [
+    "cpu",
+    pytest.param("cuda", marks=pytest.mark.cuda),
+    pytest.param("xpu", marks=pytest.mark.xpu),
+]
 HW = [(3, 4), (2, 5)]
 TEXT = [5, 3]
 

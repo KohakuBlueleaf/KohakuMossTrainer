@@ -37,7 +37,12 @@ tile config **and** the two PyTorch paths — dequantize + `F.linear` eager, and
 the same under `torch.compile` — and keeps the fastest. A kernel therefore
 only runs where it beats both PyTorch paths on that card; elsewhere the op is
 the PyTorch path. The choice is resolved once per key and held in a dict, so
-the per-call cost is one lookup.
+the per-call cost is one lookup. Only a settled choice (`tuning.decided`) is
+held: a first call where the tuner may not time — inside a trace, or the
+forward GEMM inside a checkpoint recompute — runs the planner's first
+candidate for that call alone, and the next call that may time measures the
+key. The dgrad GEMM runs inside the autograd backward and launches no autograd
+itself, so it is timed there (`in_backward=True`).
 
 The op is a `torch.library` custom op (`kohakumoss::quant_fwd` /
 `kohakumoss::quant_dgrad`) with fake implementations and registered autograd,

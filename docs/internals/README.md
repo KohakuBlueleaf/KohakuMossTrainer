@@ -8,3 +8,5 @@
 | [quant-kernels.md](quant-kernels.md) | int8 / fp8 frozen-base GEMMs |
 | [offload.md](offload.md) | activation offload, weight streaming, gradient offload, CPU optimiser |
 | [distributed-windows.md](distributed-windows.md) | process launch and backends per OS |
+| [adapter-kinds.md](adapter-kinds.md) | the per-algorithm adapter records |
+| [adapter-binding.md](adapter-binding.md) | bound adapter forwards, kits, tier ops and slots |

@@ -8,7 +8,12 @@ Every batch is packed: there is no padding anywhere in the model.
 - The joint sequence of sample i is `[img_i ; txt_i]`; joint tensors are sample-major in
   that order. `img_in_joint` / `txt_in_joint` scatter the two axes into it.
 
-`build_seqinfo(hw, text_len)` runs on the host once per batch and carries:
+`build_seqinfo(hw, text_len, img_keep=None)` runs on the host once per batch.
+`img_keep[i]` (sorted indices into sample i's row-major grid, or None for all) keeps only
+those image tokens (random token drop): `n_img`, `cu_img` and every image axis count the
+kept tokens, and each kept token keeps the RoPE position of its original grid cell.
+`SeqInfo.to(device)` moves the host tensors as one pinned buffer per dtype (one copy
+each on CUDA); the fields on the device are views of it. It carries:
 
 | field | meaning |
 | --- | --- |
