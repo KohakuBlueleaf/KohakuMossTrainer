@@ -13,5 +13,10 @@ DTYPE = "bf16"  # "bf16" | "fp16" | "fp32"
 FUSED_QKV = False
 DEVICE = "cpu"
 
+
+def main():
+    return merge_main(globals())
+
+
 if __name__ == "__main__":
-    merge_main(globals())
+    main()

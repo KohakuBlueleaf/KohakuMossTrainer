@@ -150,5 +150,10 @@ KEEP_LAST = 3
 RESUME = ""  # checkpoint dir | "latest"
 EXPORT_FORMATS = ("comfy",)  # "comfy" | "lycoris" | "merged" | "diffusers"
 
+
+def main():
+    return run(globals())
+
+
 if __name__ == "__main__":
-    run(globals())
+    main()

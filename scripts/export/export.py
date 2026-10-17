@@ -18,5 +18,10 @@ FP16_FIX = "none"  # the run's FP16_FIX ("weights" folds the trained weights)
 FP16_FIX_KWARGS = {}  # the run's FP16_FIX_KWARGS (c, s_attn, s_ffn, eps)
 DEVICE = "cpu"
 
+
+def main():
+    return export_main(globals())
+
+
 if __name__ == "__main__":
-    export_main(globals())
+    main()

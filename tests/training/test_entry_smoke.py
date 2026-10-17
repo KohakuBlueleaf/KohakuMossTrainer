@@ -1,6 +1,10 @@
 """End-to-end `run(globals())` on the random tiny model, synthetic data, CPU."""
 
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -8,6 +12,34 @@ from kohakumoss.training.entry import run
 from tests.training.test_knobs import runnable
 
 pytestmark = [pytest.mark.cpu, pytest.mark.slow]
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def kogine(*argv: str) -> subprocess.CompletedProcess:
+    """`kogine <argv>` in a child process from the repo root, on CPU."""
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "-1"}
+    cmd = [sys.executable, "-c", "from kohakuengine.cli import main; main()", *argv]
+    return subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True)
+
+
+def test_kogine_runs_train_script(tmp_path):
+    out = kogine(
+        "run",
+        "scripts/train/moss.py",
+        "--config",
+        "configs/moss/smoke/smoke_tiny.py",
+        "--set",
+        f"OUTPUT_DIR={tmp_path.as_posix()}",
+        "--set",
+        "STEPS=3",
+        "--set",
+        "SAVE_EVERY=3",
+    )
+    assert out.returncode == 0, out.stderr[-4000:]
+    lines = (tmp_path / "tiny" / "metrics.jsonl").read_text().splitlines()
+    assert len(lines) == 3 and all(json.loads(x)["loss"] > 0 for x in lines)
+    assert (tmp_path / "tiny" / "export" / "tiny-comfy.safetensors").exists()
 
 
 def smoke_knobs(tmp_path, **kw) -> dict:
