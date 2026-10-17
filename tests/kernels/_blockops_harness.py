@@ -53,7 +53,7 @@ def check(
     name: str,
     seed: int = 1,
     factor: float = 1.1,
-    floor_ulp: float = 2.0,
+    floor_ulp: float = 0.0,
     backward: bool = True,
 ) -> None:
     """Assert `backend` meets the bar on outputs and the gradients of `grads` leaves."""

@@ -1,8 +1,8 @@
 """Precision checks against an fp64 reference, judged in ULP of the tested dtype.
 
 The bar: a backend's error vs fp64 must not exceed `factor` times the error of the eager
-composition run in the same dtype (plus a floor of `floor_ulp` ULP), in both the
-elementwise-max and RMS metrics.
+composition run in the same dtype, in both the elementwise-max and RMS metrics. There is
+no absolute ULP floor by default (`floor_ulp=0`).
 """
 
 from dataclasses import dataclass
@@ -61,7 +61,7 @@ def assert_bar(
     ref64: Tensor,
     dtype: torch.dtype,
     factor: float = 1.1,
-    floor_ulp: float = 2.0,
+    floor_ulp: float = 0.0,
     name: str = "",
     factor_elem: float | None = None,
 ) -> None:

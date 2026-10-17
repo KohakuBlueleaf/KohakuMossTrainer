@@ -2,9 +2,9 @@
 
 Pinned (KERNELS.lycoris = the device's fused backend): the fused kernels are as
 accurate as the eager bodies. Both runs are judged against an fp64 eager reference
-with the same adapter tensors: the fused error (RMS, relative) may not exceed 1.5x the
-eager error in the same dtype, with a floor of 4 ULP of that dtype, for the output and
-every adapter gradient.
+with the same adapter tensors: the fused error (RMS, relative) may not exceed 1.1x the
+eager error in the same dtype (no absolute floor), for the output and every adapter
+gradient.
 
 Raced (auto): precision is LyCORIS's per-op gate (`lycoris.kernels.plans.precision`),
 so the test checks that every raced op of every layer settled on a gated pick in a
@@ -38,7 +38,7 @@ FUSED_CASES = (
     "doha",
 )
 UNRACED = ("ia3", "glora")
-FACTOR, FLOOR_ULP = 1.5, 4.0
+FACTOR = 1.1
 RACED_FACTOR = 3.0
 
 
@@ -66,7 +66,7 @@ def _rel(a, ref):
 
 
 def _check(fused, eager, ref, dtype, what, factor=FACTOR):
-    bar = max(factor * _rel(eager, ref), FLOOR_ULP * torch.finfo(dtype).eps)
+    bar = factor * _rel(eager, ref)
     err = _rel(fused, ref)
     assert err <= bar, f"{what}: fused {err:.3e} > bar {bar:.3e}"
 

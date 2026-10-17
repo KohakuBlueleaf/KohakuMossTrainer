@@ -12,12 +12,28 @@ threaded) is Linux-only by design.
 - Kernel packages: `triton-windows` (Triton backend, sm80+) and `tilelang` (TileLang
   backend, sm70 / sm75 and others). Both have Windows wheels.
 
+NVIDIA GPUs (one environment):
+
 ```bash
 uv venv -p 3.13 .venv
-uv pip install torch --index-url https://download.pytorch.org/whl/cu130
-uv pip install -e ".[kernels,lightning,dev]"
-kohakumoss-doctor
+uv pip install --python .venv/Scripts/python.exe torch --index-url https://download.pytorch.org/whl/cu130
+uv pip install --python .venv/Scripts/python.exe -e ".[kernels,lightning,textenc,quant,parquet,board,dev,bench]"
+.venv/Scripts/kohakumoss-doctor
 ```
+
+Intel Arc (XPU) needs its own environment, because the XPU build of torch replaces the CUDA
+build; the `kernels` extra is CUDA-only and is left out (the XPU torch wheel brings Intel's
+Triton):
+
+```bash
+uv venv -p 3.13 .venv-xpu
+uv pip install --python .venv-xpu/Scripts/python.exe torch --index-url https://download.pytorch.org/whl/xpu
+uv pip install --python .venv-xpu/Scripts/python.exe -e ".[lightning,textenc,quant,parquet,board,dev,bench]"
+.venv-xpu/Scripts/kohakumoss-doctor
+```
+
+`textenc` installs flash-linear-attention for the text encoder's Gated DeltaNet layers;
+`causal-conv1d` has no Windows wheel, so its convolution runs the PyTorch reference.
 
 `kohakumoss-doctor` prints the GPU arch, the toolchain and package versions, and which
 kernel backend serves each op on this machine.

@@ -101,7 +101,8 @@ computes. Every other backend equals it within the precision bar, forward and ba
 - Varlen attention must be faster than PyTorch SDPA (flash / mem-efficient). FA4-like
   designs follow KohakuFA.
 - Precision is at least that of PyTorch / `torch.compile`, or better: MMA outputs stay in
-  fp32 (accumulators, epilogues, LSE), rounded once at the store.
+  fp32 (accumulators, epilogues, LSE), rounded once at the store. The bar is relative to
+  PyTorch's own error in the same dtype; there is no absolute ULP floor.
 - fp16 training uses the residual-stream fold (`kohakumoss.model.numerics`), fp32
   accumulators, and the device-flag scaler.
 
