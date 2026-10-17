@@ -35,6 +35,11 @@ out.images[0].save("cat.png")
 - **Residency**: `gpu` keeps the text encoder and VAE on the device; `offload` parks both
   on CPU between uses; `te_once` encodes every prompt in the first call and frees the
   text encoder.
+- **Text device**: `text_device="cpu"` (`--text-device cpu` in `scripts/sample`) runs the
+  text encoder on the CPU and moves only the embeddings to the compute device, as ComfyUI
+  does on small cards. The 9B encoder then needs ~18 GB of host RAM in bf16 (`--text-dtype
+  fp32`: ~36 GB) and no VRAM; encoding speed is the CPU's. Training takes the same
+  choice as `TEXT_DEVICE = "cpu"`.
 - **fp16** (GPUs without bf16): pass `dtype=torch.float16` and an `fp16_fix`
   (`"weights"`, `"online"` or `"fp32_residual"`, with `fp16_fix_kwargs={"c": 0.0625}`),
   or load an fp16-fix checkpoint as `transformer=...`; see `docs/concepts/numerics.md`.

@@ -13,6 +13,9 @@ WEIGHTS = (
 VARIANT = "base"  # "base" | "sft" | "tiny"
 ARCH_OVERRIDES = {}  # MossArchConfig field overrides
 TEXT_ENCODER = ""  # "" = <WEIGHTS>/text_encoder; path to Qwen3.5 dir
+TEXT_DEVICE = (
+    ""  # device the text encoder runs on ("" = the training device; e.g. "cpu")
+)
 VAE = ""  # "" = <WEIGHTS>/vae
 TRAIN_TEXT_REFINER = False  # adapters/full FT also on the 2 text-refiner blocks
 

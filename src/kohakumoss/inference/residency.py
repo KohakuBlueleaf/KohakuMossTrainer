@@ -63,8 +63,8 @@ class TextOnce(Resident):
         self.encode = _no_text_encoder
         self.empty = lambda: empty
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if torch.accelerator.is_available():
+            torch.accelerator.empty_cache()
         return out
 
 

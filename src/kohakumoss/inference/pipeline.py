@@ -152,10 +152,12 @@ class MossPipeline:
         tune: str = "auto",
         text_encoder: bool = True,
         vae: bool = True,
+        text_device: torch.device | str | None = None,
     ) -> "MossPipeline":
         """`path`: weights root (base/ sft/ subdirs or one pipeline dir). `transformer`
         overrides the DiT weights (single file, HF dir, our checkpoint or an fp16-fix
         file). `fp16_fix`: none | weights | online | fp32_residual (+ kwargs).
+        `text_device` runs the text encoder elsewhere (e.g. "cpu"; default `device`).
         `text_encoder=False` / `vae=False` skip loading them (embeddings / latents in
         and out)."""
         path = Path(path)
@@ -178,8 +180,12 @@ class MossPipeline:
         te = None
         if text_encoder:
             te_root = _component_root(path, variant, "text_encoder")
-            offload = "cpu" if residency == "offload" else "none"
-            te = QwenTextEncoder.from_pretrained(te_root, device, text_dtype, offload)
+            te_device = torch.device(text_device or device)
+            on_cpu = te_device.type == "cpu"
+            offload = "cpu" if residency == "offload" and not on_cpu else "none"
+            te = QwenTextEncoder.from_pretrained(
+                te_root, te_device, text_dtype, offload, output_device=device
+            )
         decoder = None
         if vae:
             decoder = FluxVae.from_pretrained(

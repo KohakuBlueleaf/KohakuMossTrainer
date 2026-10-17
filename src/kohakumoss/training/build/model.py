@@ -129,7 +129,9 @@ def build_encoders(k: dict, device: torch.device, policy: PrecisionPolicy):
     if need_vae and vae_path:
         vae = import_object(I.VAE).from_pretrained(vae_path, device=device)
     if need_text and text_path:
-        text = import_object(I.TEXT_ENCODER).from_pretrained(text_path, device=device)
+        text = import_object(I.TEXT_ENCODER).from_pretrained(
+            text_path, device=k["TEXT_DEVICE"] or device, output_device=device
+        )
     return vae, text
 
 

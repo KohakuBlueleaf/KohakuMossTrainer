@@ -15,7 +15,8 @@ def _subdir(path: Path, name: str) -> Path:
 
 
 class QwenTextEncoder:
-    """Frozen encoder. `offload="cpu"` keeps weights on CPU and moves them per call."""
+    """Frozen encoder running on `device`; embeddings land on `output_device` (default
+    `device`). `offload="cpu"` keeps weights on CPU and moves them per call."""
 
     def __init__(
         self,
@@ -24,10 +25,12 @@ class QwenTextEncoder:
         device: torch.device | str = "cuda",
         offload: str = "none",
         max_length: int = MAX_LENGTH,
+        output_device: torch.device | str | None = None,
     ):
         self.model = model.eval().requires_grad_(False)
         self.tokenizer = tokenizer
         self.device = torch.device(device)
+        self.output_device = torch.device(output_device or device)
         self.max_length = max_length
         match offload:
             case "none":
@@ -48,6 +51,7 @@ class QwenTextEncoder:
         dtype: torch.dtype = torch.bfloat16,
         offload: str = "none",
         max_length: int = MAX_LENGTH,
+        output_device: torch.device | str | None = None,
     ) -> "QwenTextEncoder":
         """`path` is a pipeline root (text_encoder/ + tokenizer/) or a model dir."""
         path = Path(path)
@@ -55,7 +59,7 @@ class QwenTextEncoder:
         model = AutoModel.from_pretrained(
             str(_subdir(path, "text_encoder")), dtype=dtype
         )
-        return cls(model, tok, device, offload, max_length)
+        return cls(model, tok, device, offload, max_length, output_device)
 
     def format(self, prompt: str) -> str:
         """The exact training-time chat template (thinking enabled, no system prompt)."""
@@ -81,7 +85,7 @@ class QwenTextEncoder:
         for prompt in prompts:
             ids = self.token_ids(prompt).to(self.device)
             hidden = self.model(input_ids=ids, use_cache=False, return_dict=True)
-            out.append(hidden.last_hidden_state[0])
+            out.append(hidden.last_hidden_state[0].to(self.output_device))
         return out
 
     def _encode_offloaded(self, prompts: Sequence[str]) -> list[Tensor]:

@@ -5,6 +5,8 @@
     python scripts/sample/sample.py --weights <root> --prompts-file prompts.json \
         --adapter my_lora.safetensors:0.8 --dtype fp16 --fp16-fix online \
         --fp16-fix-kwargs '{"c": 0.0625}' --residency offload
+    python scripts/sample/sample.py --weights <root> --prompt "a cat" --text-device cpu \
+        --out out/samples
 
 A prompts file is a .txt (one prompt per line) or a .json list of strings or of objects
 {"prompt", "negative", "size": [H, W], "seed"}.
@@ -91,6 +93,10 @@ def main() -> None:
     ap.add_argument("--residency", default="gpu", choices=("gpu", "offload", "te_once"))
     ap.add_argument("--device", default="cuda")
     ap.add_argument(
+        "--text-device", default="", help="text encoder device, e.g. cpu; '' = --device"
+    )
+    ap.add_argument("--text-dtype", default="bf16", choices=tuple(DTYPES))
+    ap.add_argument(
         "--tune", default="auto", help="kernel tuning: auto | off | prewarm"
     )
     ap.add_argument("--out", required=True)
@@ -113,6 +119,8 @@ def main() -> None:
         adapters=[parse_adapter(a) for a in args.adapter],
         adapter_mode=args.adapter_mode,
         residency=args.residency,
+        text_device=args.text_device or None,
+        text_dtype=DTYPES[args.text_dtype],
         fp16_fix=args.fp16_fix,
         fp16_fix_kwargs=json.loads(args.fp16_fix_kwargs),
         tune=args.tune,
