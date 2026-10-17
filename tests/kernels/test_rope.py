@@ -32,7 +32,7 @@ def _inputs(hw, tl_, heads, dh, dtype, device):
     return q, k, qw, kw, seq.pos_joint.to(device), bands.to(device)
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
@@ -57,7 +57,7 @@ def test_qk_norm_rope(backend, dtype, shape, device):
     )
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_negative_axis_order(backend, device):
     """Swapping the h and w position axes must be caught."""

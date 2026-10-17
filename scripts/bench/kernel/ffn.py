@@ -4,14 +4,14 @@ python scripts/bench/kernel/ffn.py --backend triton
 """
 
 import torch
-from _blockops import contenders, dtypes, measure, parse, report
 
 from kohakumoss_kernels.backends.eager import ffn as eager
+from kohakumoss_kernels.bench.blockops import contenders, dtypes, measure, parse, report
 
 
 def main():
     args = parse()
-    device = torch.device("cuda")
+    device = torch.device(args.device)
     rows = []
     for dtype in dtypes(args):
         for n in (4400,) if args.quick else (4400, 16400):

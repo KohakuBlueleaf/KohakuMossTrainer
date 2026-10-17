@@ -23,7 +23,7 @@ from kohakumoss_kernels.quant import (
     pytorch_path,
     register_launchers,
 )
-from kohakumoss_kernels.tuning import select
+from kohakumoss_kernels.tuning import decided, select, tuner
 
 F32 = "float32"
 I8 = "int8"
@@ -108,6 +108,7 @@ _CFGS = [
     )
 ]
 _RESOLVED: dict[tuple, object] = {}
+tuner.on_reset(_RESOLVED.clear)
 
 
 def pow2_bucket(n: int, floor: int = 32) -> int:
@@ -167,14 +168,18 @@ def fwd(x, q, scale, bias):
     if run is None:
         dev = x.device
         args = (dev, n, k, bias is not None, x.dtype)
+        table_key = f"m{key[2]}_n{n}_k{k}_{x.dtype}_b{key[6]}"
         c = tuned(
             "quant_fwd_tl",
             dev,
-            f"m{key[2]}_n{n}_k{k}_{x.dtype}_b{key[6]}",
+            table_key,
             [*_CFGS, *PYTORCH_PATHS],
             lambda c: _fwd_runner(c, *args)(x, q, scale, bias),
         )
-        run = _RESOLVED[key] = _fwd_runner(c, *args)
+        run = _fwd_runner(c, *args)
+        # bind only a settled pick
+        if decided("quant_fwd_tl", dev, table_key):
+            _RESOLVED[key] = run
     return run(x, q, scale, bias)
 
 
@@ -186,19 +191,20 @@ def dgrad(g, q, scale):
     if run is None:
         dev = g.device
         args = (dev, n, k, g.dtype)
-        # The dgrad runs inside the autograd backward and launches no autograd
-        # itself, so the tuner may time it there (in_backward=True).
+        table_key = f"m{key[2]}_n{n}_k{k}_{g.dtype}"
         c = select(
             "quant_dgrad_tl",
             dev,
-            f"m{key[2]}_n{n}_k{k}_{g.dtype}",
+            table_key,
             lambda: [*_CFGS, *PYTORCH_PATHS],
             lambda c: lambda: _dgrad_runner(c, *args)(g, q, scale),
             shortlist=len(_CFGS) + len(PYTORCH_PATHS),
             errors=(RuntimeError, CompileError),
             in_backward=True,
         )
-        run = _RESOLVED[key] = _dgrad_runner(c, *args)
+        run = _dgrad_runner(c, *args)
+        if decided("quant_dgrad_tl", dev, table_key):
+            _RESOLVED[key] = run
     return run(g, q, scale)
 
 

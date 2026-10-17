@@ -3,12 +3,14 @@
 import torch
 from torch.library import wrap_triton
 
+from kohakumoss_kernels.hardware.current import on_device
+
 _PLAIN = (torch.Tensor, torch.nn.Parameter)
 
 
 class Launcher:
-    """A `JITFunction` launched directly on real tensors and through `wrap_triton`
-    while a `triton_op` is traced (fake / functional tensors)."""
+    """A `JITFunction` launched directly on real tensors (on their device) and through
+    `wrap_triton` while a `triton_op` is traced (fake / functional tensors)."""
 
     def __init__(self, fn) -> None:
         self.fn = fn
@@ -19,7 +21,8 @@ class Launcher:
     def _launch(self, grid, args, kwargs):
         first = next(a for a in args if isinstance(a, torch.Tensor))
         if type(first) in _PLAIN:
-            return self.fn[grid](*args, **kwargs)
+            with on_device(first.device):
+                return self.fn[grid](*args, **kwargs)
         return wrap_triton(self.fn)[grid](*args, **kwargs)
 
 

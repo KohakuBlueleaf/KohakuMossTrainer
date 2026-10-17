@@ -12,6 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
+from kohakumoss_kernels.backends.triton._common import Launcher
 from kohakumoss_kernels.backends.triton.optim import MASK32, _adam, _scalars, _write
 from kohakumoss_kernels.constraints import requires
 from kohakumoss_kernels.optim.reference import MODES
@@ -55,7 +56,13 @@ def _multi_kernel(
     _write(p_ptr, c_ptr, offs, mask, new, tseed, MODE)
 
 
+_MULTI = Launcher(_multi_kernel)
 _TABLES: dict[tuple, tuple] = {}
+
+
+def _signed(addr: int) -> int:
+    """A 64-bit address as int64 (XPU device addresses can exceed 2^63)."""
+    return addr - (1 << 64) if addr >= 1 << 63 else addr
 
 
 def _table(tensors: list[tuple], device) -> tuple:
@@ -63,7 +70,7 @@ def _table(tensors: list[tuple], device) -> tuple:
     hit = _TABLES.get(key)
     if hit is not None:
         return hit
-    addrs = [t.data_ptr() for row in tensors for t in row]
+    addrs = [_signed(t.data_ptr()) for row in tensors for t in row]
     sizes = [row[0].numel() for row in tensors]
     btens, bstart = [], []
     for i, n in enumerate(sizes):
@@ -108,7 +115,7 @@ def adamw_step_multi(
     ]
     addrs, btens, bstart, sizes, blocks = _table(rows, params[0].device)
     p0, g0, m0, _, c0 = rows[0]
-    _multi_kernel[(blocks,)](
+    _MULTI[(blocks,)](
         addrs, btens, bstart, sizes, *_scalars(lr, beta1, beta2, eps, wd, step),
         int(seed) & MASK32, PT=TL[p0.dtype], GT=TL[g0.dtype], MT=TL[m0.dtype],
         CT=TL[c0.dtype], MODE=MODES.index(mode), BLOCK=BLOCK, num_warps=4,

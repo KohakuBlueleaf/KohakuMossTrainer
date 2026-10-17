@@ -9,7 +9,6 @@ from tests._util.negative import must_fail
 from tests.kernels._blockops_harness import check
 
 BACKENDS = ("triton", "tilelang")
-FP32_FACTOR = 3.0
 CASES = [(3, 200, (17, 1, 40)), (2, 3072, (300, 5)), (1, 128, (33,))]
 
 
@@ -28,12 +27,17 @@ def _inputs(b, d, lens, dtype, device, wdtype=torch.float32):
     )
     x = (torch.randn(n, d) * 3).to(device, dtype)
     w = (1 + 0.5 * torch.randn(d)).to(device, wdtype)
-    shift = (0.3 * torch.randn(len(lens), d)).to(device, torch.float32)
-    scale = (0.3 * torch.randn(len(lens), d)).to(device, torch.float32)
-    return x, w, shift, scale, seg.to(device)
+    mod = per_sample_slots(len(lens), d, device)
+    return x, w, mod[:, 1], mod[:, 4], seg.to(device)
 
 
-@pytest.mark.cuda
+def per_sample_slots(b: int, d: int, device, slots: int = 6) -> torch.Tensor:
+    """[B, slots, D] fp32 modulation with distinct rows; its `[:, k]` slices are the
+    strided per-sample vectors the backbone passes (row stride slots * D)."""
+    return (0.3 * torch.randn(b, slots, d)).to(device, torch.float32)
+
+
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("case", CASES)
@@ -41,16 +45,15 @@ def test_rms_norm_mod(backend, dtype, case, device):
     fn = _impl("rms_norm_mod", backend, device, dtype)
     _, d, lens = case
     x, w, shift, scale, seg = _inputs(*case, dtype, device)
-    factor = FP32_FACTOR if dtype == torch.float32 else 1.1
     args = (x, w, shift, scale, seg, 1e-6)
     grads = (True, True, True, True, False, False)
-    check(fn, eager.rms_norm_mod, args, grads, dtype, f"{backend}-mod", factor=factor)
+    check(fn, eager.rms_norm_mod, args, grads, dtype, f"{backend}-mod")
     args = (x, None, shift, None, seg, 1e-6)
     grads = (True, False, True, False, False, False)
-    check(fn, eager.rms_norm_mod, args, grads, dtype, f"{backend}-shift", factor=factor)
+    check(fn, eager.rms_norm_mod, args, grads, dtype, f"{backend}-shift")
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_rms_norm(backend, dtype, device):
@@ -71,7 +74,7 @@ def test_rms_norm(backend, dtype, device):
     )
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_negative_segment_reduction(backend, device):
     """A backend that sums d_shift over the whole batch instead of per sample fails."""

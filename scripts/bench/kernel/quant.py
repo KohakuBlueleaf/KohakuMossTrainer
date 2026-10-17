@@ -2,16 +2,17 @@
 
 Arms per case: `eager` (dequantize to the activation dtype, then F.linear),
 `compile` (torch.compile of the same), and every registered quant_linear backend
-pinned. A backend arm runs what its tuner selected for the shape — one of its
-kernel configs or a PyTorch path — so its row says what training gets. Rows
-carry kernel time (profiler, host dispatch excluded) for forward and
-fwd+bwd(dx), the error against fp64, and `race`: the tuner's own CUDA-graph
+pinned. A backend arm runs what its tuner selected for the shape -- one of its
+kernel configs or a PyTorch path -- so its row says what training gets. A
+backend that cannot serve the device / dtype / format gets a row carrying the
+registry's reason. Rows carry kernel time (profiler, host dispatch excluded) for
+forward and fwd+bwd(dx), the error against fp64, and `race`: the tuner's own
 device times of its best kernel config against the eager and compile paths,
 for the forward and the dgrad GEMM separately. The verdict says whether the
 best kernel beats both PyTorch paths (`kernel`) and whether the selected path
 is within 3% of the faster PyTorch path (`selected`). One JSON per card.
 
-    python scripts/bench/kernel/quant.py --out runs/bench/quant
+    python scripts/bench/kernel/quant.py --out runs/bench/quant --device xpu
 """
 
 import argparse
@@ -33,27 +34,45 @@ SHAPES = {
 }
 TOKENS = (300, 4096, 16384)
 TABLES = ("quant_fwd", "quant_dgrad", "quant_fwd_tl", "quant_dgrad_tl")
+PROFILED = {
+    "cuda": (torch.profiler.ProfilerActivity.CUDA, torch.autograd.DeviceType.CUDA),
+    "xpu": (torch.profiler.ProfilerActivity.XPU, torch.autograd.DeviceType.XPU),
+}
 
 
-def kernel_ms(fn, iters: int = 5) -> float:
+class Device:
+    """The bench device, its torch device module and profiler activity, resolved once."""
+
+    def __init__(self, spec: str):
+        self.device = torch.device(spec)
+        if self.device.index is None:
+            self.device = torch.device(self.device.type, 0)
+        self.module = getattr(torch, self.device.type)
+        self.module.set_device(self.device.index)
+        self.activity, self.kind = PROFILED[self.device.type]
+
+    def sync(self) -> None:
+        self.module.synchronize(self.device)
+
+    def name(self) -> str:
+        return self.module.get_device_name(self.device.index)
+
+
+def kernel_ms(dev: Device, fn, iters: int = 5) -> float:
     for _ in range(2):
         fn()
-    torch.cuda.synchronize()
-    acts = [torch.profiler.ProfilerActivity.CUDA]
-    with torch.profiler.profile(activities=acts) as prof:
+    dev.sync()
+    with torch.profiler.profile(activities=[dev.activity]) as prof:
         for _ in range(iters):
             fn()
-        torch.cuda.synchronize()
+        dev.sync()
     us = sum(
-        e.device_time_total
-        for e in prof.key_averages()
-        if e.device_type == torch.autograd.DeviceType.CUDA
+        e.device_time_total for e in prof.key_averages() if e.device_type == dev.kind
     )
     if us > 0:
         return us / iters / 1e3
-    # CUPTI dropped the activity records (seen on sm_70/75): CUDA-graph replay
-    # device time, host launch cost excluded as the profiler sum excludes it.
-    return graph_ms(fn, torch.device("cuda", torch.cuda.current_device()))
+    # profiler recorded no device activity: the tuner's device-time measure
+    return graph_ms(fn, dev.device)
 
 
 def quantize(w, fmt):
@@ -65,7 +84,7 @@ def quantize(w, fmt):
     return (w / s[:, None]).clamp(-448, 448).to(torch.float8_e4m3fn), s.float()
 
 
-def arm_times(fn, x, g):
+def arm_times(dev: Device, fn, x, g):
     xa = x.clone().requires_grad_(True)
 
     def fwd():
@@ -76,15 +95,15 @@ def arm_times(fn, x, g):
         xa.grad = None
         fn(xa).backward(g)
 
-    return kernel_ms(fwd), kernel_ms(fwdbwd)
+    return kernel_ms(dev, fwd), kernel_ms(dev, fwdbwd)
 
 
-def race(m, n, k, dtype, fmt) -> dict:
+def race(dev: Device, m, n, k, dtype, fmt) -> dict:
     """{table: {kernel, eager, compile, config}} from the tuner rows of this shape."""
     prefix = f"m{max(32, 1 << (m - 1).bit_length())}_n{n}_k{k}_{dtype}"
     out = {}
     for kn in TABLES:
-        for key, row in tuning.table("cuda", kn).rows.items():
+        for key, row in tuning.table(dev.device, kn).rows.items():
             if not key.startswith(prefix) or ("float8" in key) != (fmt == "fp8"):
                 continue
             t = row["timings_ms"]
@@ -109,11 +128,12 @@ def _fmt_race(r: dict) -> str:
     )
 
 
-def run_case(dtype, fmt, name, n, k, m, backends):
-    w = torch.randn(n, k, device="cuda") * 0.05
+def run_case(dev: Device, dtype, fmt, name, n, k, m, backends, unavailable):
+    d = dev.device
+    w = torch.randn(n, k, device=d) * 0.05
     q, scale = quantize(w, fmt)
-    x = torch.randn(m, k, device="cuda", dtype=dtype)
-    g = torch.randn(m, n, device="cuda", dtype=dtype)
+    x = torch.randn(m, k, device=d, dtype=dtype)
+    g = torch.randn(m, n, device=d, dtype=dtype)
     ref = x.double() @ (q.double() * scale.double()[:, None]).T
 
     def eager(t):
@@ -121,7 +141,7 @@ def run_case(dtype, fmt, name, n, k, m, backends):
 
     arms = {"eager": eager, "compile": torch.compile(eager, dynamic=False)}
     for be in backends:
-        op = registry.resolve("quant_linear", "cuda", dtype, backend=be, fmt=fmt)
+        op = registry.resolve("quant_linear", d.type, dtype, backend=be, fmt=fmt)
         arms[be] = lambda t, op=op: op(t, q, scale, None, fmt)
     res = {}
     for arm, fn in arms.items():
@@ -129,10 +149,12 @@ def run_case(dtype, fmt, name, n, k, m, backends):
             with torch.no_grad():
                 got = fn(x)
             err = ((got.double() - ref).abs().max() / ref.abs().max()).item()
-            res[arm] = (*arm_times(fn, x, g), err, None)
+            res[arm] = (*arm_times(dev, fn, x, g), err, None)
         except Exception as exc:  # noqa: BLE001 - a failing arm is recorded
             res[arm] = (None, None, None, f"{type(exc).__name__}: {exc}"[:200])
-    rc = race(m, n, k, dtype, fmt)
+    for be, why in unavailable.items():
+        res[f"backend:{be}"] = (None, None, None, f"unavailable: {why}")
+    rc = race(dev, m, n, k, dtype, fmt)
     base = [res[a][1] for a in ("eager", "compile") if res[a][1]]
     base_b = min(base) if base else None
     kernel_win = {
@@ -180,14 +202,16 @@ def run_case(dtype, fmt, name, n, k, m, backends):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="runs/bench/quant")
+    ap.add_argument("--device", default="cuda", help="cuda[:i] or xpu[:i]")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--shapes", default="", help="comma list of SHAPES names")
     ap.add_argument("--tokens", default="", help="comma list of token counts")
     args = ap.parse_args()
     torch._dynamo.config.cache_size_limit = 512
-    arch = arch_of("cuda")
+    dev = Device(args.device)
+    arch = arch_of(dev.device)
     dtypes = [torch.float16] + ([torch.bfloat16] if arch.has_bf16 else [])
-    fmts = ["int8"] + (["fp8"] if arch.has_fp8 else [])
+    fmts = ["int8", "fp8"]
     shapes = {"q": SHAPES["q"]} if args.quick else SHAPES
     tokens = (4096,) if args.quick else TOKENS
     if args.shapes:
@@ -197,21 +221,26 @@ def main():
     rows, verdicts = [], []
     for fmt in fmts:
         for dtype in dtypes:
-            backends = [
-                b
-                for b, why in registry.available(
-                    "quant_linear", "cuda", dtype, fmt=fmt
-                ).items()
-                if why is None and b != "eager"
-            ]
+            avail = registry.available("quant_linear", dev.device.type, dtype, fmt=fmt)
+            avail.pop("eager", None)
+            backends = [b for b, why in avail.items() if why is None]
+            unavailable = {b: why for b, why in avail.items() if why is not None}
+            if not backends:
+                print(f"{fmt} {dtype}: no backend serves it: {unavailable}")
+                rows.append(
+                    {"fmt": fmt, "dtype": str(dtype), "unavailable": unavailable}
+                )
+                continue
             for name, (n, k) in shapes.items():
                 for m in tokens:
-                    r, v = run_case(dtype, fmt, name, n, k, m, backends)
+                    r, v = run_case(
+                        dev, dtype, fmt, name, n, k, m, backends, unavailable
+                    )
                     rows += r
                     verdicts.append(v)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    card = torch.cuda.get_device_name().replace(" ", "_")
+    card = dev.name().replace(" ", "_")
     with open(out / f"quant_{card}.json", "w", encoding="utf-8") as fh:
         json.dump({"device": card, "rows": rows, "verdicts": verdicts}, fh, indent=1)
     slow = [v[:4] for v in verdicts if v[4]["selected"] is False]

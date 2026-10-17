@@ -26,11 +26,11 @@ def _inputs(lens, d, dtype, device):
     )
     x = (torch.randn(n, d) * 4).to(device, dtype)
     o = torch.randn(n, d).to(device, dtype)
-    gate = (0.5 * torch.randn(len(lens), d)).to(device, torch.float32)
+    gate = (0.5 * torch.randn(len(lens), 6, d)).to(device, torch.float32)[:, 2]
     return x, o, gate, seg.to(device)
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("r", [1.0, 0.5])
@@ -49,6 +49,14 @@ def test_gated_residual(backend, dtype, r, case, device):
     check(
         fn,
         eager.gated_residual,
+        (x, o, gate, seg, r),
+        (True, True, False, False, False),
+        dtype,
+        f"{backend}-frozen-gate",
+    )
+    check(
+        fn,
+        eager.gated_residual,
         (x, o, None, None, r),
         (True, True, False, False, False),
         dtype,
@@ -56,7 +64,24 @@ def test_gated_residual(backend, dtype, r, case, device):
     )
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_negative_gate_read_as_contiguous(backend, device):
+    """A kernel that indexes a strided gate as row-major [B, D] must be caught."""
+    fn = _impl(backend, device, torch.float16)
+    x, o, gate, seg = _inputs((20, 30, 7), 256, torch.float16, device)
+
+    def broken(x, o, gate, seg, r):
+        return fn(x, o, gate.as_strided(gate.shape, (gate.shape[1], 1)), seg, r)
+
+    grads = (True, True, False, False, False)
+    args = (x, o, gate, seg, 1.0)
+    must_fail(
+        lambda: check(broken, eager.gated_residual, args, grads, torch.float16, "b")
+    )
+
+
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_negative_gate_sample(backend, device):
     """Using sample 0's gate for every row must be caught."""

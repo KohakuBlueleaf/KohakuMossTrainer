@@ -20,8 +20,15 @@ except ImportError:
     tilelang_fl = None
 
 PATHS = ("fused", "split")
-QK_FACTOR = 1.3
 MODULES = {"triton": triton_fl, "tilelang": tilelang_fl}
+
+
+def check_both(fn, eager, args, grads, dtype, name):
+    """The training path (forward + backward) and the no-grad path (inference, the
+    pre-activations kept in fp32 instead of saved) both meet the bar."""
+    check(fn, eager, args, grads, dtype, name)
+    with torch.no_grad():
+        check(fn, eager, args, grads, dtype, f"{name}-nograd", backward=False)
 
 
 def _impl(op, device, dtype, backend):
@@ -55,7 +62,7 @@ def eager_qk(y, wq, wk, qw, kw, pos, bands, eps, heads):
     return rope.qk_norm_rope(q, k, qw, kw, pos, bands, eps)
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", ("triton", "tilelang"))
 @pytest.mark.parametrize("path", PATHS)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -67,7 +74,8 @@ def test_linear_situ(backend, path, dtype, m, k, f, device):
         y = torch.randn(m, k).to(device, dtype)
         w = (torch.randn(2 * f, k) / k**0.5 * 3).to(device, dtype)
         b = (0.1 * torch.randn(2 * f)).to(device, dtype)
-        check(fn, eager_situ, (y, w, b), (True, True, True), dtype, f"{backend}-{path}")
+        args = (y, w, b)
+        check_both(fn, eager_situ, args, (True, True, True), dtype, f"{backend}-{path}")
         check(
             fn,
             eager_situ,
@@ -80,7 +88,7 @@ def test_linear_situ(backend, path, dtype, m, k, f, device):
         mod.force_path(None)
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", ("triton", "tilelang"))
 @pytest.mark.parametrize("path", PATHS)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -97,15 +105,15 @@ def test_linear_gated_residual(backend, path, dtype, r, device):
         a = torch.randn(n, k).to(device, dtype)
         w = (torch.randn(d, k) / k**0.5).to(device, dtype)
         x = (torch.randn(n, d) * 4).to(device, dtype)
-        gate = (0.5 * torch.randn(len(lens), d)).to(device, torch.float32)
+        gate = (0.5 * torch.randn(len(lens), 6, d)).to(device, torch.float32)[:, 2]
         args = (a, w, None, x, gate, seg.to(device), r)
         grads = (True, True, False, True, True, False, False)
-        check(fn, eager_res, args, grads, dtype, f"{backend}-{path}", factor=QK_FACTOR)
+        check_both(fn, eager_res, args, grads, dtype, f"{backend}-{path}")
     finally:
         mod.force_path(None)
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", ("triton", "tilelang"))
 @pytest.mark.parametrize("path", PATHS)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -123,12 +131,91 @@ def test_linear_qk_rope(backend, path, dtype, device):
         bands = (1 / (10000.0 ** (torch.arange(16) / 16))).to(device)
         args = (y, wq, wk, qw, kw, seq.pos_joint.to(device), bands, 1e-6, heads)
         grads = (True, True, True, True, True, False, False, False, False)
-        check(fn, eager_qk, args, grads, dtype, f"{backend}-{path}", factor=QK_FACTOR)
+        check_both(fn, eager_qk, args, grads, dtype, f"{backend}-{path}")
     finally:
         mod.force_path(None)
 
 
-@pytest.mark.cuda
+def _master_case(op, device, dtype):
+    """(eager spec, args, grads) with 16-bit activations and fp32 master weights."""
+    g = torch.Generator().manual_seed(7)
+    m, k, d = 300, 256, 384
+    y = torch.randn(m, k, generator=g).to(device, dtype)
+    w = (torch.randn(2 * d, k, generator=g) / k**0.5).to(device)
+    match op:
+        case "linear_situ":
+            b = (0.1 * torch.randn(2 * d, generator=g)).to(device)
+            return eager_situ, (y, w, b), (True, True, True)
+        case "linear_gated_residual":
+            seg = (torch.arange(m) >= 120).int().to(device)
+            x = torch.randn(m, d, generator=g).to(device, dtype)
+            gate = torch.randn(2, d, generator=g).to(device)
+            args = (y, w[:d], None, x, gate, seg, 1.0)
+            return eager_res, args, (True, True, False, True, True, False, False)
+    seq = build_seqinfo(torch.tensor([[4, 6], [3, 3]]), torch.tensor([20, 133]))
+    y = torch.randn(seq.n_joint, k, generator=g).to(device, dtype)
+    qw = (1 + 0.3 * torch.randn(128, generator=g)).to(device)
+    bands = (1 / (10000.0 ** (torch.arange(16) / 16))).to(device)
+    args = (y, w[:d], w[d:], qw, qw.clone(), seq.pos_joint.to(device), bands, 1e-6, 3)
+    return eager_qk, args, (True, True, True, True, True, False, False, False, False)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("backend", ("triton", "tilelang"))
+@pytest.mark.parametrize("path", PATHS)
+@pytest.mark.parametrize(
+    "op", ("linear_situ", "linear_gated_residual", "linear_qk_rope")
+)
+def test_fp32_master_weights(backend, path, op, device):
+    """Full finetune: fp16 activations with fp32 master weights. The matmuls take the
+    weights cast to fp16; the weight gradients come back fp32 and meet the bar."""
+    dtype = torch.float16
+    fn = _impl(op, device, dtype, backend)
+    mod = _force(backend, path)
+    try:
+        eager, args, grads = _master_case(op, device, dtype)
+        check(fn, eager, args, grads, dtype, f"{backend}-{path}-{op}-master")
+    finally:
+        mod.force_path(None)
+
+
+def _autocast(fn, device):
+    """fn run under fp16 autocast (the trainer's mixed-precision forward)."""
+
+    def run(*args):
+        with torch.autocast(device.type, dtype=torch.float16):
+            return fn(*args)
+
+    return run
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("backend", ("triton", "tilelang"))
+@pytest.mark.parametrize("path", PATHS)
+@pytest.mark.parametrize(
+    "op", ("linear_situ", "linear_gated_residual", "linear_qk_rope")
+)
+def test_fp32_activations_under_autocast(backend, path, op, device):
+    """fp32 activations and fp32 masters under fp16 autocast: the matmuls run on fp16
+    operands (as autocast does for a linear), the backward outside autocast sees one
+    dtype per matmul, and the gradients come back fp32."""
+    fn = _impl(op, device, torch.float16, backend)
+    mod = _force(backend, path)
+    try:
+        eager, args, grads = _master_case(op, device, torch.float32)
+        check(
+            _autocast(fn, device),
+            _autocast(eager, device),
+            args,
+            grads,
+            torch.float16,
+            f"{backend}-{path}-{op}-autocast",
+        )
+    finally:
+        mod.force_path(None)
+
+
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", ("triton", "tilelang"))
 def test_negative_gate_dropped(backend, device):
     """A fused residual that forgets the gate must be caught."""

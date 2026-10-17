@@ -2,8 +2,11 @@
 / graph capture, so live calls only look tuned choices up."""
 
 from collections.abc import Callable
+from functools import partial
 
 import torch
+
+from kohakumoss_kernels.registry import Bound, exercise
 
 
 def attention_lengths(max_len: int, floor: int = 64) -> list[int]:
@@ -26,16 +29,24 @@ def prewarm_attention(
     segments: int = 2,
 ) -> None:
     """Run `fn` (an `attention_varlen` implementation) forward + backward once per
-    length bucket up to `max_len`, on its own leaves under `enable_grad`."""
+    length bucket up to `max_len`, on its own leaves under `enable_grad`. A `Bound` op
+    whose backend fails here, the backward included, falls back before step 0."""
     device = torch.device(device)
     for length in attention_lengths(max_len):
         n = length * segments
         cu = torch.arange(0, n + 1, length, device=device, dtype=torch.int32)
         with torch.enable_grad():
             q, k, v = (
-                torch.randn(
-                    n, heads, head_dim, device=device, dtype=dtype
-                ).requires_grad_()
+                torch.randn(n, heads, head_dim, device=device, dtype=dtype)
                 for _ in range(3)
             )
-            fn(q, k, v, cu, length, head_dim**-0.5).sum().backward()
+            step = partial(_step, q=q, k=k, v=v, cu=cu, length=length)
+            if isinstance(fn, Bound):
+                exercise(fn, step)
+            else:
+                step(fn)
+
+
+def _step(op: Callable, q, k, v, cu, length: int) -> None:
+    leaves = [t.detach().requires_grad_() for t in (q, k, v)]
+    op(*leaves, cu, length, q.shape[-1] ** -0.5).sum().backward()

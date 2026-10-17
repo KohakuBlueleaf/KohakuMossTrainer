@@ -1,7 +1,8 @@
 """TileLang token MSE: sum over tokens of weight[seg] * mask * mean_c((pred - target)^2).
 
-Forward writes one fp32 partial per program row lane, summed in torch; `weight` and
-`mask` are data and get no gradient.
+Forward computes in double-float (fp32 pairs), one row per thread, and writes one pair
+partial per row, pair-summed and rounded once; `weight` and `mask` are data and get no
+gradient.
 """
 
 import tilelang.language as T
@@ -11,7 +12,19 @@ from torch.library import custom_op
 
 from kohakumoss_kernels.backends.compile.race import raced, shape_key
 from kohakumoss_kernels.backends.eager import loss as eager_loss
-from kohakumoss_kernels.backends.tilelang._blockops import DTYPE, CompileError, compiled
+from kohakumoss_kernels.backends.tilelang._blockops import (
+    DTYPE,
+    CompileError,
+    compiled,
+    total,
+)
+from kohakumoss_kernels.backends.tilelang._df import (
+    df_add,
+    df_div,
+    df_mul,
+    two_prod,
+    two_sum,
+)
 from kohakumoss_kernels.constraints import requires
 from kohakumoss_kernels.registry import register
 
@@ -19,9 +32,12 @@ __all__ = ["token_mse"]
 
 F32 = "float32"
 BM, THREADS = 16, 128
+FWD_ROWS = 128
 
 
 def _fwd_prim(c, dtype):
+    """One row per thread, double-float over the row's channels; per-row pair partials
+    of weight * mask * mean((p - t)^2)."""
     n = T.dynamic("n")
     b = T.dynamic("b")
     pp = T.dynamic("p")
@@ -33,22 +49,42 @@ def _fwd_prim(c, dtype):
         seg: T.Tensor((n,), "int32"),
         w: T.Tensor((b,), F32),
         m: T.Tensor((n,), F32),
-        part: T.Tensor((pp, BM), F32),
+        part: T.Tensor((pp, FWD_ROWS, 1, 2, 1), F32),
     ):
-        with T.Kernel(T.ceildiv(n, BM), threads=THREADS) as bx:
-            sq = T.alloc_fragment((BM, c), F32)
-            err = T.alloc_fragment((BM,), F32)
-            for i, j in T.Parallel(BM, c):
-                rr = T.min(bx * BM + i, n - 1)
-                d = T.cast(p[rr, j], F32) - T.cast(t[rr, j], F32)
-                sq[i, j] = d * d
-            T.reduce_sum(sq, err, dim=1)
-            for i in T.Parallel(BM):
-                row = bx * BM + i
-                rr = T.min(row, n - 1)
-                part[bx, i] = T.if_then_else(
-                    row < n, err[i] / c * w[seg[rr]] * m[rr], 0.0
-                )
+        with T.Kernel(T.ceildiv(n, FWD_ROWS), threads=FWD_ROWS) as bx:
+            eh = T.alloc_fragment((FWD_ROWS,), F32)
+            el = T.alloc_fragment((FWD_ROWS,), F32)
+            th = T.alloc_fragment((FWD_ROWS,), F32)
+            tl = T.alloc_fragment((FWD_ROWS,), F32)
+            uh = T.alloc_fragment((FWD_ROWS,), F32)
+            ul = T.alloc_fragment((FWD_ROWS,), F32)
+            T.clear(eh)
+            T.clear(el)
+            for i in T.Parallel(FWD_ROWS):
+                rr = T.min(bx * FWD_ROWS + i, n - 1)
+                for j in T.serial(c):
+                    dh, dl = two_sum(T.cast(p[rr, j], F32), -T.cast(t[rr, j], F32))
+                    th[i] = dh
+                    tl[i] = dl
+                    sh, sl = df_mul(th[i], tl[i], th[i], tl[i])
+                    uh[i] = sh
+                    ul[i] = sl
+                    h, lw = df_add(eh[i], el[i], uh[i], ul[i])
+                    eh[i] = h
+                    el[i] = lw
+            for i in T.Parallel(FWD_ROWS):
+                rr = T.min(bx * FWD_ROWS + i, n - 1)
+                qh, ql = df_div(eh[i], el[i], T.float32(c))
+                th[i] = qh
+                tl[i] = ql
+                wh, wl = two_prod(w[seg[rr]], m[rr])
+                uh[i] = wh
+                ul[i] = wl
+            for i in T.Parallel(FWD_ROWS):
+                row = bx * FWD_ROWS + i
+                h, lw = df_mul(th[i], tl[i], uh[i], ul[i])
+                part[bx, i, 0, 0, 0] = T.if_then_else(row < n, h, 0.0)
+                part[bx, i, 0, 1, 0] = T.if_then_else(row < n, lw, 0.0)
 
     return main
 
@@ -87,12 +123,14 @@ def _mask(mask, n, device):
     )
 
 
-@custom_op("kohakumoss::f6tl_token_mse_fwd", mutates_args=())
+@custom_op("kohakumoss::tilelang_token_mse_fwd", mutates_args=())
 def _fwd_op(
     pred: Tensor, target: Tensor, seg: Tensor, weight: Tensor, mask: Tensor | None
 ) -> Tensor:
     n, c = pred.shape
-    part = torch.empty(-(-n // BM), BM, device=pred.device, dtype=torch.float32)
+    part = torch.empty(
+        -(-n // FWD_ROWS), FWD_ROWS, 1, 2, 1, device=pred.device, dtype=torch.float32
+    )
     kernel = compiled(_fwd_prim, pred.device, c, DTYPE[pred.dtype])
     kernel(
         pred,
@@ -102,7 +140,7 @@ def _fwd_op(
         _mask(mask, n, pred.device),
         part,
     )
-    return part.sum()
+    return total(part).reshape(())
 
 
 @_fwd_op.register_fake
@@ -110,7 +148,7 @@ def _(pred, target, seg, weight, mask):
     return pred.new_empty((), dtype=torch.float32)
 
 
-@custom_op("kohakumoss::f6tl_token_mse_bwd", mutates_args=())
+@custom_op("kohakumoss::tilelang_token_mse_bwd", mutates_args=())
 def _bwd_op(
     gs: Tensor,
     pred: Tensor,

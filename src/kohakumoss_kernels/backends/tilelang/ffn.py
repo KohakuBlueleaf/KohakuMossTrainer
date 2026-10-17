@@ -80,7 +80,7 @@ def _launch(prim, kind, x, f, *args):
             *args
         )
 
-    tuned_run(f"f6tl_situ_{kind}", x.device, f"f{f}-{x.dtype}", CFGS, run)
+    tuned_run(f"tilelang_situ_{kind}", x.device, f"f{f}-{x.dtype}", CFGS, run)
 
 
 def situ_forward(x: Tensor) -> Tensor:
@@ -98,7 +98,7 @@ def situ_backward(gr: Tensor, x: Tensor) -> Tensor:
     return dx
 
 
-@custom_op("kohakumoss::f6tl_situ_fwd", mutates_args=())
+@custom_op("kohakumoss::tilelang_situ_fwd", mutates_args=())
 def _fwd_op(x: Tensor) -> Tensor:
     return situ_forward(x)
 
@@ -108,7 +108,7 @@ def _(x):
     return x.new_empty(x.shape[0], x.shape[1] // 2)
 
 
-@custom_op("kohakumoss::f6tl_situ_bwd", mutates_args=())
+@custom_op("kohakumoss::tilelang_situ_bwd", mutates_args=())
 def _bwd_op(gr: Tensor, x: Tensor) -> Tensor:
     return situ_backward(gr, x)
 

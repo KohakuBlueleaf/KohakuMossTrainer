@@ -31,7 +31,7 @@ def _inputs(lens, c, dtype, device):
     return pred, target, seg.to(device), weight, mask
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("lens", [(17, 1, 40), (4096, 1024)])
@@ -39,27 +39,11 @@ def test_token_mse(backend, dtype, lens, device):
     fn = _impl(backend, device, dtype)
     pred, target, seg, weight, mask = _inputs(lens, 128, dtype, device)
     grads = (True, True, False, False, False)
-    check(
-        fn,
-        eager.token_mse,
-        (pred, target, seg, weight, mask),
-        grads,
-        dtype,
-        backend,
-        factor=3.0,
-    )
-    check(
-        fn,
-        eager.token_mse,
-        (pred, target, seg, weight, None),
-        grads,
-        dtype,
-        backend,
-        factor=3.0,
-    )
+    check(fn, eager.token_mse, (pred, target, seg, weight, mask), grads, dtype, backend)
+    check(fn, eager.token_mse, (pred, target, seg, weight, None), grads, dtype, backend)
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_negative_weight_ignored(backend, device):
     """Dropping the per-sample weight must be caught."""

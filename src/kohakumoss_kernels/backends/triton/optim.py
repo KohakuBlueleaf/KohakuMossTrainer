@@ -8,7 +8,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from kohakumoss_kernels.backends.triton._common import cdiv
+from kohakumoss_kernels.backends.triton._common import Launcher, cdiv
 from kohakumoss_kernels.constraints import requires
 from kohakumoss_kernels.optim.reference import BLOCK as QBLOCK
 from kohakumoss_kernels.optim.reference import MODES
@@ -111,6 +111,10 @@ def _adamw8_kernel(
     _write(p_ptr, c_ptr, offs, mask, new, seed, MODE)
 
 
+_ADAMW = Launcher(_adamw_kernel)
+_ADAMW8 = Launcher(_adamw8_kernel)
+
+
 def _scalars(lr, beta1, beta2, eps, wd, step):
     c1 = 1.0 / (1.0 - beta1**step)
     c2 = 1.0 / (1.0 - beta2**step) ** 0.5
@@ -125,7 +129,7 @@ def adamw_step(
     if n == 0:
         return
     code = MODES.index(mode)
-    _adamw_kernel[(cdiv(n, 1024),)](
+    _ADAMW[(cdiv(n, 1024),)](
         p, g, m, r, comp if comp is not None else p, n,
         *_scalars(lr, beta1, beta2, eps, wd, step), int(seed) & MASK32,
         MODE=code, BLOCK=1024, num_warps=4,
@@ -140,7 +144,7 @@ def adamw8bit_step(
     if n == 0:
         return
     code = MODES.index(mode)
-    _adamw8_kernel[(cdiv(n, QBLOCK),)](
+    _ADAMW8[(cdiv(n, QBLOCK),)](
         p, g, mq, ms, rq, rs, comp if comp is not None else p, n,
         *_scalars(lr, beta1, beta2, eps, wd, step), int(seed) & MASK32,
         MODE=code, BLOCK=QBLOCK, num_warps=4,

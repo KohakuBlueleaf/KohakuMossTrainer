@@ -4,15 +4,15 @@ python scripts/bench/kernel/qk_rope.py --backend triton
 """
 
 import torch
-from _blockops import contenders, dtypes, measure, parse, report
 
 from kohakumoss.types.seqinfo import build_seqinfo
 from kohakumoss_kernels.backends.eager import rope as eager
+from kohakumoss_kernels.bench.blockops import contenders, dtypes, measure, parse, report
 
 
 def main():
     args = parse()
-    device = torch.device("cuda")
+    device = torch.device(args.device)
     rows = []
     cases = [([[64, 64]], [300]), ([[64, 64]] * 4, [300, 120, 77, 500])]
     if args.quick:
@@ -35,19 +35,20 @@ def main():
                 not args.no_compile,
             )
             call = (q, k, qw, kw, seq.pos_joint.to(device), bands, 1e-6)
-            grads = (True, True, False, False, False, False, False)
-            rows.append(
-                measure(
-                    f"N={n} B={len(hw)}",
-                    fns,
-                    eager.qk_norm_rope,
-                    call,
-                    grads,
-                    dtype,
-                    args.iters,
-                    device,
+            for label, w_grad in (("lora", False), ("full", True)):
+                grads = (True, True, w_grad, w_grad, False, False, False)
+                rows.append(
+                    measure(
+                        f"N={n} B={len(hw)} {label}",
+                        fns,
+                        eager.qk_norm_rope,
+                        call,
+                        grads,
+                        dtype,
+                        args.iters,
+                        device,
+                    )
                 )
-            )
     report("qk_norm_rope", rows, args.out, device)
 
 

@@ -1,4 +1,4 @@
-"""Triton weight-only quantized linear (sm80+; fp8 storage from sm89).
+"""Triton weight-only quantized linear (CUDA sm80+ and XPU; fp8 storage from sm89).
 
 Forward: y = (x @ q^T) * scale + bias; the int8 / e4m3 tile converts exactly to
 the activation dtype in registers, the scale is applied to the fp32 accumulator.
@@ -13,6 +13,7 @@ import triton.language as tl
 from kohakumoss_kernels import registry, tuning
 from kohakumoss_kernels.backends.triton._common import pow2_bucket
 from kohakumoss_kernels.constraints import requires
+from kohakumoss_kernels.hardware.current import on_device
 from kohakumoss_kernels.quant import (
     PYTORCH_PATHS,
     fmt_supported,
@@ -20,6 +21,7 @@ from kohakumoss_kernels.quant import (
     pytorch_path,
     register_launchers,
 )
+from kohakumoss_kernels.tuning import tuner
 
 
 @triton.jit
@@ -151,6 +153,11 @@ def _launch_fwd(cfg, x, q, scale, bias, y):
     m, k = x.shape
     n = q.shape[0]
     grid = (triton.cdiv(m, cfg["bm"]) * triton.cdiv(n, cfg["bn"]),)
+    with on_device(x.device):
+        _launch_fwd_kernel(grid, cfg, x, q, scale, bias, y, m, n, k)
+
+
+def _launch_fwd_kernel(grid, cfg, x, q, scale, bias, y, m, n, k):
     _fwd_kernel[grid](
         x,
         q,
@@ -177,6 +184,11 @@ def _launch_dgrad(cfg, g, q, scale, dx):
     m, n = g.shape
     k = q.shape[1]
     grid = (triton.cdiv(m, cfg["bm"]) * triton.cdiv(k, cfg["bn"]),)
+    with on_device(g.device):
+        _launch_dgrad_kernel(grid, cfg, g, q, scale, dx, m, n, k)
+
+
+def _launch_dgrad_kernel(grid, cfg, g, q, scale, dx, m, n, k):
     _dgrad_kernel[grid](
         g,
         q,
@@ -202,6 +214,7 @@ def _key(m, n, k, x, q, bias) -> str:
 
 
 _RESOLVED: dict[tuple, object] = {}
+tuner.on_reset(_RESOLVED.clear)
 
 
 def _fwd_runner(cfg):
@@ -246,16 +259,20 @@ def fwd(x, q, scale, bias):
     )
     run = _RESOLVED.get(key)
     if run is None:
+        table_key = _key(m, n, k, x, q, bias)
         cfg = tuning.select(
             "quant_fwd",
             x.device,
-            _key(m, n, k, x, q, bias),
+            table_key,
             lambda: _candidates(m),
             lambda c: lambda: _fwd_runner(c)(x, q, scale, bias),
             shortlist=len(_TILES) + len(PYTORCH_PATHS),
             errors=(Exception,),
         )
-        run = _RESOLVED[key] = _fwd_runner(cfg)
+        run = _fwd_runner(cfg)
+        # bind only a settled pick
+        if tuning.decided("quant_fwd", x.device, table_key):
+            _RESOLVED[key] = run
     return run(x, q, scale, bias)
 
 
@@ -265,17 +282,20 @@ def dgrad(g, q, scale):
     key = ("dgrad", g.device.index, pow2_bucket(m, 32), n, k, g.dtype, q.dtype)
     run = _RESOLVED.get(key)
     if run is None:
+        table_key = _key(m, n, k, g, q, None)
         cfg = tuning.select(
             "quant_dgrad",
             g.device,
-            _key(m, n, k, g, q, None),
+            table_key,
             lambda: _candidates(m),
             lambda c: lambda: _dgrad_runner(c)(g, q, scale),
             shortlist=len(_TILES) + len(PYTORCH_PATHS),
             errors=(Exception,),
             in_backward=True,
         )
-        run = _RESOLVED[key] = _dgrad_runner(cfg)
+        run = _dgrad_runner(cfg)
+        if tuning.decided("quant_dgrad", g.device, table_key):
+            _RESOLVED[key] = run
     return run(g, q, scale)
 
 
@@ -288,5 +308,5 @@ registry.register(
     "quant_linear",
     "triton",
     make_quant_linear("triton"),
-    supports=requires(kinds=("cuda",), min_sm=80, extra=_rule),
+    supports=requires(kinds=("cuda", "xpu"), min_sm=80, extra=_rule),
 )

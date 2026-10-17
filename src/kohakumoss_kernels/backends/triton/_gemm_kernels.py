@@ -99,6 +99,8 @@ def residual_gemm_kernel(
     N,
     K,
     r,
+    g_row,
+    g_col,
     HAS_BIAS: tl.constexpr,
     HAS_GATE: tl.constexpr,
     SCALED: tl.constexpr,
@@ -108,7 +110,8 @@ def residual_gemm_kernel(
     BK: tl.constexpr,
     GROUP_M: tl.constexpr,
 ):
-    """out = x * r + (A W^T + b) * gate[seg]; o = A W^T + b saved when SAVE."""
+    """out = x * r + (A W^T + b) * gate[seg] (gate read through its strides); o = A W^T
+    + b saved when SAVE."""
     pm, pn = _pid_mn(M, N, BM, BN, GROUP_M)
     offs_m = pm * BM + tl.arange(0, BM)
     offs_n = pn * BN + tl.arange(0, BN)
@@ -126,7 +129,8 @@ def residual_gemm_kernel(
         tl.store(o_ptr + offs, acc.to(o_ptr.dtype.element_ty), mask=mask)
     if HAS_GATE:
         s = tl.load(seg_ptr + offs_m, mask=m_ok, other=0).to(tl.int64)
-        g = tl.load(gate_ptr + s[:, None] * N + offs_n[None, :], mask=mask, other=0.0)
+        goff = s[:, None] * g_row + offs_n[None, :] * g_col
+        g = tl.load(gate_ptr + goff, mask=mask, other=0.0)
         acc = acc * g.to(tl.float32)
     x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     if SCALED:

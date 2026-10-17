@@ -1,10 +1,10 @@
 """Triton RMSNorm and RMSNorm + per-sample modulation, forward and backward.
 
 Forward: one row tile `[ROWS, next_pow2(D)]` per program, fp32 math, one rounding;
-`rstd [N]` fp32 is kept for the backward. Backward: one program per segment tile
-writes `dx` and per-tile column partials of `sum(g * xhat)` and `sum(g)`; a second
-launch sums them per sample, giving d_scale = w * S_gx, d_shift = S_g and
-d_weight = sum_b (1 + scale_b) * S_gx without atomics.
+`rstd [N]` fp32 is kept for the backward. Backward: one program per segment tile writes
+`dx` and per-tile Kahan-compensated fp32 column partials of `sum(g * xhat)` and
+`sum(g)`; a segment sum and an epilogue give d_scale = w * S_gx, d_shift = S_g and
+d_weight = sum_b (1 + scale_b) * S_gx without atomics. See docs/internals/fp16.md.
 """
 
 import torch
@@ -16,8 +16,11 @@ from torch.library import triton_op
 from kohakumoss_kernels.backends.compile.race import raced, shape_key
 from kohakumoss_kernels.backends.triton._blockops import (
     SegPlan,
+    kahan,
     opt,
     row_candidates,
+    store_pair,
+    strides2,
     tile_range,
 )
 from kohakumoss_kernels.backends.triton._common import Launcher, cdiv
@@ -42,6 +45,10 @@ def _fwd_kernel(
     N,
     D,
     eps,
+    sh_row,
+    sh_col,
+    sc_row,
+    sc_col,
     HAS_W: tl.constexpr,
     HAS_SHIFT: tl.constexpr,
     HAS_SCALE: tl.constexpr,
@@ -55,19 +62,20 @@ def _fwd_kernel(
     mask = rok[:, None] & cok[None, :]
     offs = rows.to(tl.int64)[:, None] * D + cols[None, :]
     x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    if HAS_SHIFT or HAS_SCALE:
+        s = tl.load(seg_ptr + rows, mask=rok, other=0).to(tl.int64)
     ms = tl.div_rn(tl.sum(x * x, axis=1), D * 1.0)
     rstd = tl.div_rn(1.0, tl.sqrt_rn(ms + eps.to(tl.float32)))
     y = x * rstd[:, None]
     if HAS_W:
         y = y * tl.load(w_ptr + cols, mask=cok, other=0.0).to(tl.float32)[None, :]
-    if HAS_SHIFT or HAS_SCALE:
-        s = tl.load(seg_ptr + rows, mask=rok, other=0).to(tl.int64)
-        moff = s[:, None] * D + cols[None, :]
-        if HAS_SCALE:
-            sc = tl.load(scale_ptr + moff, mask=mask, other=0.0).to(tl.float32)
-            y = y * (1.0 + sc)
-        if HAS_SHIFT:
-            y = y + tl.load(shift_ptr + moff, mask=mask, other=0.0).to(tl.float32)
+    if HAS_SCALE:
+        soff = s[:, None] * sc_row + cols[None, :] * sc_col
+        sc = tl.load(scale_ptr + soff, mask=mask, other=0.0).to(tl.float32)
+        y = y * (1.0 + sc)
+    if HAS_SHIFT:
+        hoff = s[:, None] * sh_row + cols[None, :] * sh_col
+        y = y + tl.load(shift_ptr + hoff, mask=mask, other=0.0).to(tl.float32)
     tl.store(y_ptr + offs, y.to(y_ptr.dtype.element_ty), mask=mask)
     tl.store(rstd_ptr + rows, rstd, mask=rok)
 
@@ -86,9 +94,12 @@ def _bwd_kernel(
     D,
     B,
     CHUNK,
+    sc_row,
+    sc_col,
     HAS_W: tl.constexpr,
     HAS_SCALE: tl.constexpr,
     HAS_SEG: tl.constexpr,
+    NEED_P: tl.constexpr,
     ROWS: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_B: tl.constexpr,
@@ -101,10 +112,13 @@ def _bwd_kernel(
     if HAS_W:
         m = tl.load(w_ptr + cols, mask=cok, other=0.0).to(tl.float32)
     if HAS_SCALE:
-        sc = tl.load(scale_ptr + b.to(tl.int64) * D + cols, mask=cok, other=0.0)
-        m = m * (1.0 + sc.to(tl.float32))
+        soff = b.to(tl.int64) * sc_row + cols * sc_col
+        sc = tl.load(scale_ptr + soff, mask=cok, other=0.0).to(tl.float32)
+        m = m * (1.0 + sc)
     acc_gx = tl.zeros([BLOCK_D], tl.float32)
     acc_g = tl.zeros([BLOCK_D], tl.float32)
+    c_gx = tl.zeros([BLOCK_D], tl.float32)
+    c_g = tl.zeros([BLOCK_D], tl.float32)
     for r0 in range(start, stop, ROWS):
         rows = r0 + tl.arange(0, ROWS)
         rok = rows < stop
@@ -113,20 +127,69 @@ def _bwd_kernel(
         x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         g = tl.load(g_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         rs = tl.load(rstd_ptr + rows, mask=rok, other=0.0)
-        xh = x * rs[:, None]
+        xhat = x * rs[:, None]
         gm = g * m[None, :]
-        c = tl.div_rn(tl.sum(gm * xh, axis=1), D * 1.0)
-        dx = rs[:, None] * (gm - xh * c[:, None])
+        c = tl.div_rn(tl.sum(gm * xhat, axis=1), D * 1.0)
+        dx = rs[:, None] * (gm - xhat * c[:, None])
         tl.store(dx_ptr + offs, dx.to(dx_ptr.dtype.element_ty), mask=mask)
-        acc_gx += tl.sum(g * xh, axis=0)
-        acc_g += tl.sum(g, axis=0)
-    base = t.to(tl.int64) * 2 * D
-    tl.store(part_ptr + base + cols, acc_gx, mask=cok)
-    tl.store(part_ptr + base + D + cols, acc_g, mask=cok)
+        if NEED_P:
+            acc_gx, c_gx = kahan(acc_gx, c_gx, tl.sum(g * xhat, axis=0))
+            acc_g, c_g = kahan(acc_g, c_g, tl.sum(g, axis=0))
+    if NEED_P:
+        base = part_ptr + t.to(tl.int64) * 4 * D + cols
+        store_pair(base, D, acc_gx, -c_gx, cok)
+        store_pair(base + 2 * D, D, acc_g, -c_g, cok)
+
+
+@triton.jit
+def _grads_kernel(
+    sums_ptr,
+    w_ptr,
+    scale_ptr,
+    dw_ptr,
+    dshift_ptr,
+    dscale_ptr,
+    B,
+    D,
+    sc_row,
+    sc_col,
+    HAS_W: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+    NEED_W: tl.constexpr,
+    NEED_SHIFT: tl.constexpr,
+    NEED_SCALE: tl.constexpr,
+    BD: tl.constexpr,
+):
+    """d_weight, d_shift, d_scale (fp32) from the per-sample sums [2 (S_gx, S_g), B, D];
+    d_weight sums over samples with Kahan compensation."""
+    cols = tl.program_id(0) * BD + tl.arange(0, BD)
+    ok = cols < D
+    w = tl.full([BD], 1.0, tl.float32)
+    if HAS_W:
+        w = tl.load(w_ptr + cols, mask=ok, other=0.0).to(tl.float32)
+    acc = tl.zeros([BD], tl.float32)
+    comp = tl.zeros([BD], tl.float32)
+    for b in range(B):
+        src = sums_ptr + b * D + cols
+        gx = tl.load(src, mask=ok, other=0.0)
+        if NEED_SHIFT:
+            g = tl.load(src + B * D, mask=ok, other=0.0)
+            tl.store(dshift_ptr + b * D + cols, g, mask=ok)
+        if NEED_SCALE:
+            tl.store(dscale_ptr + b * D + cols, w * gx, mask=ok)
+        if NEED_W:
+            if HAS_SCALE:
+                soff = b.to(tl.int64) * sc_row + cols * sc_col
+                sc = tl.load(scale_ptr + soff, mask=ok, other=0.0).to(tl.float32)
+                gx = gx * (1.0 + sc)
+            acc, comp = kahan(acc, comp, gx)
+    if NEED_W:
+        tl.store(dw_ptr + cols, acc - comp, mask=ok)
 
 
 _fwd = Launcher(_fwd_kernel)
 _bwd = Launcher(_bwd_kernel)
+_grads = Launcher(_grads_kernel)
 
 
 def _fwd_launch(cfg, x, w, shift, scale, seg, y, rstd, eps):
@@ -143,6 +206,8 @@ def _fwd_launch(cfg, x, w, shift, scale, seg, y, rstd, eps):
         n,
         d,
         eps,
+        *strides2(shift),
+        *strides2(scale),
         HAS_W=w is not None,
         HAS_SHIFT=shift is not None,
         HAS_SCALE=scale is not None,
@@ -159,7 +224,7 @@ def _fwd_impl(x, w, shift, scale, seg, eps):
     block = triton.next_power_of_2(d)
     key = f"d{d}-{x.dtype}-{w is not None}{shift is not None}{scale is not None}"
     cfg = select(
-        "f6_rms_norm_fwd",
+        "triton_rms_norm_fwd",
         x.device,
         key,
         lambda: row_candidates(block),
@@ -169,7 +234,7 @@ def _fwd_impl(x, w, shift, scale, seg, eps):
     return y, rstd
 
 
-@triton_op("kohakumoss::f6_rms_norm_fwd", mutates_args=())
+@triton_op("kohakumoss::triton_rms_norm_fwd", mutates_args=())
 def _fwd_op(
     x: Tensor,
     weight: Tensor | None,
@@ -181,11 +246,13 @@ def _fwd_op(
     return _fwd_impl(x, weight, shift, scale, seg, eps)
 
 
-def _bwd_launch(cfg, g, x, rstd, w, scale, seg, b, dx):
+def _bwd_launch(cfg, g, x, rstd, w, scale, seg, b, dx, need_p):
     n, d = x.shape
     rows = cfg["ROWS"]
     plan = SegPlan(seg, n, b, rows, x.device)
-    part = torch.empty(plan.tiles, 2, d, device=x.device, dtype=torch.float32)
+    part = torch.empty(
+        plan.tiles if need_p else 1, 2, 2, d, device=x.device, dtype=torch.float32
+    )
     _bwd[(plan.tiles,)](
         g,
         x,
@@ -199,9 +266,11 @@ def _bwd_launch(cfg, g, x, rstd, w, scale, seg, b, dx):
         d,
         plan.b,
         plan.chunk,
+        *strides2(scale),
         HAS_W=w is not None,
         HAS_SCALE=scale is not None,
         HAS_SEG=plan.has_seg,
+        NEED_P=need_p,
         ROWS=rows,
         BLOCK_D=triton.next_power_of_2(d),
         BLOCK_B=plan.block_b,
@@ -210,7 +279,34 @@ def _bwd_launch(cfg, g, x, rstd, w, scale, seg, b, dx):
     return plan, part
 
 
-@triton_op("kohakumoss::f6_rms_norm_bwd", mutates_args=())
+def _grads_launch(sums, w, scale, b, d, need_w, need_shift, need_scale):
+    f32 = dict(device=sums.device, dtype=torch.float32)
+    dw = torch.empty(d if need_w else 0, **f32)
+    dshift = torch.empty((b, d) if need_shift else 0, **f32)
+    dscale = torch.empty((b, d) if need_scale else 0, **f32)
+    bd = min(256, triton.next_power_of_2(d))
+    _grads[(cdiv(d, bd),)](
+        sums,
+        w if w is not None else sums,
+        scale if scale is not None else sums,
+        dw,
+        dshift,
+        dscale,
+        b,
+        d,
+        *strides2(scale),
+        HAS_W=w is not None,
+        HAS_SCALE=scale is not None,
+        NEED_W=need_w,
+        NEED_SHIFT=need_shift,
+        NEED_SCALE=need_scale,
+        BD=bd,
+        num_warps=2,
+    )
+    return dw, dshift, dscale
+
+
+@triton_op("kohakumoss::triton_rms_norm_bwd", mutates_args=())
 def _bwd_op(
     g: Tensor,
     x: Tensor,
@@ -223,36 +319,33 @@ def _bwd_op(
     need_shift: bool,
     need_scale: bool,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """(dx, dweight, dshift, dscale); gradients not needed come back empty."""
+    """(dx, dweight, dshift fp32, dscale fp32); gradients not needed come back empty."""
     n, d = x.shape
     dx = torch.empty_like(x)
     block = triton.next_power_of_2(d)
+    need_p = need_w or need_shift or need_scale
     key = f"d{d}-{x.dtype}-{weight is not None}{scale is not None}{seg is not None}"
+    key = f"{key}-{need_p}"
+    args = (g, x, rstd, weight, scale, seg, batch, dx, need_p)
     cfg = select(
-        "f6_rms_norm_bwd",
+        "triton_rms_norm_bwd",
         x.device,
         key,
         lambda: row_candidates(block),
-        lambda c: lambda: _bwd_launch(c, g, x, rstd, weight, scale, seg, batch, dx),
+        lambda c: lambda: _bwd_launch(c, *args),
     )
-    plan, part = _bwd_launch(cfg, g, x, rstd, weight, scale, seg, batch, dx)
-    dw, dshift, dscale = x.new_empty(0), x.new_empty(0), x.new_empty(0)
-    if not (need_w or need_shift or need_scale):
-        return dx, dw, dshift, dscale
-    sums = plan.reduce(part, 2, d)
-    s_gx, s_g = sums[0], sums[1]
-    if need_w:
-        coef = s_gx if scale is None else s_gx * (1.0 + scale.float())
-        dw = coef.sum(0).to(weight.dtype)
-    if need_shift:
-        dshift = s_g.clone()
-    if need_scale:
-        dscale = s_gx.clone() if weight is None else s_gx * weight.float()
-    return dx, dw, dshift, dscale
+    plan, part = _bwd_launch(cfg, *args)
+    if not need_p:
+        return dx, x.new_empty(0), x.new_empty(0), x.new_empty(0)
+    sums = plan.reduce(part, 2, d, rounded=True)
+    dw, dshift, dscale = _grads_launch(
+        sums, weight, scale, plan.b, d, need_w, need_shift, need_scale
+    )
+    return dx, dw.to(weight.dtype) if need_w else dw, dshift, dscale
 
 
 def _setup(ctx, inputs, output):
-    x, weight, shift, scale, seg, _ = inputs
+    x, weight, shift, scale, seg, eps = inputs
     ctx.save_for_backward(x, output[1], weight, scale, seg)
     ctx.shift_dtype = None if shift is None else shift.dtype
     ctx.batch = (
@@ -300,10 +393,16 @@ def rms_norm_mod(
     seg: Tensor | None,
     eps: float,
 ) -> Tensor:
-    """`rms_norm(x) * (1 + scale[seg]) + shift[seg]` over the last dim (eager spec)."""
+    """`rms_norm(x) * (1 + scale[seg]) + shift[seg]` over the last dim (eager spec);
+    shift / scale [B, D] may be strided views (read through their strides)."""
     shape = x.shape
     y, _ = _fwd_op(
-        x.reshape(-1, shape[-1]).contiguous(), weight, shift, scale, seg, eps
+        x.reshape(-1, shape[-1]).contiguous(),
+        None if weight is None else weight.contiguous(),
+        shift,
+        scale,
+        None if seg is None else seg.contiguous(),
+        eps,
     )
     return y.view(shape)
 

@@ -6,6 +6,7 @@ Segment tile tables (sample, first row, end row per tile) are built with device 
 ops from `seg` (no host sync) and cached per `seg` tensor for the rest of the step.
 """
 
+import math
 import threading
 import weakref
 from collections.abc import Callable
@@ -15,10 +16,14 @@ import tilelang.language as T
 import torch
 from torch import Tensor
 
+from kohakumoss_kernels.backends.tilelang._df import df_add
+from kohakumoss_kernels.hardware.current import on_device
 from kohakumoss_kernels.hardware.device import probe
 from kohakumoss_kernels.tuning.tuner import select
 
 DTYPE = {torch.float16: "float16", torch.bfloat16: "bfloat16", torch.float32: "float32"}
+F32 = "float32"
+I32 = "int32"
 
 _CACHE: dict[tuple, object] = {}
 _LOCK = threading.Lock()
@@ -39,8 +44,26 @@ def _pass_configs(target: str) -> dict:
     return {"tl.disable_warp_specialized": True}
 
 
-def compiled(builder: Callable, device: torch.device, *args):
-    """builder(*args) compiled for `device`'s arch once per process; failures are kept."""
+class OnDevice:
+    """A compiled kernel launched with its device current."""
+
+    __slots__ = ("kernel", "device")
+
+    def __init__(self, kernel, device: torch.device):
+        self.kernel, self.device = kernel, device
+
+    def __call__(self, *args):
+        with on_device(self.device):
+            return self.kernel(*args)
+
+
+def compiled(builder: Callable, device: torch.device, *args) -> OnDevice:
+    """builder(*args) compiled for `device`'s arch once per process (failures are
+    kept), launched on `device`."""
+    return OnDevice(_compiled(builder, device, *args), device)
+
+
+def _compiled(builder: Callable, device: torch.device, *args):
     target = arch(device)
     key = (builder.__module__, builder.__qualname__, target, *args)
     kernel = _CACHE.get(key)
@@ -159,38 +182,116 @@ def tile_plan(
     return plan
 
 
-def segsum_prim(d, rows, slots, bd, threads):
-    """out[s, b] = sum over the tiles of sample b and their `rows` of part[t, r, s]."""
+def segsum_groups_prim(d, rows, slots, bd, threads):
+    """Pass 1 of the pair sums: group g of sample b sums `ch` consecutive (tile, row)
+    entries of the fp32 pairs part[t, r, s, :, :] into mid [g, slots, 2, b, d]."""
     b = T.dynamic("b")
     tt = T.dynamic("t")
+    gg = T.dynamic("g")
 
     @T.prim_func
     def main(
-        part: T.Tensor((tt, rows, slots, d), "float32"),
-        tbeg: T.Tensor((b,), "int32"),
-        tend: T.Tensor((b,), "int32"),
-        out: T.Tensor((slots, b, d), "float32"),
+        part: T.Tensor((tt, rows, slots, 2, d), F32),
+        tbeg: T.Tensor((b,), I32),
+        tend: T.Tensor((b,), I32),
+        mid: T.Tensor((gg, slots, 2, b, d), F32),
+        ch: T.int32,
     ):
-        with T.Kernel(b, T.ceildiv(d, bd), slots, threads=threads) as (sb, cb, s):
-            acc = T.alloc_fragment((bd,), "float32")
-            T.clear(acc)
-            for t in T.serial(tend[sb] - tbeg[sb]):
-                for r in T.serial(rows):
-                    for j in T.Parallel(bd):
-                        acc[j] += part[tbeg[sb] + t, r, s, T.min(cb * bd + j, d - 1)]
+        with T.Kernel(b, T.ceildiv(d, bd), gg * slots, threads=threads) as (
+            sb,
+            cb,
+            gs,
+        ):
+            hi = T.alloc_fragment((bd,), F32)
+            lo = T.alloc_fragment((bd,), F32)
+            gi = gs // slots
+            s = gs % slots
+            ubeg = tbeg[sb] * rows + gi * ch
+            uend = T.min(tend[sb] * rows, ubeg + ch)
+            T.clear(hi)
+            T.clear(lo)
+            for u in T.serial(T.max(uend - ubeg, 0)):
+                for j in T.Parallel(bd):
+                    col = T.min(cb * bd + j, d - 1)
+                    t = (ubeg + u) // rows
+                    r = (ubeg + u) % rows
+                    h, lw = df_add(
+                        hi[j], lo[j], part[t, r, s, 0, col], part[t, r, s, 1, col]
+                    )
+                    hi[j] = h
+                    lo[j] = lw
             for j in T.Parallel(bd):
                 if cb * bd + j < d:
-                    out[s, sb, cb * bd + j] = acc[j]
+                    mid[gi, s, 0, sb, cb * bd + j] = hi[j]
+                    mid[gi, s, 1, sb, cb * bd + j] = lo[j]
 
     return main
 
 
-def segment_sums(part: Tensor, plan: TilePlan, slots: int, d: int) -> Tensor:
-    """[slots, B, D] fp32 per-sample sums of part [tiles, rows, slots, D]."""
-    out = torch.empty(slots, plan.b, d, device=part.device, dtype=torch.float32)
-    kernel = compiled(segsum_prim, part.device, d, part.shape[1], slots, 128, 128)
-    kernel(part, plan.tbeg, plan.tend, out)
+def segsum_final_prim(d, slots, bd, threads, rounded):
+    """Pass 2: pair sums over the groups of mid [g, slots, 2, b, d]: out [slots, 2,
+    b, d] pairs, or [slots, b, d] rounded to fp32."""
+    b = T.dynamic("b")
+    gg = T.dynamic("g")
+    shape = (slots, b, d) if rounded else (slots, 2, b, d)
+
+    @T.prim_func
+    def main(mid: T.Tensor((gg, slots, 2, b, d), F32), out: T.Tensor(shape, F32)):
+        with T.Kernel(b, T.ceildiv(d, bd), slots, threads=threads) as (sb, cb, s):
+            hi = T.alloc_fragment((bd,), F32)
+            lo = T.alloc_fragment((bd,), F32)
+            T.clear(hi)
+            T.clear(lo)
+            for g in T.serial(gg):
+                for j in T.Parallel(bd):
+                    col = T.min(cb * bd + j, d - 1)
+                    h, lw = df_add(
+                        hi[j], lo[j], mid[g, s, 0, sb, col], mid[g, s, 1, sb, col]
+                    )
+                    hi[j] = h
+                    lo[j] = lw
+            for j in T.Parallel(bd):
+                if cb * bd + j < d:
+                    if rounded:
+                        out[s, sb, cb * bd + j] = T.ieee_add(hi[j], lo[j])
+                    else:
+                        out[s, 0, sb, cb * bd + j] = hi[j]
+                        out[s, 1, sb, cb * bd + j] = lo[j]
+
+    return main
+
+
+def segment_sums(part: Tensor, plan: TilePlan, rounded: bool) -> Tensor:
+    """Per-sample pair sums of part [tiles, rows, slots, 2, D] (fp32 pairs): pairs
+    [slots, 2, B, D], or [slots, B, D] rounded to fp32 when `rounded`."""
+    return pair_sums(part, plan.tbeg, plan.tend, plan.b, rounded)
+
+
+def pair_sums(part: Tensor, tbeg: Tensor, tend: Tensor, b: int, rounded: bool):
+    """`segment_sums` over explicit per-sample tile ranges [tbeg, tend): groups of
+    about sqrt(entries) (tile, row) entries summed in parallel, then the groups."""
+    tiles, rows, slots, _, d = part.shape
+    entries = max(1, tiles * rows)
+    ch = max(8, math.isqrt(entries))
+    groups = cdiv(entries, ch)
+    bd = min(128, 1 << max(0, (d - 1).bit_length()))
+    dev = part.device
+    mid = torch.empty(groups, slots, 2, b, d, device=dev, dtype=torch.float32)
+    compiled(segsum_groups_prim, dev, d, rows, slots, bd, 128)(
+        part, tbeg, tend, mid, ch
+    )
+    shape = (slots, b, d) if rounded else (slots, 2, b, d)
+    out = torch.empty(shape, device=dev, dtype=torch.float32)
+    compiled(segsum_final_prim, dev, d, slots, bd, 128, rounded)(mid, out)
     return out
+
+
+def total(part: Tensor) -> Tensor:
+    """fp32 [slots, D] sums over every tile and row of part [T, rows, slots, 2, D]."""
+    dev = part.device
+    tbeg = torch.zeros(1, device=dev, dtype=torch.int32)
+    tend = torch.full((1,), part.shape[0], device=dev, dtype=torch.int32)
+    return pair_sums(part, tbeg, tend, 1, True)[:, 0]
 
 
 def f32(t: Tensor | None, shape, device) -> Tensor:
@@ -198,3 +299,21 @@ def f32(t: Tensor | None, shape, device) -> Tensor:
     if t is None:
         return torch.zeros(shape, device=device, dtype=torch.float32)
     return t.to(torch.float32).contiguous()
+
+
+_ZEROS: dict[tuple, Tensor] = {}
+
+
+def per_sample(t: Tensor | None, b: int, d: int, device) -> tuple[Tensor, int, int]:
+    """A per-sample [B, D] tensor as (flat fp32 view over its storage, row stride,
+    column stride): any strides, no copy when it is fp32; shared zeros when absent."""
+    if t is None:
+        key = (b, d, str(device))
+        if key not in _ZEROS:
+            _ZEROS[key] = torch.zeros(b * d, device=device, dtype=torch.float32)
+        return _ZEROS[key], d, 1
+    if t.dtype != torch.float32:
+        t = t.float()
+    rs, cs = t.stride()
+    length = (t.shape[0] - 1) * rs + (t.shape[1] - 1) * cs + 1
+    return t.as_strided((length,), (1,), t.storage_offset()), rs, cs

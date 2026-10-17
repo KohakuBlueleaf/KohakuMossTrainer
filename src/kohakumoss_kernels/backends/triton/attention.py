@@ -1,10 +1,7 @@
-"""Triton varlen attention: `attention_varlen` for sm80+ CUDA and XPU, fwd + bwd.
+"""Triton varlen attention ops `kohakumoss::attn_varlen_triton{,_bwd}` (sm80+ CUDA, XPU).
 
-Registered as `torch.ops.kohakumoss.attn_varlen_triton{,_bwd}` (triton_op, so Inductor
-sees the launches) with autograd attached. Tile configs come from the tuner, keyed by
-dtype, heads, head dim, segment count and the longest segment's power-of-two bucket.
-The backward races two strategies: split (dK/dV kernel + dQ kernel, deterministic) and
-fused (one pass, dQ through fp32 atomics); `KOHAKUMOSS_DETERMINISTIC=1` keeps split.
+Tiles per problem key `dtype-h<heads>-d<head dim>-L<longest segment, pow2 bucket>`; the
+backward races split vs fused. See docs/internals/kernel-dev.md and tuning.md.
 """
 
 import math
@@ -19,8 +16,10 @@ from kohakumoss_kernels import tuning
 from kohakumoss_kernels.backends.triton import _attention_kernels as K
 from kohakumoss_kernels.backends.triton._common import Launcher, cdiv, pow2_bucket
 from kohakumoss_kernels.constraints import requires
+from kohakumoss_kernels.errors import BUILD_ERRORS, unavailable
 from kohakumoss_kernels.hardware.device import planning_device
 from kohakumoss_kernels.tuning.plan import Work, rank
+from kohakumoss_kernels.tuning.tuner import on_reset
 
 LOG2E = 1.0 / math.log(2.0)
 HEAD_DIMS = (32, 64, 128, 256)
@@ -80,6 +79,27 @@ SEEDS = {
               _cfg(64, 128, 8, 2), _cfg(32, 128, 4, 2)],
 }  # fmt: skip
 
+ARCH_SEEDS = {
+    80: {
+        "fwd": [_cfg(128, 64, 4, 3), _cfg(128, 128, 8, 3), _cfg(128, 64, 8, 3)],
+        "dkdv": [_cfg(64, 128, 8, 2), _cfg(32, 128, 4, 3), _cfg(64, 64, 4, 3)],
+        "dq": [_cfg(128, 64, 8, 3), _cfg(128, 32, 4, 3), _cfg(128, 64, 8, 2)],
+        "fused": [_cfg(64, 128, 8, 2), _cfg(32, 128, 4, 3), _cfg(16, 128, 8, 4)],
+    },
+    120: {
+        "fwd": [_cfg(128, 64, 8, 3), _cfg(128, 64, 8, 2), _cfg(128, 32, 4, 2)],
+        "dkdv": [_cfg(32, 32, 4, 3), _cfg(64, 64, 8, 3), _cfg(32, 32, 4, 2)],
+        "dq": [_cfg(128, 32, 8, 3), _cfg(128, 64, 8, 2), _cfg(128, 32, 8, 2)],
+        "fused": [_cfg(16, 128, 8, 4), _cfg(16, 128, 8, 3), _cfg(64, 64, 8, 3)],
+    },
+}
+
+
+def _seeds(dev, kind: str) -> list[dict]:
+    """The arch's measured seeds (`ARCH_SEEDS[sm]`), then the shared ones."""
+    own = ARCH_SEEDS.get(dev.sm, {}).get(kind, [])
+    return own + [c for c in SEEDS[kind] if c not in own]
+
 
 SAFE = {
     "fwd": _cfg(64, 32, 4, 1),
@@ -92,7 +112,7 @@ SAFE = {
 def _candidates(dev, kind, d, esize, heads, segs, max_len):
     """Seed tiles first (legal ones), then the planner's ranking. When nothing will be
     timed (tracing, TUNE=off) a small tile that fits every sm80+ card leads."""
-    seeds = [c for c in SEEDS[kind] if _fits(c, dev, kind, d, esize)]
+    seeds = [c for c in _seeds(dev, kind) if _fits(c, dev, kind, d, esize)]
     ranked = _ranked(dev, kind, d, esize, heads, segs, max_len)
     order = seeds + [c for c in ranked if c not in seeds]
     if not tuning.timing_allowed(in_backward=kind != "fwd"):
@@ -155,7 +175,8 @@ def _run_fwd(cfg, q, k, v, cu, max_len, scale, o, m, lg):
     n, h, d = q.shape
     _FWD[(cdiv(max_len, cfg["BM"]), h, cu.numel() - 1)](
         q, k, v, o, m, lg, cu, scale * LOG2E, n, *_strides(q, k, v, o),
-        D=d, BM=cfg["BM"], BN=cfg["BN"], num_warps=cfg["warps"], num_stages=cfg["stages"],
+        D=d, BM=cfg["BM"], BN=cfg["BN"],
+        num_warps=cfg["warps"], num_stages=cfg["stages"],
     )  # fmt: skip
 
 
@@ -165,7 +186,8 @@ def _run_dkdv(cfg, a, dk, dv):
     _DKDV[(cdiv(max_len, cfg["BN"]), h, cu.numel() - 1)](
         q, k, v, do, m, lg, delta, dk, dv, cu, scale, scale * LOG2E, n,
         *_strides(q, k, v, do, dk),
-        D=d, BM=cfg["BM"], BN=cfg["BN"], num_warps=cfg["warps"], num_stages=cfg["stages"],
+        D=d, BM=cfg["BM"], BN=cfg["BN"],
+        num_warps=cfg["warps"], num_stages=cfg["stages"],
     )  # fmt: skip
 
 
@@ -175,7 +197,8 @@ def _run_dq(cfg, a, dq):
     _DQ[(cdiv(max_len, cfg["BM"]), h, cu.numel() - 1)](
         q, k, v, do, m, lg, delta, dq, cu, scale, scale * LOG2E, n,
         *_strides(q, k, v, do, dq),
-        D=d, BM=cfg["BM"], BN=cfg["BN"], num_warps=cfg["warps"], num_stages=cfg["stages"],
+        D=d, BM=cfg["BM"], BN=cfg["BN"],
+        num_warps=cfg["warps"], num_stages=cfg["stages"],
     )  # fmt: skip
 
 
@@ -186,7 +209,8 @@ def _run_fused(cfg, a, dq, dk, dv):
     _FUSED[(cdiv(max_len, cfg["BN"]), h, cu.numel() - 1)](
         q, k, v, do, m, lg, delta, dk, dv, acc, cu, scale, scale * LOG2E, n,
         *_strides(q, k, v, do, dk),
-        D=d, BM=cfg["BM"], BN=cfg["BN"], num_warps=cfg["warps"], num_stages=cfg["stages"],
+        D=d, BM=cfg["BM"], BN=cfg["BN"],
+        num_warps=cfg["warps"], num_stages=cfg["stages"],
     )  # fmt: skip
     _CAST[(cdiv(acc.numel(), 1024),)](acc, dq, scale, acc.numel(), BLOCK=1024)
 
@@ -197,6 +221,7 @@ def _run_split(dkdv, dqc, a, dq, dk, dv):
 
 
 _BOUND: dict[tuple, object] = {}
+on_reset(_BOUND.clear)
 
 
 def _bound(ident: tuple, kernels: tuple[str, ...], build):
@@ -222,7 +247,7 @@ def _tile(kind, a, key, launch):
         lambda: _candidates(dev, kind, *rest),
         launch,
         shortlist=SHORTLIST,
-        errors=(Exception,),
+        errors=BUILD_ERRORS,
         in_backward=True,
     )
 
@@ -245,6 +270,7 @@ def _build_backward(a, key, dq, dk, dv):
         key,
         lambda: [{"impl": "fused"}, {"impl": "split"}],
         lambda s: lambda: options[s["impl"]](a, dq, dk, dv),
+        errors=BUILD_ERRORS,
         in_backward=True,
     )
     return options[strategy["impl"]]
@@ -261,7 +287,7 @@ def _build_forward(args, key):
         lambda: _candidates(dev, "fwd", d, q.element_size(), h, segs, max_len),
         lambda c: lambda: _run_fwd(c, *args),
         shortlist=SHORTLIST,
-        errors=(Exception,),
+        errors=BUILD_ERRORS,
     )
     return partial(_run_fwd, cfg)
 
@@ -306,9 +332,7 @@ def attn_varlen_triton_bwd(
     if n == 0 or max_seqlen == 0:
         return dq, dk, dv
     delta = torch.empty(h, n, device=q.device, dtype=torch.float32)
-    _DELTA[(cdiv(n, 64), h)](
-        o, do, delta, n, *_strides(o, do), D=d, BM=64,
-    )  # fmt: skip
+    _DELTA[(cdiv(n, 64), h)](o, do, delta, n, *_strides(o, do), D=d, BM=64)
     a = (q, k, v, do, m, lg, delta, cu, max_seqlen, scale)
     key = _key(q, cu.shape[0] - 1, max_seqlen)
     run = _bound(
@@ -337,11 +361,44 @@ def _backward(ctx, do, _dm, _dl):
 register_autograd("kohakumoss::attn_varlen_triton", _backward, setup_context=_setup)
 
 
+def _bwd_bound(q: Tensor, cu: Tensor, max_len: int) -> bool:
+    return ("bwd", q.device, _key(q, cu.shape[0] - 1, max_len)) in _BOUND
+
+
 def attention_varlen(
     q: Tensor, k: Tensor, v: Tensor, cu_seqlens: Tensor, max_seqlen: int, scale: float
 ) -> Tensor:
-    """Packed varlen attention through the Triton kernels only."""
-    return attn_varlen_triton(q, k, v, cu_seqlens, int(max_seqlen), float(scale))[0]
+    """Packed varlen attention through the Triton kernels only. A build or launch
+    failure (forward, or the backward built on the first grad-enabled call of a
+    problem key) raises `BackendUnavailable`."""
+    max_seqlen, scale = int(max_seqlen), float(scale)
+    q, k, v = (t if t.stride(-1) == 1 else t.contiguous() for t in (q, k, v))
+    if torch.compiler.is_compiling():
+        return attn_varlen_triton(q, k, v, cu_seqlens, max_seqlen, scale)[0]
+    try:
+        o, m, lg = attn_varlen_triton(q, k, v, cu_seqlens, max_seqlen, scale)
+        if needs_backward(q, k, v) and not _bwd_bound(q, cu_seqlens, max_seqlen):
+            with torch.no_grad():
+                attn_varlen_triton_bwd(
+                    torch.zeros_like(o),
+                    q,
+                    k,
+                    v,
+                    o,
+                    m,
+                    lg,
+                    cu_seqlens,
+                    max_seqlen,
+                    scale,
+                )
+    except Exception as err:
+        raise unavailable("attention_varlen", err, "triton") from err
+    return o
+
+
+def needs_backward(*ts: Tensor) -> bool:
+    """A backward will run through this call (grad mode on, some input requires grad)."""
+    return torch.is_grad_enabled() and any(t.requires_grad for t in ts)
 
 
 def head_dim_ok(query) -> str | None:

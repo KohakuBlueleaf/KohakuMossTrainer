@@ -10,13 +10,14 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.library import custom_op
 
+from kohakumoss_kernels.backends._master import activation, operand, weight_grad
 from kohakumoss_kernels.backends.compile.ops import compiled_op
 from kohakumoss_kernels.backends.compile.race import raced, shape_key
 from kohakumoss_kernels.backends.tilelang import _gemm_prims as prims
 from kohakumoss_kernels.backends.tilelang._blockops import (
     CompileError,
     compiled,
-    f32,
+    per_sample,
     tuned,
 )
 from kohakumoss_kernels.backends.tilelang.ffn import situ_backward, situ_forward
@@ -96,13 +97,14 @@ def _situ_run(cfg, y, w, bias, save):
     return out, (ug if save else y.new_empty(0))
 
 
-@custom_op("kohakumoss::f6tl_linear_situ_fwd", mutates_args=())
+@custom_op("kohakumoss::tilelang_linear_situ_fwd", mutates_args=())
 def _situ_fwd(
     y: Tensor, w: Tensor, bias: Tensor | None, save: bool
 ) -> tuple[Tensor, Tensor]:
     key = f"{_bucket(y.shape[0])}-{y.shape[1]}-{w.shape[0]}-{bias is not None}-{save}"
+    w, bias = operand(w, y), operand(bias, y)
     cfg = _choose(
-        "f6tl_linear_situ",
+        "tilelang_linear_situ",
         y.device,
         key,
         GEMM_CFGS,
@@ -117,7 +119,7 @@ def _(y, w, bias, save):
     return y.new_empty(m, f2 // 2), (y.new_empty(m, f2) if save else y.new_empty(0))
 
 
-@custom_op("kohakumoss::f6tl_linear_situ_bwd", mutates_args=())
+@custom_op("kohakumoss::tilelang_linear_situ_bwd", mutates_args=())
 def _situ_bwd(
     ga: Tensor,
     y: Tensor,
@@ -128,24 +130,31 @@ def _situ_bwd(
     need_b: bool,
 ) -> tuple[Tensor, Tensor, Tensor]:
     dug = situ_backward(ga, ug)
-    dy = dug @ w if need_y else y.new_empty(0)
-    dw = (dug.t() @ y).to(w.dtype) if need_w else y.new_empty(0)
+    dy = dug @ operand(w, dug) if need_y else y.new_empty(0)
+    dw = weight_grad(dug, y, w.dtype) if need_w else y.new_empty(0)
     db = dug.float().sum(0) if need_b else y.new_empty(0)
     return dy, dw, db
 
 
 @_situ_bwd.register_fake
 def _(ga, y, w, ug, need_y, need_w, need_b):
+    m, f2 = ga.shape[0], ug.shape[1]
     return (
-        torch.empty_like(y) if need_y else y.new_empty(0),
-        torch.empty_like(w) if need_w else y.new_empty(0),
-        y.new_empty(w.shape[0], dtype=torch.float32) if need_b else y.new_empty(0),
+        y.new_empty(m, w.shape[1]) if need_y else y.new_empty(0),
+        y.new_empty(f2, y.shape[1], dtype=w.dtype) if need_w else y.new_empty(0),
+        y.new_empty(f2, dtype=torch.float32) if need_b else y.new_empty(0),
     )
+
+
+def _kept(t: Tensor, needed: bool) -> Tensor:
+    """`t` when the backward uses it, else an empty tensor of its dtype and device."""
+    return t if needed else t.new_empty(0)
 
 
 def _situ_setup(ctx, inputs, output):
     y, w, bias, _ = inputs
-    ctx.save_for_backward(y, w, output[1])
+    need = ctx.needs_input_grad
+    ctx.save_for_backward(_kept(y, need[1]), _kept(w, need[0]), output[1])
     ctx.b_dtype = None if bias is None else bias.dtype
 
 
@@ -171,12 +180,8 @@ def linear_situ(y: Tensor, w_up_gate: Tensor, bias: Tensor | None) -> Tensor:
         t is not None and t.requires_grad for t in (y, w_up_gate, bias)
     )
     try:
-        a, _ = _situ_fwd(
-            y.reshape(-1, shape[-1]).contiguous(),
-            w_up_gate.to(y.dtype).contiguous(),
-            None if bias is None else bias.to(y.dtype),
-            save,
-        )
+        y2 = activation(y.reshape(-1, shape[-1])).contiguous()
+        a, _ = _situ_fwd(y2, w_up_gate, bias, save)
     except CompileError:
         return compiled_op("linear_situ")(y, w_up_gate, bias)
     return a.view(*shape[:-1], a.shape[-1])
@@ -188,15 +193,15 @@ def linear_situ(y: Tensor, w_up_gate: Tensor, bias: Tensor | None) -> Tensor:
 def _res_run(cfg, a, w, bias, x, gate, seg, r, save):
     m, k = a.shape
     n = w.shape[0]
-    if cfg["path"] == "split" or bias is not None:
+    if cfg["path"] == "split" or bias is not None or x.dtype != a.dtype:
         o = F.linear(a, w, bias)
         return residual_forward(x, o, gate, seg, r), (o if save else a.new_empty(0))
     out = torch.empty_like(x)
     o = torch.empty(m, n, device=a.device, dtype=a.dtype) if save else out
-    gf = (
-        f32(gate, (1, n), a.device)
+    gf, gr, gc = (
+        per_sample(gate, *gate.shape, a.device)
         if gate is not None
-        else torch.ones(1, n, device=a.device)
+        else per_sample(None, 1, n, a.device)
     )
     sg = (
         seg.to(torch.int32).contiguous()
@@ -207,18 +212,19 @@ def _res_run(cfg, a, w, bias, x, gate, seg, r, save):
         prims.residual_gemm_prim, a.device, k, n, cfg["bm"], cfg["bn"], cfg["bk"],
         cfg["threads"], cfg["stages"], gate is not None, r != 1.0, save,
     )  # fmt: skip
-    kernel(a, w, x, gf, sg, out, o, float(r))
+    kernel(a, w, x, gf, sg, out, o, float(r), gr, gc)
     return out, (o if save else a.new_empty(0))
 
 
-@custom_op("kohakumoss::f6tl_linear_gres_fwd", mutates_args=())
+@custom_op("kohakumoss::tilelang_linear_gres_fwd", mutates_args=())
 def _res_fwd(
     a: Tensor, w: Tensor, bias: Tensor | None, x: Tensor, gate: Tensor | None,
     seg: Tensor | None, r: float, save: bool,
 ) -> tuple[Tensor, Tensor]:  # fmt: skip
     key = f"{_bucket(a.shape[0])}-{a.shape[1]}-{w.shape[0]}-{gate is not None}-{r != 1.0}-{save}"
+    w, bias = operand(w, a), operand(bias, a)
     run = lambda c: _res_run(c, a, w, bias, x, gate, seg, r, save)  # noqa: E731
-    return run(_choose("f6tl_linear_gres", a.device, key, GEMM_CFGS, run))
+    return run(_choose("tilelang_linear_gres", a.device, key, GEMM_CFGS, run))
 
 
 @_res_fwd.register_fake
@@ -228,7 +234,7 @@ def _(a, w, bias, x, gate, seg, r, save):
     )
 
 
-@custom_op("kohakumoss::f6tl_linear_gres_bwd", mutates_args=())
+@custom_op("kohakumoss::tilelang_linear_gres_bwd", mutates_args=())
 def _res_bwd(
     g: Tensor, a: Tensor, w: Tensor, o: Tensor, gate: Tensor | None, seg: Tensor | None,
     r: float, need_a: bool, need_w: bool, need_b: bool, need_gate: bool,
@@ -239,8 +245,9 @@ def _res_bwd(
         dgate = g.new_empty(0)
     else:
         dx, do, dgate = residual_backward(g, o, gate, seg, r, need_gate)
-    da = do @ w if need_a else g.new_empty(0)
-    dw = (do.t() @ a).to(w.dtype) if need_w else g.new_empty(0)
+    do = do.to(a.dtype)
+    da = do @ operand(w, do) if need_a else g.new_empty(0)
+    dw = weight_grad(do, a, w.dtype) if need_w else g.new_empty(0)
     db = do.float().sum(0) if need_b else g.new_empty(0)
     return dx, da, dw, db, dgate
 
@@ -250,9 +257,9 @@ def _(g, a, w, o, gate, seg, r, need_a, need_w, need_b, need_gate):
     e = g.new_empty(0)
     return (
         torch.empty_like(g) if r != 1.0 else e,
-        torch.empty_like(a) if need_a else e,
-        torch.empty_like(w) if need_w else e,
-        g.new_empty(w.shape[0], dtype=torch.float32) if need_b else e,
+        g.new_empty(g.shape[0], w.shape[1]) if need_a else e,
+        g.new_empty(g.shape[1], a.shape[1], dtype=w.dtype) if need_w else e,
+        g.new_empty(g.shape[1], dtype=torch.float32) if need_b else e,
         (
             g.new_empty(gate.shape, dtype=torch.float32)
             if (gate is not None and need_gate)
@@ -263,7 +270,8 @@ def _(g, a, w, o, gate, seg, r, need_a, need_w, need_b, need_gate):
 
 def _res_setup(ctx, inputs, output):
     a, w, bias, x, gate, seg, r, _ = inputs
-    ctx.save_for_backward(a, w, output[1], gate, seg)
+    need = ctx.needs_input_grad
+    ctx.save_for_backward(_kept(a, need[1]), _kept(w, need[0]), output[1], gate, seg)
     ctx.r = r
     ctx.b_dtype = None if bias is None else bias.dtype
 
@@ -297,9 +305,8 @@ def linear_gated_residual(a, w, bias, x, gate, seg, r) -> Tensor:
     save = torch.is_grad_enabled() and gate is not None and gate.requires_grad
     try:
         out, _ = _res_fwd(
-            a.reshape(-1, a.shape[-1]).contiguous(), w.to(a.dtype).contiguous(),
-            None if bias is None else bias.to(a.dtype), x.reshape(-1, shape[-1]).contiguous(),
-            gate, seg, float(r), save,
+            activation(a.reshape(-1, a.shape[-1])).contiguous(), w, bias,
+            x.reshape(-1, shape[-1]).contiguous(), gate, seg, float(r), save,
         )  # fmt: skip
     except CompileError:
         return compiled_op("linear_gated_residual")(a, w, bias, x, gate, seg, r)
@@ -336,17 +343,18 @@ def _qk_run(cfg, y, wq, wk, qw, kw, pos, bands, eps, heads, save):
     return qo, ko, qp.reshape(-1), kp.reshape(-1), qr.reshape(-1), kr.reshape(-1)
 
 
-@custom_op("kohakumoss::f6tl_linear_qk_fwd", mutates_args=())
+@custom_op("kohakumoss::tilelang_linear_qk_fwd", mutates_args=())
 def _qk_fwd(
     y: Tensor, wq: Tensor, wk: Tensor, qw: Tensor, kw: Tensor, pos: Tensor, bands: Tensor,
     eps: float, heads: int, save: bool,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:  # fmt: skip
     key = f"{_bucket(y.shape[0])}-{y.shape[1]}-{wq.shape[0]}-{heads}-{save}"
+    wq, wk = operand(wq, y), operand(wk, y)
 
     def run(c):
         return _qk_run(c, y, wq, wk, qw, kw, pos, bands, eps, heads, save)  # noqa: E731
 
-    return run(_choose("f6tl_linear_qk", y.device, key, QK_CFGS, run))
+    return run(_choose("tilelang_linear_qk", y.device, key, QK_CFGS, run))
 
 
 @_qk_fwd.register_fake
@@ -364,20 +372,22 @@ def _(y, wq, wk, qw, kw, pos, bands, eps, heads, save):
     )
 
 
-@custom_op("kohakumoss::f6tl_linear_qk_bwd", mutates_args=())
+@custom_op("kohakumoss::tilelang_linear_qk_bwd", mutates_args=())
 def _qk_bwd(
     gq: Tensor, gk: Tensor, y: Tensor, wq: Tensor, wk: Tensor, qp: Tensor, kp: Tensor,
     qr: Tensor, kr: Tensor, qw: Tensor, kw: Tensor, pos: Tensor, bands: Tensor, heads: int,
-    need_y: bool, need_wq: bool, need_wk: bool,
+    need_y: bool, need_wq: bool, need_wk: bool, eps: float, need_w: bool,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:  # fmt: skip
-    m, d = y.shape[0], wq.shape[0]
+    m, d = gq.shape
     shape = (m, heads, d // heads)
-    dqp, dqw = _backward_one(gq.view(shape), qp.view(shape), qr, qw, pos, bands)
-    dkp, dkw = _backward_one(gk.view(shape), kp.view(shape), kr, kw, pos, bands)
-    dqp, dkp = dqp.view(m, d), dkp.view(m, d)
-    dy = torch.addmm(dqp @ wq, dkp, wk) if need_y else y.new_empty(0)
-    dwq = (dqp.t() @ y).to(wq.dtype) if need_wq else y.new_empty(0)
-    dwk = (dkp.t() @ y).to(wk.dtype) if need_wk else y.new_empty(0)
+    gqs, gks, qps, kps = gq.view(shape), gk.view(shape), qp.view(shape), kp.view(shape)
+    dqk = torch.empty(m, 2 * d, device=gq.device, dtype=qp.dtype)
+    dqp, dkp = dqk[:, :d], dqk[:, d:]
+    _, dqw = _backward_one(gqs, qps, qr, qw, pos, bands, eps, need_w, dqp)
+    _, dkw = _backward_one(gks, kps, kr, kw, pos, bands, eps, need_w, dkp)
+    dy = dqk @ torch.cat((wq, wk)).to(dqk.dtype) if need_y else y.new_empty(0)
+    dwq = weight_grad(dqp, y, wq.dtype) if need_wq else y.new_empty(0)
+    dwk = weight_grad(dkp, y, wk.dtype) if need_wk else y.new_empty(0)
     return dy, dwq, dwk, dqw, dkw
 
 
@@ -400,37 +410,43 @@ def _(
     need_y,
     need_wq,
     need_wk,
+    eps,
+    need_w,
 ):
     e = y.new_empty(0)
-    dh = wq.shape[0] // heads
-    w = y.new_empty(dh, dtype=torch.float32)
+    m, d = gq.shape
+    w = y.new_empty(d // heads if need_w else 0, dtype=torch.float32)
     return (
-        torch.empty_like(y) if need_y else e,
-        torch.empty_like(wq) if need_wq else e,
-        torch.empty_like(wk) if need_wk else e,
+        y.new_empty(m, wq.shape[1]) if need_y else e,
+        y.new_empty(d, y.shape[1], dtype=wq.dtype) if need_wq else e,
+        y.new_empty(d, y.shape[1], dtype=wk.dtype) if need_wk else e,
         w,
         torch.empty_like(w),
     )
 
 
 def _qk_setup(ctx, inputs, output):
-    y, wq, wk, qw, kw, pos, bands, _, heads, _ = inputs
+    y, wq, wk, qw, kw, pos, bands, eps, heads, _ = inputs
+    need = ctx.needs_input_grad
     ctx.save_for_backward(
-        y, wq, wk, output[2], output[3], output[4], output[5], qw, kw, pos, bands
-    )
+        _kept(y, need[1] or need[2]), _kept(wq, need[0]), _kept(wk, need[0]),
+        output[2], output[3], output[4], output[5], qw, kw, pos, bands,
+    )  # fmt: skip
     ctx.heads = heads
+    ctx.eps = eps
     ctx.w_dtypes = (qw.dtype, kw.dtype)
+    ctx.out_shape = (y.shape[0], wq.shape[0])
 
 
 def _qk_backward(ctx, gq, gk, *_rest):
     y, wq, wk, qp, kp, qr, kr, qw, kw, pos, bands = ctx.saved_tensors
     need = ctx.needs_input_grad
-    out_shape = (y.shape[0], wq.shape[0])
+    out_shape = ctx.out_shape
     gq = y.new_zeros(out_shape) if gq is None else gq.contiguous()
     gk = y.new_zeros(out_shape) if gk is None else gk.contiguous()
     dy, dwq, dwk, dqw, dkw = _qk_bwd(
         gq, gk, y, wq, wk, qp, kp, qr, kr, qw, kw, pos, bands, ctx.heads,
-        need[0], need[1], need[2],
+        need[0], need[1], need[2], ctx.eps, need[3] or need[4],
     )  # fmt: skip
     return (
         dy if need[0] else None,
@@ -454,8 +470,7 @@ def linear_qk_rope(y, wq, wk, q_weight, k_weight, pos, bands, eps, heads):
     )
     try:
         qo, ko, _, _, _, _ = _qk_fwd(
-            y.reshape(m, -1).contiguous(), wq.to(y.dtype).contiguous(),
-            wk.to(y.dtype).contiguous(), q_weight.float().contiguous(),
+            activation(y.reshape(m, -1)).contiguous(), wq, wk, q_weight.float().contiguous(),
             k_weight.float().contiguous(), pos.float().contiguous(),
             bands.float().contiguous(), eps, heads, save,
         )  # fmt: skip

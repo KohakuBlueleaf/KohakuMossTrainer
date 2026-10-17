@@ -25,14 +25,15 @@ def _cases(device, dtype):
     d = 256
     x = torch.randn(n, d, device=device).to(dtype)
     w = torch.ones(d, device=device)
-    mod = 0.1 * torch.randn(2, d, device=device)
+    mods = 0.1 * torch.randn(2, 6, d, device=device)
+    mod = mods[:, 0]
     q = torch.randn(n, 2, 128, device=device).to(dtype)
     bands = (1 / (10000.0 ** (torch.arange(16) / 16))).to(device)
     pos = seq.pos_joint.to(device)
     w_ug = (torch.randn(512, d, device=device) / 16).to(dtype)
     w_o = (torch.randn(d, d, device=device) / 16).to(dtype)
     return {
-        "rms_norm_mod": (x, w, mod, mod.clone(), seg, 1e-6),
+        "rms_norm_mod": (x, w, mod, mods[:, 1], seg, 1e-6),
         "qk_norm_rope": (
             q,
             q.clone(),
@@ -61,7 +62,7 @@ def _sum(out):
     return sum(o.float().sum() for o in outs)
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize(
     "op",

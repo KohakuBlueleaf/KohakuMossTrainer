@@ -18,9 +18,12 @@ from torch.library import custom_op, register_autograd, register_fake
 from kohakumoss_kernels import tuning
 from kohakumoss_kernels.backends.tilelang import _attention_kernels as K
 from kohakumoss_kernels.constraints import requires
+from kohakumoss_kernels.errors import BUILD_ERRORS, unavailable
+from kohakumoss_kernels.hardware.current import on_device
 from kohakumoss_kernels.hardware.device import planning_device
 from kohakumoss_kernels.registry import register
 from kohakumoss_kernels.tuning.plan import Work, rank
+from kohakumoss_kernels.tuning.tuner import on_reset
 
 LOG2E = 1.0 / math.log(2.0)
 HEAD_DIMS = (64, 128)
@@ -30,6 +33,7 @@ SHORTLIST = 6
 _CACHE: dict[tuple, object] = {}
 _LOCK = threading.Lock()
 _BOUND: dict[tuple, object] = {}
+on_reset(_BOUND.clear)
 
 SPACES = {
     "fwd": [
@@ -226,7 +230,7 @@ def _select(kind, q, cu, max_len, key, launch):
         ),
         lambda c: launch(_compiled(kind, q.device, h, d, dt, c), c),
         shortlist=SHORTLIST,
-        errors=(Exception,),
+        errors=BUILD_ERRORS,
         in_backward=kind != "fwd",
     )
     return _compiled(kind, q.device, h, d, dt, cfg), cfg
@@ -288,7 +292,10 @@ def attn_varlen_tilelang(
         return o, m, lg
     args = (q, k, v, cu, max_seqlen, scale, o, m, lg)
     key = _key(q, cu.shape[0] - 1, max_seqlen)
-    _bound(("fwd", q.device, key), FWD_KERNELS, lambda: _build_fwd(args, key))(*args)
+    with on_device(q.device):
+        _bound(("fwd", q.device, key), FWD_KERNELS, lambda: _build_fwd(args, key))(
+            *args
+        )
     return o, m, lg
 
 
@@ -319,10 +326,13 @@ def attn_varlen_tilelang_bwd(
     if n == 0 or max_seqlen == 0:
         return dq, dk, dv
     delta = torch.empty(h, n, device=q.device, dtype=torch.float32)
-    _delta_kernel(q.device, h, d, DTYPES[q.dtype])(o, do, delta)
     args = (q, k, v, do, m, lg, delta, cu, max_seqlen, scale, dq, dk, dv)
     key = _key(q, cu.shape[0] - 1, max_seqlen)
-    _bound(("bwd", q.device, key), BWD_KERNELS, lambda: _build_bwd(args, key))(*args)
+    with on_device(q.device):
+        _delta_kernel(q.device, h, d, DTYPES[q.dtype])(o, do, delta)
+        _bound(("bwd", q.device, key), BWD_KERNELS, lambda: _build_bwd(args, key))(
+            *args
+        )
     return dq, dk, dv
 
 
@@ -362,8 +372,33 @@ register_autograd("kohakumoss::attn_varlen_tilelang", _backward, setup_context=_
 def attention_varlen(
     q: Tensor, k: Tensor, v: Tensor, cu_seqlens: Tensor, max_seqlen: int, scale: float
 ) -> Tensor:
-    """Packed varlen attention (the registry entry)."""
-    return attn_varlen_tilelang(q, k, v, cu_seqlens, int(max_seqlen), float(scale))[0]
+    """Packed varlen attention (the registry entry). A build failure (forward, or the
+    backward built on the first grad-enabled call of a problem key) raises
+    `BackendUnavailable`."""
+    max_seqlen, scale = int(max_seqlen), float(scale)
+    if torch.compiler.is_compiling():
+        return attn_varlen_tilelang(q, k, v, cu_seqlens, max_seqlen, scale)[0]
+    try:
+        o, m, lg = attn_varlen_tilelang(q, k, v, cu_seqlens, max_seqlen, scale)
+        key = _key(q, cu_seqlens.shape[0] - 1, max_seqlen)
+        grad = torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v))
+        if grad and ("bwd", q.device, key) not in _BOUND:
+            with torch.no_grad():
+                attn_varlen_tilelang_bwd(
+                    torch.zeros_like(o),
+                    q,
+                    k,
+                    v,
+                    o,
+                    m,
+                    lg,
+                    cu_seqlens,
+                    max_seqlen,
+                    scale,
+                )
+    except Exception as err:
+        raise unavailable("attention_varlen", err, "tilelang") from err
+    return o
 
 
 def _head_dim_ok(query) -> str | None:

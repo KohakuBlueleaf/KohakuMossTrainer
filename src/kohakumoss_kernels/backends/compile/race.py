@@ -15,10 +15,12 @@ from collections.abc import Callable
 import torch
 from torch import Tensor
 
-from kohakumoss_kernels.backends.compile.ops import EAGER, compiled_op
+from kohakumoss_kernels.backends.compile.ops import compiled_op
+from kohakumoss_kernels.errors import BUILD_ERRORS, BackendUnavailable, unavailable
 from kohakumoss_kernels.tuning.tuner import (
     decided,
     get_mode,
+    on_reset,
     select,
     table,
     timing_allowed,
@@ -99,12 +101,8 @@ class RacedOp:
         self.name = f"race_{backend}_{op_name}"
         self.op_name = op_name
         self.key_fn = key_fn
-        self.impls = {
-            "kernel": kernel_fn,
-            "compile": compiled_op(op_name),
-            "eager": EAGER[op_name],
-        }
-        self.healthy: dict[str, str | None] = {}
+        self.impls = {"kernel": kernel_fn, "compile": compiled_op(op_name)}
+        self.healthy: dict[str, BackendUnavailable | None] = {}
         self.bound: dict[tuple, Callable] = {}
         self.pending: dict[tuple, list] = {}
         self.pinned: str | None = None
@@ -120,9 +118,10 @@ class RacedOp:
         )
         return f"{self.key_fn(*args)}-g{flags}"
 
-    def _probe(self, args) -> str | None:
-        """None when the kernel runs on this device (checked once per device, without
-        recording autograd); else the error, and the eager spec is bound there."""
+    def _probe(self, args) -> None:
+        """Check once per device (without recording autograd) that the kernel builds
+        and runs; a build failure raises `BackendUnavailable` (the registry records it,
+        warns and falls back), anything else (out-of-memory, a bug) propagates."""
         dev = str(_device(args))
         if dev not in self.healthy:
             try:
@@ -132,17 +131,17 @@ class RacedOp:
                     )
                 self.healthy[dev] = None
             except Exception as err:  # noqa: BLE001
-                self.healthy[dev] = f"{type(err).__name__}: {err}"[:500]
-        return self.healthy[dev]
+                self.healthy[dev] = unavailable(self.op_name, err, dev)
+        if self.healthy[dev] is not None:
+            raise self.healthy[dev]
 
     def _lookup(self, args, qk) -> Callable:
         if self.pinned is not None:
             fn = self.impls[self.pinned]
         elif torch.compiler.is_compiling():
             fn = self.impls["kernel"]
-        elif self._probe(args) is not None:
-            fn = self.impls["eager"]
         else:
+            self._probe(args)
             row = table(_device(args), self.name).get(self.problem(args))
             if row is None and get_mode() != "off":
                 self.pending[qk] = [_spec(a) for a in args]
@@ -171,8 +170,9 @@ class RacedOp:
             lambda: [KERNEL, COMPILE],
             lambda c: _step(self.impls[c["impl"]], args),
             shortlist=2,
-            errors=(RuntimeError, ValueError, TypeError),
+            errors=BUILD_ERRORS,
             autograd=True,
+            timing="events",
         )
         self.choice = cfg["impl"]
         if decided(self.name, device, key):
@@ -195,7 +195,7 @@ class RacedOp:
             args = [_rebuild(s) for s in specs]
             try:
                 self.decide(*args)
-            except RuntimeError:
+            except BackendUnavailable:
                 self.pending.pop(qk, None)
                 continue
             if decided(self.name, _device(args), self.problem(args)):
@@ -210,12 +210,15 @@ def raced(backend: str, op_name: str, kernel_fn: Callable, key_fn: Callable) -> 
 
 
 def reset() -> None:
-    """Forget every binding and queued problem (a fresh process, for tests)."""
+    """Forget every binding and queued problem (tuner reset, broadcast, tests)."""
     for op in list(_OPS):
         op.bound.clear()
         op.pending.clear()
         op.pinned = None
         op.choice = None
+
+
+on_reset(reset)
 
 
 def retune_pending() -> int:

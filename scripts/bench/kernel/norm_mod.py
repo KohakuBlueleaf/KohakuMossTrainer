@@ -4,9 +4,9 @@ python scripts/bench/kernel/norm_mod.py --backend triton
 """
 
 import torch
-from _blockops import contenders, dtypes, measure, parse, report
 
 from kohakumoss_kernels.backends.eager import norm as eager
+from kohakumoss_kernels.bench.blockops import contenders, dtypes, measure, parse, report
 
 
 def seg_of(lens, device):
@@ -17,7 +17,7 @@ def seg_of(lens, device):
 
 def main():
     args = parse()
-    device = torch.device("cuda")
+    device = torch.device(args.device)
     rows = []
     cases = [(4400,), (4100, 4100, 4100, 4100)] if not args.quick else [(4400,)]
     for dtype in dtypes(args):

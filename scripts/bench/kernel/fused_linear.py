@@ -6,10 +6,10 @@ and torch.compile of that composition.
 
 import torch
 import torch.nn.functional as F
-from _blockops import contenders, dtypes, measure, parse, report
 
 from kohakumoss.types.seqinfo import build_seqinfo
 from kohakumoss_kernels.backends.eager import ffn, norm, rope
+from kohakumoss_kernels.bench.blockops import contenders, dtypes, measure, parse, report
 
 
 def eager_situ(y, w, b):
@@ -28,7 +28,7 @@ def eager_qk(y, wq, wk, qw, kw, pos, bands, eps, heads):
 
 def main():
     args = parse()
-    device = torch.device("cuda")
+    device = torch.device(args.device)
     rows = []
     hw = [[64, 64]] * (1 if args.quick else 4)
     tl_ = [300, 120, 77, 500][: len(hw)]

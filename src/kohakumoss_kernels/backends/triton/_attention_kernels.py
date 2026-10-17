@@ -3,13 +3,18 @@
 Packed `[N, H, D]` tensors (last dim contiguous), segments from `cu_seqlens`; grid
 axis 0 covers the longest segment, programs past their segment's end exit. Row
 statistics are two fp32 planes `M` (raw score max) and `L` (log2 of the row sum),
-probabilities are `exp2((s - m) * c - l)`: shift before scale keeps the row's largest
-probability exactly 1. dS is rounded before the softmax scale, which is applied to
-the fp32 dQ / dK accumulators. See docs/internals/kernel-dev.md.
+probabilities are `exp2((s - m) * c - l)`. Every MMA takes 16-bit operands (P and dS
+rounded once) with fp32 accumulation. See docs/internals/kernel-dev.md.
 """
 
 import triton
 import triton.language as tl
+
+
+@triton.jit
+def _mma(a, b, acc):
+    """acc + a @ b for fp32 `a` (rounded to `b`'s 16-bit dtype) and 16-bit `b`."""
+    return tl.dot(a.to(b.dtype), b, acc)
 
 
 @triton.jit
@@ -26,7 +31,7 @@ def _fwd_tile(acc, m_i, l_i, q, k_ptrs, v_ptrs, cols, c, MASKED: tl.constexpr):
     m_new = tl.maximum(m_i, tl.max(s, 1))
     alpha = tl.exp2((m_i - m_new) * c)
     p = tl.exp2((s - m_new[:, None]) * c)
-    acc = tl.dot(p.to(v.dtype), v, acc * alpha[:, None])
+    acc = _mma(p, v, acc * alpha[:, None])
     l_i = l_i * alpha + tl.sum(p, 1)
     return acc, m_new, l_i
 
@@ -77,12 +82,9 @@ def fwd_kernel(
     tok = start + offs_m
     tl.store(M + head * N + tok, m_i, mask=rows)
     tl.store(L + head * N + tok, tl.log2(l_i), mask=rows)
+    out = tok[:, None] * so_n + head * so_h + offs_d[None, :]
     o = acc / l_i[:, None]
-    tl.store(
-        OUT + tok[:, None] * so_n + head * so_h + offs_d[None, :],
-        o.to(OUT.dtype.element_ty),
-        mask=rows[:, None],
-    )
+    tl.store(OUT + out, o.to(OUT.dtype.element_ty), mask=rows[:, None])
 
 
 @triton.jit
@@ -132,9 +134,9 @@ def _dkdv_tile(dk, dv, k, v, qt_ptrs, do_ptrs, stat, rows, c, MASKED: tl.constex
     pt = tl.exp2((tl.dot(k, qt) - m[None, :]) * c - lg[None, :])
     if MASKED:
         pt = tl.where(rows[None, :], pt, 0.0)
-    dv = tl.dot(pt.to(do.dtype), do, dv)
+    dv = _mma(pt, do, dv)
     dst = pt * (tl.dot(v, tl.trans(do)) - delta[None, :])
-    dk = tl.dot(dst.to(qt.dtype), tl.trans(qt), dk)
+    dk = _mma(dst, tl.trans(qt), dk)
     return dk, dv
 
 
@@ -196,15 +198,15 @@ def dkdv_kernel(
 
 @triton.jit
 def _fused_tile(dk, dv, k, v, qt_ptrs, do_ptrs, dq_ptrs, stat, rows, c,
-                MASKED: tl.constexpr):  # fmt: skip
+                MASKED: tl.constexpr, BM: tl.constexpr, D: tl.constexpr):  # fmt: skip
     qt, do, m, lg, delta = _load_rows(qt_ptrs, do_ptrs, stat, rows, MASKED)
     pt = tl.exp2((tl.dot(k, qt) - m[None, :]) * c - lg[None, :])
     if MASKED:
         pt = tl.where(rows[None, :], pt, 0.0)
-    dv = tl.dot(pt.to(do.dtype), do, dv)
-    dst = (pt * (tl.dot(v, tl.trans(do)) - delta[None, :])).to(qt.dtype)
+    dv = _mma(pt, do, dv)
+    dst = (pt * (tl.dot(v, tl.trans(do)) - delta[None, :])).to(k.dtype)
     dk = tl.dot(dst, tl.trans(qt), dk)
-    part = tl.dot(tl.trans(dst), k)
+    part = tl.dot(tl.trans(dst), k, tl.zeros([BM, D], tl.float32))
     if MASKED:
         tl.atomic_add(dq_ptrs, part, mask=rows[:, None], sem="relaxed")
     else:
@@ -256,7 +258,7 @@ def fused_bwd_kernel(
             do_base + offs_m[:, None] * sd_n + offs_d[None, :],
             dq_base + offs_m[:, None] * dq_n + offs_d[None, :],
             (M + st_base + offs_m, L + st_base + offs_m, DELTA + st_base + offs_m),
-            offs_m < seqlen, c, False,
+            offs_m < seqlen, c, False, BM, D,
         )  # fmt: skip
     if full < seqlen:
         offs_m = full + tl.arange(0, BM)
@@ -266,7 +268,7 @@ def fused_bwd_kernel(
             do_base + offs_m[:, None] * sd_n + offs_d[None, :],
             dq_base + offs_m[:, None] * dq_n + offs_d[None, :],
             (M + st_base + offs_m, L + st_base + offs_m, DELTA + st_base + offs_m),
-            offs_m < seqlen, c, True,
+            offs_m < seqlen, c, True, BM, D,
         )  # fmt: skip
     dk = dk * scale.to(tl.float32)
     out = (start + offs_n)[:, None] * sg_n + head * sg_h + offs_d[None, :]
@@ -296,7 +298,7 @@ def _dq_tile(dq, q, do, m, lg, delta, k_ptrs, v_ptrs, cols, c, MASKED: tl.conste
     if MASKED:
         p = tl.where(cols[None, :], p, 0.0)
     ds = p * (tl.dot(do, tl.trans(v)) - delta[:, None])
-    return tl.dot(ds.to(k.dtype), k, dq)
+    return _mma(ds, k, dq)
 
 
 @triton.jit

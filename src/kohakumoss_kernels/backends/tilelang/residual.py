@@ -1,7 +1,7 @@
 """TileLang gated residual `x * r + o * gate[seg]`, forward and backward.
 
 The backward runs one program per segment tile, writes d_o (and d_x when r != 1) and
-per-tile partials of sum(g * o) that are summed per sample into d_gate.
+per-tile fp32-pair partials of sum(g * o) that are pair-summed per sample into d_gate.
 """
 
 import tilelang.language as T
@@ -15,12 +15,14 @@ from kohakumoss_kernels.backends.tilelang._blockops import (
     DTYPE,
     CompileError,
     compiled,
-    f32,
+    per_sample,
     segment_sums,
     tile_plan,
     tuned_run,
 )
+from kohakumoss_kernels.backends.tilelang._df import df_add, two_prod
 from kohakumoss_kernels.constraints import requires
+from kohakumoss_kernels.reduce import DF, MODE
 from kohakumoss_kernels.registry import register
 
 __all__ = ["gated_residual"]
@@ -38,32 +40,37 @@ def _threads(d: int) -> int:
     return 128
 
 
-def _fwd_prim(d, bm, threads, gated, dtype):
+def _fwd_prim(d, bm, threads, gated, dtype, xdt):
+    """y = x * r + o * gate[seg]: o in `dtype`, x and y in `xdt` (the residual
+    stream, fp16 or fp32)."""
     n = T.dynamic("n")
-    b = T.dynamic("b")
+    lg = T.dynamic("lg")
 
     @T.prim_func
     def with_gate(
-        x: T.Tensor((n, d), dtype),
+        x: T.Tensor((n, d), xdt),
         o: T.Tensor((n, d), dtype),
-        gate: T.Tensor((b, d), F32),
+        gate: T.Tensor((lg,), F32),
         seg: T.Tensor((n,), I32),
-        y: T.Tensor((n, d), dtype),
+        y: T.Tensor((n, d), xdt),
         r: T.float32,
+        gr: T.int32,
+        gc: T.int32,
     ):
         with T.Kernel(T.ceildiv(n, bm), threads=threads) as bx:
             for i, j in T.Parallel(bm, d):
                 row = bx * bm + i
                 rr = T.min(row, n - 1)
-                v = T.cast(x[rr, j], F32) * r + T.cast(o[rr, j], F32) * gate[seg[rr], j]
+                gv = gate[seg[rr] * gr + j * gc]
+                v = T.cast(x[rr, j], F32) * r + T.cast(o[rr, j], F32) * gv
                 if row < n:
-                    y[row, j] = T.cast(v, dtype)
+                    y[row, j] = T.cast(v, xdt)
 
     @T.prim_func
     def plain(
-        x: T.Tensor((n, d), dtype),
+        x: T.Tensor((n, d), xdt),
         o: T.Tensor((n, d), dtype),
-        y: T.Tensor((n, d), dtype),
+        y: T.Tensor((n, d), xdt),
         r: T.float32,
     ):
         with T.Kernel(T.ceildiv(n, bm), threads=threads) as bx:
@@ -72,36 +79,42 @@ def _fwd_prim(d, bm, threads, gated, dtype):
                 rr = T.min(row, n - 1)
                 v = T.cast(x[rr, j], F32) * r + T.cast(o[rr, j], F32)
                 if row < n:
-                    y[row, j] = T.cast(v, dtype)
+                    y[row, j] = T.cast(v, xdt)
 
     return with_gate if gated else plain
 
 
-def _bwd_prim(d, bm, bd, threads, need_dx, dtype):
+def _bwd_prim(d, bm, bd, threads, need_dx, dtype, df, xdt):
+    """Backward with per-tile fp32-pair partials of sum(g * o): double-float with
+    `df` (exact products), Kahan otherwise; g and dx in `xdt`, o and do in `dtype`."""
     n = T.dynamic("n")
-    b = T.dynamic("b")
+    lg = T.dynamic("lg")
     tt = T.dynamic("t")
 
     @T.prim_func
     def main(
-        g: T.Tensor((n, d), dtype),
+        g: T.Tensor((n, d), xdt),
         o: T.Tensor((n, d), dtype),
-        gate: T.Tensor((b, d), F32),
+        gate: T.Tensor((lg,), F32),
         tseg: T.Tensor((tt,), I32),
         tstart: T.Tensor((tt,), I32),
         tstop: T.Tensor((tt,), I32),
-        dx: T.Tensor((n, d), dtype),
+        dx: T.Tensor((n, d), xdt),
         do: T.Tensor((n, d), dtype),
-        part: T.Tensor((tt, bm, 1, d), F32),
+        part: T.Tensor((tt, bm, 1, 2, d), F32),
         r: T.float32,
+        gr: T.int32,
+        gc: T.int32,
     ):
         with T.Kernel(tt, T.ceildiv(d, bd), threads=threads) as (t, cb):
             acc = T.alloc_fragment((bm, bd), F32)
+            comp = T.alloc_fragment((bm, bd), F32)
             gf = T.alloc_fragment((bm, bd), F32)
             sb = tseg[t]
             start = tstart[t]
             stop = tstop[t]
             T.clear(acc)
+            T.clear(comp)
             for it in T.serial(T.ceildiv(stop - start, bm)):
                 for i, j in T.Parallel(bm, bd):
                     row = start + it * bm + i
@@ -110,36 +123,51 @@ def _bwd_prim(d, bm, bd, threads, need_dx, dtype):
                     rr = T.min(row, n - 1)
                     cc = T.min(col, d - 1)
                     gf[i, j] = T.if_then_else(ok, T.cast(g[rr, cc], F32), 0.0)
-                    acc[i, j] += gf[i, j] * T.if_then_else(
-                        ok, T.cast(o[rr, cc], F32), 0.0
-                    )
+                    ov = T.if_then_else(ok, T.cast(o[rr, cc], F32), 0.0)
+                    if df:
+                        ph, pl = two_prod(gf[i, j], ov)
+                        h, lw = df_add(acc[i, j], comp[i, j], ph, pl)
+                        acc[i, j] = h
+                        comp[i, j] = lw
+                    else:
+                        y = gf[i, j] * ov - comp[i, j]
+                        s = acc[i, j] + y
+                        comp[i, j] = (s - acc[i, j]) - y
+                        acc[i, j] = s
                 for i, j in T.Parallel(bm, bd):
                     row = start + it * bm + i
                     col = cb * bd + j
                     if row < stop and col < d:
-                        do[row, col] = T.cast(gf[i, j] * gate[sb, col], dtype)
+                        gv = gate[sb * gr + col * gc]
+                        do[row, col] = T.cast(gf[i, j] * gv, dtype)
                         if need_dx:
-                            dx[row, col] = T.cast(gf[i, j] * r, dtype)
+                            dx[row, col] = T.cast(gf[i, j] * r, xdt)
             for i, j in T.Parallel(bm, bd):
                 if cb * bd + j < d:
-                    part[t, i, 0, cb * bd + j] = acc[i, j]
+                    part[t, i, 0, 0, cb * bd + j] = acc[i, j]
+                    if df:
+                        part[t, i, 0, 1, cb * bd + j] = comp[i, j]
+                    else:
+                        part[t, i, 0, 1, cb * bd + j] = -comp[i, j]
 
     return main
 
 
-def _bwd_plain_prim(d, bm, threads, need_dx, dtype):
+def _bwd_plain_prim(d, bm, threads, need_dx, dtype, xdt):
     """d_o = g * gate[seg] (and d_x = g * r) when no gate gradient is needed."""
     n = T.dynamic("n")
-    b = T.dynamic("b")
+    lg = T.dynamic("lg")
 
     @T.prim_func
     def main(
-        g: T.Tensor((n, d), dtype),
-        gate: T.Tensor((b, d), F32),
+        g: T.Tensor((n, d), xdt),
+        gate: T.Tensor((lg,), F32),
         seg: T.Tensor((n,), I32),
-        dx: T.Tensor((n, d), dtype),
+        dx: T.Tensor((n, d), xdt),
         do: T.Tensor((n, d), dtype),
         r: T.float32,
+        gr: T.int32,
+        gc: T.int32,
     ):
         with T.Kernel(T.ceildiv(n, bm), threads=threads) as bx:
             for i, j in T.Parallel(bm, d):
@@ -147,32 +175,27 @@ def _bwd_plain_prim(d, bm, threads, need_dx, dtype):
                 rr = T.min(row, n - 1)
                 gv = T.cast(g[rr, j], F32)
                 if row < n:
-                    do[row, j] = T.cast(gv * gate[seg[rr], j], dtype)
+                    do[row, j] = T.cast(gv * gate[seg[rr] * gr + j * gc], dtype)
                     if need_dx:
-                        dx[row, j] = T.cast(gv * r, dtype)
+                        dx[row, j] = T.cast(gv * r, xdt)
 
     return main
 
 
 def residual_forward(x, o, gate, seg, r):
-    """x * r + o * gate[seg] for x, o [N, D] (no autograd)."""
+    """x * r + o * gate[seg] for x, o [N, D] (no autograd); y in x's dtype."""
     n, d = x.shape
     y = torch.empty_like(x)
     bm = _bm(d)
     kernel = compiled(
-        _fwd_prim, x.device, d, bm, _threads(d), gate is not None, DTYPE[x.dtype]
-    )
+        _fwd_prim, x.device, d, bm, _threads(d), gate is not None, DTYPE[o.dtype],
+        DTYPE[x.dtype],
+    )  # fmt: skip
     if gate is None:
         kernel(x, o, y, float(r))
     else:
-        kernel(
-            x,
-            o,
-            f32(gate, gate.shape, x.device),
-            seg.to(torch.int32).contiguous(),
-            y,
-            float(r),
-        )
+        flat, gr, gc = per_sample(gate, *gate.shape, x.device)
+        kernel(x, o, flat, seg.to(torch.int32).contiguous(), y, float(r), gr, gc)
     return y
 
 
@@ -188,41 +211,49 @@ BWD_CFGS = [
 
 
 def residual_backward(g, o, gate, seg, r, need_gate=True):
-    """(d_x or empty when r == 1, d_o, d_gate fp32 [B, D] or empty) (no autograd)."""
+    """(d_x or empty when r == 1, d_o in o's dtype, d_gate fp32 [B, D] or empty) (no
+    autograd); g is in x's dtype, o may be empty (of its dtype) without `need_gate`."""
     n, d = g.shape
     dev = g.device
     need_dx = r != 1.0
-    do = torch.empty_like(g)
+    do = torch.empty_like(g, dtype=o.dtype)
     dx = torch.empty_like(g) if need_dx else g
-    gf = f32(gate, gate.shape, dev)
+    gf, gr, gc = per_sample(gate, *gate.shape, dev)
+    dts = (DTYPE[o.dtype], DTYPE[g.dtype])
     if not need_gate:
         sg = seg.to(torch.int32).contiguous()
 
         def plain(c):
             kernel = compiled(
-                _bwd_plain_prim, dev, d, c["bm"], c["threads"], need_dx, DTYPE[g.dtype]
+                _bwd_plain_prim, dev, d, c["bm"], c["threads"], need_dx, *dts
             )
-            kernel(g, gf, sg, dx, do, float(r))
+            kernel(g, gf, sg, dx, do, float(r), gr, gc)
 
-        key = f"d{d}-{g.dtype}-{need_dx}"
-        tuned_run("f6tl_gated_residual_bwd_plain", dev, key, PLAIN_CFGS, plain)
+        key = f"d{d}-{g.dtype}-{o.dtype}-{need_dx}"
+        tuned_run("tilelang_gated_residual_bwd_plain", dev, key, PLAIN_CFGS, plain)
         return (dx if need_dx else g.new_empty(0)), do, g.new_empty(0)
 
     def run(c):
         plan = tile_plan(seg, n, gate.shape[0], c["bm"], dev, c["per_sm"])
-        part = torch.empty(plan.tiles, c["bm"], 1, d, device=dev, dtype=torch.float32)
-        kernel = compiled(
-            _bwd_prim, dev, d, c["bm"], c["bd"], c["threads"], need_dx, DTYPE[g.dtype]
+        part = torch.empty(
+            plan.tiles, c["bm"], 1, 2, d, device=dev, dtype=torch.float32
         )
-        kernel(g, o, gf, plan.tseg, plan.tstart, plan.tstop, dx, do, part, float(r))
+        kernel = compiled(
+            _bwd_prim, dev, d, c["bm"], c["bd"], c["threads"], need_dx, dts[0], DF,
+            dts[1],
+        )  # fmt: skip
+        kernel(
+            g, o, gf, plan.tseg, plan.tstart, plan.tstop, dx, do, part, float(r), gr, gc
+        )
         return plan, part
 
-    key = f"d{d}-{g.dtype}-{need_dx}"
-    plan, part = tuned_run("f6tl_gated_residual_bwd", dev, key, BWD_CFGS, run)
-    return (dx if need_dx else g.new_empty(0)), do, segment_sums(part, plan, 1, d)[0]
+    key = f"d{d}-{g.dtype}-{o.dtype}-{need_dx}-{MODE}"
+    plan, part = tuned_run("tilelang_gated_residual_bwd", dev, key, BWD_CFGS, run)
+    dgate = segment_sums(part, plan, rounded=True)[0]
+    return (dx if need_dx else g.new_empty(0)), do, dgate
 
 
-@custom_op("kohakumoss::f6tl_gated_residual_fwd", mutates_args=())
+@custom_op("kohakumoss::tilelang_gated_residual_fwd", mutates_args=())
 def _fwd_op(
     x: Tensor, o: Tensor, gate: Tensor | None, seg: Tensor | None, r: float
 ) -> Tensor:
@@ -234,7 +265,7 @@ def _(x, o, gate, seg, r):
     return torch.empty_like(x)
 
 
-@custom_op("kohakumoss::f6tl_gated_residual_bwd", mutates_args=())
+@custom_op("kohakumoss::tilelang_gated_residual_bwd", mutates_args=())
 def _bwd_op(
     g: Tensor, o: Tensor, gate: Tensor, seg: Tensor, r: float, need_gate: bool
 ) -> tuple[Tensor, Tensor, Tensor]:
@@ -247,14 +278,16 @@ def _(g, o, gate, seg, r, need_gate):
     dgate = (
         gate.new_empty(gate.shape, dtype=torch.float32) if need_gate else g.new_empty(0)
     )
-    return dx, torch.empty_like(g), dgate
+    return dx, torch.empty_like(g, dtype=o.dtype), dgate
 
 
 def _setup(ctx, inputs, output):
     x, o, gate, seg, r = inputs
-    ctx.save_for_backward(o, gate, seg)
+    gate_grad = gate is not None and ctx.needs_input_grad[2]
+    ctx.save_for_backward(o if gate_grad else o.new_empty(0), gate, seg)
     ctx.r = r
     ctx.x_dtype = x.dtype
+    ctx.o_dtype = o.dtype
 
 
 def _backward(ctx, gy):
@@ -263,7 +296,7 @@ def _backward(ctx, gy):
     need = ctx.needs_input_grad
     if gate is None:
         dx = gy if r == 1.0 else (gy.float() * r).to(ctx.x_dtype)
-        return dx, gy.to(o.dtype), None, None, None
+        return dx, gy.to(ctx.o_dtype), None, None, None
     dx, do, dgate = _bwd_op(gy.contiguous(), o, gate, seg, r, need[2])
     dx = gy if r == 1.0 else dx
     return dx, do, dgate.to(gate.dtype) if need[2] else None, None, None

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import torch
 
+from kohakumoss_kernels.hardware.arch import arch_of
 from kohakumoss_kernels.hardware.device import probe
 from kohakumoss_kernels.optim import new_8bit_state, resolve
 from kohakumoss_kernels.tuning.timing import best_ms
@@ -63,8 +64,13 @@ def run_case(name, shapes, pdtype, sdtype, mode, backend, device, iters):
         for p, g in zip(tparams, grads):
             p.grad = g.float()
         for flag in ("fused", "foreach"):
-            opt = torch.optim.AdamW(tparams, lr=1e-4, betas=(0.9, 0.95), **{flag: True})
-            row[f"torch_{flag}_fp32_ms"] = best_ms(opt.step, device, iters)
+            try:
+                opt = torch.optim.AdamW(
+                    tparams, lr=1e-4, betas=(0.9, 0.95), **{flag: True}
+                )
+                row[f"torch_{flag}_fp32_ms"] = best_ms(opt.step, device, iters)
+            except RuntimeError as err:
+                row[f"torch_{flag}_fp32_error"] = str(err)[:200]
     return row
 
 
@@ -73,9 +79,10 @@ def main():
     p.add_argument("--backend", default="auto")
     p.add_argument("--out", default="runs/kernel")
     p.add_argument("--iters", type=int, default=10)
+    p.add_argument("--device", default="cuda", help="cuda | cuda:N | xpu:N")
     args = p.parse_args()
-    device = torch.device("cuda")
-    has_bf16 = torch.cuda.get_device_capability(device)[0] >= 8
+    device = torch.device(args.device)
+    has_bf16 = arch_of(device).has_bf16
     half = torch.bfloat16 if has_bf16 else torch.float16
     cases = [
         ("lora-fp32", lora_shapes(), torch.float32, torch.float32, "nearest"),

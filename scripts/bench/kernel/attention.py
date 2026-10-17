@@ -1,15 +1,19 @@
 """Varlen attention: every backend vs PyTorch at MOSS-Image shapes, speed and accuracy.
 
-    python scripts/bench/kernel/attention.py --dtype fp16 --out runs/bench/attention
+    python scripts/bench/kernel/attention.py --device cuda --dtype fp16 --out runs/bench/attention
 
-Rows: case x implementation, forward and forward+backward device ms (best of N, CUDA
-events), peak memory, and relative error vs the fp64 eager reference for o, dq, dk, dv.
+Rows: case x implementation, forward and forward+backward device ms (best of N, device
+events; fwd+bwd is the median over `--rounds` rounds that alternate the
+implementations), the step's memory above what was allocated before it, and relative
+error vs the fp64 eager reference for o, dq, dk, dv.
+`--device` takes any CUDA or XPU device (`cuda:1`, `xpu:0`).
 PyTorch baselines: per-segment SDPA loop (eager and torch.compile), padded SDPA with a
 key mask, torch varlen_attn and flex_attention with a document mask where available.
 """
 
 import argparse
 import json
+import statistics
 from pathlib import Path
 
 import torch
@@ -99,15 +103,19 @@ def make_flex(cu, n):
     return run
 
 
+def _sm80(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 8
+
+
 def implementations(device, dtype, cu, n):
     impls = {
         "sdpa_loop": sdpa_loop,
         "sdpa_loop_compiled": torch.compile(sdpa_loop, dynamic=True),
         "sdpa_padded": padded_sdpa,
     }
-    if varlen_attn is not None and torch.cuda.get_device_capability(device)[0] >= 8:
+    if varlen_attn is not None and _sm80(device):
         impls["torch_varlen_attn"] = torch_varlen
-    if flex_attention is not None and torch.cuda.get_device_capability(device)[0] >= 8:
+    if flex_attention is not None and (_sm80(device) or device.type == "xpu"):
         impls["flex_doc_mask"] = make_flex(cu, n)
     for backend in ("tilelang", "triton"):
         try:
@@ -118,15 +126,28 @@ def implementations(device, dtype, cu, n):
             continue
     if "kohakumoss_triton" in impls:
         impls["kohakumoss_triton_raced"] = impls.pop("kohakumoss_triton")
-        impls["kohakumoss_triton"] = triton_kernels.attention_varlen
+        impls["kohakumoss_triton_kernels"] = triton_kernels.attention_varlen
     return impls
 
 
 def rel(a, r):
-    return ((a.double() - r).norm() / r.norm().clamp_min(1e-30)).item()
+    return (
+        (a.to(r.device, torch.float64) - r).norm() / r.norm().clamp_min(1e-30)
+    ).item()
 
 
-def run_case(name, lens, device, dtype, iters, only):
+def interleaved(steps, device, iters, rounds):
+    """{impl: [ms per round]}: every round times each step once (best of `iters`)."""
+    times = {impl: [] for impl in steps}
+    for _ in range(rounds):
+        for impl, step in steps.items():
+            times[impl].append(best_ms(step, device, iters))
+    return times
+
+
+def run_case(name, lens, device, mem, dtype, iters, only, rounds=1):
+    """Rows of one case; `mem` is the device module (torch.cuda / torch.xpu). fwd + bwd
+    is the median over `rounds` interleaved rounds (min in `fwd_bwd_min_ms`)."""
     n = sum(lens)
     cu = torch.tensor(
         [0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32, device=device
@@ -135,10 +156,14 @@ def run_case(name, lens, device, dtype, iters, only):
     q, k, v, do = (
         torch.randn(n, HEADS, HEAD_DIM, device=device, dtype=dtype) for _ in range(4)
     )
-    ref_in = [t[:, REF_HEADS].double().requires_grad_() for t in (q, k, v)]
-    ref = sdpa_loop(*ref_in, cu, max_len, scale)
-    ref.backward(do[:, REF_HEADS].double())
-    rows = []
+    # fp64 reference on the device where it is native (CUDA), else on the CPU
+    ref_dev = device if device.type == "cuda" else torch.device("cpu")
+    ref_in = [
+        t[:, REF_HEADS].to(ref_dev, torch.float64).requires_grad_() for t in (q, k, v)
+    ]
+    ref = sdpa_loop(*ref_in, cu.to(ref_dev), max_len, scale)
+    ref.backward(do[:, REF_HEADS].to(ref_dev, torch.float64))
+    rows, steps = [], {}
     for impl, fn in implementations(device, dtype, cu, n).items():
         if only and not any(s in impl for s in only):
             continue
@@ -162,28 +187,26 @@ def run_case(name, lens, device, dtype, iters, only):
         del out
         fwd_in = [t.detach() for t in (q, k, v)]
         with torch.no_grad():
-            fwd = best_ms(
-                lambda: fn(*fwd_in, cu, max_len, scale), torch.device(device), iters
-            )
+            fwd = best_ms(lambda: fn(*fwd_in, cu, max_len, scale), device, iters)
 
-        def step():
+        def step(fn=fn, leaves=leaves):
             for t in leaves:
                 t.grad = None
             fn(*leaves, cu, max_len, scale).backward(do)
 
-        torch.cuda.reset_peak_memory_stats(device)
-        both = best_ms(step, torch.device(device), iters)
-        peak = torch.cuda.max_memory_allocated(device) / 2**20
+        base = mem.memory_allocated(device)
+        mem.reset_peak_memory_stats(device)
+        step()
+        peak = (mem.max_memory_allocated(device) - base) / 2**20
+        steps[impl] = step
         rows.append(
-            {
-                "case": name,
-                "impl": impl,
-                "fwd_ms": fwd,
-                "fwd_bwd_ms": both,
-                "peak_mib": peak,
-                **errs,
-            }
+            {"case": name, "impl": impl, "fwd_ms": fwd, "peak_mib": peak, **errs}
         )
+    times = interleaved(steps, device, iters, rounds)
+    for row in rows:
+        if row["impl"] in times:
+            row["fwd_bwd_ms"] = statistics.median(times[row["impl"]])
+            row["fwd_bwd_min_ms"] = min(times[row["impl"]])
     return rows
 
 
@@ -191,22 +214,32 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dtype", default="fp16", choices=("fp16", "bf16"))
     ap.add_argument("--iters", type=int, default=10)
+    ap.add_argument("--rounds", type=int, default=1, help="interleaved fwd+bwd rounds")
     ap.add_argument("--cases", nargs="*", default=list(CASES))
     ap.add_argument("--out", default="runs/bench/attention")
     ap.add_argument("--impls", nargs="*", default=[], help="substring filter")
+    ap.add_argument("--device", default="cuda", help="cuda, cuda:1, xpu, xpu:0, ...")
     args = ap.parse_args()
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
-    device = "cuda"
+    device = torch.device(args.device)
+    mem = getattr(torch, device.type)
+    if device.index is None:
+        device = torch.device(device.type, mem.current_device())
+    mem.set_device(device)
     dev = probe(device)
     rows = []
     for name in args.cases:
-        rows += run_case(name, CASES[name], device, dtype, args.iters, args.impls)
-        torch.cuda.empty_cache()
+        rows += run_case(
+            name, CASES[name], device, mem, dtype, args.iters, args.impls, args.rounds
+        )
+        mem.empty_cache()
     report = {
         "device": dev.key,
         "mma_tflops": dev.mma_tflops,
         "dram_gbs": dev.dram_gbs,
         "dtype": args.dtype,
+        "iters": args.iters,
+        "rounds": args.rounds,
         "rows": rows,
     }
     tag = "-".join(args.impls) or "all"

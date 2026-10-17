@@ -106,7 +106,11 @@ def situ_forward(x: Tensor) -> Tensor:
     a = torch.empty(n, f2 // 2, device=x.device, dtype=x.dtype)
     key = f"f{f2 // 2}-{x.dtype}"
     cfg = select(
-        "f6_situ_fwd", x.device, key, candidates, lambda c: lambda: launch_fwd(c, x, a)
+        "triton_situ_fwd",
+        x.device,
+        key,
+        candidates,
+        lambda c: lambda: launch_fwd(c, x, a),
     )
     launch_fwd(cfg, x, a)
     return a
@@ -117,7 +121,7 @@ def situ_backward(gr: Tensor, x: Tensor) -> Tensor:
     dx = torch.empty_like(x)
     key = f"f{gr.shape[1]}-{x.dtype}"
     cfg = select(
-        "f6_situ_bwd",
+        "triton_situ_bwd",
         x.device,
         key,
         candidates,
@@ -127,12 +131,12 @@ def situ_backward(gr: Tensor, x: Tensor) -> Tensor:
     return dx
 
 
-@triton_op("kohakumoss::f6_situ_fwd", mutates_args=())
+@triton_op("kohakumoss::triton_situ_fwd", mutates_args=())
 def _fwd_op(x: Tensor) -> Tensor:
     return situ_forward(x)
 
 
-@triton_op("kohakumoss::f6_situ_bwd", mutates_args=())
+@triton_op("kohakumoss::triton_situ_bwd", mutates_args=())
 def _bwd_op(gr: Tensor, x: Tensor) -> Tensor:
     return situ_backward(gr, x)
 

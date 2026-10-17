@@ -1,12 +1,15 @@
 """Prewarm of the block ops: run each op forward + backward on scratch MOSS-shaped
 inputs (so kernel configs are tuned and kernel-vs-compile choices are measured and
-stored) before training, outside any no_grad / checkpoint / graph capture."""
+stored) before training, outside any no_grad / checkpoint / graph capture. A backend
+that fails here, the backward included, falls back before step 0."""
 
 from collections.abc import Callable
+from functools import partial
 
 import torch
 
 from kohakumoss_kernels.backends.compile.race import retune_pending
+from kohakumoss_kernels.registry import Bound, exercise
 
 
 def _segments(lengths: list[int], device) -> torch.Tensor:
@@ -65,7 +68,16 @@ def prewarm_block_ops(
             for name, args in calls.items():
                 if name not in ops:
                     continue
-                out = ops[name](*args)
-                outs = out if isinstance(out, tuple) else (out,)
-                torch.autograd.backward([o.float().sum() for o in outs])
+                step = partial(_forward_backward, args=args)
+                op = ops[name]
+                if isinstance(op, Bound):
+                    exercise(op, step)
+                else:
+                    step(op)
     return retune_pending()
+
+
+def _forward_backward(op: Callable, args: tuple) -> None:
+    out = op(*args)
+    outs = out if isinstance(out, tuple) else (out,)
+    torch.autograd.backward([o.float().sum() for o in outs])

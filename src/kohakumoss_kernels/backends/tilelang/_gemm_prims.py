@@ -52,20 +52,23 @@ def situ_gemm_prim(k, f, bm, bn, bk, threads, stages, save):
 
 
 def residual_gemm_prim(k, n, bm, bn, bk, threads, stages, gated, scaled, save):
-    """out = x * r + (A W^T) * gate[seg]; o = A W^T stored when `save`."""
+    """out = x * r + (A W^T) * gate[seg] (gate flat with row / column strides gr, gc);
+    o = A W^T stored when `save`."""
     m = T.dynamic("m")
-    b = T.dynamic("b")
+    lg = T.dynamic("lg")
 
     @T.prim_func
     def main(
         a: T.Tensor((m, k), F16),
         w: T.Tensor((n, k), F16),
         x: T.Tensor((m, n), F16),
-        gate: T.Tensor((b, n), F32),
+        gate: T.Tensor((lg,), F32),
         seg: T.Tensor((m,), I32),
         out: T.Tensor((m, n), F16),
         o: T.Tensor((m, n), F16),
         r: T.float32,
+        gr: T.int32,
+        gc: T.int32,
     ):
         with T.Kernel(T.ceildiv(n, bn), T.ceildiv(m, bm), threads=threads) as (bx, by):
             a_s = T.alloc_shared((bm, bk), F16)
@@ -81,7 +84,7 @@ def residual_gemm_prim(k, n, bm, bn, bk, threads, stages, gated, scaled, save):
                 col = bx * bn + j
                 rr = T.min(row, m - 1)
                 cc = T.min(col, n - 1)
-                gv = T.if_then_else(gated, gate[seg[rr], cc], 1.0)
+                gv = T.if_then_else(gated, gate[seg[rr] * gr + cc * gc], 1.0)
                 xv = T.cast(x[rr, cc], F32)
                 xv = T.if_then_else(scaled, xv * r, xv)
                 if row < m and col < n:

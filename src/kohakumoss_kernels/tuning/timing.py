@@ -1,10 +1,14 @@
 """Device-time measurement: busy warmup, L2 flush between calls, CUDA-graph replay."""
 
+import time
 from collections.abc import Callable
 
 import torch
 
+from kohakumoss_kernels.hardware.current import on_device
+
 WARMUP_MS = 25.0
+CAPTURE = "thread_local"
 
 
 def _sync(device: torch.device) -> None:
@@ -15,14 +19,21 @@ def _sync(device: torch.device) -> None:
 
 
 def _elapsed_ms(fn: Callable[[], object], calls: int, device: torch.device) -> float:
-    start = torch.Event(device=device, enable_timing=True)
-    end = torch.Event(device=device, enable_timing=True)
-    start.record()
-    for _ in range(calls):
-        fn()
-    end.record()
-    _sync(device)
-    return start.elapsed_time(end)
+    """Device ms of `calls` calls (wall ms on CPU, which has no events)."""
+    if device.type == "cpu":
+        t = time.perf_counter()
+        for _ in range(calls):
+            fn()
+        return (time.perf_counter() - t) * 1e3
+    with on_device(device):
+        start = torch.Event(device=device, enable_timing=True)
+        end = torch.Event(device=device, enable_timing=True)
+        start.record()
+        for _ in range(calls):
+            fn()
+        end.record()
+        end.synchronize()
+        return start.elapsed_time(end)
 
 
 def warm(fn: Callable[[], object], device: torch.device, warmup_ms: float = WARMUP_MS):
@@ -45,13 +56,7 @@ def best_ms(
     for _ in range(iters):
         if flush is not None:
             flush.zero_()
-        start = torch.Event(device=device, enable_timing=True)
-        end = torch.Event(device=device, enable_timing=True)
-        start.record()
-        fn()
-        end.record()
-        _sync(device)
-        best = min(best, start.elapsed_time(end))
+        best = min(best, _elapsed_ms(fn, 1, device))
     return best
 
 
@@ -73,7 +78,7 @@ def graph_ms(
         return best_ms(fn, device, iters)
     graph = torch.cuda.CUDAGraph()
     try:
-        with torch.cuda.graph(graph):
+        with on_device(device), torch.cuda.graph(graph, capture_error_mode=CAPTURE):
             for _ in range(calls):
                 fn()
     except RuntimeError:

@@ -15,9 +15,13 @@ from tests._util.precision import assert_bar
 
 
 def _leaf(t, dtype=None, grad=True):
+    """A fresh leaf with `t`'s values, shape and strides (strided views stay strided)."""
     if not isinstance(t, Tensor):
         return t
-    out = t.detach().clone() if dtype is None else t.detach().to(dtype)
+    out = torch.empty_strided(
+        t.shape, t.stride(), dtype=dtype or t.dtype, device=t.device
+    )
+    out.copy_(t.detach())
     if grad and out.is_floating_point():
         out.requires_grad_(True)
     return out
@@ -52,26 +56,17 @@ def check(
     dtype: torch.dtype,
     name: str,
     seed: int = 1,
-    factor: float = 1.1,
-    floor_ulp: float = 0.0,
     backward: bool = True,
 ) -> None:
-    """Assert `backend` meets the bar on outputs and the gradients of `grads` leaves."""
+    """Assert `backend` meets the bar on outputs and the gradients of `grads` leaves;
+    `dtype` is the tested activation dtype (the gradients keep their leaves' dtypes)."""
     lb, ob = run(backend, args, grads, False)
     le, oe = run(eager, args, grads, False)
     lr, orf = run(eager, args, grads, True)
     for i, (a, b, c) in enumerate(zip(ob, oe, orf)):
         assert a.dtype == b.dtype, f"{name} out{i}: dtype {a.dtype} != {b.dtype}"
         assert a.shape == b.shape, f"{name} out{i}: shape {a.shape} != {b.shape}"
-        assert_bar(
-            a.detach(),
-            b.detach(),
-            c.detach(),
-            dtype,
-            factor,
-            floor_ulp,
-            f"{name} out{i}",
-        )
+        assert_bar(a.detach(), b.detach(), c.detach(), f"{name} {dtype} out{i}")
     if not backward:
         return
     gen = torch.Generator(device="cpu").manual_seed(seed)
@@ -85,4 +80,4 @@ def check(
         gb, ge, gr = lb[i].grad, le[i].grad, lr[i].grad
         assert gb is not None, f"{name} grad{i}: missing"
         assert gb.dtype == args[i].dtype, f"{name} grad{i}: dtype {gb.dtype}"
-        assert_bar(gb, ge, gr, dtype, factor, floor_ulp, f"{name} grad{i}")
+        assert_bar(gb, ge, gr, f"{name} {dtype} grad{i}")

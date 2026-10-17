@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from kohakumoss_kernels import registry
+from kohakumoss_kernels.hardware.current import on_device
 
 FORMATS = {"int8": torch.int8, "fp8": torch.float8_e4m3fn}
 
@@ -70,7 +71,7 @@ def register_launchers(backend: str, fwd: Callable, dgrad: Callable) -> None:
 def _quant_fwd(
     x: Tensor, q: Tensor, scale: Tensor, bias: Tensor | None, backend: str
 ) -> Tensor:
-    with torch.cuda.device(x.device) if x.is_cuda else _null():
+    with on_device(x.device):
         return _LAUNCHERS[backend][0](x, q, scale, bias)
 
 
@@ -81,7 +82,7 @@ def _(x, q, scale, bias, backend):
 
 @torch.library.custom_op("kohakumoss::quant_dgrad", mutates_args=())
 def _quant_dgrad(dy: Tensor, q: Tensor, scale: Tensor, backend: str) -> Tensor:
-    with torch.cuda.device(dy.device) if dy.is_cuda else _null():
+    with on_device(dy.device):
         return _LAUNCHERS[backend][1](dy, q, scale)
 
 
@@ -111,14 +112,6 @@ def _backward(ctx, grad):
 
 
 _quant_fwd.register_autograd(_backward, setup_context=_setup)
-
-
-class _null:
-    def __enter__(self):
-        return None
-
-    def __exit__(self, *exc):
-        return False
 
 
 def make_quant_linear(backend: str) -> Callable:

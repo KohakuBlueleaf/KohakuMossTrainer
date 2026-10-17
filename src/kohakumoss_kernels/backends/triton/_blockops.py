@@ -5,7 +5,8 @@ kernels that reduce over a sample's rows run one program per *segment tile*: a r
 of at most CHUNK rows inside one sample. `segment_bounds` writes the sample row
 bounds `cu [B+1]` on the device (no host sync); a program finds its tile from `cu`
 with a vector prefix sum, so partials are per tile and sums are deterministic.
-See docs/internals/fp16.md.
+Partials are fp32 pairs (hi, lo planes) summed in double-float. See
+docs/internals/fp16.md.
 """
 
 import torch
@@ -15,6 +16,97 @@ from torch import Tensor
 
 from kohakumoss_kernels.backends.triton._common import Launcher, cdiv
 from kohakumoss_kernels.hardware.device import probe
+
+
+@triton.jit
+def kahan(s, c, x):
+    """(s, c) after adding x with compensation; the sum is s - c."""
+    y = x - c
+    t = s + y
+    return t, (t - s) - y
+
+
+@triton.jit
+def two_sum(a, b):
+    """(s, e) with s + e == a + b exactly (Knuth)."""
+    s = a + b
+    bb = s - a
+    return s, (a - (s - bb)) + (b - bb)
+
+
+@triton.jit
+def two_prod(a, b):
+    """(p, e) with p + e == a * b exactly (FMA)."""
+    p = a * b
+    return p, tl.fma(a, b, -p)
+
+
+@triton.jit
+def df_add(ah, al, bh, bl):
+    """Double-float a + b (each an unevaluated pair hi + lo of fp32)."""
+    s, e = two_sum(ah, bh)
+    e = e + (al + bl)
+    hi = s + e
+    return hi, e - (hi - s)
+
+
+@triton.jit
+def df_mul(ah, al, bh, bl):
+    """Double-float a * b."""
+    p, e = two_prod(ah, bh)
+    e = e + (ah * bl + al * bh)
+    hi = p + e
+    return hi, e - (hi - p)
+
+
+@triton.jit
+def df_sum(hi, lo, axis: tl.constexpr):
+    """Double-float sum of pairs along `axis` (a tree of `df_add`)."""
+    return tl.reduce((hi, lo), axis, df_add)
+
+
+@triton.jit
+def df_scale(a, bh, bl):
+    """Double-float a * (bh + bl) for an fp32 a."""
+    p, e = two_prod(a, bh)
+    e = e + a * bl
+    hi = p + e
+    return hi, e - (hi - p)
+
+
+@triton.jit
+def df_div(h, lo, n):
+    """Double-float (h + lo) / n for an fp32 n."""
+    q = tl.div_rn(h, n)
+    ql = tl.div_rn(tl.fma(-q, n, h) + lo, n)
+    s = q + ql
+    return s, ql - (s - q)
+
+
+@triton.jit
+def df_rstd(h, lo, eps):
+    """Double-float 1 / sqrt(h + lo + eps): fp32 seed and one Newton step in pairs."""
+    q, ql = df_add(h, lo, eps + 0.0 * h, 0.0 * h)
+    r0 = tl.div_rn(1.0, tl.sqrt_rn(q))
+    r2, r2l = two_prod(r0, r0)
+    t, tlo = df_mul(q, ql, r2, r2l)
+    e, el = df_add(1.0 - t, 0.0 * t, -tlo, 0.0 * t)
+    return two_sum(r0, 0.5 * r0 * (e + el))
+
+
+@triton.jit
+def df_mean_sq(x, axis: tl.constexpr, n):
+    """Double-float mean of x * x along `axis` (exact squares, pair sum)."""
+    sh, sl = two_prod(x, x)
+    sh, sl = df_sum(sh, sl, axis)
+    return df_div(sh, sl, n)
+
+
+@triton.jit
+def store_pair(ptr, stride, hi, lo, mask):
+    """Store a pair as two fp32 planes `stride` elements apart."""
+    tl.store(ptr, hi, mask=mask)
+    tl.store(ptr + stride, lo, mask=mask)
 
 
 @triton.jit
@@ -89,19 +181,37 @@ def segment_sum_kernel(
     T,
     SLOTS: tl.constexpr,
     HAS_SEG: tl.constexpr,
+    ROUND: tl.constexpr,
     BLOCK_B: tl.constexpr,
+    BT: tl.constexpr,
     BD: tl.constexpr,
 ):
-    """out[s, b] = sum over the tiles of sample b of part[tile, s]; part [T, SLOTS, D]."""
+    """Pair sums over the tiles of sample b of part [T, SLOTS, 2, D] (fp32 pairs), BT
+    tiles per step: out [SLOTS, 2, B, D] pairs, or [SLOTS, B, D] rounded to fp32 with
+    ROUND."""
     b = tl.program_id(0)
     cols = tl.program_id(1) * BD + tl.arange(0, BD)
     ok = cols < D
     beg, end = segment_tiles(b, cu_ptr, B, CHUNK, T, HAS_SEG, BLOCK_B)
     for s in tl.static_range(SLOTS):
-        acc = tl.zeros([BD], tl.float32)
-        for t in range(beg, end):
-            acc += tl.load(part_ptr + (t * SLOTS + s) * D + cols, mask=ok, other=0.0)
-        tl.store(out_ptr + (s * B + b) * D + cols, acc, mask=ok)
+        hi = tl.zeros([BD], tl.float32)
+        lo = tl.zeros([BD], tl.float32)
+        for t0 in range(beg, end, BT):
+            ts = t0 + tl.arange(0, BT)
+            m = (ts < end)[:, None] & ok[None, :]
+            src = (
+                part_ptr
+                + (ts.to(tl.int64)[:, None] * SLOTS + s) * 2 * D
+                + cols[None, :]
+            )
+            ph, pl = df_sum(
+                tl.load(src, mask=m, other=0.0), tl.load(src + D, mask=m, other=0.0), 0
+            )
+            hi, lo = df_add(hi, lo, ph, pl)
+        if ROUND:
+            tl.store(out_ptr + (s * B + b) * D + cols, hi + lo, mask=ok)
+        else:
+            store_pair(out_ptr + (s * 2 * B + b) * D + cols, B * D, hi, lo, ok)
 
 
 _bounds = Launcher(segment_bounds_kernel)
@@ -139,29 +249,54 @@ class SegPlan:
         else:
             self.cu = torch.zeros(1, device=device, dtype=torch.int32)
 
-    def reduce(self, part: Tensor, slots: int, d: int) -> Tensor:
-        """[slots, B, D] fp32 per-sample sums of the tile partials [tiles, slots, D]."""
-        out = torch.empty(slots, self.b, d, device=part.device, dtype=torch.float32)
-        bd = min(256, triton.next_power_of_2(d))
-        _segsum[(self.b, cdiv(d, bd))](
-            part,
-            out,
-            self.cu,
-            d,
-            self.b,
-            self.chunk,
-            self.tiles,
-            SLOTS=slots,
-            HAS_SEG=self.has_seg,
-            BLOCK_B=self.block_b,
-            BD=bd,
-            num_warps=2,
-        )
-        return out
+    def reduce(self, part: Tensor, slots: int, d: int, rounded: bool) -> Tensor:
+        """Per-sample sums of the tile pair partials [tiles, slots, 2, D]: fp32 pairs
+        [slots, 2, B, D], or [slots, B, D] rounded to fp32 when `rounded`."""
+        return pair_sums(part, self.cu, self.b, self.chunk, self.has_seg, rounded)
+
+
+def pair_sums(
+    part: Tensor, cu: Tensor, b: int, chunk: int, has_seg: bool, rounded: bool
+) -> Tensor:
+    """Pair sums of part [T, slots, 2, D] over each sample's tiles (all T tiles as one
+    sample without segments); see `segment_sum_kernel`."""
+    tiles, slots, _, d = part.shape
+    shape = (slots, b, d) if rounded else (slots, 2, b, d)
+    out = torch.empty(shape, device=part.device, dtype=torch.float32)
+    bd = min(128, triton.next_power_of_2(d))
+    bt = max(8, 2048 // bd)
+    _segsum[(b, cdiv(d, bd))](
+        part,
+        out,
+        cu,
+        d,
+        b,
+        chunk,
+        tiles,
+        SLOTS=slots,
+        HAS_SEG=has_seg,
+        ROUND=rounded,
+        BLOCK_B=triton.next_power_of_2(max(b, 1)),
+        BT=bt,
+        BD=bd,
+        num_warps=4,
+    )
+    return out
+
+
+def total(part: Tensor) -> Tensor:
+    """fp32 [slots, D] sums of every row of part [T, slots, 2, D] (pairs)."""
+    cu = torch.empty(1, device=part.device, dtype=torch.int32)
+    return pair_sums(part, cu, 1, 1, False, True)[:, 0]
 
 
 def empty() -> Tensor:
     return torch.empty(0)
+
+
+def strides2(t: Tensor | None) -> tuple[int, int]:
+    """(row, column) strides of a per-sample [B, D] tensor ((0, 0) when absent)."""
+    return (0, 0) if t is None else (t.stride(0), t.stride(1))
 
 
 def opt(t: Tensor) -> Tensor | None:

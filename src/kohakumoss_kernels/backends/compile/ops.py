@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from kohakumoss_kernels.backends.eager import ffn, loss, norm, rope
+from kohakumoss_kernels.errors import unavailable
 
 
 def _linear_situ(y: Tensor, w: Tensor, bias: Tensor | None) -> Tensor:
@@ -41,25 +42,37 @@ EAGER: dict[str, Callable] = {
 COMPILED = tuple(EAGER)
 
 
-@cache
-def compiled_op(name: str, dynamic: bool | None = True) -> Callable:
-    """torch.compile(eager spec of `name`, dynamic=`dynamic`), built lazily on first call.
+class CompiledOp:
+    """torch.compile of one eager spec, built on the first call; a build failure of
+    that call raises `BackendUnavailable`, later calls run the compiled callable
+    directly. Inside an outer torch.compile the eager spec is traced. See
+    docs/internals/fp16.md."""
 
-    The registered arm is `dynamic=True`: every shape symbolic from the first trace, so a
-    later token count never recompiles the frame into a different graph that a pending
-    checkpoint recompute of an earlier shape would then hit (`dynamic=None` does exactly
-    that: static first, dynamic on the second shape). Inside an outer torch.compile the
-    eager spec itself is traced (no nested compile).
-    """
-    eager = EAGER[name]
-    holder: list = []
+    def __init__(self, name: str, dynamic: bool | None, backend: str | Callable):
+        self.eager = EAGER[name]
+        self.dynamic = dynamic
+        self.backend = backend
+        self.__name__ = f"compiled_{name}"
+        self.run = self._first
 
-    def call(*args):
+    def __call__(self, *args):
         if torch.compiler.is_compiling():
-            return eager(*args)
-        if not holder:
-            holder.append(torch.compile(eager, dynamic=dynamic))
-        return holder[0](*args)
+            return self.eager(*args)
+        return self.run(*args)
 
-    call.__name__ = f"compiled_{name}"
-    return call
+    def _first(self, *args):
+        compiled = torch.compile(self.eager, dynamic=self.dynamic, backend=self.backend)
+        try:
+            out = compiled(*args)
+        except Exception as err:  # noqa: BLE001
+            raise unavailable(self.__name__, err) from err
+        self.run = compiled
+        return out
+
+
+@cache
+def compiled_op(
+    name: str, dynamic: bool | None = True, backend: str | Callable = "inductor"
+) -> CompiledOp:
+    """The process's `CompiledOp` of `name` for (`dynamic`, `backend`)."""
+    return CompiledOp(name, dynamic, backend)

@@ -35,7 +35,7 @@ def _slow_kernel(x):
     return y
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 def test_call_never_times_and_retune_binds_winner(device, fresh):
     op = race.raced("test", "situ_glu", _slow_kernel, race.shape_key)
     x = torch.randn(2048, 8192, device=device)
@@ -48,7 +48,7 @@ def test_call_never_times_and_retune_binds_winner(device, fresh):
     assert op.bound[race._quick_key((x,))] is op.impls["compile"]
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("ctx", ["inference", "checkpoint"])
 def test_retune_inside_untimed_context_stays_queued(device, fresh, ctx):
     """A retune reached under inference mode or inside a checkpointed forward times
@@ -72,7 +72,7 @@ def test_retune_inside_untimed_context_stays_queued(device, fresh, ctx):
     assert op.choice == "compile" and not op.pending
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 def test_tune_off_never_races(device, fresh):
     tuner.set_mode("off")
     op = race.raced("test", "situ_glu", _slow_kernel, race.shape_key)
@@ -91,7 +91,7 @@ def _block_inputs(device, dtype):
     seq = build_seqinfo(torch.tensor([[4, 6], [3, 5]]), torch.tensor([7, 11]))
     n, d = seq.n_joint, 256
     x = torch.randn(n, d, device=device).to(dtype)
-    mod = 0.1 * torch.randn(2, d, device=device)
+    mod = (0.1 * torch.randn(2, 6, d, device=device))[:, 3]
     bands = (1 / (10000.0 ** (torch.arange(16) / 16))).to(device)
     return x, mod, seq.seg_joint.to(device), seq.pos_joint.to(device), bands
 
@@ -115,7 +115,7 @@ EAGER = {
 }
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 def test_checkpointed_block_on_fresh_cache(device, fresh):
     """Default kernels inside non-reentrant checkpointing, first step on a fresh cache."""
     dtype = torch.float16
@@ -208,7 +208,7 @@ def _check_graphs(graphs: dict[str, int]) -> None:
         assert n == (2 if name in per_sample else 1), f"{name}: {n} graphs"
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 def test_compile_arm_checkpointed_across_shapes(device, fresh):
     """Registered compile arm (dynamic=True) inside block checkpointing, token count
     changing every step and across micro-batches whose recomputes run after later
@@ -216,7 +216,7 @@ def test_compile_arm_checkpointed_across_shapes(device, fresh):
     _check_graphs(_compile_arm_steps(device, True))
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 def test_compile_arm_automatic_dynamic_is_caught(device, fresh):
     """`dynamic=None` (static first trace, dynamic recompile on the next length) is
     what lets a recompute meet a different graph than its forward; the graph check
@@ -225,7 +225,7 @@ def test_compile_arm_automatic_dynamic_is_caught(device, fresh):
     must_fail(lambda: _check_graphs(graphs), "automatic dynamic recompiles")
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 def test_prewarm_binds_every_op(device, fresh):
     ops = {name: _registered(name, device, torch.float16) for name in EAGER}
     measured = prewarm_block_ops(
@@ -236,10 +236,10 @@ def test_prewarm_binds_every_op(device, fresh):
         assert op.bound and not op.pending
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("ctx", [torch.no_grad, torch.inference_mode])
-def test_no_grad_forward_on_fresh_cache(device, fresh, ctx):
-    dtype = torch.float32 if device.type == "cuda" else torch.float32
+@pytest.mark.parametrize("dtype,tol", [(torch.float32, 1e-4), (torch.float16, 2e-2)])
+def test_no_grad_forward_on_fresh_cache(device, fresh, ctx, dtype, tol):
     try:
         ops = {name: _registered(name, device, dtype) for name in EAGER}
     except registry.NoImplementationError as err:
@@ -248,4 +248,4 @@ def test_no_grad_forward_on_fresh_cache(device, fresh, ctx):
     with ctx():
         out = _block(ops, x, mod, seg, pos, bands)
         ref = _block(EAGER, x, mod, seg, pos, bands)
-    torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(out, ref, rtol=tol, atol=tol)

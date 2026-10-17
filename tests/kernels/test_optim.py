@@ -11,7 +11,7 @@ BACKENDS = ("triton", "tilelang")
 HP = dict(lr=1e-3, beta1=0.9, beta2=0.95, eps=1e-8, wd=0.01)
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize(
     "pdtype,sdtype,mode",
@@ -99,7 +99,7 @@ def check_adamw(fn, pdtype, sdtype, mode, device, steps=3):
         assert d <= 4.0, f"{name}: {d} ulp"
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize(
     "pdtype,sdtype,mode",
@@ -116,7 +116,7 @@ def test_adamw(backend, pdtype, sdtype, mode, device):
     check_adamw(fn, pdtype, sdtype, mode, device)
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_negative_wrong_decay(backend, device):
     """Decay applied to the gradient (coupled L2) instead of the parameter is caught."""
@@ -130,7 +130,7 @@ def test_negative_wrong_decay(backend, device):
     )
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_stochastic_rounding_unbiased(backend, device):
     """Mean of many stochastic writebacks equals the fp32 value; nearest does not."""
@@ -160,7 +160,7 @@ def _assert(cond):
     assert cond
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_kahan_tracks_fp32(backend, device):
     """Kahan writeback of tiny updates follows an fp32 master; plain nearest stalls."""
@@ -202,7 +202,7 @@ def test_kahan_tracks_fp32(backend, device):
     must_fail(lambda: _assert(drift("nearest") < 1e-5), "nearest stalls")
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("pdtype", [torch.float32, torch.bfloat16])
 def test_adamw8bit(backend, pdtype, device):

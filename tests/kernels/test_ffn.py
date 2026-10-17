@@ -19,7 +19,7 @@ def _impl(backend, device, dtype):
         pytest.skip(str(err))
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", [(37, 2 * 200), (513, 2 * 8192), (3, 4, 2 * 64)])
@@ -29,7 +29,7 @@ def test_situ_glu(backend, dtype, shape, device):
     check(fn, eager.situ_glu, (x,), (True,), dtype, backend)
 
 
-@pytest.mark.cuda
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_negative_halves_swapped(backend, device):
     """Reading [gate | up] instead of [up | gate] must be caught."""

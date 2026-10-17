@@ -14,13 +14,19 @@ ACC = "float32"
 DELTA_BLOCK = 64
 
 
-def _pass_configs(arch: str) -> dict:
-    return {"tl.disable_warp_specialized": True, "tl.disable_tma_lower": True}
+def _pass_configs(arch: str, safe: bool) -> dict:
+    out = {"tl.disable_warp_specialized": True, "tl.disable_tma_lower": True}
+    if not safe:
+        out["tl.disable_safe_memory_legalize"] = True
+    return out
 
 
-def compile_kernel(prim, arch: str):
+def compile_kernel(prim, arch: str, safe: bool = True):
+    """Compile for `arch`; `safe=False` drops TileLang's automatic bounds guards (tests)."""
     return tilelang.compile(
-        prim, target={"kind": "cuda", "arch": arch}, pass_configs=_pass_configs(arch)
+        prim,
+        target={"kind": "cuda", "arch": arch},
+        pass_configs=_pass_configs(arch, safe),
     )
 
 
@@ -207,9 +213,10 @@ def dkdv(
                     T.copy(Q[q0 : q0 + bm, head, :], q_s)
                     T.copy(dO[q0 : q0 + bm, head, :], do_s)
                     for j in T.Parallel(bm):
-                        m_s[j] = M[head, start + qb * bm + j]
-                        l_s[j] = L[head, start + qb * bm + j]
-                        d_s[j] = Delta[head, start + qb * bm + j]
+                        row = qb * bm + j < seqlen
+                        m_s[j] = T.if_then_else(row, M[head, q0 + j], 0)
+                        l_s[j] = T.if_then_else(row, L[head, q0 + j], 0)
+                        d_s[j] = T.if_then_else(row, Delta[head, q0 + j], 0)
                     T.clear(p_t)
                     T.gemm(
                         k_s, q_s, p_t, transpose_B=True, policy=T.GemmWarpPolicy.FullRow
@@ -300,9 +307,10 @@ def dq(
                 T.copy(Q[q0 : q0 + bm, head, :], q_s)
                 T.copy(dO[q0 : q0 + bm, head, :], do_s)
                 for i in T.Parallel(bm):
-                    m_f[i] = M[head, start + qb * bm + i]
-                    l_f[i] = L[head, start + qb * bm + i]
-                    d_f[i] = Delta[head, start + qb * bm + i]
+                    row = qb * bm + i < seqlen
+                    m_f[i] = T.if_then_else(row, M[head, q0 + i], 0)
+                    l_f[i] = T.if_then_else(row, L[head, q0 + i], 0)
+                    d_f[i] = T.if_then_else(row, Delta[head, q0 + i], 0)
                 T.clear(acc)
                 for kb in T.serial(T.ceildiv(seqlen, bn)):
                     k0 = start + kb * bn

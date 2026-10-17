@@ -1,6 +1,7 @@
 """Triton token MSE: sum over tokens of weight[seg] * mask * mean_c((pred - target)^2).
 
-Forward writes one fp32 partial per program, summed afterwards (deterministic). The
+Forward computes in double-float (fp32 pairs) and writes one pair partial per program,
+pair-summed afterwards (deterministic) and rounded once. The
 backward writes d_pred (and d_target = -d_pred when asked); `weight` and `mask` are
 data, not trained, and get no gradient.
 """
@@ -12,6 +13,14 @@ from torch import Tensor
 from torch.library import triton_op
 
 from kohakumoss_kernels.backends.compile.race import raced, shape_key
+from kohakumoss_kernels.backends.triton._blockops import (
+    df_div,
+    df_mul,
+    df_sum,
+    total,
+    two_prod,
+    two_sum,
+)
 from kohakumoss_kernels.backends.triton._common import Launcher, cdiv
 from kohakumoss_kernels.constraints import requires
 from kohakumoss_kernels.registry import register
@@ -42,15 +51,21 @@ def _fwd_kernel(
     rok = rows < N
     mask = rok[:, None] & (cols < C)[None, :]
     offs = rows.to(tl.int64)[:, None] * C + cols[None, :]
-    d = tl.load(p_ptr + offs, mask=mask, other=0.0).to(tl.float32) - tl.load(
-        t_ptr + offs, mask=mask, other=0.0
-    ).to(tl.float32)
-    err = tl.div_rn(tl.sum(d * d, axis=1), C * 1.0)
+    p = tl.load(p_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    t = tl.load(t_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    dh, dl = two_sum(p, -t)
+    sh, sl = df_mul(dh, dl, dh, dl)
+    eh, el = df_sum(sh, sl, 1)
+    eh, el = df_div(eh, el, C * 1.0)
     s = tl.load(seg_ptr + rows, mask=rok, other=0)
     w = tl.load(w_ptr + s, mask=rok, other=0.0).to(tl.float32)
+    wl = 0.0 * w
     if HAS_MASK:
-        w = w * tl.load(m_ptr + rows, mask=rok, other=0.0).to(tl.float32)
-    tl.store(part_ptr + pid, tl.sum(err * w, axis=0))
+        w, wl = two_prod(w, tl.load(m_ptr + rows, mask=rok, other=0.0).to(tl.float32))
+    eh, el = df_mul(eh, el, w, wl)
+    eh, el = df_sum(eh, el, 0)
+    tl.store(part_ptr + pid * 2, eh)
+    tl.store(part_ptr + pid * 2 + 1, el)
 
 
 @triton.jit
@@ -93,22 +108,22 @@ _fwd = Launcher(_fwd_kernel)
 _bwd = Launcher(_bwd_kernel)
 
 
-@triton_op("kohakumoss::f6_token_mse_fwd", mutates_args=())
+@triton_op("kohakumoss::triton_token_mse_fwd", mutates_args=())
 def _fwd_op(
     pred: Tensor, target: Tensor, seg: Tensor, weight: Tensor, mask: Tensor | None
 ) -> Tensor:
     n, c = pred.shape
     progs = cdiv(n, ROWS)
-    part = torch.empty(progs, device=pred.device, dtype=torch.float32)
+    part = torch.empty(progs, 1, 2, 1, device=pred.device, dtype=torch.float32)
     _fwd[(progs,)](
         pred, target, seg, weight, mask if mask is not None else weight, part, n, c,
         HAS_MASK=mask is not None, ROWS=ROWS, BLOCK_C=triton.next_power_of_2(c),
-        num_warps=4,
+        num_warps=4, enable_fp_fusion=False,
     )  # fmt: skip
-    return part.sum()
+    return total(part).reshape(())
 
 
-@triton_op("kohakumoss::f6_token_mse_bwd", mutates_args=())
+@triton_op("kohakumoss::triton_token_mse_bwd", mutates_args=())
 def _bwd_op(
     gs: Tensor,
     pred: Tensor,
@@ -148,14 +163,15 @@ _fwd_op.register_autograd(_backward, setup_context=_setup)
 def token_mse(
     pred: Tensor, target: Tensor, seg: Tensor, weight: Tensor, mask: Tensor | None
 ) -> Tensor:
-    """fp32 sum over tokens of weight[seg] * mask * mean_c((pred - target)^2)."""
+    """fp32 sum over tokens of weight[seg] * mask * mean_c((pred - target)^2); the 1-D
+    weight / mask / seg are read densely (a strided one is copied)."""
     c = pred.shape[-1]
     return _fwd_op(
         pred.reshape(-1, c).contiguous(),
         target.reshape(-1, c).contiguous(),
-        seg,
-        weight,
-        mask,
+        seg.contiguous(),
+        weight.contiguous(),
+        None if mask is None else mask.reshape(-1).contiguous(),
     )
 
 
