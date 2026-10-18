@@ -320,8 +320,11 @@ class MossPipeline:
         step_callback: Callable[[int, Tensor], None] | None = None,
         progress: bool = True,
     ) -> GenerateResult:
-        """One image per prompt; sample i depends only on its prompt, size and seed.
-        `progress` shows tqdm bars (sampler steps per batch, decode) at INFO level."""
+        """One image per prompt. Sample i's noise and conditioning depend only on its
+        prompt, size and seed (no other sample's content reaches it, its slot does
+        not matter); bitwise it also depends on the batch's shapes, which set the
+        kernels' problem shapes. `progress` shows tqdm bars (sampler steps per batch,
+        decode) at INFO level."""
         start = time.perf_counter()
         te = self.place.text_encoder
         if te is not None and hasattr(te, "progress"):

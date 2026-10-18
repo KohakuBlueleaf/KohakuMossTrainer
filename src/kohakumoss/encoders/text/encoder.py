@@ -39,6 +39,7 @@ from kohakumoss.offload.encoders.text_memory import choose_text_memory, text_siz
 from kohakumoss.quant.stored_text import load_stored_text, read_text_record
 from kohakumoss.types.plans import TextEncoderPlan
 from kohakumoss_common.calls import nothing
+from kohakumoss_kernels.hardware.current import synchronize
 
 ENCODER_ID = "qwen3.5-9b"
 
@@ -191,11 +192,20 @@ class QwenTextEncoder:
 
     @torch.no_grad()
     def _encode(self, prompts: Sequence[str]) -> list[Tensor]:
+        """The prompts' embeddings; the process's first encode also encodes the empty
+        prompt, in a pass of its own, so the prompts' packs are the same on every
+        call."""
+        if self._empty is None:
+            self._empty = self._pass([""])[0]
+        out = self._pass(list(prompts)) if prompts else []
+        self.stats["prompts"] += len(prompts)
+        if self.plan.free_after_use:
+            self.release()
+        return out
+
+    def _pass(self, texts: list[str]) -> list[Tensor]:
+        """One text-encoder pass over `texts` (packed, placed, synchronised)."""
         start = time.perf_counter()
-        want_empty = self._empty is None
-        texts = list(prompts) + ([""] if want_empty else [])
-        if not texts:
-            return []
         rows = self.token_ids(texts)
         lengths = [len(r) for r in rows]
         groups = plan_groups(lengths, self.batch, self.plan.max_tokens, self.padded)
@@ -224,18 +234,12 @@ class QwenTextEncoder:
         finally:
             self.placement.end()
         self.after_pass()
-        if want_empty:
-            self._empty = out.pop()
         for dev in {self.device, self.output_device}:
-            if dev.type in ("cuda", "xpu"):
-                torch.accelerator.synchronize(dev)
+            synchronize(dev)
         self.stats["passes"] += 1
-        self.stats["prompts"] += len(prompts)
         self.stats["tokens"] += sum(lengths)
         self.stats["seconds"] += time.perf_counter() - start
         self.stats["h2d_bytes"] = self.placement.h2d_bytes
-        if self.plan.free_after_use:
-            self.release()
         return out
 
     def release(self) -> None:
