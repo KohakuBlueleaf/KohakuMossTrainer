@@ -1,12 +1,30 @@
-"""fp8 test references: the exact fp64 value of a quantized operand, and a weight-only
-binding of fp8-compute bases (the reference output of an fp8-compute model: its
-quantized weights, unquantized activations)."""
+"""fp8 test references: the exact fp64 value of a quantized operand, the scale-tensor
+size of a recipe, and a weight-only binding of fp8-compute bases (the reference output
+of an fp8-compute model: its quantized weights, unquantized activations)."""
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
 from kohakumoss.quant.compute import ComputeWeight
+from kohakumoss_kernels.fp8.formats import BLOCK, MX_BLOCK, RECIPES
+from kohakumoss_kernels.tuning.buckets import cdiv
+
+
+def scale_numel(recipe: str, rows: int, k: int, role: str = "act") -> int:
+    """Elements of the scale tensor of a [rows, K] operand."""
+    match recipe, role:
+        case "tensor", _:
+            return 1
+        case "row", _:
+            return rows
+        case "block", "act":
+            return rows * (k // BLOCK)
+        case "block", _:
+            return cdiv(rows, BLOCK) * (k // BLOCK)
+        case "mx", _:
+            return rows * (k // MX_BLOCK)
+    raise ValueError(f"fp8 recipe {recipe!r} not in {RECIPES}")
 
 
 def deq64(q: Tensor, s: Tensor, recipe: str) -> Tensor:

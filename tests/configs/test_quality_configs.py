@@ -39,7 +39,7 @@ def test_run_settings(name):
     k = knobs(name)
     assert (k["STEPS"], k["SAVE_EVERY"], k["KEEP_LAST"], k["SEED"]) == (400, 100, 0, 0)
     assert (k["LATENT_CACHE"], k["TEXT_CACHE"]) == ("offline", "online")
-    assert k["TEXT_ENCODE"]["memory"] == "stream" and k["MEMORY_PROFILE"] == "auto"
+    assert k["TEXT_ENCODE"]["memory"] == "ring" and k["MEMORY_PROFILE"] == "auto"
     assert k["OPTIMIZER"] == "adamw" and k["PRECISION"] == "bf16"
     for prec in ({}, FP16):
         assert blocking(problems(TRAIN, {**k, **prec})) == []

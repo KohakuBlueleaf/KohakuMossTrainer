@@ -1,5 +1,5 @@
 """GPU AdamW for streamed (`swap`) blocks, stepped per block inside backward of the
-last micro-batch; states streamed or resident. See docs/internals/offload.md."""
+last micro-batch; states streamed or on the device. See docs/internals/offload.md."""
 
 import torch
 from torch import Tensor
@@ -12,12 +12,12 @@ STATE_SLOTS = 3
 
 
 def slot_bytes(
-    block_numel: int, weight_bytes: int, resident: bool, slots: int = STATE_SLOTS
+    block_numel: int, weight_bytes: int, device_states: bool, slots: int = STATE_SLOTS
 ) -> int:
     """Device bytes of StreamedAdamW's slot ring for blocks of `block_numel` streamed
     parameters: per slot an fp32 gradient and the streaming-dtype weight, plus fp32
     master / m / v rows for streamed states."""
-    fp32_rows = 1 if resident else 4
+    fp32_rows = 1 if device_states else 4
     return max(2, slots) * block_numel * (4 * fp32_rows + weight_bytes)
 
 
@@ -35,58 +35,60 @@ class StreamedAdamW:
     """Per-block GPU AdamW over a trainable WeightStream. `groups`: torch-style groups
     over the stream's masters. `reduce(flat, block)` runs on each block's fp32 gradient
     sums before the transform (DDP: in-place SUM on the update stream, to the block's
-    owner). Streamed states: only the owner (`stream.mine`) holds a block's moments and
-    steps it; resident states: every rank steps every block, the owner writes the host
-    master and streaming copy. `transform(g) -> found_inf | None` runs on each summed
-    gradient before its update (unscale / clip; a nonzero found_inf skips it). Device
-    bytes per block parameter: `state_slots` x (fp32 gradient + streaming weight), plus
-    3 fp32 rows (master, m, v) per slot for streamed states (`slot_bytes`)."""
+    owner). Streamed states: only the owner (`weight_stream.mine`) holds a block's
+    moments and steps it; device states: every rank steps every block, the owner
+    writes the host master and streaming copy. `transform(g) -> found_inf | None` runs
+    on each summed gradient before its update (unscale / clip; a nonzero found_inf
+    skips it). Device bytes per block parameter: `state_slots` x (fp32 gradient +
+    streaming weight), plus 3 fp32 rows (master, m, v) per slot for streamed states
+    (`slot_bytes`)."""
 
     handles_decay_to_one = True
 
     def __init__(
         self,
-        stream: WeightStream,
+        weight_stream: WeightStream,
         lr: float = 1e-4,
         betas=(0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.01,
-        resident: bool = False,
+        device_states: bool = False,
         state_slots: int = STATE_SLOTS,
         groups: list[dict] | None = None,
     ):
-        if not stream.trainable:
+        ws = weight_stream
+        if not ws.trainable:
             raise ValueError("StreamedAdamW needs a trainable (swap) WeightStream")
-        self.stream = stream
-        self.device = stream.device
-        self.cuda = stream.cuda
-        self.dm = stream.dm
-        self.resident = resident
-        self.params = list(stream.params.values())
+        self.weight_stream = ws
+        self.device = ws.device
+        self.streamed = ws.streamed
+        self.dm = ws.dm
+        self.device_states = device_states
+        self.params = list(ws.params.values())
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         self.param_groups = make_groups(
             groups if groups is not None else self.params, defaults
         )
         by_id = {id(p): g for g in self.param_groups for p in g["params"]}
-        missing = [k for k, p in stream.params.items() if id(p) not in by_id]
+        missing = [k for k, p in ws.params.items() if id(p) not in by_id]
         if missing:
             raise ValueError(f"streamed parameters in no group: {missing[:4]}")
-        self.group_of = {k: by_id[id(p)] for k, p in stream.params.items()}
-        self.keys: list[list[tuple[int, str]]] = [[] for _ in range(stream.n)]
-        for key in stream.params:
+        self.group_of = {k: by_id[id(p)] for k, p in ws.params.items()}
+        self.keys: list[list[tuple[int, str]]] = [[] for _ in range(ws.n)]
+        for key in ws.params:
             self.keys[key[0]].append(key)
-        pin = stream.pinned
+        pin = ws.pinned
         self.transform = nothing
         self.steps = {
             key: torch.zeros((), dtype=torch.float32, device=self.device)
-            for key in stream.params
+            for key in ws.params
         }
         self.moments: dict[tuple[int, str], tuple[Tensor, Tensor]] = {}
         self.dev_state: dict[tuple[int, str], tuple[Tensor, Tensor, Tensor]] = {}
-        self.state_keys = [k for k in stream.params if resident or stream.mine(k[0])]
+        self.state_keys = [k for k in ws.params if device_states or ws.mine(k[0])]
         for key in self.state_keys:
-            master = stream.params[key]
-            if resident:
+            master = ws.params[key]
+            if device_states:
                 m = master.detach().to(self.device)
                 self.dev_state[key] = (m, torch.zeros_like(m), torch.zeros_like(m))
             else:
@@ -95,15 +97,15 @@ class StreamedAdamW:
                     for _ in range(2)
                 )
         names = [name for _, name in self.keys[0]] if self.keys else []
-        shapes = {name: stream.layout[name][0] for name in names}
+        shapes = {name: ws.layout[name][0] for name in names}
         self.n_slots = max(2, state_slots)
-        # rows: master, m, v (streamed states only; resident states live in dev_state)
+        # rows: master, m, v (streamed states only; device states live in dev_state)
         self.slots = [
             {
                 name: torch.empty((3, *shape), dtype=torch.float32, device=self.device)
                 for name, shape in shapes.items()
             }
-            for _ in range(0 if resident else self.n_slots)
+            for _ in range(0 if device_states else self.n_slots)
         ]
         # the block's fp32 gradient sums, one flat buffer per slot (`reduce` sums it)
         total = sum(shape.numel() for shape in shapes.values())
@@ -116,9 +118,7 @@ class StreamedAdamW:
         # the updated weight in the streaming dtype, written back to the host copy
         self.weight_slots = [
             {
-                name: torch.empty(
-                    shape, dtype=stream.layout[name][1], device=self.device
-                )
+                name: torch.empty(shape, dtype=ws.layout[name][1], device=self.device)
                 for name, shape in shapes.items()
             }
             for _ in range(self.n_slots)
@@ -128,7 +128,7 @@ class StreamedAdamW:
         self.has_acc: dict[int, dict[str, bool]] = {}
         self.pending: dict[int, dict[str, Tensor]] = {}
         self.stats = {"bytes_h2d": 0, "bytes_d2h": 0}
-        if self.cuda:
+        if self.streamed:
             cur = self.dm.current_stream(self.device)
             self.h2d = self.dm.Stream(self.device)
             self.d2h = self.dm.Stream(self.device)
@@ -137,23 +137,23 @@ class StreamedAdamW:
             self.free = [self.dm.Event() for _ in range(self.n_slots)]
             for ev in self.free:
                 ev.record(cur)
-        self._load = self._load_resident if resident else self._load_streamed
-        self._apply = self._apply_resident if resident else self._apply_streamed
-        stream.optimizer = self
+        self._load = self._load_device if device_states else self._load_streamed
+        self._apply = self._apply_device if device_states else self._apply_streamed
+        ws.optimizer = self
 
     def start(self, last: bool) -> None:
         """Last micro-batch: step blocks in backward; else accumulate grads on host."""
         if last:
-            self.stream.on_grad = self._on_grad
-            self.stream.on_block_backward = self._prefetch
+            self.weight_stream.on_grad = self._on_grad
+            self.weight_stream.on_block_backward = self._prefetch
         else:
-            self.stream.on_grad = self.stream.accumulate
-            self.stream.on_block_backward = nothing
+            self.weight_stream.on_grad = self.weight_stream.accumulate
+            self.weight_stream.on_block_backward = nothing
 
     def _prefetch(self, index: int) -> None:
         keys = self.keys[index]
-        self.stream.land_block(index, keys)
-        filled = self.stream.grad_filled
+        self.weight_stream.land_block(index, keys)
+        filled = self.weight_stream.grad_filled
         self.has_acc[index] = {name: filled.get((i, name), False) for i, name in keys}
         self.pending[index] = {}
         self._load(index)
@@ -172,13 +172,13 @@ class StreamedAdamW:
         self.slot_of[index] = slot
         return slot
 
-    def _load_resident(self, index: int) -> None:
+    def _load_device(self, index: int) -> None:
         slot = self._take_slot(index)
         if any(self.has_acc[index].values()):
             self._copy_in(index, slot, acc_only=True)
 
     def _load_streamed(self, index: int) -> None:
-        acc_only = not self.stream.mine(index)
+        acc_only = not self.weight_stream.mine(index)
         self._copy_in(index, self._take_slot(index), acc_only=acc_only)
 
     def _copy_in(self, index: int, slot: int, acc_only: bool) -> None:
@@ -186,7 +186,7 @@ class StreamedAdamW:
         acc = self.has_acc[index]
         for key in self.keys[index]:
             name = key[1]
-            master = self.stream.params[key]
+            master = self.weight_stream.params[key]
             if not acc_only:
                 bufs = self.slots[slot]
                 m, v = self.moments[key]
@@ -196,13 +196,15 @@ class StreamedAdamW:
                     (bufs[name][2], v),
                 ]
             if acc[name]:
-                copies.append((self.grad_views[slot][name], self.stream.host_grad[key]))
-        if not self.cuda:
+                copies.append(
+                    (self.grad_views[slot][name], self.weight_stream.host_grad[key])
+                )
+        if not self.streamed:
             for dst, src in copies:
                 dst.copy_(src)
             return
         self.h2d.wait_event(self.free[slot])
-        self.h2d.wait_event(self.stream.host_ready[index])
+        self.h2d.wait_event(self.weight_stream.host_ready[index])
         with self.dm.stream(self.h2d):
             for dst, src in copies:
                 dst.copy_(src, non_blocking=True)
@@ -226,7 +228,7 @@ class StreamedAdamW:
             else:
                 views[name].copy_(grads[name])
         self.reduce(self.grad_flat[slot], index)
-        if not (self.resident or self.stream.mine(index)):
+        if not (self.device_states or self.weight_stream.mine(index)):
             return []
         outs = []
         for key in self.keys[index]:
@@ -244,7 +246,7 @@ class StreamedAdamW:
         slot = self.slot_of.pop(index)
         acc = self.has_acc.pop(index)
         grads = self.pending.pop(index)
-        if not self.cuda:
+        if not self.streamed:
             self._write_back(index, slot, self._update(index, slot, acc, grads))
             return
         self.opt.wait_stream(self.dm.current_stream(self.device))
@@ -263,27 +265,27 @@ class StreamedAdamW:
         weight.copy_(master)
         host_m, host_v = self.moments[key]
         pairs = [
-            (self.stream.params[key].data, master),
+            (self.weight_stream.params[key].data, master),
             (host_m, m),
             (host_v, v),
-            (self.stream.host[key[0]][key[1]], weight),
+            (self.weight_stream.host[key[0]][key[1]], weight),
         ]
         return pairs, weight
 
-    def _apply_resident(self, key, slot, g, step, group, found, weight):
+    def _apply_device(self, key, slot, g, step, group, found, weight):
         master, m, v = self.dev_state[key]
         fused_adamw(master, g, m, v, step, group, found)
-        if not self.stream.mine(key[0]):
+        if not self.weight_stream.mine(key[0]):
             return [], weight
         weight.copy_(master)
         pairs = [
-            (self.stream.params[key].data, master),
-            (self.stream.host[key[0]][key[1]], weight),
+            (self.weight_stream.params[key].data, master),
+            (self.weight_stream.host[key[0]][key[1]], weight),
         ]
         return pairs, weight
 
     def _write_back(self, index: int, slot: int, outs) -> None:
-        if not self.cuda:
+        if not self.streamed:
             for pairs, _ in outs:
                 for dst, src in pairs:
                     dst.copy_(src)
@@ -295,32 +297,34 @@ class StreamedAdamW:
                     dst.copy_(src, non_blocking=True)
                     self.stats["bytes_d2h"] += src.nbytes
         self.free[slot].record(self.d2h)
-        self.stream.host_ready[index].record(self.d2h)
+        self.weight_stream.host_ready[index].record(self.d2h)
 
     def finish(self) -> None:
-        """After the last micro-batch's backward: drop resident block copies so the next
-        forward reloads the updated weights, and clear the consumed host grad sums;
-        raises when a block loaded for its step was never stepped."""
+        """After the last micro-batch's backward: the compute stream waits for the block
+        updates and the host for the state copies; the step's host gradient sums end
+        (`WeightStream.zero_grads`) and the ring forgets every slot, so the next forward
+        reloads the updated weights; raises when a block loaded for its step was never
+        stepped."""
         if self.slot_of:
             raise RuntimeError(
                 f"StreamedAdamW: blocks {sorted(self.slot_of)} were loaded in backward "
                 "but never stepped (a gradient of theirs did not arrive)"
             )
-        if self.cuda:
+        if self.streamed:
             self.dm.current_stream(self.device).wait_stream(self.opt)
             self.h2d.synchronize()
-        self.stream.zero_grads()
-        self.stream.ring.forget()
+        self.weight_stream.zero_grads()
+        self.weight_stream.ring.forget()
 
     def synchronize(self) -> None:
         """Wait until every write-back has landed in host memory."""
-        if self.cuda:
+        if self.streamed:
             self.d2h.synchronize()
 
     def masters(self) -> dict[tuple[int, str], Tensor]:
         """Current fp32 masters (the host parameters)."""
         self.synchronize()
-        return {k: p.detach() for k, p in self.stream.params.items()}
+        return {k: p.detach() for k, p in self.weight_stream.params.items()}
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         return None
@@ -331,23 +335,27 @@ class StreamedAdamW:
         self.synchronize()
         out = {}
         for key in self.state_keys:
-            m, v = self.dev_state[key][1:] if self.resident else self.moments[key]
+            m, v = self.dev_state[key][1:] if self.device_states else self.moments[key]
             out[f"{key[0]}:{key[1]}"] = (m, v, self.steps[key].clone())
         return out
 
     def load_state_dict(self, state: dict) -> None:
         """Restore moments / steps; masters come from the parameters (re-pushed to the
-        resident copies and the streaming weights)."""
+        device-state copies and the streaming weights)."""
         for key in self.state_keys:
-            master = self.stream.params[key]
+            master = self.weight_stream.params[key]
             m, v, step = state[f"{key[0]}:{key[1]}"]
-            dst = self.dev_state[key] if self.resident else (None, *self.moments[key])
+            dst = (
+                self.dev_state[key]
+                if self.device_states
+                else (None, *self.moments[key])
+            )
             dst[1].copy_(m)
             dst[2].copy_(v)
             self.steps[key].fill_(float(step))
-            if self.resident:
+            if self.device_states:
                 dst[0].copy_(master.data)
-        self.stream.refresh()
+        self.weight_stream.refresh()
 
 
 __all__ = ["StreamedAdamW"]

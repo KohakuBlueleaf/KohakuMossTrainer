@@ -6,6 +6,8 @@ from functools import partial
 import torch
 from torch import Tensor
 
+from kohakumoss_common.calls import identity
+
 
 @dataclass(frozen=True)
 class BlockConfig:
@@ -45,10 +47,6 @@ class StreamConfig:
 
 def _at(values: tuple[float, ...], i: int) -> float:
     return values[i] if values else 1.0
-
-
-def identity(x: Tensor) -> Tensor:
-    return x
 
 
 def _cast(dtype: torch.dtype, x: Tensor) -> Tensor:

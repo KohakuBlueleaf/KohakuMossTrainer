@@ -28,17 +28,17 @@ def _blocks() -> list[nn.Module]:
 def per_block(stream: WeightStream) -> None:
     """The broken variant: a fresh flat buffer for every block of every step."""
     reducer = stream.reducer
-    flush = reducer.flush_block
+    reduce_block = reducer.reduce_block
 
     def fresh(index: int, grads: dict) -> None:
         reducer.flat = torch.empty_like(reducer.flat)
-        flush(index, grads)
+        reduce_block(index, grads)
 
-    reducer.flush_block = fresh
+    reducer.reduce_block = fresh
 
 
 def check_one_buffer(broken=None, steps: int = 2) -> None:
-    stream = WeightStream(_blocks(), "cpu", resident=2, pinned=False, trainable=True)
+    stream = WeightStream(_blocks(), "cpu", slots=2, pinned=False, trainable=True)
     if broken is not None:
         broken(stream)
     seen = []

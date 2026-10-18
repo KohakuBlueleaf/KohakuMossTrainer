@@ -1,4 +1,4 @@
-"""Precision layer for scripts/train/moss.py: fp16 compute for GPUs without bf16 (V100,
+"""Precision layer for scripts/train/moss.py: fp16 compute for fp16-only GPUs (V100,
 2080 Ti) with the online residual-stream fix (c = 1/16). See docs/guides/configs.md and
 docs/concepts/numerics.md."""
 

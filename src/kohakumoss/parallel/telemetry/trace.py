@@ -13,13 +13,10 @@ from torch.profiler import ProfilerActivity, profile
 
 from kohakumoss.logging.log import get_logger, hl
 from kohakumoss.parallel.telemetry.timeline import breakdown
+from kohakumoss_common.calls import nothing
+from kohakumoss_kernels.hardware.current import synchronize
 
 log = get_logger(__name__)
-
-
-def _sync(device: torch.device) -> None:
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
 
 
 class StepTrace:
@@ -55,19 +52,19 @@ class StepTrace:
             activities.append(ProfilerActivity.CUDA)
         self.prof = profile(activities=activities, record_shapes=False)
         for device in (self.device, *self.extra):
-            _sync(device)
+            synchronize(device)
         self.prof.start()
         self.t0 = time.perf_counter()
 
     def _close(self) -> dict:
         for device in (self.device, *self.extra):
-            _sync(device)
+            synchronize(device)
         wall_us = (time.perf_counter() - self.t0) * 1e6
         self.prof.stop()
         self.root.mkdir(parents=True, exist_ok=True)
         path = self.root / f"trace.rank{self.rank}.json.gz"
         self.prof.export_chrome_trace(str(path))
-        getattr(self.prof, "wait_for_exports", _nothing)()
+        getattr(self.prof, "wait_for_exports", nothing)()
         with gzip.open(path, "rt", encoding="utf-8") as f:
             events = json.load(f).get("traceEvents", [])
         steps = self.last - self.first
@@ -98,10 +95,10 @@ class ProfilerWindow:
 
     def on_step_end(self, state, out) -> None:
         if state.step == self.first:
-            _sync(self.device)
+            synchronize(self.device)
             torch.cuda.profiler.start()
         elif state.step == self.last:
-            _sync(self.device)
+            synchronize(self.device)
             torch.cuda.profiler.stop()
             self.on_step_end = _done
 
@@ -111,8 +108,4 @@ def _index(device: torch.device) -> int:
 
 
 def _done(state, out) -> None:
-    return None
-
-
-def _nothing() -> None:
     return None

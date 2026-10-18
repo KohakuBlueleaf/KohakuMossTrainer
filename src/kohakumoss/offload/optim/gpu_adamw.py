@@ -11,7 +11,7 @@ from kohakumoss.offload.accel import module, streamed
 RING_SLOTS = 3
 
 
-def ring_bytes(largest: int) -> int:
+def state_ring_bytes(largest: int) -> int:
     """Device bytes of HostStateAdamW's state ring: RING_SLOTS slots of 4 fp32 rows
     (master, m, v, gradient) of the largest parameter."""
     return RING_SLOTS * 4 * 4 * largest
@@ -143,11 +143,11 @@ class HostStateAdamW(_GroupsMixin):
         self.host: dict[int, tuple] = {}
         largest = max((p.numel() for p in self.params), default=0)
         self.device = self.params[0].device if self.params else torch.device("cpu")
-        cuda = streamed(self.device)
-        self.cuda = cuda
+        side = streamed(self.device)
+        self.streamed = side
         self.dm = module(self.device)
-        pin = pinned and cuda
-        step_device = self.device if cuda else torch.device("cpu")
+        pin = pinned and side
+        step_device = self.device if side else torch.device("cpu")
         self.steps = {
             id(p): torch.zeros((), dtype=torch.float32, device=step_device)
             for p in self.params
@@ -169,7 +169,7 @@ class HostStateAdamW(_GroupsMixin):
         self.after = {id(a): b for a, b in zip(order, order[1:])}
         self.last: Tensor | None = None
         self.stats = {"bytes_h2d": 0, "bytes_d2h": 0}
-        if cuda:
+        if side:
             self.h2d = self.dm.Stream(self.device)
             self.d2h = self.dm.Stream(self.device)
             self.opt = self.dm.Stream(self.device)
@@ -252,7 +252,7 @@ class HostStateAdamW(_GroupsMixin):
 
     def finish(self) -> None:
         """The compute stream waits for every in-flight update (before the next forward)."""
-        if self.cuda:
+        if self.streamed:
             self.dm.current_stream(self.device).wait_stream(self.opt)
         self.loaded.clear()
         self.last = None
@@ -274,7 +274,7 @@ class HostStateAdamW(_GroupsMixin):
 
     def synchronize(self) -> None:
         """Wait until every state write-back has landed on the host."""
-        if self.cuda:
+        if self.streamed:
             self.d2h.synchronize()
 
     def state_dict(self) -> dict:

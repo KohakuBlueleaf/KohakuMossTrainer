@@ -9,8 +9,8 @@ import torch
 @dataclass(frozen=True)
 class DeviceStreams:
     """`device`, its device module `dm` (torch.cuda / torch.xpu / the host stand-in) and
-    `cuda`: side streams and events exist there (CUDA / XPU)."""
+    `streamed`: side streams and events exist there (CUDA / XPU, `accel.streamed`)."""
 
     device: torch.device
     dm: object
-    cuda: bool
+    streamed: bool

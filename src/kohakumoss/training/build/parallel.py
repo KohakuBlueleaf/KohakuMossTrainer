@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from kohakumoss.diffusion.objective import all_reduce_sum, identity_reduce
+from kohakumoss.diffusion.objective import all_reduce_sum
 from kohakumoss.parallel.ddp import (
     AsyncReducer,
     GradReducer,
@@ -23,18 +23,18 @@ from kohakumoss.training.optim.bundle.base import (
     all_reduce_max,
     all_reduce_norm,
     local_grad_norm,
-    no_agree,
 )
+from kohakumoss_common.calls import identity
 
 
 @dataclass
 class ParallelHooks:
     """What the loop needs from the parallel layout (single-device defaults)."""
 
-    reduce: Callable = identity_reduce
+    reduce: Callable = identity
     world_factor: int = 1
-    agree: Callable = no_agree
-    reduce_loss: Callable = no_agree
+    agree: Callable = identity
+    reduce_loss: Callable = identity
     grad_norm: Callable = local_grad_norm
     accumulate: Callable = no_accumulate
     before: Callable = lambda: None

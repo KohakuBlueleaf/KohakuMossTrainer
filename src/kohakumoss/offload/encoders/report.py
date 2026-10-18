@@ -6,15 +6,8 @@ import torch
 from torch import nn
 
 from kohakumoss.logging.log import hl
+from kohakumoss.offload.weights.layers import module_bytes
 from kohakumoss_common.units import GIB
-
-
-def module_bytes(module) -> int:
-    """Parameter + buffer bytes of a module (0 for None or a non-module)."""
-    if not isinstance(module, torch.nn.Module):
-        return 0
-    tensors = [*module.parameters(), *module.buffers()]
-    return sum(t.nbytes for t in tensors)
 
 
 def split_bytes(module: nn.Module | None, device="cuda") -> tuple[int, int]:
@@ -36,7 +29,8 @@ def split_bytes(module: nn.Module | None, device="cuda") -> tuple[int, int]:
     return on, host
 
 
-def gib(n: int | float) -> str:
+def gib_text(n: int | float) -> str:
+    """`n` bytes as "x.xx GiB"."""
     return f"{n / GIB:.2f} GiB"
 
 
@@ -51,23 +45,23 @@ def te_line(te, path, device) -> tuple[str, dict]:
     precision = f"precision {te.plan.precision}, {te.plan.dtype}"
     match name:
         case "resident":
-            where = f"resident on {dev} ({hl(gib(res))}; {precision})"
+            where = f"resident on {dev} ({hl(gib_text(res))}; {precision})"
         case "cpu":
             where = (
-                f"cpu (weights in host RAM, {hl(gib(host))}; runs on the host; "
+                f"cpu (weights in host RAM, {hl(gib_text(host))}; runs on the host; "
                 f"{precision})"
             )
         case "offload":
             where = (
-                f"offload (weights in host RAM{pinned}, {hl(gib(host))}; whole model "
-                f"moved to {dev} per pass, ~{hl(gib(run))}; {precision})"
+                f"offload (weights in host RAM{pinned}, {hl(gib_text(host))}; whole model "
+                f"moved to {dev} per pass, ~{hl(gib_text(run))}; {precision})"
             )
         case _:
-            ring = getattr(placement, "resident", 0)
+            ring = getattr(placement, "slots", 0)
             where = (
-                f"{name} (weights in host RAM{pinned}, {hl(gib(host))}; ring of "
-                f"{hl(ring)} layers on {dev}, ~{hl(gib(run - res))}, "
-                f"{hl(gib(res))} resident; {precision})"
+                f"{name} (weights in host RAM{pinned}, {hl(gib_text(host))}; ring of "
+                f"{hl(ring)} layers on {dev}, ~{hl(gib_text(run - res))}, "
+                f"{hl(gib_text(res))} resident; {precision})"
             )
     if te.plan.free_after_use:
         where += "; freed after the first encode"
@@ -86,16 +80,18 @@ def vae_line(vae, path, placement: str, device) -> tuple[str, dict]:
     size = module_bytes(getattr(vae, "vae", vae))
     match placement:
         case "offload":
-            where = f"offload (host RAM, moved to {device} per pass, {hl(gib(size))})"
+            where = (
+                f"offload (host RAM, moved to {device} per pass, {hl(gib_text(size))})"
+            )
         case "stream":
             where = (
-                f"stream (host RAM, {hl(gib(size))}; encoder / decoder blocks through "
+                f"stream (host RAM, {hl(gib_text(size))}; encoder / decoder blocks through "
                 f"a 2-layer ring on {device}, the rest moved per pass)"
             )
         case "cpu":
-            where = f"cpu (host RAM, {hl(gib(size))}; runs on the host)"
+            where = f"cpu (host RAM, {hl(gib_text(size))}; runs on the host)"
         case _:
-            where = f"resident on {device} ({hl(gib(size))})"
+            where = f"resident on {device} ({hl(gib_text(size))})"
     return f"VAE: {hl(path, 'path')} -> {where}", {"gib": round(size / GIB, 2)}
 
 

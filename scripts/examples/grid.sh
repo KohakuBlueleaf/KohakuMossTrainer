@@ -26,7 +26,7 @@ options (defaults in brackets; see grid.ps1 for each one's meaning):
   --size HxW [1024x1024]   --steps N [30]   --cfg X [3.0]   --seed N [0]
   --precision bf16|fp16 [bf16]   --fp16-fix online|fp32_residual|none [online]
   --base-precision compute|int8|fp8|fp8_compute|mxfp8 [compute]   --fp8-recipe row|tensor|block [row]
-  --memory auto|PROFILE|"" [auto; "" = whole DiT resident]   --text-memory auto|resident|offload|stream|cpu [auto]
+  --memory auto|PROFILE|"" [auto; "" = whole DiT resident]   --text-memory auto|resident|offload|ring|cpu [auto]
   --text-precision compute|int8|fp8|fp8_compute|mxfp8 [compute]   --free-text-encoder
   --vae-memory auto|resident|offload|stream|cpu [auto]   --vae-dtype auto|bf16|fp16|fp32 [auto]
   --batch N [4]   --tune off|table [off]   --layout prompt-cols|prompt-rows [prompt-cols]
@@ -95,7 +95,7 @@ while [ $# -gt 0 ]; do
     --base-precision) choice base-precision "$2" compute int8 fp8 fp8_compute mxfp8; base_precision=$2; shift ;;
     --fp8-recipe) choice fp8-recipe "$2" row tensor block; fp8_recipe=$2; shift ;;
     --memory) memory=$2; shift ;;
-    --text-memory) choice text-memory "$2" auto resident offload stream cpu; text_memory=$2; shift ;;
+    --text-memory) choice text-memory "$2" auto resident offload ring stream cpu; text_memory=$2; shift ;;
     --text-precision) choice text-precision "$2" compute int8 fp8 fp8_compute mxfp8; text_precision=$2; shift ;;
     --free-text-encoder) free_text=1 ;;
     --vae-memory) choice vae-memory "$2" auto resident offload stream cpu; vae_memory=$2; shift ;;

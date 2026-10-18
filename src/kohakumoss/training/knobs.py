@@ -9,7 +9,7 @@ from kohakumoss.diffusion.objective import LOSSES, WEIGHTINGS
 from kohakumoss.diffusion.timestep import TIMESTEPS
 from kohakumoss.encoders.knob_names import ENCODER_FIELDS, RENAMED_SAMPLE, SAMPLE_NAMES
 from kohakumoss.logging import LOGGERS
-from kohakumoss.memory.knob_map import mixing_problems, plan_fields
+from kohakumoss.memory.knob_map import mixing_problems, plan_fields, primary_names
 from kohakumoss.memory.profiles import KNOB_FIELDS, ORDER, PROFILES, resolve
 from kohakumoss.memory.release import release_problems
 from kohakumoss.offload.accel import default_type
@@ -120,13 +120,16 @@ def run_name(k: dict) -> str:
 
 
 def is_full(k: dict) -> bool:
-    """Full finetune: the backbone's own weights train (no LyCORIS module)."""
+    """Full finetune: the backbone's own weights train."""
     return k["ALGO"] == "full"
 
 
 def collect(g: dict) -> dict:
-    """UPPER_CASE globals of the train script (after the config was applied)."""
-    return {k: v for k, v in g.items() if k.isupper() and not k.startswith("_")}
+    """UPPER_CASE globals of the train script (after the config was applied), with
+    MEMORY_PROFILE in its primary spelling (`primary_names`)."""
+    return primary_names(
+        {k: v for k, v in g.items() if k.isupper() and not k.startswith("_")}
+    )
 
 
 def _registry_ok(name, registry) -> bool:
@@ -300,9 +303,9 @@ def _layout(k: dict):
         return None
 
 
-def step_state(k: dict) -> bool:
+def has_step_state(k: dict) -> bool:
     """The run's adapters carry per-micro-batch step state (full FT carries none)."""
-    return not is_full(k) and config_from_knobs(k).step_state
+    return not is_full(k) and config_from_knobs(k).has_step_state
 
 
 def _plans(k: dict) -> tuple[list, list[str]]:

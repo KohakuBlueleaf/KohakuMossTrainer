@@ -26,9 +26,9 @@ class GradSink:
         pinned: bool,
         stats: dict,
     ):
-        device, dm, cuda = dev.device, dev.dm, dev.cuda
+        device, dm, side = dev.device, dev.dm, dev.streamed
         self.params = params
-        self.cuda = cuda
+        self.streamed = side
         self.pinned = pinned
         self.stats = stats
         self.host_grad: dict[tuple[int, str], Tensor] = {}
@@ -38,7 +38,7 @@ class GradSink:
         for key in params:
             self.block_keys[key[0]].append(key)
         self.acc = None
-        if not cuda:
+        if not side:
             self.accumulate, self.drain, self.land_block = (
                 self._accumulate_host,
                 nothing,

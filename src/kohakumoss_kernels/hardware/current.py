@@ -24,6 +24,16 @@ def device_module(device: torch.device | str):
     return _MODULES.get(torch.device(device).type)
 
 
+def with_index(device: torch.device | str) -> torch.device:
+    """`device` with its index filled in (an accelerator's current one when unset; the
+    host as given)."""
+    device = torch.device(device)
+    mod = _MODULES.get(device.type)
+    if mod is not None and device.index is None:
+        return torch.device(device.type, mod.current_device())
+    return device
+
+
 def on_device(device: torch.device):
     """Context making `device` current; a no-op when it already is."""
     mod = _MODULES.get(device.type)

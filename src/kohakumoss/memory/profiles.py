@@ -159,7 +159,8 @@ def resolve(
     """Named profile + overrides -> concrete MemoryPlan for `device`; raises listing all
     problems. `auto` is resolved by `planner.auto_plan`, not here. With `inference`,
     activation knobs are dropped (no_grad saves nothing) and streaming needs no
-    checkpointing."""
+    checkpointing. `profile` may use the old ring spelling (`profile_name`)."""
+    profile = profile_name(profile)
     if profile not in PROFILES:
         raise ValueError(f"memory profile {profile!r} not in {tuple(PROFILES)}")
     overrides = dict(overrides or {})
@@ -203,10 +204,10 @@ CATALOG_AXES: tuple[dict[str, dict], ...] = (
     },
     {
         "resident": dict(stream="off"),
-        "stream16": dict(stream="ring", stream_resident=16),
-        "stream8": dict(stream="ring", stream_resident=8),
-        "stream4": dict(stream="ring", stream_resident=4),
-        "stream2": dict(stream="ring", stream_resident=2),
+        "ring16": dict(stream="ring", stream_resident=16),
+        "ring8": dict(stream="ring", stream_resident=8),
+        "ring4": dict(stream="ring", stream_resident=4),
+        "ring2": dict(stream="ring", stream_resident=2),
     },
     {"": dict(act_offload=False), "actoff": dict(act_offload=True)},
     {
@@ -219,10 +220,21 @@ CATALOG_AXES: tuple[dict[str, dict], ...] = (
 )
 
 
+RING_ALIASES = {f"stream{n}": f"ring{n}" for n in (16, 8, 4, 2)}
+
+
+def profile_name(name):
+    """A profile name in its primary spelling: the weight-ring parts `stream16` ..
+    `stream2` read as `ring16` .. `ring2`; any other value is returned as is."""
+    if not isinstance(name, str):
+        return name
+    return "-".join(RING_ALIASES.get(part, part) for part in name.split("-"))
+
+
 def catalog() -> dict[str, dict]:
     """Every combination of the placement axes (checkpoint x weights x activations x
     optimizer x gradients) that validates for a frozen-base run, named by its parts;
-    precision is never part of a profile. See docs/concepts/profiles.md."""
+    precision comes from the precision knobs. See docs/concepts/profiles.md."""
     out: dict[str, dict] = {}
     for combo in product(*(axis.items() for axis in CATALOG_AXES)):
         name = "-".join(part for part, _ in combo if part)
@@ -241,7 +253,7 @@ PROFILES["manual"] = {}
 
 def catalog_name(profile: str) -> str | None:
     """The catalog entry whose plan equals `profile`'s (a short name), or None."""
-    plan = replace(MemoryPlan(), **PROFILES[profile])
+    plan = replace(MemoryPlan(), **PROFILES[profile_name(profile)])
     for name, values in CATALOG.items():
         if replace(MemoryPlan(), **values) == plan:
             return name

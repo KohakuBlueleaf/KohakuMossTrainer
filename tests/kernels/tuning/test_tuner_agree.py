@@ -212,7 +212,7 @@ def test_deferred_key_skips_a_broken_config(tmp_path, monkeypatch):
     monkeypatch.setattr(tuner, "_TABLES", {})
     try:
         check_deferred_skips_a_broken_config(monkeypatch, "k_def")
-        monkeypatch.setattr(tuner, "_defer", _first_unchecked)
+        monkeypatch.setattr(tuner, "_bind_untimed", _first_unchecked)
         must_fail(
             lambda: check_deferred_skips_a_broken_config(monkeypatch, "k_def2"),
             "the broken first config bound",
@@ -237,7 +237,7 @@ def check_gathers_only_when_measured(monkeypatch) -> None:
 
 def test_agree_gathers_only_after_a_measurement(monkeypatch):
     check_gathers_only_when_measured(monkeypatch)
-    monkeypatch.setattr(tuner, "measured_anywhere", lambda count, group=None: True)
+    monkeypatch.setattr(tuner, "positive_anywhere", lambda count, group=None: True)
     must_fail(
         lambda: check_gathers_only_when_measured(monkeypatch), "a gather every step"
     )

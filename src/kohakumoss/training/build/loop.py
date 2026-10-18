@@ -5,8 +5,6 @@ from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 
-import torch.distributed as dist
-
 from kohakumoss.diffusion.objective import WEIGHTINGS, TokenNormalizer
 from kohakumoss.diffusion.timestep import TIMESTEPS
 from kohakumoss.inference.pipeline import MossPipeline
@@ -40,7 +38,7 @@ from kohakumoss.training.callbacks.kernels import (
     vram_callbacks,
 )
 from kohakumoss.training.callbacks.progress import ProgressBar
-from kohakumoss.training.callbacks.repro import StepRecorder, no_record
+from kohakumoss.training.callbacks.repro import StepRecorder
 from kohakumoss.training.callbacks.runner import MeetRanks, rank0_decision
 from kohakumoss.training.callbacks.startup import StepOneBreakdown
 from kohakumoss.training.callbacks.transfer import TransferStats, transfer_sources
@@ -63,6 +61,7 @@ from kohakumoss.training.vae import LatentAhead
 from kohakumoss_common.calls import nothing
 from kohakumoss_common.registry import build
 from kohakumoss_data import CacheWriter, DataConfig
+from kohakumoss_kernels.dist import initialized
 from kohakumoss_kernels.tuning.window import tuning_window
 
 
@@ -73,12 +72,12 @@ def build_step(
     autocast,
     device,
     sampler=None,
-    stream_rank: int = 0,
+    data_rank: int = 0,
     recorder=None,
     forward=None,
 ):
     """TrainStep with the loss, weighting, sampler and mask handling bound; its sigma /
-    noise streams are those of `stream_rank`; `recorder` (a StepRecorder) keeps each
+    noise streams are those of `data_rank`; `recorder` (a StepRecorder) keeps each
     prepared micro-batch; `forward` is the module the step calls instead of the
     backbone (the backbone under torch DDP)."""
     masked = is_masked(k)
@@ -97,7 +96,7 @@ def build_step(
         seed=k["SEED"],
         masked=masked,
         pre_forward=built.trainable.begin_step,
-        rank=stream_rank,
+        rank=data_rank,
         keep=None if recorder is None else recorder.keep,
     )
 
@@ -206,9 +205,8 @@ def build_optim(k: dict, built, device, prec, hooks, keep: set[int] | None = Non
 def build_ema_for(k: dict, built, bundle, names: set[str] | None = None, rank: int = 0):
     """EMA over the trainable set (only `names` when given: pipeline stages), each
     average on its parameter's device (host masters: host); its update first waits for
-    the bundle's in-backward block write-back (`ema_wait`). Under DDP only rank 0 keeps
-    one (every rank holds the same parameters after the reduction; rank 0 saves);
-    host averages update in the background (`BackgroundEMA`)."""
+    the bundle's in-backward block write-back (`ema_before_read`). Under DDP only rank
+    0 keeps one; host averages update in the background (`BackgroundEMA`)."""
     if k.get("PARALLEL", "none") == "ddp" and rank != 0:
         return NoEMA()
     named = list(built.trainable.named_trainable())
@@ -217,11 +215,11 @@ def build_ema_for(k: dict, built, bundle, names: set[str] | None = None, rank: i
     ema = build_ema(named, k["EMA"])
     if host_averaged(ema):
         ema = BackgroundEMA(ema)
-    ema.wait = ema_wait(bundle)
+    ema.before_read = ema_before_read(bundle)
     return ema
 
 
-def ema_wait(bundle) -> Callable[[], None]:
+def ema_before_read(bundle) -> Callable[[], None]:
     """What the EMA waits for before reading the masters: the per-block optimiser's
     write-back to the host masters (`StreamedAdamW.synchronize`), else nothing."""
     blocks = getattr(bundle, "blocks", None)
@@ -384,7 +382,7 @@ def build_callbacks(
     if k["NONFINITE_PATIENCE"] > 0:
         floor = getattr(bundle.scaler, "floor", bundle.scaler.scale)
         dump = str(Path(output_dir) / "instability")
-        record = no_record if recorder is None else recorder.write
+        record = nothing if recorder is None else recorder.write
         forget = nothing if recorder is None else recorder.drop
         cbs.append(NonFiniteGuard(k["NONFINITE_PATIENCE"], floor, dump, record, forget))
     if is_main and shown:
@@ -392,11 +390,7 @@ def build_callbacks(
     if k["SAVE_EVERY"] > 0:
         cbs.append(SaveCheckpoint(k["SAVE_EVERY"], checkpoints, parts))
     if k["SAVE_MINUTES"] > 0:
-        agree = (
-            {"agree": rank0_decision}
-            if dist.is_available() and dist.is_initialized()
-            else {}
-        )
+        agree = {"agree": rank0_decision} if initialized() else {}
         cbs.append(
             TimedCheckpoint(
                 k["SAVE_MINUTES"], checkpoints, parts, every=k["LOG_EVERY"], **agree
@@ -407,7 +401,7 @@ def build_callbacks(
 
 def validation_data_config(k: dict):
     """The validation set's DataConfig: the run's data knobs over VALIDATION['datasets'],
-    every sample conditional (no text dropout)."""
+    every sample conditional."""
     return DataConfig.from_knobs(
         {**k, "DATASETS": k["VALIDATION"]["datasets"], "TEXT_DROP": 0.0}
     )

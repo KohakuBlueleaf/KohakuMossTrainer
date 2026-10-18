@@ -2,8 +2,8 @@
 
 `resident`: everything on the device. `cpu`: everything on the host, run there.
 `offload`: host (pinned) copies; every pass copies the whole model in and drops the
-device copies after it. `stream`: decoder layers through a `LayerStreamer` ring, the
-small rest resident. Under offload / stream the token embedding table stays on the
+device copies after it. `ring`: decoder layers through a `LayerStreamer` ring, the
+small rest resident. Under offload / ring the token embedding table stays on the
 host and only the looked-up rows cross the bus. `begin()` / `end()` bracket one pass;
 `end()` releases every device weight buffer the pass used. See
 docs/internals/offload.md.
@@ -21,6 +21,7 @@ from kohakumoss.offload.encoders.placement import HostCopies
 from kohakumoss.offload.weights.layers import (
     LayerStreamer,
     host_copy,
+    module_bytes,
     module_tensors,
     tensor_bytes,
     tensor_ids,
@@ -72,7 +73,7 @@ class TextPlacement:
         """Device bytes held between passes."""
         if self.device.type == "cpu":
             return 0
-        return tensor_bytes(module_tensors(self.model).values())
+        return module_bytes(self.model)
 
     def pass_bytes(self) -> int:
         """Device weight bytes held during a pass."""
@@ -124,14 +125,14 @@ class OffloadPlacement(TextPlacement):
         return self.copies.nbytes
 
 
-class StreamPlacement(TextPlacement):
-    """Decoder layers streamed through `resident` ring slots per layer signature; the
+class RingPlacement(TextPlacement):
+    """Decoder layers streamed through `slots` ring slots per layer signature; the
     final norm and rotary tables resident; the embedding table on the host."""
 
-    name = "stream"
+    name = "ring"
 
-    def __init__(self, model, layers, embedding, device, pinned=True, resident=2):
-        self.resident = max(int(resident), 2)
+    def __init__(self, model, layers, embedding, device, pinned=True, slots=2):
+        self.slots = max(int(slots), 2)
         super().__init__(model, layers, embedding, device, pinned)
 
     def place(self) -> None:
@@ -142,7 +143,7 @@ class StreamPlacement(TextPlacement):
             elif id(t) not in inside:
                 t.data = t.data.to(self.device)
         self.streamer = LayerStreamer(
-            self.layers, self.device, resident=self.resident, pinned=self.pinned
+            self.layers, self.device, slots=self.slots, pinned=self.pinned
         )
         self.enter = [
             lambda i=i: self.streamer.enter(i) for i in range(len(self.layers))
@@ -179,7 +180,7 @@ PLACEMENTS = {
     "resident": TextPlacement,
     "cpu": HostPlacement,
     "offload": OffloadPlacement,
-    "stream": StreamPlacement,
+    "ring": RingPlacement,
 }
 
 
@@ -193,7 +194,7 @@ def apply_to_text_encoder(
 ) -> tuple[TextPlacement, dict, TextEncoderPlan]:
     """Quantize a frozen text model's linears under `plan.precision` (per channel or
     per `quant_group`), resolve `memory="auto"` with `choose(model, device)` on the
-    quantized sizes, place it (resident / offload / stream / cpu) and bind the quantized
+    quantized sizes, place it (resident / offload / ring / cpu) and bind the quantized
     GEMMs to the compute device. Returns (placement, quantization report, plan)."""
     report = {"stored": plan.stored} if plan.stored else {}
     if plan.precision != "compute" and not plan.stored:
@@ -209,7 +210,7 @@ def apply_to_text_encoder(
         plan = replace(plan, memory=choose(text_model, torch.device(device)))
     layers = list(getattr(text_model, "layers", []))
     embedding = getattr(text_model, "embed_tokens", None)
-    kw = {"resident": plan.stream_resident} if plan.memory == "stream" else {}
+    kw = {"slots": plan.stream_resident} if plan.memory == "ring" else {}
     placement = PLACEMENTS[plan.memory](
         text_model, layers, embedding, device, plan.pinned, **kw
     )

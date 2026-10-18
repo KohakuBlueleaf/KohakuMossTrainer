@@ -9,7 +9,6 @@ from kohakumoss_kernels.fp8.formats import (
     RECIPES,
     dequantize,
     quantize,
-    scale_numel,
     swizzle_mx,
 )
 from kohakumoss_kernels.fp8.op import (
@@ -33,6 +32,5 @@ __all__ = [
     "make_fp8_linear_train",
     "quantize",
     "register_launchers",
-    "scale_numel",
     "swizzle_mx",
 ]

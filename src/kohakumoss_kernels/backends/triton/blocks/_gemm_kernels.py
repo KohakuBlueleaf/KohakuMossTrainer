@@ -1,7 +1,7 @@
 """Triton GEMMs `A [M, K] @ W[rows, K]^T` with the MOSS block epilogues fused in.
 
-fp32 accumulation; the epilogue reads the fp32 accumulator (no intermediate rounding)
-and rounds once at the store. Grid is 1-D with GROUP_M swizzling for L2 reuse.
+fp32 accumulation; the epilogue reads the fp32 accumulator and rounds once at the
+store. Grid is 1-D with GROUP_M swizzling for L2 reuse.
 """
 
 import triton

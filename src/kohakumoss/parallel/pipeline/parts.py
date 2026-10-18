@@ -2,7 +2,7 @@
 
 The engines need: `prologue(img, text, sigma, seq) -> (x, PartsCtx)`, `layers`,
 `epilogue(x, ctx) -> pred`, `prologue_modules()`, `epilogue_modules()`, `bands`,
-`residual_scale`, `stream_dtype`, `conditioning_trainable()`. `BackboneParts` provides
+`residual_scale`, `residual_dtype`, `conditioning_trainable()`. `BackboneParts` provides
 them for MossBackbone.
 """
 
@@ -44,7 +44,7 @@ class BackboneParts(nn.Module):
         return self.backbone.residual_scale
 
     @property
-    def stream_dtype(self) -> torch.dtype:
+    def residual_dtype(self) -> torch.dtype:
         """Dtype of the residual stream between blocks (fp32 under the fp32-residual
         fix, else the compute dtype)."""
         return self.backbone._stream_dtype

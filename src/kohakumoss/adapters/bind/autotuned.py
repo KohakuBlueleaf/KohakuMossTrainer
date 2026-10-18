@@ -15,6 +15,7 @@ from lycoris.kernels.select import fusable
 from torch import Tensor
 
 from kohakumoss.adapters.bind import bodies
+from kohakumoss_common.units import MIB
 from kohakumoss_kernels.backends.compile.ops import CompiledOp
 from kohakumoss_kernels.dtypes import short
 from kohakumoss_kernels.errors import BUILD_ERRORS
@@ -37,7 +38,6 @@ TOKEN_PATTERNS = ((True, True), (False, True), (False, False))
 WEIGHT_PATTERNS = ((False, True), (True, True), (False, False))
 PAIR_PATTERNS = ((True, True), (False, False))
 BODY = 1  # index of the body candidate in `AutotunedOp.configs`
-MIB = 1 << 20
 _OPS: "weakref.WeakSet[AutotunedOp]" = weakref.WeakSet()
 
 

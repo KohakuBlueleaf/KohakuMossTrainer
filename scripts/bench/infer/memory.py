@@ -96,7 +96,7 @@ def main():
     )
     ap.add_argument("--vae-memory", default="offload")
     ap.add_argument("--vae-tile", action="store_true")
-    ap.add_argument("--text-memory", default="stream")
+    ap.add_argument("--text-memory", default="ring")
     ap.add_argument("--text-precision", default="compute")
     ap.add_argument("--size", default="1024x1024")
     ap.add_argument("--steps", type=int, default=4)

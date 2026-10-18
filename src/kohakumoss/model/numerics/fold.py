@@ -193,11 +193,6 @@ def unfold(model: MossBackbone) -> None:
     model.fold_scales = None
 
 
-def unfolded_state_dict(model: MossBackbone) -> dict[str, Tensor]:
-    """The state dict as it would be without the fold (affected tensors are copies)."""
-    return unfold_state(model, dict(model.state_dict()))
-
-
 def unfold_state(model: MossBackbone, sd: dict[str, Tensor]) -> dict[str, Tensor]:
     """`sd` (keys and space of this model's folded weights) with the fold undone;
     affected tensors are copies."""

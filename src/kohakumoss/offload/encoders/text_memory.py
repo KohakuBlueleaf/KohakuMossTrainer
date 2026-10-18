@@ -5,9 +5,9 @@ from dataclasses import dataclass
 
 from torch import nn
 
-from kohakumoss.offload.weights.layers import module_tensors, tensor_bytes
+from kohakumoss.offload.weights.layers import module_bytes, module_tensors, tensor_bytes
 
-ORDER = ("resident", "stream")
+ORDER = ("resident", "ring")
 
 
 @dataclass(frozen=True)
@@ -26,9 +26,9 @@ class TextSizes:
     elem: int
 
 
-def text_sizes(model: nn.Module, resident: int = 2) -> TextSizes:
-    """Sizes of a (possibly quantized) Qwen3.5 text model; `ring` is the stream ring of
-    `resident` slots per layer signature."""
+def text_sizes(model: nn.Module, slots: int = 2) -> TextSizes:
+    """Sizes of a (possibly quantized) Qwen3.5 text model; `ring` is the layer ring of
+    `slots` slots per layer signature."""
     cfg = model.config
     layers = list(model.layers)
     emb = model.embed_tokens.weight
@@ -40,10 +40,10 @@ def text_sizes(model: nn.Module, resident: int = 2) -> TextSizes:
         sigs[sig] = tensor_bytes(ts.values())
         total_layers += sigs[sig]
     return TextSizes(
-        total=tensor_bytes(module_tensors(model).values()),
+        total=module_bytes(model),
         embedding=emb.nbytes,
         layers=total_layers,
-        ring=max(resident, 2) * sum(sigs.values()),
+        ring=max(slots, 2) * sum(sigs.values()),
         hidden=cfg.hidden_size,
         intermediate=cfg.intermediate_size,
         value_heads=cfg.linear_num_value_heads,
@@ -72,7 +72,7 @@ def text_footprint(memory: str, s: TextSizes, tokens_pass: int, tokens_call: int
             return {"resident": s.total, "pass": s.total + act}
         case "offload":
             return {"resident": 0, "pass": s.total - s.embedding + act}
-        case "stream":
+        case "ring":
             rest = s.total - s.embedding - s.layers
             return {"resident": rest, "pass": rest + s.ring + act}
         case _:
@@ -82,10 +82,8 @@ def text_footprint(memory: str, s: TextSizes, tokens_pass: int, tokens_call: int
 def choose_text_memory(
     s: TextSizes, budget: int, step_peak: int, tokens_pass: int, tokens_call: int
 ) -> tuple[str, list[dict]]:
-    """The fastest placement that fits, in ORDER (stream is faster than offload and
-    needs less; offload is an explicit choice only): resident needs its weights next to
-    the DiT step peak, stream its pass peak (the DiT step runs after the pass released
-    its buffers). Returns (choice, per-placement rows)."""
+    """The first placement in ORDER that fits: resident needs its weights next to the
+    DiT step peak, ring its pass peak. Returns (choice, per-placement rows)."""
     rows = []
     for memory in ORDER:
         fp = text_footprint(memory, s, tokens_pass, tokens_call)
@@ -93,4 +91,4 @@ def choose_text_memory(
         rows.append({"memory": memory, **fp, "need": need, "fits": need <= budget})
         if need <= budget:
             return memory, rows
-    return "stream", rows
+    return "ring", rows

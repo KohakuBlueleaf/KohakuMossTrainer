@@ -15,6 +15,7 @@ from torch import Tensor, nn
 
 from kohakumoss.offload.accel import module, streamed
 from kohakumoss_common.calls import nothing
+from kohakumoss_common.runs import runs_within
 
 
 def gamma_from_sigma_rel(sigma_rel: float, iters: int = 60) -> float:
@@ -49,19 +50,6 @@ class NoEMA:
 
 
 CHUNK_NUMEL = 64 * 1024 * 1024  # fp32 elements of converted copies alive at once
-
-
-def _chunks(indices: list[int], sizes: list[int], limit: int) -> list[list[int]]:
-    """Consecutive groups of `indices` whose summed size stays within `limit` (a
-    tensor larger than `limit` is a group of its own)."""
-    out, cur, total = [], [], 0
-    for i in indices:
-        if cur and total + sizes[i] > limit:
-            out.append(cur)
-            cur, total = [], 0
-        cur.append(i)
-        total += sizes[i]
-    return out + ([cur] if cur else [])
 
 
 class _HostStage:
@@ -111,7 +99,7 @@ class _BufferEMA:
         self.names = [n for n, _ in named]
         self.params = [p for _, p in named]
         self.tags = tuple(tags)
-        self.wait: Callable[[], None] = nothing
+        self.before_read: Callable[[], None] = nothing
         self.buffers = {
             tag: [
                 p.detach().to(device=device or p.device, dtype=torch.float32, copy=True)
@@ -127,9 +115,8 @@ class _BufferEMA:
         ]
         rest = [i for i in range(len(self.params)) if i not in set(same)]
         self.direct = same
-        self.converted = _chunks(
-            rest, [p.numel() for p in self.params], max(int(chunk_numel), 1)
-        )
+        sizes = [p.numel() for p in self.params]
+        self.converted = runs_within(rest, sizes.__getitem__, max(int(chunk_numel), 1))
         staged = [
             i
             for i in rest
@@ -156,8 +143,8 @@ class _BufferEMA:
 
     def _lerp_all(self, weights: list[float]) -> None:
         """Average every parameter into every tag's buffers (`weights` per tag), once
-        `wait()` returned (the masters' write-back has landed)."""
-        self.wait()
+        `before_read()` returned (the masters' write-back has landed)."""
+        self.before_read()
         if self.direct:
             src = [self.params[i].detach() for i in self.direct]
             for tag, w in zip(self.tags, weights):
@@ -240,12 +227,12 @@ class BackgroundEMA:
         return self.inner.buffers
 
     @property
-    def wait(self) -> Callable[[], None]:
-        return self.inner.wait
+    def before_read(self) -> Callable[[], None]:
+        return self.inner.before_read
 
-    @wait.setter
-    def wait(self, fn: Callable[[], None]) -> None:
-        self.inner.wait = fn
+    @before_read.setter
+    def before_read(self, fn: Callable[[], None]) -> None:
+        self.inner.before_read = fn
 
     def join(self) -> None:
         if self.pending is not None:

@@ -7,14 +7,14 @@ docs/internals/offload.md for their derivation and the probe that calibrates the
 from dataclasses import dataclass, field
 
 from kohakumoss.memory.profiles import checkpoint_mode
-from kohakumoss.offload.optim import gpu_adamw
-from kohakumoss.offload.optim import grad as grad_offload_ring
+from kohakumoss.offload.optim.gpu_adamw import state_ring_bytes
+from kohakumoss.offload.optim.grad import grad_ring_bytes
 from kohakumoss.offload.optim.stream_optim import slot_bytes
 from kohakumoss.quant.compute import COMPUTE as FP8_COMPUTE
 from kohakumoss.types.arch import MossArchConfig
 from kohakumoss.types.plans import MemoryPlan
+from kohakumoss_common.units import GIB
 
-GIB = 1024**3
 PRECISION_BYTES = {
     "compute": None,
     "bf16": 2,
@@ -213,8 +213,8 @@ def estimate_inference(work: Workload, plan: MemoryPlan) -> Estimate:
     wb = weight_bytes(plan, cb, training=False)
     blocks = arch.depth * block_params(arch)
     rest = total_params(arch) - blocks
-    resident = min(max(plan.stream_resident, 2), arch.depth) * block_params(arch)
-    placed = rest + (resident if plan.stream != "off" else blocks)
+    ring_params = min(max(plan.stream_resident, 2), arch.depth) * block_params(arch)
+    placed = rest + (ring_params if plan.stream != "off" else blocks)
     est.parts["weights"] = int(placed * wb)
     est.parts["activations"] = int(
         work.tokens * saved_per_token(arch, "none") * work.act_factor * cb
@@ -238,8 +238,8 @@ def estimate(work: Workload, plan: MemoryPlan) -> Estimate:
     rest = total_params(arch) - blocks
     shard = work.world if work.sharded else 1
     if plan.stream != "off":
-        resident = max(plan.stream_resident, 2) * block_params(arch)
-        est.parts["weights"] = int(rest * pb + resident * wb)
+        ring_params = max(plan.stream_resident, 2) * block_params(arch)
+        est.parts["weights"] = int(rest * pb + ring_params * wb)
     else:
         est.parts["weights"] = int((rest + blocks) * pb) // shard
 
@@ -256,13 +256,13 @@ def estimate(work: Workload, plan: MemoryPlan) -> Estimate:
             est.parts["optim"] = n * state_bytes(work, plan) // shard
         swap = plan.stream == "swap"
         if swap and plan.optim_state != "cpu":
-            resident = plan.optim_state == "gpu"
-            est.parts["optim_slots"] = slot_bytes(block_params(arch), cb, resident)
+            device_states = plan.optim_state == "gpu"
+            est.parts["optim_slots"] = slot_bytes(block_params(arch), cb, device_states)
         largest = largest_device_param(arch, swap)
         if plan.optim_state == "stream":
-            est.parts["state_ring"] = gpu_adamw.ring_bytes(largest)
+            est.parts["state_ring"] = state_ring_bytes(largest)
         if grad_offload:
-            est.parts["grad_ring"] = grad_offload_ring.ring_bytes(largest)
+            est.parts["grad_ring"] = grad_ring_bytes(largest)
         on_device = n - blocks if swap else n
         est.parts["ema"] = 4 * work.ema_decays * on_device // shard
     if work.trainable_params:
@@ -280,8 +280,8 @@ def estimate(work: Workload, plan: MemoryPlan) -> Estimate:
         per_tok *= f
     stored = n_ckpt * per_tok + (arch.depth - n_ckpt) * per_tok_full
     if plan.act_offload:
-        resident = max(plan.act_offload_inflight, 2)
-        stored = resident * max(
+        act_blocks = max(plan.act_offload_inflight, 2)
+        stored = act_blocks * max(
             per_tok, per_tok_full if n_ckpt < arch.depth else per_tok
         )
     est.parts["activations"] = int(work.tokens * stored * cb)

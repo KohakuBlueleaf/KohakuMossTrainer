@@ -1,6 +1,6 @@
 """Set up KohakuMoss on a Google Colab VM: a uv venv with the torch build matching the
 driver's CUDA, the package extras, an optional editable LyCORIS checkout, then the
-doctor report. Runs with the VM's system Python; nothing is installed into it but uv.
+doctor report. Runs with the VM's system Python; only uv is installed into it.
 See docs/guides/install.md (Google Colab).
 
     python scripts/colab/setup.py

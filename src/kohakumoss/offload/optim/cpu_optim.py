@@ -138,8 +138,8 @@ class CPUAdamW(Optimizer):
                 self._init(p, group)
 
     def _init(self, p: Tensor, group: dict) -> None:
-        cuda = streamed(p.device)
-        pin = self.pinned and cuda
+        side = streamed(p.device)
+        pin = self.pinned and side
         master = p.detach().to("cpu", torch.float32).clone()
         self.state[p].update(
             master=master,
@@ -149,7 +149,7 @@ class CPUAdamW(Optimizer):
         )
         shadow = torch.empty(p.shape, dtype=p.dtype, pin_memory=pin)
         lane = _Lane(None, shadow, None, None, group, pin=pin)
-        if cuda:
+        if side:
             if p.device not in self._streams:
                 self._streams[p.device] = (
                     module(p.device).Stream(p.device),

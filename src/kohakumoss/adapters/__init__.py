@@ -13,7 +13,7 @@ from kohakumoss.adapters.infer.inference import (
 )
 from kohakumoss.adapters.kinds import Kind, register
 from kohakumoss.adapters.train.adapter_set import FORMATS, LycoAdapterSet
-from kohakumoss.adapters.train.tlora import set_token_mask, token_mask
+from kohakumoss.adapters.train.tlora import token_mask
 
 LYCORIS_MIN = lycoris_version.LYCORIS_MIN
 
@@ -33,6 +33,5 @@ __all__ = [
     "load_adapters",
     "register",
     "resolve_preset",
-    "set_token_mask",
     "token_mask",
 ]

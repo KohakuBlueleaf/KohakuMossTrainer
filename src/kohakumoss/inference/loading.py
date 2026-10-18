@@ -72,7 +72,7 @@ class LoadedDit:
     backbone: torch.nn.Module
     stacks: list = field(default_factory=list)
     plan: MemoryPlan = field(default_factory=MemoryPlan)
-    stream: object = None
+    weight_stream: object = None
 
 
 def _plan_dict(plan) -> dict:
@@ -199,15 +199,15 @@ def load_dit(
             log.info(f"MEMORY_PROFILE 'auto' -> {hl(memory)}")
         plan = resolve_memory(memory, memory_overrides, device, inference=True)
         began = time.perf_counter()
-        stream = apply_inference_plan(
+        weight_stream = apply_inference_plan(
             plan, device, dtype, backbone=backbone, keep_fp32=DEFAULT_KEEP_FP32
-        ).stream
+        ).weight_stream
         backbone.bind_ops(OpSet.resolve(device, dtype, kernels))
         took = f"{time.perf_counter() - began:.1f}s"
         suffix = f" on {device} (applied in {hl(took)})"
         log_object(log, "DiT memory plan", plan, suffix=suffix)
         stacks = attach_after_plan(backbone, adapters, adapter_mode, device)
-        loaded = LoadedDit(backbone, stacks, plan, stream)
+        loaded = LoadedDit(backbone, stacks, plan, weight_stream)
     if adapters:
         modes = sorted({s.effective_mode for s in loaded.stacks}) or [adapter_mode]
         names = [f"{a}:{m}" for a, m in adapters]

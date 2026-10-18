@@ -2,11 +2,7 @@
 
 from kohakumoss.diffusion.objective.flow import noise_latents
 from kohakumoss.diffusion.objective.loss import HuberLoss, L1Loss, MSELoss
-from kohakumoss.diffusion.objective.normalize import (
-    TokenNormalizer,
-    all_reduce_sum,
-    identity_reduce,
-)
+from kohakumoss.diffusion.objective.normalize import TokenNormalizer, all_reduce_sum
 from kohakumoss.diffusion.objective.weighting import (
     eps_weighting,
     no_weighting,
@@ -33,6 +29,5 @@ __all__ = [
     "MSELoss",
     "TokenNormalizer",
     "all_reduce_sum",
-    "identity_reduce",
     "noise_latents",
 ]

@@ -5,7 +5,8 @@ docs/guides/logging.md."""
 
 from kohakumoss.inference import peaks
 from kohakumoss.logging.log import hl
-from kohakumoss.offload.encoders.report import gib, module_bytes, split_bytes
+from kohakumoss.offload.encoders.report import gib_text, split_bytes
+from kohakumoss.offload.weights.layers import module_bytes
 from kohakumoss_common.units import GIB
 from kohakumoss_data.resolution.geometry import LATENT_FACTOR
 from kohakumoss_kernels.dtypes import NAME_OF
@@ -45,13 +46,15 @@ def dit_line(backbone, path, device, plan) -> tuple[str, dict]:
     head = f"transformer: {hl(path, 'path')} -> "
     fields = {"gpu_gib": round(on / GIB, 2), "host_gib": round(host / GIB, 2)}
     if host == 0:
-        where = f"resident on {device} ({hl(gib(on))}, {dtype}{base}{_fold(backbone)})"
+        where = (
+            f"resident on {device} ({hl(gib_text(on))}, {dtype}{base}{_fold(backbone)})"
+        )
         return head + where, fields
     blocks = list(backbone.layers)
     resident = sum(split_bytes(b)[1] == 0 for b in blocks)
     where = (
         f"streamed from host, {hl(resident)} of {len(blocks)} blocks resident "
-        f"({hl(gib(on))} on {device}, {hl(gib(host))} host; {dtype}{base}"
+        f"({hl(gib_text(on))} on {device}, {hl(gib_text(host))} host; {dtype}{base}"
         f"{_fold(backbone)})"
     )
     return head + where, fields

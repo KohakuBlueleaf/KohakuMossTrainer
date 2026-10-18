@@ -43,14 +43,15 @@ param(
     [switch] $FixFile,
     # DiT base: compute = bf16 / fp16; int8 / fp8 = weight-only; fp8_compute / mxfp8 = fp8 GEMMs (sm89+).
     [ValidateSet("compute", "int8", "fp8", "fp8_compute", "mxfp8")] [string] $BasePrecision = "compute",
-    # Memory profile (weights stay at -BasePrecision; no profile quantizes). Any catalog name, built
+    # Memory profile (weights stay at -BasePrecision). Any catalog name, built
     # from its parts in this order (omit a part for its default):
     #   checkpoint: nockpt | ckpt | subckpt
-    #   weights:    resident | stream16 | stream8 | stream4 | stream2   (blocks kept on the GPU)
+    #   weights:    resident | ring16 | ring8 | ring4 | ring2   (blocks kept on the GPU)
     #   activations: actoff                                             (offload saved activations)
     #   optimizer:  optfused | optstream | optcpu                        (default: GPU AdamW)
     #   gradients:  gradoff                                             (offload gradients)
-    #   e.g. ckpt-stream8, nockpt-resident-optcpu, ckpt-stream2-actoff-optstream-gradoff
+    #   e.g. ckpt-ring8, nockpt-resident-optcpu, ckpt-ring2-actoff-optstream-gradoff
+    #   (the older spellings stream16 .. stream2 are accepted too)
     # Short names: speed, balanced, low, minimal; auto = the fastest whose estimate fits the GPU.
     # Full list: kohakumoss-config list. "manual" = no profile: the plan comes from -Checkpoint ...
     # -FusedStep below (unset ones take their default).
@@ -80,8 +81,8 @@ param(
     [int] $TargetArea = 1048576,
     # Joint (image + text) tokens per packed batch.
     [int] $MaxTokens = 8192,
-    # Text encoder during training: auto (fastest that fits) | stream (layers from host RAM) | offload | resident.
-    [ValidateSet("auto", "stream", "offload", "resident")] [string] $TextMemory = "auto",
+    # Text encoder during training: auto (fastest that fits) | ring (layers from host RAM; "stream" is accepted too) | offload | resident.
+    [ValidateSet("auto", "ring", "stream", "offload", "resident")] [string] $TextMemory = "auto",
     # Caches: off = no cache, the VAE and text encoder encode every batch in the loop and nothing is
     # written | online = encode on a miss and write latents / text embeddings to the cache dir on disk
     # (later runs read them back) | offline = read a prebuilt cache only.

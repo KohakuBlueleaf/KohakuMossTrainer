@@ -7,6 +7,8 @@ import sys
 import torch
 
 from kohakumoss_common.devices import streamed_type
+from kohakumoss_kernels.hardware.current import with_index as with_index
+from kohakumoss_kernels.hardware.memory import mem_info
 
 EXPANDABLE = "expandable_segments:True"
 ALLOC_ENV = ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF")
@@ -70,25 +72,21 @@ def configure_allocator(device: torch.device | str) -> str:
     return EXPANDABLE
 
 
-def with_index(device: torch.device | str) -> torch.device:
-    """`device` with its index filled in (the current one when unset)."""
-    device = torch.device(device)
-    if streamed(device) and device.index is None:
-        return torch.device(device.type, module(device).current_device())
-    return device
-
-
 def device_budget(device: torch.device | str) -> int:
     """Bytes an `auto` placement may plan for on `device`: free memory now (the context
     and every other process already subtracted), with headroom; the host has no limit.
     """
-    device = torch.device(device)
-    match device.type:
-        case "cuda":
-            free, _ = torch.cuda.mem_get_info(device)
-            return int(free * HEADROOM)
-        case "xpu":
-            free, _ = torch.xpu.mem_get_info(device)
-            return int(free * HEADROOM)
-        case _:
-            return 1 << 62
+    if not streamed(device):
+        return 1 << 62
+    return int(free_bytes(device) * HEADROOM)
+
+
+def free_bytes(device: torch.device | str) -> int:
+    """Free bytes of the accelerator `device` from the driver; raises where the backend
+    reports none (an `auto` placement cannot plan there)."""
+    info = mem_info(device)
+    if info is None:
+        raise RuntimeError(
+            f"{device}: the backend reports no free memory (mem_get_info)"
+        )
+    return info[0]

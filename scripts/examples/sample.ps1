@@ -42,8 +42,9 @@ param(
     # fp16 residual fix when no -Transformer is given: online | fp32_residual | none.
     [ValidateSet("online", "fp32_residual", "none")] [string] $Fp16Fix = "online",
     # Text-encoder placement: auto = fastest that fits; resident = whole TE on the GPU; offload = moved in
-    # per prompt batch; stream = layers streamed from host RAM (~2 GB on the GPU); cpu = run on the CPU.
-    [ValidateSet("auto", "resident", "offload", "stream", "cpu")] [string] $TextMemory = "auto",
+    # per prompt batch; ring = layers streamed from host RAM (~2 GB on the GPU; "stream" is accepted too);
+    # cpu = run on the CPU.
+    [ValidateSet("auto", "resident", "offload", "ring", "stream", "cpu")] [string] $TextMemory = "auto",
     # Text-encoder precision: compute = bf16 / fp16; int8 / fp8 = quantized weight storage (16-bit math);
     # fp8_compute / mxfp8 = fp8 GEMMs (sm89+).
     [ValidateSet("compute", "int8", "fp8", "fp8_compute", "mxfp8")] [string] $TextPrecision = "compute",

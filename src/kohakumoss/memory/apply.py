@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from functools import partial
 
 import torch
-import torch.distributed as dist
 from torch import nn
 
 from kohakumoss.memory.runners import build_runner
@@ -21,6 +20,7 @@ from kohakumoss.quant.compute import COMPUTE as FP8_COMPUTE
 from kohakumoss.quant.compute import ComputeWeight
 from kohakumoss.quant.convert import attach_compute, default_filter, quantize_model
 from kohakumoss.types.plans import MemoryPlan
+from kohakumoss_kernels.dist import dist_rank, grouped
 
 QUANT = ("fp8", "int8", "fp8_compute", "mxfp8")
 
@@ -32,7 +32,7 @@ class MemoryEngines:
     plan: MemoryPlan
     runner: object = None
     offload: ActivationOffload | None = None
-    stream: WeightStream | None = None
+    weight_stream: WeightStream | None = None
     fused: FusedStep | None = None
     grads: GradOffload | None = None
     fp8: list = field(default_factory=list)
@@ -41,30 +41,30 @@ class MemoryEngines:
 
     @property
     def host_stepped(self) -> bool:
-        """Streamed trainable blocks are stepped by a host optimiser after backward
-        (no in-backward block optimiser attached to the stream)."""
+        """Streamed trainable blocks are stepped by a host optimiser after backward."""
         return (
-            self.stream is not None
-            and self.stream.trainable
-            and self.stream.optimizer is None
+            self.weight_stream is not None
+            and self.weight_stream.trainable
+            and self.weight_stream.optimizer is None
         )
 
     def before_step(self) -> None:
         """Land offloaded / streamed-block gradients on the host before optimiser.step."""
         if self.host_stepped:
-            self.stream.flush_grads()
+            self.weight_stream.expose_grads()
         if self.grads is not None:
-            self.grads.flush()
+            self.grads.drain()
 
     def after_step(self) -> None:
-        """Push updated host masters into the streaming copies, clear host grads (an
-        in-backward block optimiser finishes itself), requantize trainable fp8-compute
-        weights."""
+        """After a host-stepped optimizer step: push the updated host masters into the
+        streaming copies and end the step's host gradient sums (an in-backward block
+        optimiser finishes itself); reset the activation offload and the gradient
+        offload; requantize trainable fp8-compute weights."""
         for lin in self.fp8:
             lin.compute.refresh(lin.weight)
         if self.host_stepped:
-            self.stream.refresh()
-            self.stream.zero_grads()
+            self.weight_stream.refresh()
+            self.weight_stream.zero_grads()
         if self.offload is not None:
             self.offload.reset()
         if self.grads is not None:
@@ -75,8 +75,8 @@ class MemoryEngines:
         of trainable streamed masters, the trainable fp8-compute caches."""
         for lin in self.fp8:
             lin.compute.refresh(lin.weight)
-        if self.stream is not None and self.stream.trainable:
-            self.stream.refresh()
+        if self.weight_stream is not None and self.weight_stream.trainable:
+            self.weight_stream.refresh()
 
     def exclude_params(self, params) -> None:
         """Never offload these parameters' saved tensors (adapters bound after the plan);
@@ -87,19 +87,21 @@ class MemoryEngines:
         live = []
         if self.backbone is not None:
             live += [*self.backbone.parameters(), *self.backbone.buffers()]
-        if self.stream is not None:
-            live += self.stream.storages()
+        if self.weight_stream is not None:
+            live += self.weight_stream.storages()
         self.offload.rebuild([*live, *params])
 
     def host_params(self) -> list[nn.Parameter]:
-        """Parameters whose masters live on the host (optimise with a host optimiser)."""
-        if self.stream is None or not self.stream.trainable:
+        """The trainable streamed block weights, whose fp32 masters live on the host
+        (stepped in backward by StreamedAdamW with a GPU optim_state, by the host AdamW
+        with 'cpu'); empty without a trainable stream."""
+        if self.weight_stream is None or not self.weight_stream.trainable:
             return []
-        return list(self.stream.params.values())
+        return list(self.weight_stream.params.values())
 
     def close(self) -> None:
         """Stop every host worker thread the engines started."""
-        for engine in (self.stream, self.grads):
+        for engine in (self.weight_stream, self.grads):
             if engine is not None:
                 engine.close()
 
@@ -108,14 +110,14 @@ def _node_share(trainable: bool, n_blocks: int, device, plan: MemoryPlan) -> dic
     """WeightStream kwargs when several ranks of one node train the same streamed
     blocks (DDP): one shared host region for the masters and streaming copies, and
     the block owners of the host optimiser shards; none otherwise."""
-    multi = trainable and dist.is_available() and dist.is_initialized()
-    if not multi or dist.get_world_size() < 2:
+    if not (trainable and grouped()):
         return {}
     pin = plan.pinned and torch.device(device).type == "cuda"
+    rank, world = dist_rank()
     return {
         "share": partial(SharedHost, pin=pin),
-        "owners": block_owners(n_blocks, dist.get_world_size()),
-        "rank": dist.get_rank(),
+        "owners": block_owners(n_blocks, world),
+        "rank": rank,
     }
 
 
@@ -224,16 +226,16 @@ def apply_to_backbone(
     if plan.stream != "off":
         move_except(backbone, backbone.layers, device)
         trainable = plan.stream == "swap" and trainable_base
-        engines.stream = WeightStream(
+        engines.weight_stream = WeightStream(
             backbone.layers,
             device,
-            resident=max(plan.stream_resident, 2),
+            slots=max(plan.stream_resident, 2),
             pinned=plan.pinned,
             trainable=trainable,
             dtype=compute_dtype,
             **_node_share(trainable and training, len(backbone.layers), device, plan),
         )
-        masters = {id(p) for p in engines.stream.params.values()}
+        masters = {id(p) for p in engines.weight_stream.params.values()}
         for block in backbone.layers:
             for t in list(block.parameters()) + list(block.buffers()):
                 if id(t) not in masters:
@@ -244,13 +246,13 @@ def apply_to_backbone(
         )
         engines.offload.exclude(p for p in backbone.parameters())
         engines.offload.exclude(p for p in backbone.buffers())
-        if engines.stream is not None:
-            engines.offload.exclude(engines.stream.storages())
+        if engines.weight_stream is not None:
+            engines.offload.exclude(engines.weight_stream.storages())
     engines.runner = build_runner(
         plan.checkpoint if training else "none",
         backbone.layers,
         offload=engines.offload,
-        engine=engines.stream,
+        weight_stream=engines.weight_stream,
     )
     backbone.set_runner(engines.runner)
     return engines

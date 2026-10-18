@@ -6,7 +6,7 @@ docs/concepts/profiles.md."""
 
 OPTIMIZER = "adamw"
 EMA = 0.0
-MEMORY_PROFILE = "ckpt-stream4-actoff-optstream-gradoff"
+MEMORY_PROFILE = "ckpt-ring4-actoff-optstream-gradoff"
 MAX_TOKENS = 8192
-TEXT_ENCODE = {"memory": "stream", "ahead": 8}
+TEXT_ENCODE = {"memory": "ring", "ahead": 8}
 _BASE = "../_base/base_full.py"  # validation base of this layer

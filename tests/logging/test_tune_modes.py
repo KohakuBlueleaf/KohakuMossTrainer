@@ -22,8 +22,8 @@ from kohakumoss.model.opset import OpSet
 from kohakumoss.training.build import kernels as train_kernels
 from kohakumoss.training.callbacks import kernels as step_kernels
 from kohakumoss_kernels.backends.compile.choice import retune_pending
-from kohakumoss_kernels.backends.compile.prewarm import prewarm_block_ops
 from kohakumoss_kernels.tuning import tuner
+from tests._util.blockops_prewarm import prewarm_block_ops
 from tests._util.logs import assert_phases
 from tests._util.negative import must_fail
 from tests.training.knobs.test_knobs import runnable

@@ -12,7 +12,6 @@ import numpy as np
 
 RECORD = struct.Struct("<QIHHBB6xQ")
 CODECS = {"jpeg": 1, "png": 2, "webp": 3, "jxl": 4, "avif": 5, "bmp": 6, "other": 0}
-CODEC_NAMES = {v: k for k, v in CODECS.items()}
 FLAG_ALPHA = 1
 SHARD_BYTES = 1 << 30
 

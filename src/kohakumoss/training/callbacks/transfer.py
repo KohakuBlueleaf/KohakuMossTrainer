@@ -36,7 +36,7 @@ def transfer_sources(engines, bundle) -> list:
     """Every object of the run's memory engines and optimiser bundle that counts its
     host <-> device bytes (each once)."""
     candidates = [
-        getattr(engines, "stream", None),
+        getattr(engines, "weight_stream", None),
         getattr(engines, "grads", None),
         getattr(engines, "offload", None),
     ]

@@ -70,13 +70,6 @@ def version(dist: str) -> str | None:
         return None
 
 
-def _version_key(path: str) -> tuple:
-    parts = Path(path).parts
-    idx = next((i for i, p in enumerate(parts) if p.upper() == "MSVC"), None)
-    ver = parts[idx + 1] if idx is not None and idx + 1 < len(parts) else "0"
-    return tuple(int(x) if x.isdigit() else 0 for x in ver.split("."))
-
-
 @cache
 def _vswhere(*args: str) -> list[str]:
     """vswhere's output lines for `args`: once per process, and across processes from
@@ -101,9 +94,14 @@ def _vswhere(*args: str) -> list[str]:
     return lines
 
 
-@cache
-def msvc_compiler() -> str | None:
-    """Path of the newest x64 MSVC `cl.exe`, or None."""
+def vswhere(*args: str) -> list[str]:
+    """vswhere's output lines for `args` (cached, `_vswhere`); empty without vswhere."""
+    return _vswhere(*args)
+
+
+def msvc_compilers() -> list[str]:
+    """Every x64 MSVC `cl.exe`: under the installs vswhere lists, then under the
+    Program Files roots (VS_ROOTS)."""
     found: list[str] = []
     for root in _vswhere("-all", "-property", "installationPath"):
         found += glob.glob(
@@ -113,7 +111,7 @@ def msvc_compiler() -> str | None:
         )
     for root in VS_ROOTS:
         found += glob.glob(os.path.join(root, CL_GLOB))
-    return max(found, key=_version_key) if found else None
+    return found
 
 
 @cache

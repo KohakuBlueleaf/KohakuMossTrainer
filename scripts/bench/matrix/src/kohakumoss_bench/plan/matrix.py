@@ -36,7 +36,7 @@ from kohakumoss_bench.run.filters import keep_kinds, keep_names, keep_priorities
 
 NAMED = (*ORDER, "auto")
 CHECKPOINT_RANK = {"nockpt": 0, "ckpt": 1, "subckpt": 2}
-WEIGHT_RANK = {"resident": 0, "stream16": 1, "stream8": 2, "stream4": 3, "stream2": 4}
+WEIGHT_RANK = {"resident": 0, "ring16": 1, "ring8": 2, "ring4": 3, "ring2": 4}
 CAP_PROFILE = "minimal"
 MAIN_ALGOS = ("lora32", "lokr16")
 ROW_ALGOS = ("dora16", "loha16", "oft64")
@@ -51,8 +51,8 @@ CACHE_MODES = {
     "latent": {"LATENT_CACHE": "offline", "TEXT_CACHE": "off"},
     "latenttext": {"LATENT_CACHE": "offline", "TEXT_CACHE": "offline"},
 }
-LOWVRAM_LOKR_PROFILE = "ckpt-stream2-actoff-optstream-gradoff"
-LOWVRAM_LOKR_TEXT = {"memory": "stream", "ahead": 8}
+LOWVRAM_LOKR_PROFILE = "ckpt-ring2-actoff-optstream-gradoff"
+LOWVRAM_LOKR_TEXT = {"memory": "ring", "ahead": 8}
 
 
 def lokr_params(arch: MossArchConfig, factor: int = 16) -> int:
@@ -328,7 +328,7 @@ def infer_runs(host, opts, card, train, export, tags) -> list[Run]:
             "ADAPTERS": [adapter],
             "ADAPTER_MODE": "bypass",
             "MEMORY_PROFILE": "low",
-            "TEXT_ENCODE": {"memory": "stream"},
+            "TEXT_ENCODE": {"memory": "ring"},
             "VAE_ENCODE": {"memory": "offload"},
         },
     }
@@ -427,8 +427,8 @@ def cache_runs(host: Host, opts: Options, card: Card) -> list[Run]:
 def placement_setups(card: Card) -> list[tuple]:
     """(precision, base, algo, profile, TEXT_ENCODE extra, [(text, VAE memory), ...]) of
     the encoder-placement rows: LoRA r32 balanced (text auto / resident / offload, text
-    stream with the VAE resident and offloaded), LoRA r32 minimal and the low-VRAM LoKr
-    setup (text auto / resident / offload / stream; the profile's VAE)."""
+    ring with the VAE resident and offloaded), LoRA r32 minimal and the low-VRAM LoKr
+    setup (text auto / resident / offload / ring; the profile's VAE)."""
     first = precisions(card)[0]
     text = [("auto", None), ("resident", None), ("offload", None)]
     return [
@@ -438,16 +438,16 @@ def placement_setups(card: Card) -> list[tuple]:
             "lora32",
             "balanced",
             {},
-            text + [("stream", "resident"), ("stream", "offload")],
+            text + [("ring", "resident"), ("ring", "offload")],
         ),
-        (first, "compute", "lora32", "minimal", {}, text + [("stream", None)]),
+        (first, "compute", "lora32", "minimal", {}, text + [("ring", None)]),
         (
             "fp16",
             "int8",
             "lokr16",
             LOWVRAM_LOKR_PROFILE,
             {"ahead": LOWVRAM_LOKR_TEXT["ahead"]},
-            text + [("stream", None)],
+            text + [("ring", None)],
         ),
     ]
 

@@ -2,6 +2,8 @@
 MEMORY_PROFILE='manual' the memory knobs set the plan; with a named profile they must be
 unset. Precision knobs are independent of the profile. See docs/concepts/profiles.md."""
 
+from kohakumoss.memory.profiles import profile_name
+
 MANUAL = "manual"
 MEMORY_KNOBS = {
     "CHECKPOINT": "checkpoint",
@@ -19,6 +21,13 @@ PRECISION_KNOBS = {
     "FP8_DGRAD": "fp8_dgrad",
 }
 PLACEMENT_KNOBS = ("STREAM", "STREAM_RESIDENT", "PINNED")
+
+
+def primary_names(k: dict) -> dict:
+    """`k` with MEMORY_PROFILE in its primary spelling (`profiles.profile_name`)."""
+    if "MEMORY_PROFILE" not in k:
+        return k
+    return {**k, "MEMORY_PROFILE": profile_name(k["MEMORY_PROFILE"])}
 
 
 def knob_fields(k: dict, knobs: dict[str, str]) -> dict:

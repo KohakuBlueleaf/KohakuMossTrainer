@@ -85,7 +85,7 @@ def _pipeline_hooks(ctx: RunContext) -> ParallelHooks:
 
 
 def _plain_parts(ctx: RunContext, args: tuple, names, extra) -> Parts:
-    if getattr(ctx.built.engines.stream, "owners", None) is not None:
+    if getattr(ctx.built.engines.weight_stream, "owners", None) is not None:
         return ShardedOptimParts(*args, extra=extra)
     return Parts(*args, extra=extra)
 
@@ -156,7 +156,7 @@ class Layout:
     pipelined: bool = False
     stage_rng: bool = False
 
-    def stream_rank(self, rank: int) -> int:
+    def data_rank(self, rank: int) -> int:
         """The rank whose data, sigma and noise streams this rank draws."""
         return 0 if self.shared_data else rank
 

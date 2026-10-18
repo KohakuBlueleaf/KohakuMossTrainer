@@ -31,8 +31,8 @@ WORK = Workload(PRESETS["base"], img_tokens=4096, txt_tokens=300)
 
 
 def per_plan(plan) -> str:
-    """Stream next to streamed DiT blocks, offload next to resident ones."""
-    return "stream" if plan.stream != "off" else "offload"
+    """A ring next to streamed DiT blocks, offload next to resident ones."""
+    return "ring" if plan.stream != "off" else "offload"
 
 
 def check_rows(mode) -> None:
@@ -42,7 +42,7 @@ def check_rows(mode) -> None:
     rows = {r["profile"]: r for r in report.rows if "text_memory" in r}
     assert {"speed", "balanced"} <= set(rows), rows
     assert rows["speed"]["text_memory"] == "offload", rows["speed"]
-    assert rows["balanced"]["text_memory"] == "stream", rows["balanced"]
+    assert rows["balanced"]["text_memory"] == "ring", rows["balanced"]
     for row in rows.values():
         # an offload pass runs after the step released its buffers: it may not raise
         # the peak; a streamed encoder keeps its resident part next to the step
@@ -52,7 +52,7 @@ def check_rows(mode) -> None:
 
 def test_text_placement_follows_each_plan():
     check_rows(per_plan)
-    must_fail(lambda: check_rows("stream"), "one fixed mode for every plan")
+    must_fail(lambda: check_rows("ring"), "one fixed mode for every plan")
 
 
 def _knobs(tmp_path, **over) -> dict:

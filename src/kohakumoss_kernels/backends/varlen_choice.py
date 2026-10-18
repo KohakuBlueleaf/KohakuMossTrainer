@@ -29,7 +29,7 @@ if _varlen_attn is not None:
 
 def flash_varlen_usable(device: torch.device) -> bool:
     """Whether torch's flash `varlen_attn` runs on `device`: the build has flash attention
-    and the card is sm80+ (Windows wheels ship without it)."""
+    and the card is sm80+ (the Linux torch builds carry it)."""
     return (
         _varlen_attn is not None
         and device.type == "cuda"

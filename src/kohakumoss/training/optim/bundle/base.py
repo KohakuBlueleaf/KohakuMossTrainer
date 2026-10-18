@@ -16,7 +16,7 @@ from kohakumoss.training.optim.bundle.nonfinite import (
     nonfinite_count,
     param_names,
 )
-from kohakumoss_common.calls import nothing
+from kohakumoss_common.calls import identity, nothing
 
 
 def local_grad_norm(grads: list[Tensor]) -> Tensor:
@@ -33,10 +33,6 @@ def all_reduce_norm(grads: list[Tensor]) -> Tensor:
     sq = local_grad_norm(grads).square().reshape(1)
     torch.distributed.all_reduce(sq, op=torch.distributed.ReduceOp.SUM)
     return sq.sqrt()[0]
-
-
-def no_agree(flag: Tensor) -> Tensor:
-    return flag
 
 
 def all_reduce_max(flag: Tensor) -> Tensor:
@@ -125,12 +121,12 @@ class Bundle:
         groups: list[dict],
         grad_clip: float,
         grad_norm: Callable[[list[Tensor]], Tensor] = local_grad_norm,
-        agree: Callable[[Tensor], Tensor] = no_agree,
+        agree: Callable[[Tensor], Tensor] = identity,
         train_mode: Callable[[], None] = nothing,
         eval_mode: Callable[[], None] = nothing,
         before: Callable[[], None] = nothing,
         after: Callable[[], None] = nothing,
-        reduce_loss: Callable[[Tensor], Tensor] = no_agree,
+        reduce_loss: Callable[[Tensor], Tensor] = identity,
         grads: Callable[[], list[Tensor]] | None = None,
         device: torch.device | None = None,
         reduce_step: Callable | None = None,

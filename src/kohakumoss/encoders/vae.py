@@ -64,14 +64,6 @@ def resolve_vae_dtype(name: str | torch.dtype, device) -> torch.dtype:
     return torch.float32
 
 
-def vae_encoder_spec(
-    path: str | Path = "", device: torch.device | str = "cuda", dtype="auto", **_
-) -> str:
-    """The `encoder_spec` `vae_encoder(...)` gives for the same arguments, without
-    loading the weights."""
-    return vae_spec(resolve_vae_dtype(dtype, device))
-
-
 def vae_dtype_problems(name: str, device) -> list[str]:
     """Every problem with VAE_DTYPE=`name` on `device`."""
     if name not in VAE_DTYPES:

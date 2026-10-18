@@ -75,7 +75,7 @@ class AdapterConfig:
         return BY_ALGO[self.algo]
 
     @property
-    def step_state(self) -> bool:
+    def has_step_state(self) -> bool:
         """The adapters carry per-step state: T-LoRA masks, DyLoRA ranks or
         module-dropout draws."""
         rec = BY_ALGO.get(self.algo)

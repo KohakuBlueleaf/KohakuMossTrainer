@@ -6,4 +6,4 @@ algorithm layer; see docs/guides/configs.md and docs/concepts/profiles.md."""
 
 MEMORY_PROFILE = "low"
 MAX_TOKENS = 8192
-TEXT_ENCODE = {"memory": "stream", "ahead": 4}
+TEXT_ENCODE = {"memory": "ring", "ahead": 4}

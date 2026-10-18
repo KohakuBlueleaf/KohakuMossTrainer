@@ -25,24 +25,22 @@ def _pick(budget: int, step: int) -> str:
 
 
 def test_footprints_order_by_what_stays_on_the_device():
-    fp = {
-        m: text_footprint(m, SIZES, *TOKENS) for m in ("resident", "offload", "stream")
-    }
+    fp = {m: text_footprint(m, SIZES, *TOKENS) for m in ("resident", "offload", "ring")}
     assert fp["resident"]["resident"] == SIZES.total
     assert fp["offload"]["resident"] == 0
-    assert fp["stream"]["resident"] == SIZES.total - SIZES.embedding - SIZES.layers
-    assert fp["stream"]["pass"] < fp["offload"]["pass"] < fp["resident"]["pass"]
+    assert fp["ring"]["resident"] == SIZES.total - SIZES.embedding - SIZES.layers
+    assert fp["ring"]["pass"] < fp["offload"]["pass"] < fp["resident"]["pass"]
 
 
-def test_auto_picks_resident_when_it_fits_next_to_the_step_else_stream(monkeypatch):
+def test_auto_picks_resident_when_it_fits_next_to_the_step_else_ring(monkeypatch):
     assert _pick(40 * GIB, 8 * GIB) == "resident"
-    assert _pick(20 * GIB, 8 * GIB) == "stream"
-    assert _pick(8 * GIB, 6 * GIB) == "stream"
+    assert _pick(20 * GIB, 8 * GIB) == "ring"
+    assert _pick(8 * GIB, 6 * GIB) == "ring"
 
     def never_offload():
         for budget in (8, 12, 16, 20, 24, 32, 48):
             assert _pick(budget * GIB, 8 * GIB) != "offload", budget
 
     never_offload()
-    monkeypatch.setattr(text_memory, "ORDER", ("resident", "offload", "stream"))
-    must_fail(never_offload, "offload ranked before stream")
+    monkeypatch.setattr(text_memory, "ORDER", ("resident", "offload", "ring"))
+    must_fail(never_offload, "offload ranked before ring")

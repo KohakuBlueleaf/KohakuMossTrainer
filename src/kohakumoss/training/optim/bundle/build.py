@@ -7,12 +7,12 @@ import torch
 from torch import Tensor
 
 from kohakumoss.precision.scaler import DynamicScaler, NoScaler
-from kohakumoss.training.optim.bundle.base import Bundle, local_grad_norm, no_agree
+from kohakumoss.training.optim.bundle.base import Bundle, local_grad_norm
 from kohakumoss.training.optim.bundle.fused import FusedStepBundle
 from kohakumoss.training.optim.bundle.mirror import schedule_for
 from kohakumoss.training.optim.optimizers.factory import OPTIMIZERS
 from kohakumoss.types.plans import PrecisionConfig
-from kohakumoss_common.calls import nothing
+from kohakumoss_common.calls import identity, nothing
 from kohakumoss_common.registry import build
 
 SHARED_STEP = frozenset({"master_adamw", "host_state_adamw", "cpu_adamw"})
@@ -42,7 +42,7 @@ def build_bundle(
     grad_clip: float,
     fused_step: bool = False,
     grad_norm: Callable[[list[Tensor]], Tensor] = local_grad_norm,
-    agree: Callable[[Tensor], Tensor] = no_agree,
+    agree: Callable[[Tensor], Tensor] = identity,
     **hooks,
 ):
     """The bundle the drivers use; `fused_step` returns the per-parameter variant.

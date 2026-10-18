@@ -26,13 +26,13 @@ def check_steps(off: GradOffload, params) -> None:
     for _ in range(2):
         off.start(False)
         _backward(params, 1.0)
-    off.flush()
+    off.drain()
     assert torch.equal(off.host[params[0]], torch.full((3, 4), 2.0))
     off.zero()
     assert torch.equal(off.host[params[0]], torch.full((3, 4), 2.0)), "sum zeroed"
     off.start(False)
     _backward(params, 3.0, which=(0,))
-    off.flush()
+    off.drain()
     assert torch.equal(off.host[params[0]], torch.full((3, 4), 3.0))
     assert off.filled_sums() == [off.host[params[0]]]
     off.restore(params[1])
@@ -78,8 +78,8 @@ def test_late_parameter_is_settled(monkeypatch):
     check_settled(GradOffload(params, pinned=False), params)
     params = _params()
     lazy = GradOffload(params, pinned=False)
-    monkeypatch.setattr(lazy, "settle", lambda: None)
-    must_fail(lambda: check_settled(lazy, params), "settle skipped")
+    monkeypatch.setattr(lazy, "finish_unhooked", lambda: None)
+    must_fail(lambda: check_settled(lazy, params), "finish_unhooked skipped")
 
 
 def test_host_adamw_steps_only_filled_sums():
@@ -89,7 +89,7 @@ def test_host_adamw_steps_only_filled_sums():
     opt.use_host_grads(off)
     off.start(False)
     _backward(params, 1.0, which=(0,))
-    off.flush()
+    off.drain()
     before = params[1].detach().clone()
     opt.step()
     assert torch.equal(params[1].detach(), before), "a parameter with no sum moved"

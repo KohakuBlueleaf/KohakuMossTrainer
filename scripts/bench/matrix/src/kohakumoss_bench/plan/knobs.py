@@ -97,8 +97,8 @@ def data_knobs(host: Host, opts: Options) -> dict:
 
 
 def train_knobs(host: Host, opts: Options, precision: str, algo: str) -> dict:
-    """A short training run's knobs (no saves, samples, validation or exports; one
-    metric row per step; console only)."""
+    """A short training run's knobs (training steps only; one metric row per step;
+    console only)."""
     return {
         **data_knobs(host, opts),
         **weights_knobs(host, precision, fix_mode(host, opts)),
@@ -138,7 +138,7 @@ def quality_knobs(
         "SCHEDULE": {"mode": "constant", "warmup": 20, "end": -1},
         "MEMORY_PROFILE": "auto",
         "TEXT_CACHE": "online",
-        "TEXT_ENCODE": {"memory": "stream"},
+        "TEXT_ENCODE": {"memory": "ring"},
         "SAVE_EVERY": opts.quality_save,
         "SAMPLE_EVERY": opts.quality_steps // 2,
         "SAMPLE_PROMPTS": "{sample_prompts}",
@@ -188,7 +188,7 @@ def grid_knobs(
         "ADAPTER_MODE": "bypass",
         "DEVICE": card.device_type,
         "VAE_ENCODE": {"memory": "offload"},
-        "TEXT_ENCODE": {"memory": "stream"},
+        "TEXT_ENCODE": {"memory": "ring"},
         "TUNE": "table",
         "PROMPTS": "{prompts}",
         "SIZES": ["1024x1024"],

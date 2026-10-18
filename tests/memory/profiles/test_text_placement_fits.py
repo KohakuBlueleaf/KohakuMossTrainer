@@ -44,14 +44,14 @@ def _placed(rule, name: str, budget_gib: float) -> str:
 
 def check_fits(rule) -> None:
     assert _placed(rule, "balanced", 40) == "resident"
-    assert _placed(rule, "balanced", 8) == "stream"
+    assert _placed(rule, "balanced", 8) == "ring"
     for name in ORDER:
         assert _placed(rule, name, 96) == "resident", name
 
 
 def _tied_to_dit(plan) -> str:
     """The rule that streams the text encoder whenever the DiT streams."""
-    return "stream" if plan.stream != "off" else "auto"
+    return "ring" if plan.stream != "off" else "auto"
 
 
 def test_text_encoder_takes_the_fastest_fit():

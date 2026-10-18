@@ -9,15 +9,12 @@ from collections.abc import Callable
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
+from kohakumoss_common.calls import identity
 from kohakumoss_common.devices import streamed_type
 from kohakumoss_common.imports import import_object
 
 WORKER_START = "spawn" if sys.platform == "win32" else "forkserver"
 WORKER_LOOP = "torch.utils.data._utils.worker"
-
-
-def identity(batch):
-    return batch
 
 
 def pinnable() -> bool:

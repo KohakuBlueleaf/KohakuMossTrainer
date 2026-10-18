@@ -1,7 +1,7 @@
 """Choose each layer's bound forward once, from its kind record and the bind context.
 
 Every decision here happens at bind time and yields a distinct callable; the bound
-forward never inspects mode, multiplier, flags or training state.
+forward is that callable, called directly.
 """
 
 from functools import partial

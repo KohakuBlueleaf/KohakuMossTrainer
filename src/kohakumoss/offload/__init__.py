@@ -4,7 +4,7 @@ streaming, layer streaming, shared host memory), optimiser and gradient offload
 
 from kohakumoss.offload.activation import ActivationOffload
 from kohakumoss.offload.optim.cpu_optim import CPUAdamW
-from kohakumoss.offload.optim.fused_step import FusedStep, PerParamOptimizer
+from kohakumoss.offload.optim.fused_step import FusedStep
 from kohakumoss.offload.optim.grad import GradOffload
 from kohakumoss.offload.weights.layers import LayerStreamer
 from kohakumoss.offload.weights.stream import StreamedWeight, WeightStream
@@ -15,7 +15,6 @@ __all__ = [
     "FusedStep",
     "GradOffload",
     "LayerStreamer",
-    "PerParamOptimizer",
     "StreamedWeight",
     "WeightStream",
 ]

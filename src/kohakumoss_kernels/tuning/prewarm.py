@@ -10,19 +10,11 @@ import torch
 from kohakumoss_common.log import get_logger, hl
 from kohakumoss_kernels.hardware.current import rng_kept
 from kohakumoss_kernels.registry import Bound, exercise
-from kohakumoss_kernels.tuning.buckets import SEGMENT_CAP
+from kohakumoss_kernels.tuning.buckets import LENGTH_FLOOR, SEGMENT_CAP, pow2_buckets
 
 log = get_logger(__name__)
-
-
-def attention_lengths(max_len: int, floor: int = 64) -> list[int]:
-    """One segment length per power-of-two bucket up to `max_len` (the tuning keys)."""
-    out, b = [], floor
-    while b < max_len:
-        out.append(b)
-        b *= 2
-    out.append(max_len)
-    return out
+# one segment length per power-of-two bucket up to `max_len` (the tuning keys)
+attention_lengths = partial(pow2_buckets, floor=LENGTH_FLOOR)
 
 
 def reachable_segments(

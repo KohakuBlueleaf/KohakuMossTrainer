@@ -2,11 +2,11 @@
 
 The choices of a registered op are its own backend's kernel (`kernel`) and `compile`.
 A call looks its problem up: a bound callable, else the settled per-card result of an
-earlier measurement, else the kernel (and the problem is queued, until the tuner is
-sealed). `retune_pending()`
-(between steps, outside any autograd graph) measures the queued problems and stores the
-winners; the next call of each binds its winner; `decide(*args)` measures one problem
-directly. See docs/internals/tuning.md#kernel-vs-compile.
+earlier measurement, else the kernel (queued for the retune until `window.seal`).
+`retune_pending()` (end of the prewarm replay and the retune steps, outside any
+autograd graph) measures the queued problems and stores the winners; the next call of
+each binds its winner; `decide(*args)` measures one problem directly. See
+docs/internals/tuning.md#kernel-vs-compile.
 """
 
 import time
@@ -173,7 +173,7 @@ class KernelOrCompile:
             return self.impls["kernel"]
         else:
             self._probe(args)
-            tuned = get_mode() == "table" and not sealed()
+            queues = get_mode() == "table" and not sealed()
             key = self.problem(args)
             note(self.name, key)
             row = settled(self.name, _device(args), key)
@@ -182,9 +182,9 @@ class KernelOrCompile:
             impl = row["impl"] if row is not None else "kernel"
             if row is not None:
                 decisions.record(self.name, key, "table", {"impl": impl})
-            elif tuned:
+            elif queues:
                 self.pending[qk] = [_layout(a) for a in args]
-                decisions.queued(self.name, key)
+                decisions.undecided(self.name, key)
             else:
                 decisions.record(self.name, key, "default", KERNEL)
             fn = self._impl(impl, args)
@@ -200,8 +200,9 @@ class KernelOrCompile:
 
     def decide(self, *args) -> str:
         """Measure this problem (or read its stored result), store and bind the winner.
-        Where the tuner may not time an autograd launch the kernel is returned unbound
-        and the problem stays queued."""
+        Frozen or deferring outside `timing_here`, the kernel binds untimed and unstored
+        (`tuner._bind_untimed`). Where the context forbids timing an autograd launch the
+        kernel is returned unbound and the problem stays queued."""
         device = _device(args)
         key = self.problem(args)
         cfg = select(
@@ -304,9 +305,10 @@ def drop_pending() -> int:
 
 
 def retune_pending() -> int:
-    """Decide every queued problem of every op (call between steps), without returning
-    memory to the driver; nothing is measured where the tuner may not time an autograd
-    launch."""
+    """Decide every queued problem of every op (end of the prewarm replay, the retune
+    steps, after an owned pipeline's generate), returning memory to the driver only
+    when a problem's inputs do not fit; nothing is measured where the context forbids
+    timing an autograd launch."""
     if not timing_allowed(autograd=True):
         return 0
     devices = {

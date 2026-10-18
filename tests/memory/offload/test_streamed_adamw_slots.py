@@ -1,5 +1,5 @@
 """StreamedAdamW's slot ring, model-free (blocks of one linear each, on the host): the
-device bytes it allocates are `slot_bytes` (no master / moment rows with resident
+device bytes it allocates are `slot_bytes` (no master / moment rows with device
 states), the training estimate counts exactly that, a slot still holding an unstepped
 block is never handed out again, and the host gradient sums are replaced, not zeroed,
 between steps."""
@@ -34,11 +34,11 @@ def _blocks() -> list[nn.Module]:
     return out
 
 
-def _optimizer(resident: bool) -> StreamedAdamW:
+def _optimizer(device_states: bool) -> StreamedAdamW:
     stream = WeightStream(
-        _blocks(), "cpu", resident=2, pinned=False, trainable=True, dtype=torch.bfloat16
+        _blocks(), "cpu", slots=2, pinned=False, trainable=True, dtype=torch.bfloat16
     )
-    return StreamedAdamW(stream, lr=1e-3, resident=resident)
+    return StreamedAdamW(stream, lr=1e-3, device_states=device_states)
 
 
 def _ring_bytes(opt: StreamedAdamW) -> int:
@@ -48,27 +48,29 @@ def _ring_bytes(opt: StreamedAdamW) -> int:
     return sum(t.numel() * t.element_size() for t in tensors)
 
 
-def _matches(opt: StreamedAdamW, resident: bool) -> None:
-    assert _ring_bytes(opt) == slot_bytes(OUT * IN, 2, resident), _ring_bytes(opt)
+def _matches(opt: StreamedAdamW, device_states: bool) -> None:
+    assert _ring_bytes(opt) == slot_bytes(OUT * IN, 2, device_states), _ring_bytes(opt)
 
 
-@pytest.mark.parametrize("resident", [True, False])
-def test_ring_bytes_are_slot_bytes(resident):
-    opt = _optimizer(resident)
-    _matches(opt, resident)
-    assert (opt.slots == []) == resident
-    must_fail(lambda: _matches(opt, not resident), "the other state placement")
+@pytest.mark.parametrize("device_states", [True, False])
+def test_ring_bytes_are_slot_bytes(device_states):
+    opt = _optimizer(device_states)
+    _matches(opt, device_states)
+    assert (opt.slots == []) == device_states
+    must_fail(lambda: _matches(opt, not device_states), "the other state placement")
 
 
-def test_resident_ring_holds_no_state_rows(monkeypatch):
+def test_device_state_ring_holds_no_state_rows(monkeypatch):
     real = StreamedAdamW.__init__
 
     def always_rows(self, stream, *args, **kwargs):
-        real(self, stream, *args, **{**kwargs, "resident": False})
-        self.resident = True
+        real(self, stream, *args, **{**kwargs, "device_states": False})
+        self.device_states = True
 
     monkeypatch.setattr(StreamedAdamW, "__init__", always_rows)
-    must_fail(lambda: _matches(_optimizer(True), True), "rows allocated when resident")
+    must_fail(
+        lambda: _matches(_optimizer(True), True), "rows allocated with device states"
+    )
 
 
 @pytest.mark.parametrize("state", ["gpu", "stream"])
@@ -165,8 +167,8 @@ def _check_sums(stream: WeightStream) -> None:
 
 
 def test_host_sums_replaced_not_zeroed(monkeypatch):
-    _check_sums(_optimizer(False).stream)
-    adding = _optimizer(False).stream
+    _check_sums(_optimizer(False).weight_stream)
+    adding = _optimizer(False).weight_stream
     sink = adding.grads
     monkeypatch.setattr(sink, "accumulate", _always_add.__get__(sink))
     must_fail(lambda: _check_sums(adding), "a step's first gradient added to old sums")

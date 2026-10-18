@@ -17,11 +17,13 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from kohakumoss.types.plans import ParallelPlan
+from kohakumoss_kernels.dist import COLLECTIVE_DEVICE, grouped
+from kohakumoss_kernels.dist import dist_rank as dist_rank
 
 IS_WINDOWS = sys.platform == "win32"
 TIMEOUT_S = 600.0  # default DIST_TIMEOUT: seconds a collective / the store waits
 RANK0_WAIT_S = 7200.0  # default DIST_GATE_TIMEOUT: seconds a store gate waits
-DEVICE_BACKENDS = ("nccl", "xccl")
+DEVICE_BACKENDS = tuple(COLLECTIVE_DEVICE)
 BINDS = ("lazy", "device")
 _GATES = itertools.count()
 _STARTUP = {"timeout_s": RANK0_WAIT_S}
@@ -169,13 +171,6 @@ def rank0_value(
     return wait_for_rank0(name, store, timeout_s)
 
 
-def dist_rank() -> tuple[int, int]:
-    """(rank, world) of the default process group; (0, 1) without one."""
-    if dist.is_available() and dist.is_initialized():
-        return dist.get_rank(), dist.get_world_size()
-    return 0, 1
-
-
 def startup_barrier(
     name: str, world: int, store=None, timeout_s: float | None = None
 ) -> None:
@@ -191,7 +186,7 @@ def startup_barrier(
 def ranks_meet(what: str) -> None:
     """`startup_barrier` over the default process group (nothing without one or with
     one rank); a distinct gate per call."""
-    if dist.is_initialized() and dist.get_world_size() > 1:
+    if grouped():
         startup_barrier(gate_name(what), dist.get_world_size())
 
 
@@ -268,9 +263,3 @@ def spawn(fn, plan: ParallelPlan, *args, device_type: str = "cuda") -> None:
     )
     mp.spawn(_entry, args=(fn, cfg, args), nprocs=world, join=True)
     del store
-
-
-def local_env(device: torch.device | str = "cuda") -> DistEnv:
-    """The single-process environment (no process group)."""
-    device = torch.device(device)
-    return DistEnv(0, 1, 0, device, "none")

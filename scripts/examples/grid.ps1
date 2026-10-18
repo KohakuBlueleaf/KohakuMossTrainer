@@ -74,8 +74,8 @@ param(
     # DiT memory profile: auto = the fastest profile that fits the card's free memory | minimal (2 resident
     # blocks, the rest streamed; fits 8 GB) | low | balanced | any catalog name | "" = whole DiT on the GPU.
     [string] $Memory = "auto",
-    # Text encoder: auto | resident | offload | stream (layers from host RAM, ~2 GB) | cpu.
-    [ValidateSet("auto", "resident", "offload", "stream", "cpu")] [string] $TextMemory = "auto",
+    # Text encoder: auto | resident | offload | ring (layers from host RAM, ~2 GB; "stream" is accepted too) | cpu.
+    [ValidateSet("auto", "resident", "offload", "ring", "stream", "cpu")] [string] $TextMemory = "auto",
     # Text-encoder precision: compute | int8 | fp8 | fp8_compute | mxfp8.
     [ValidateSet("compute", "int8", "fp8", "fp8_compute", "mxfp8")] [string] $TextPrecision = "compute",
     # Free the text encoder after the one encode of every prompt.

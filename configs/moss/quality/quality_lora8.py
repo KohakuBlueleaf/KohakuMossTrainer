@@ -36,4 +36,4 @@ SEED = 0
 SAMPLE_EVERY = 0
 LATENT_CACHE = "offline"
 TEXT_CACHE = "online"
-TEXT_ENCODE = {"memory": "stream"}
+TEXT_ENCODE = {"memory": "ring"}

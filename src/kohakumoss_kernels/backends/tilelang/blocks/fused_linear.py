@@ -1,6 +1,6 @@
 """TileLang fused linear ops (fp16, sm70+): GEMM + MOSS epilogue. This module holds the
-fused GEMM launches, their tile configs and what the TileLang kernels take (no bias,
-the residual stream in the activation dtype); the host code (paths, custom ops,
+fused GEMM launches, their tile configs and what the TileLang kernels take (bias-free
+GEMMs, the residual stream in the activation dtype); the host code (paths, custom ops,
 autograd) is `backends/_fused_linear.py`. A fused config that does not compile is
 dropped; a problem nothing compiles for runs the compiled eager composition.
 """

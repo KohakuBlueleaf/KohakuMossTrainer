@@ -157,8 +157,9 @@ SAFE = {
 
 
 def _candidates(kind, dev, d, esize, heads, segs, max_len):
-    """Per-arch seed configs first, then the analytical ranking; when nothing will be
-    timed the per-arch first seed (or the small `SAFE` tile) leads."""
+    """Per-arch seed configs first, then the analytical ranking; when the pick will be
+    untimed (tracing, TUNE=off, a backward / recompute, a frozen or deferring tuner) the
+    per-arch first seed (or the small `SAFE` tile) leads."""
     seeds = [
         c
         for c in SEEDS.get((kind, dev.sm), [])
@@ -167,7 +168,7 @@ def _candidates(kind, dev, d, esize, heads, segs, max_len):
     order = seeds + [
         c for c in _ranked(kind, dev, d, esize, heads, segs, max_len) if c not in seeds
     ]
-    if not seeds and not tuning.timing_allowed(in_backward=kind != "fwd"):
+    if not seeds and not tuning.will_time(in_backward=kind != "fwd"):
         order = [SAFE[kind]] + [c for c in order if c != SAFE[kind]]
     return order
 

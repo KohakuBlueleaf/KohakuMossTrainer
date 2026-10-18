@@ -88,7 +88,7 @@ def test_valid_knobs_pass():
     assert_valid(knobs(PROMPT="", PROMPTS=["a", "b"]))
     assert_valid(
         knobs(
-            TEXT_ENCODE={"memory": "stream", "free_after_use": True},
+            TEXT_ENCODE={"memory": "ring", "free_after_use": True},
             VAE_ENCODE={"memory": "offload", "tile": True},
             MEMORY_PROFILE="minimal",
             BASE_PRECISION="int8",

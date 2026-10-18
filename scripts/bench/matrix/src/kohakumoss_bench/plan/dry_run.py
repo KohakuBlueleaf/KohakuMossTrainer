@@ -11,7 +11,7 @@ step. See docs/performance/bench-matrix.md#plan.
 import heapq
 
 from kohakumoss.memory.estimate import block_params, total_params
-from kohakumoss.memory.profiles import PROFILES, checkpoint_mode
+from kohakumoss.memory.profiles import PROFILES, checkpoint_mode, profile_name
 from kohakumoss.model.flops import PEAK_TFLOPS, forward_flops, step_flops
 from kohakumoss.types.arch import PRESETS
 from kohakumoss_bench.plan import matrix
@@ -41,7 +41,7 @@ def train_step_s(card: Card, opts: Options, knobs: dict) -> float:
     samples = max(1, round(tokens / SAMPLE_TOKENS))
     img = int(tokens * 0.94)
     lens = [tokens // samples] * samples
-    profile = PROFILES.get(knobs.get("MEMORY_PROFILE", "balanced"), {})
+    profile = PROFILES.get(profile_name(knobs.get("MEMORY_PROFILE", "balanced")), {})
     mode, _ = checkpoint_mode(profile.get("checkpoint", "block"))
     full = knobs.get("ALGO") == "full"
     fwd = forward_flops(ARCH, img, lens, tokens - img)

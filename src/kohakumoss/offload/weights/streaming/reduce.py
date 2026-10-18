@@ -27,19 +27,19 @@ class BlockReducer:
         mine: Callable[[int], bool],
         stats: dict,
     ):
-        device, dm, cuda = dev.device, dev.dm, dev.cuda
+        device, dm, side = dev.device, dev.dm, dev.streamed
         self.grads = grads
         self.params = grads.params
         self.device = device
         self.dm = dm
-        self.cuda = cuda
+        self.streamed = side
         self.mine = mine
         self.stats = stats
         self.reduce: Callable[[Tensor, int], None] | None = None
         self.flat: Tensor | None = None
         self.pending: dict[int, dict[tuple[int, str], Tensor]] = {}
-        self.red = dm.Stream(device) if cuda and trainable else None
-        if cuda:
+        self.red = dm.Stream(device) if side and trainable else None
+        if side:
             self._order, self._side, self._keep = (
                 self._order_device,
                 partial(dm.stream, self.red),
@@ -79,10 +79,10 @@ class BlockReducer:
         pending = self.pending.setdefault(key[0], {})
         pending[key] = grad
         if len(pending) == len(self.grads.block_keys[key[0]]):
-            self.flush_block(key[0], self.pending.pop(key[0]))
+            self.reduce_block(key[0], self.pending.pop(key[0]))
 
     @torch.no_grad()
-    def flush_block(self, index: int, grads: dict) -> None:
+    def reduce_block(self, index: int, grads: dict) -> None:
         """Earlier micro-batches' host sum + this one's gradients -> the fp32 flat
         buffer on the side stream -> `reduce` -> the owner's `host_grad` (replacing the
         sum)."""
@@ -100,7 +100,7 @@ class BlockReducer:
                 view = flat[offset : offset + shape.numel()].view(shape)
                 offset += shape.numel()
                 if sink.filled.get(key, False):
-                    view.copy_(sink.host_grad[key], non_blocking=self.cuda)
+                    view.copy_(sink.host_grad[key], non_blocking=self.streamed)
                     view.add_(grads[key])
                 else:
                     view.copy_(grads[key])
@@ -109,7 +109,7 @@ class BlockReducer:
                 self.reduce(flat, index)
             if self.mine(index):
                 for key, view in views:
-                    sink.buffer(key).copy_(view, non_blocking=self.cuda)
+                    sink.buffer(key).copy_(view, non_blocking=self.streamed)
                     sink.filled[key] = True
                 self.stats["bytes_d2h"] += total * 4
         self._keep(used)

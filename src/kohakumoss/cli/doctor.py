@@ -7,15 +7,13 @@ The report holds no paths, host or user names.
 """
 
 import argparse
-import glob
 import importlib.metadata as metadata
 import json
-import os
 import platform
 import re
 import shutil
-import subprocess
 import sys
+from pathlib import Path
 
 import torch
 
@@ -23,10 +21,11 @@ from kohakumoss.cli.missing import missing
 from kohakumoss.logging.log import render
 from kohakumoss.memory.profiles import ORDER
 from kohakumoss.memory.profiles import resolve as resolve_profile
+from kohakumoss_common.units import gib
 from kohakumoss_kernels import available, registry, status
 from kohakumoss_kernels import ops as kernel_ops
 from kohakumoss_kernels.hardware.arch import arch_of
-from kohakumoss_kernels.hardware.toolchain import compilers
+from kohakumoss_kernels.hardware.toolchain import compilers, msvc_compilers, vswhere
 
 PACKAGES = (
     "torch",
@@ -42,11 +41,7 @@ PACKAGES = (
     "transformers",
     "bitsandbytes",
 )
-VSWHERE = r"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s'\",;]*|(?<![\w.])/[\w.-]+/[^\s'\",;]*")
-MSVC_GLOB = (
-    r"%ProgramFiles%\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe"
-)
 
 
 def versions() -> dict[str, str | None]:
@@ -71,7 +66,7 @@ def devices() -> list[dict]:
                     "name": props.name,
                     "capability": f"{props.major}.{props.minor}",
                     "arch": arch.name,
-                    "memory_gib": round(props.total_memory / 1024**3, 2),
+                    "memory_gib": round(gib(props.total_memory), 2),
                     "bf16": arch.has_bf16,
                     "fp8": arch.has_fp8,
                 }
@@ -84,7 +79,7 @@ def devices() -> list[dict]:
                     "index": i,
                     "name": props.name,
                     "arch": "xpu",
-                    "memory_gib": round(props.total_memory / 1024**3, 2),
+                    "memory_gib": round(gib(props.total_memory), 2),
                 }
             )
     return out
@@ -101,17 +96,8 @@ def msvc() -> dict:
     if sys.platform != "win32":
         return {"needed": False}
     found = shutil.which("cl") is not None
-    vswhere = os.path.expandvars(VSWHERE)
-    via_vswhere = False
-    if os.path.exists(vswhere):
-        res = subprocess.run(
-            [vswhere, "-latest", "-products", "*", "-property", "installationVersion"],
-            capture_output=True,
-            text=True,
-        )
-        via_vswhere = bool(res.stdout.strip())
-    direct = sorted(glob.glob(os.path.expandvars(MSVC_GLOB)))
-    versions_found = sorted({p.split(os.sep)[-5] for p in direct})
+    via_vswhere = bool(vswhere("-latest", "-property", "installationPath"))
+    versions_found = sorted({Path(p).parts[-5] for p in msvc_compilers()})
     return {
         "needed": True,
         "cl_on_path": found,

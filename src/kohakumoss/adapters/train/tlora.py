@@ -111,9 +111,3 @@ def restore_masks(masks: dict[int, Tensor]) -> None:
     clear_masks()
     for group, mask in masks.items():
         set_timestep_mask(mask, group)
-
-
-def set_token_mask(sigma: Tensor, seg: Tensor, max_rank: int, **kwargs) -> None:
-    """Install a joint-axis mask (group 0) directly, for callers outside an
-    AdapterSet step."""
-    set_timestep_mask(token_mask(sigma, seg, max_rank, **kwargs), AXES["joint"])

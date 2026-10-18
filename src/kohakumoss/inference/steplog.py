@@ -65,27 +65,27 @@ class _DeviceMarks:
 
 class StepClock:
     """`tick(i)` after sampler step `i` (one mark, no sync); `summary()` after a batch
-    reads every step, logs them and the summary. `stream` is the DiT's WeightStream or
-    None; `rows` holds the per-step rows once `summary()` ran."""
+    reads every step, logs them and the summary. `weight_stream` is the DiT's
+    WeightStream or None; `rows` holds the per-step rows once `summary()` ran."""
 
-    def __init__(self, device: torch.device, steps: int, stream=None):
+    def __init__(self, device: torch.device, steps: int, weight_stream=None):
         self.device = device
         self.steps = steps
-        self.stream = stream or _NoStream()
-        self.read = _no_read if stream is None else read_timing
+        self.weight_stream = weight_stream or _NoStream()
+        self.read = _no_read if weight_stream is None else read_timing
         self.marks = _DeviceMarks(device) if streamed(device) else _HostMarks(device)
         self.rows: list[dict] = []
         self.ticks: list[tuple[int, object, dict]] = []
 
     def start(self) -> None:
-        self.stream.set_timing(True)
-        self.stream.cut_timing()
+        self.weight_stream.set_timing(True)
+        self.weight_stream.cut_timing()
         self.t0 = self.marks.mark()
         self.ticks = []
         self.rows.clear()
 
     def tick(self, i: int) -> None:
-        self.ticks.append((i, self.marks.mark(), self.stream.cut_timing()))
+        self.ticks.append((i, self.marks.mark(), self.weight_stream.cut_timing()))
 
     def _rows(self) -> list[dict]:
         self.marks.settle()
@@ -98,9 +98,8 @@ class StepClock:
 
     def summary(self) -> dict:
         """The batch's per-step lines, then the mean seconds per step without the first
-        (JIT compiles, first copies) and the copy / overlap ratios over the same
-        steps."""
-        self.stream.set_timing(False)
+        and the copy / overlap ratios over the same steps."""
+        self.weight_stream.set_timing(False)
         self.rows[:] = self._rows()
         for row in self.rows:
             log.info(_line(row, self.steps))

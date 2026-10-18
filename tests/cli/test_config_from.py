@@ -105,7 +105,7 @@ def test_wizard(tmp_path):
     assert_every_knob(text)
     _, k = config_knobs(out, ROOT)
     assert (k["ALGO"], k["PRECISION"], k["STEPS"]) == ("lokr", "fp16", 300)
-    assert k["MEMORY_PROFILE"] == "ckpt-stream4-actoff-optstream-gradoff"
+    assert k["MEMORY_PROFILE"] == "ckpt-ring4-actoff-optstream-gradoff"
     assert k["RUN_NAME"] == "wiz"
     assert (tmp_path / "wiz_data.py").is_file()
 

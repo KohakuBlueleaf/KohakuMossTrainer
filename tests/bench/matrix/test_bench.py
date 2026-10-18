@@ -44,17 +44,17 @@ def host() -> Host:
 
 
 def test_frontier_drops_offload_that_buys_nothing():
-    gib = {"ckpt-stream8": 10.0, "ckpt-stream8-gradoff": 9.9, "ckpt-stream2": 6.0}
+    gib = {"ckpt-ring8": 10.0, "ckpt-ring8-gradoff": 9.9, "ckpt-ring2": 6.0}
     kept = matrix.frontier(list(gib), gib, 0.03)
-    assert kept == ["ckpt-stream8", "ckpt-stream2"]
+    assert kept == ["ckpt-ring8", "ckpt-ring2"]
 
     def check(keep):
-        assert "ckpt-stream8-gradoff" not in keep
+        assert "ckpt-ring8-gradoff" not in keep
 
     must_fail(lambda: check(list(gib)), "no frontier: dominated entry kept")
-    assert matrix.frontier(
-        list(gib), {**gib, "ckpt-stream8-gradoff": 8.0}, 0.03
-    ) == list(gib)
+    assert matrix.frontier(list(gib), {**gib, "ckpt-ring8-gradoff": 8.0}, 0.03) == list(
+        gib
+    )
 
 
 def test_queue_fits_card_and_orders_dependencies():
@@ -318,8 +318,8 @@ def test_nonfinite_steps_listed_with_scale():
 def test_host_ram_estimate_and_budget():
     base = {"MAX_TOKENS": 8192, "BASE_PRECISION": "compute"}
     resident = Run("a", "speed", TRAIN, {**base, "MEMORY_PROFILE": "ckpt-resident"}, 1)
-    stream = Run("b", "speed", TRAIN, {**base, "MEMORY_PROFILE": "ckpt-stream8"}, 1)
-    acts = {**base, "MEMORY_PROFILE": "nockpt-stream16-actoff"}
+    stream = Run("b", "speed", TRAIN, {**base, "MEMORY_PROFILE": "ckpt-ring8"}, 1)
+    acts = {**base, "MEMORY_PROFILE": "nockpt-ring16-actoff"}
     heavy = Run("c", "speed", TRAIN, acts, 1)
     small, mid, big = (hostmem.run_gib(r) for r in (resident, stream, heavy))
     assert small == hostmem.BASELINE_GIB and mid > small + 8 and big > mid + 30

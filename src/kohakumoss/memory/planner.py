@@ -46,7 +46,7 @@ def with_text(
     memory: str = "auto",
 ) -> tuple[int, str]:
     """(peak bytes of the step with the text encoder, its placement): resident text
-    weights add to the DiT step peak; an offload / stream pass peaks on top of the
+    weights add to the DiT step peak; an offload / ring pass peaks on top of the
     persistent DiT parts only (its buffers are released before the step). `memory`
     'auto' picks the fastest placement that fits `budget`."""
     persistent = est.device(PERSISTENT)

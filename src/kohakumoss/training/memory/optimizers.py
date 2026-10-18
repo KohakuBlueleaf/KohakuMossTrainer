@@ -17,11 +17,12 @@ from kohakumoss.memory.apply import (
 )
 from kohakumoss.offload.optim.stream_optim import StreamedAdamW
 from kohakumoss.parallel.ddp import ShardedNorm, sum_block_stats
-from kohakumoss.training.optim.bundle.base import local_grad_norm, no_agree
+from kohakumoss.training.optim.bundle.base import local_grad_norm
 from kohakumoss.training.optim.bundle.build import build_bundle
 from kohakumoss.training.optim.bundle.nonfinite import param_names
 from kohakumoss.training.optim.optimizers.factory import master_groups
 from kohakumoss.types.plans import MemoryPlan, PrecisionConfig
+from kohakumoss_common.calls import identity
 
 ADAMW_BY_STATE = {
     "gpu": "adamw",
@@ -80,27 +81,29 @@ def host_grad_names(grads, masters: list[Tensor], by_id: dict[int, str]) -> list
 
 
 def _offload_parts(
-    grads, host_optimizer: bool, fused: bool, masters, by_id: dict[int, str]
+    grads, cpu_adamw: bool, fused: bool, masters, by_id: dict[int, str]
 ) -> dict:
     """Bundle hooks for gradient offload: in-backward finish, host optimiser (reads the
     host sums holding this step's gradients and the streamed blocks' host gradients),
     or device optimiser (sums put back on the device before the step). Off the fused
-    path, parameters whose last-micro-batch hook did not fire are settled first."""
-    match (fused, host_optimizer):
+    path under DDP (a `final` on the last micro-batch), parameters whose
+    last-micro-batch hook did not fire are finished first; without DDP that is a
+    no-op."""
+    match (fused, cpu_adamw):
         case (True, _):
             return {"after": grads.zero}
         case (False, True):
             return {
-                "settle": grads.settle,
-                "before": grads.flush,
+                "finish_unhooked": grads.finish_unhooked,
+                "before": grads.drain,
                 "after": grads.zero,
                 "grads": partial(_host_grads, grads, list(masters)),
                 "grad_names": partial(host_grad_names, grads, list(masters), by_id),
             }
         case _:
             return {
-                "settle": grads.settle,
-                "before": _chain(grads.flush, grads.to_device),
+                "finish_unhooked": grads.finish_unhooked,
+                "before": _chain(grads.drain, grads.to_device),
                 "after": grads.zero,
             }
 
@@ -139,9 +142,9 @@ def _ddp_kept(ddp, engines: MemoryEngines, grads, params) -> Callable | None:
     are summed on the last micro-batch and replace their host sums (the returned
     GradOffload callback; None without offload)."""
     if engines.host_stepped:
-        owners = engines.stream.owners
+        owners = engines.weight_stream.owners
         reduce = ddp.block_reduce(owners, everyone=owners is None)
-        ddp.watch(engines.stream.reduce_with(reduce))
+        ddp.watch(engines.weight_stream.reduce_with(reduce))
     if grads is None:
         return None
     ddp.host_reads = True
@@ -153,14 +156,18 @@ def _start_both(first: Callable, second: Callable, last: bool):
     return second(last)
 
 
-def _not_mine(stream) -> set[int]:
+def _not_mine(weight_stream) -> set[int]:
     """Ids of the streamed masters another rank steps (DDP block owners)."""
-    return {id(p) for key, p in stream.params.items() if not stream.mine(key[0])}
+    return {
+        id(p)
+        for key, p in weight_stream.params.items()
+        if not weight_stream.mine(key[0])
+    }
 
 
-def _owned_grads(stream) -> set[int]:
+def _owned_grads(weight_stream) -> set[int]:
     """Ids of this rank's streamed-block host gradients (sharded across ranks)."""
-    return {id(g) for g in stream.host_grad.values()}
+    return {id(g) for g in weight_stream.host_grad.values()}
 
 
 def _host_barrier(sync: Callable[[], None], arena) -> None:
@@ -170,8 +177,9 @@ def _host_barrier(sync: Callable[[], None], arena) -> None:
     arena.ready()
 
 
-def host_optimizer(bundle):
-    """The bundle's optimiser of the device parameters."""
+def device_optimizer(bundle):
+    """The bundle's optimiser of the device (non-streamed) parameters: `shared`, else
+    `optimizer`."""
     return bundle.shared if bundle.shared is not None else bundle.optimizer
 
 
@@ -191,17 +199,17 @@ def build_memory_optim(
     """(bundle, accumulate-context factory) over `groups` under `plan`.
 
     `swap` blocks with a GPU optim_state step per block in backward (StreamedAdamW;
-    resident states for `gpu`); with `cpu` they join the host AdamW after
-    `flush_grads`. `hooks`: the parallel layout's loop hooks (ParallelHooks); its
+    device states for `gpu`); with `cpu` they join the host AdamW after
+    `expose_grads`. `hooks`: the parallel layout's loop hooks (ParallelHooks); its
     `ddp` AsyncReducer sums every gradient that leaves backward before the step (the
     in-backward step, gradient offload, streamed blocks) across ranks first."""
     w = resolve_wiring(plan, engines, optimizer, hooks)
     by_id = {id(p): n for p, n in zip(_group_params(groups), param_names(groups))}
-    stream = engines.stream
+    weight_stream = engines.weight_stream
     grad_norm = getattr(hooks, "grad_norm", local_grad_norm)
     if w.sharded and not w.gpu_blocks:
-        groups, _ = split_groups(groups, _not_mine(stream))
-        grad_norm = ShardedNorm(partial(_owned_grads, stream), device)
+        groups, _ = split_groups(groups, _not_mine(weight_stream))
+        grad_norm = ShardedNorm(partial(_owned_grads, weight_stream), device)
     dev_groups, block_groups = (
         split_groups(groups, w.streamed) if w.gpu_blocks else (groups, [])
     )
@@ -233,12 +241,15 @@ def build_memory_optim(
         grad_clip,
         fused_step=w.fused,
         grad_norm=grad_norm,
-        agree=getattr(hooks, "agree", no_agree),
+        agree=getattr(hooks, "agree", identity),
         before=_chain(
-            extra.get("settle"), before, engines.before_step, extra.get("before")
+            extra.get("finish_unhooked"),
+            before,
+            engines.before_step,
+            extra.get("before"),
         ),
         after=_chain(engines.after_step, extra.get("after")),
-        reduce_loss=getattr(hooks, "reduce_loss", no_agree),
+        reduce_loss=getattr(hooks, "reduce_loss", identity),
         grads=extra.get("grads"),
         grad_names=extra.get("grad_names"),
         reduce_step=getattr(hooks, "reduce_step", None),
@@ -255,7 +266,7 @@ class OptimWiring:
     name: str
     fused: bool
     gpu_blocks: bool
-    resident_states: bool
+    device_states: bool
     host_adamw: bool
     sharded: bool
     ddp: object | None
@@ -268,7 +279,7 @@ def resolve_wiring(
     """The wiring of OPTIMIZER under `plan` over `engines` and the layout's `hooks`;
     raises when GPU-stepped swap blocks lack the in-backward step."""
     name = optimizer_for(optimizer, plan)
-    stream = engines.stream
+    weight_stream = engines.weight_stream
     streamed = frozenset(id(p) for p in engines.host_params())
     gpu_blocks = bool(streamed) and plan.optim_state != "cpu"
     fused = bool(plan.fused_step)
@@ -281,9 +292,11 @@ def resolve_wiring(
         name=name,
         fused=fused,
         gpu_blocks=gpu_blocks,
-        resident_states=plan.optim_state == "gpu",
+        device_states=plan.optim_state == "gpu",
         host_adamw=name == "cpu_adamw",
-        sharded=ddp is not None and stream is not None and stream.owners is not None,
+        sharded=ddp is not None
+        and weight_stream is not None
+        and weight_stream.owners is not None,
         ddp=ddp,
         streamed=streamed,
     )
@@ -296,13 +309,13 @@ def _wire_kept(
     streamed blocks and offloaded gradients, host-stepped blocks start each
     micro-batch."""
     if w.host_adamw and grads is not None:
-        host_optimizer(bundle).use_host_grads(grads)
+        device_optimizer(bundle).use_host_grads(grads)
     final = None
     if w.ddp is not None:
         final = _ddp_kept(w.ddp, engines, grads, device_params)
     accumulate = getattr(hooks, "accumulate", None) or _null_accumulate
     if engines.host_stepped:
-        accumulate = partial(_start_both, engines.stream.start, accumulate)
+        accumulate = partial(_start_both, engines.weight_stream.start, accumulate)
     return bundle, _offload_start(grads, accumulate, final)
 
 
@@ -322,36 +335,36 @@ def _wire_fused(
     else:
         bundle.attach(attach_fused_step(engines, device_params, step))
     if w.gpu_blocks:
-        _attach_blocks(bundle, w, engines.stream, block_groups, hyper)
+        _attach_blocks(bundle, w, engines.weight_stream, block_groups, hyper)
     if ddp is None:
         return bundle, bundle.start
-    # gradient offload settles its late parameters into the reduction before it ends
+    # ddp.finish after GradOffload.finish (index 0) when gradient offload is attached
     bundle.finishers.insert(0 if grads is None else 1, ddp.finish)
     return bundle, partial(_start_both, ddp.start, bundle.start)
 
 
-def _attach_blocks(bundle, w: OptimWiring, stream, block_groups, hyper) -> None:
+def _attach_blocks(bundle, w: OptimWiring, weight_stream, block_groups, hyper) -> None:
     """StreamedAdamW over the swap blocks, its DDP reduction and the shared-region
     barrier."""
     blocks = StreamedAdamW(
-        stream,
+        weight_stream,
         lr=hyper["lr"],
         betas=hyper["betas"],
         eps=hyper["eps"],
         weight_decay=0.0,
-        resident=w.resident_states,
+        device_states=w.device_states,
         groups=master_groups(block_groups),
     )
     bundle.attach_blocks(blocks)
     if w.ddp is not None:
-        everyone = w.resident_states or not w.sharded
-        blocks.reduce = w.ddp.block_reduce(stream.owners, everyone=everyone)
+        everyone = w.device_states or not w.sharded
+        blocks.reduce = w.ddp.block_reduce(weight_stream.owners, everyone=everyone)
         w.ddp.watch(getattr(blocks, "opt", None))
         if not everyone:
             bundle.reduce_block_stats = sum_block_stats
-    if stream.arena is not None:
+    if weight_stream.arena is not None:
         bundle.finishers.append(
-            partial(_host_barrier, blocks.synchronize, stream.arena)
+            partial(_host_barrier, blocks.synchronize, weight_stream.arena)
         )
 
 

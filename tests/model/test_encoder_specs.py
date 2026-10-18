@@ -34,7 +34,7 @@ def test_text_spec_tells_computations_apart():
     ]
     _distinct(variants)
     assert spec() == "bf16/compute" and spec(precision="mxfp8") == "bf16/mxfp8/mx"
-    same = [spec(memory="stream"), spec(memory="offload", batch=4, layout="padded")]
+    same = [spec(memory="ring"), spec(memory="offload", batch=4, layout="padded")]
     assert set(same) == {spec()}
 
     def precision_only(plan, dtype) -> str:

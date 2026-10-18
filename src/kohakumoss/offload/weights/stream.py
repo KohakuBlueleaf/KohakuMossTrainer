@@ -46,7 +46,7 @@ __all__ = [
 
 class WeightStream:
     """Ring-buffer weight streaming over a sequence of identically shaped blocks. A
-    frozen ring keeps its first `resident - 2` blocks on the device once loaded and
+    frozen ring keeps its first `slots - 2` blocks on the device once loaded and
     cycles the rest through two slots; a trainable (`swap`) ring cycles every block.
 
     Trainable rings: `share(nbytes)` (DDP on one node) returns the SharedHost region the
@@ -61,7 +61,7 @@ class WeightStream:
         self,
         blocks: Sequence[nn.Module],
         device: torch.device | str,
-        resident: int = 2,
+        slots: int = 2,
         pinned: bool = True,
         trainable: bool = False,
         dtype: torch.dtype | None = None,
@@ -69,18 +69,18 @@ class WeightStream:
         owners: list[int] | None = None,
         rank: int = 0,
     ):
-        if resident < 2:
-            raise ValueError("resident must be >= 2")
+        if slots < 2:
+            raise ValueError("slots must be >= 2")
         self.device = with_index(torch.device(device))
-        self.cuda = streamed(self.device)
+        self.streamed = streamed(self.device)
         self.dm = module(self.device)
-        self.pinned = pinned and self.cuda
+        self.pinned = pinned and self.streamed
         self.trainable = trainable
         self.owners = owners
         self.rank = rank
         self.n = len(blocks)
-        resident = min(resident, self.n)
-        kept = self.n if resident == self.n else resident - 2
+        slots = min(slots, self.n)
+        kept = self.n if slots == self.n else slots - 2
         self.arena = None
         if trainable and share is not None:
             self.arena = share(self._shared_bytes(blocks, dtype))
@@ -93,14 +93,14 @@ class WeightStream:
         if self.arena is not None:
             self.arena.ready()
         self.stats = {"loads": 0, "bytes_h2d": 0, "bytes_d2h": 0, "host_syncs": 0}
-        dev = DeviceStreams(self.device, self.dm, self.cuda)
+        dev = DeviceStreams(self.device, self.dm, self.streamed)
         self.timer = SpanTimer(dev, self.stats)
         self.copier = H2DCopier(
-            dev, resident, self.n, host_pinned, trainable, self.stats, self.timer
+            dev, slots, self.n, host_pinned, trainable, self.stats, self.timer
         )
         keep = 0 if trainable else kept
         self.ring = SlotRing(
-            self.host, self.layout, self.device, resident, keep, self.copier, self.stats
+            self.host, self.layout, self.device, slots, keep, self.copier, self.stats
         )
         self.grads = GradSink(self.params, self.n, dev, self.pinned, self.stats)
         self.reducer = BlockReducer(self.grads, dev, trainable, self.mine, self.stats)
@@ -111,11 +111,14 @@ class WeightStream:
         self.on_grad = self.grads.accumulate
         self.on_block_backward = nothing
         self.optimizer = None
-        self._sync = partial(self.dm.synchronize, self.device) if self.cuda else nothing
+        self._sync = (
+            partial(self.dm.synchronize, self.device) if self.streamed else nothing
+        )
 
     @property
-    def resident(self) -> int:
-        return self.ring.resident
+    def slots(self) -> int:
+        """Device slots of the ring."""
+        return self.ring.n_slots
 
     @property
     def accumulate(self) -> Callable[[tuple[int, str], Tensor], None]:
@@ -237,7 +240,7 @@ class WeightStream:
         self.release(index)
         return _Exit.apply(y, self, index)
 
-    def flush_grads(self) -> None:
+    def expose_grads(self) -> None:
         """Land every queued gradient and expose it as the host master's `.grad`."""
         self.grads.drain()
         self.reducer.synchronize()
@@ -255,8 +258,8 @@ class WeightStream:
         """Before each micro-batch of a host-stepped ring: under a cross-rank reduction
         (`reduce_with`) the last one sends each block's step gradient through it;
         otherwise gradients accumulate on the host."""
-        flush = self.reducer.reduce is not None
-        self.on_grad = self.reducer.collect if last and flush else self.accumulate
+        reducing = self.reducer.reduce is not None
+        self.on_grad = self.reducer.collect if last and reducing else self.accumulate
 
     def zero_grads(self) -> None:
         """End the step's host gradient sums (after the optimiser step): the next

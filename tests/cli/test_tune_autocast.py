@@ -1,6 +1,6 @@
-"""`kohakumoss-tune` and the inference prewarm record under the autocast the run they
-tune for uses: the trainer's for training shapes, the sampler's for inference shapes,
-so the stored keys carry the dtypes those calls meet."""
+"""`kohakumoss-tune` records under the autocast the run it tunes for uses: the
+trainer's for training shapes, the sampler's for inference shapes, so the stored keys
+carry the dtypes those calls meet."""
 
 import contextlib
 from types import SimpleNamespace
@@ -9,7 +9,6 @@ import pytest
 import torch
 
 from kohakumoss.cli import tune
-from kohakumoss.inference import warm
 from kohakumoss.inference.pipeline import sampling_autocast
 from tests._util.negative import must_fail
 
@@ -42,25 +41,14 @@ def check_autocast(record_autocast) -> None:
     )
 
 
-def check_prewarm(prewarm_autocast) -> None:
-    backbone = _backbone(torch.bfloat16)
-    sampler = _state(sampling_autocast(backbone, CPU))
-    assert _state(prewarm_autocast(backbone, CPU)) == sampler, sampler
-
-
 def test_recorded_under_the_runs_autocast():
     check_autocast(tune.record_autocast)
-    check_prewarm(warm.prewarm_autocast)
 
 
 def test_negative_no_autocast():
     must_fail(
         lambda: check_autocast(lambda dtype, device, backward: contextlib.nullcontext),
         "shapes recorded without autocast",
-    )
-    must_fail(
-        lambda: check_prewarm(lambda backbone, device: contextlib.nullcontext),
-        "inference prewarm recorded without the sampler's autocast",
     )
 
 

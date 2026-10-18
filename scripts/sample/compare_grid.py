@@ -42,7 +42,7 @@ ADAPTER_MODE = "bypass"  # "bypass" | "merge" (both undone between columns)
 PRECISION = "bf16"  # compute dtype: "bf16" | "fp16" | "fp32" | "auto"
 FP16_FIX = "none"  # "none" | "online" | "fp32_residual"
 FP16_FIX_KWARGS = {}  # e.g. {"c": 0.0625}
-TUNE = "off"  # "off" (stored per-card decisions, else fixed defaults; nothing timed) | "table" (missing decisions also tuned on first use, then stored; no prewarm)
+TUNE = "off"  # "off" (stored per-card decisions, else fixed defaults; nothing timed) | "table" (missing decisions also tuned on first use, then stored)
 
 # ===================== DEVICES =====================
 DEVICE = "cuda"
@@ -51,7 +51,7 @@ TEXT_ENCODE = (
     {}
 )  # TextEncoderPlan fields as in sample.py ("free_after_use": True frees it after the one encode)
 VAE_ENCODE = {}  # VaePlan fields as in sample.py
-VAE_DTYPE = "auto"  # "auto" (bf16, fp16 without bf16) | "bf16" | "fp16" | "fp32"
+VAE_DTYPE = "auto"  # "auto" (bf16, fp16 on fp16-only GPUs) | "bf16" | "fp16" | "fp32"
 MEMORY_PROFILE = ""  # DiT memory profile: "" (resident) | a catalog profile | "speed" | "balanced" | "low" | "minimal" | "manual" | "auto" (the fastest that fits)
 MEMORY_OVERRIDES = {}  # MemoryPlan fields
 BASE_PRECISION = (

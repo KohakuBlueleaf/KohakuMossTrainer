@@ -143,20 +143,21 @@ class OffloadRunner:
 
 
 class StreamRunner:
-    """Wraps another (checkpointing) runner; block weights are streamed by `engine`."""
+    """Wraps another (checkpointing) runner; block weights are streamed by
+    `weight_stream`."""
 
-    def __init__(self, inner, engine):
+    def __init__(self, inner, weight_stream):
         self.inner = inner
-        self.engine = engine
+        self.weight_stream = weight_stream
 
     def bind(self, layers) -> "StreamRunner":
         self.inner.bind(layers)
         return self
 
     def run(self, index: int, block: nn.Module, x: Tensor, ctx: BlockCtx) -> Tensor:
-        x = self.engine.enter(index, x)
+        x = self.weight_stream.enter(index, x)
         y = self.inner.run(index, block, x, ctx)
-        return self.engine.exit(index, y)
+        return self.weight_stream.exit(index, y)
 
 
 class StageRunner:
@@ -184,9 +185,10 @@ def build_runner(
     checkpoint_value: str,
     layers,
     offload=None,
-    engine=None,
+    weight_stream=None,
 ) -> object:
-    """Compose and bind the runner for a plan's checkpoint mode, offload and stream."""
+    """Compose and bind the runner for a plan's checkpoint mode, offload and weight
+    stream."""
     if checkpoint_value.startswith("partial:"):
         frac = float(checkpoint_value.split(":", 1)[1])
         runner = CheckpointRunner("block", checkpoint_blocks(len(layers), frac))
@@ -196,6 +198,6 @@ def build_runner(
         runner = CheckpointRunner(checkpoint_value)
     if offload is not None:
         runner = OffloadRunner(runner, offload)
-    if engine is not None:
-        runner = StreamRunner(runner, engine)
+    if weight_stream is not None:
+        runner = StreamRunner(runner, weight_stream)
     return runner.bind(layers)

@@ -25,15 +25,15 @@ from kohakumoss.types.step import StepOut
 from kohakumoss_common.calls import nothing
 
 
-def begin_and_capture(step, trainable, index: int, sigma: Tensor, seq):
-    """Install the adapter step state of one micro-batch (`step.pre_forward`) and
-    return it (`trainable.step_state()`) for its later forward / backward."""
-    step.pre_forward(sigma, seq, index)
+def begin_and_capture(train_step, trainable, step: int, sigma: Tensor, seq):
+    """Install the adapter step state of one micro-batch (`train_step.pre_forward`)
+    and return it (`trainable.step_state()`) for its later forward / backward."""
+    train_step.pre_forward(sigma, seq, step)
     return trainable.step_state()
 
 
 class ThreadedDriver(NativeDriver):
-    """GRAD_ACC micro-batches per step through a single-process multi-device pipeline;
+    """MICROBATCHES micro-batches per step through a single-process multi-device pipeline;
     predictions come back to the first device for the loss."""
 
     def __init__(self, *args, pipe, **kwargs):

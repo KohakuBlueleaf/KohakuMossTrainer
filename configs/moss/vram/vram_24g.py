@@ -6,4 +6,4 @@ docs/concepts/profiles.md."""
 
 MEMORY_PROFILE = "balanced"
 MAX_TOKENS = 12288
-TEXT_ENCODE = {"memory": "stream", "ahead": 8}
+TEXT_ENCODE = {"memory": "ring", "ahead": 8}

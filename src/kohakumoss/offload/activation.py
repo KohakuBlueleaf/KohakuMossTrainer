@@ -31,12 +31,12 @@ VIEWS = frozenset(
 @dataclass
 class Packet:
     """One offloaded saved tensor; `users` saved variables share it. `given`: its host
-    buffer went back to the pool (the device copy `gpu` is then the only one)."""
+    buffer went back to the pool (`device_copy` is then the only copy)."""
 
     host: Tensor
     block: int
     d2h: object = None
-    gpu: Tensor | None = None
+    device_copy: Tensor | None = None
     h2d: object = None
     flat: Tensor | None = None
     users: int = 1
@@ -115,9 +115,9 @@ class ActivationOffload:
     ):
         self.device = with_index(device)
         self.min_bytes = min_bytes
-        self.cuda = streamed(self.device)
+        self.streamed = streamed(self.device)
         self.dm = module(self.device)
-        self.pinned = pinned and self.cuda
+        self.pinned = pinned and self.streamed
         self.inflight = inflight
         self.skip: set[int] = set()
         self.seen: dict[tuple, tuple] = {}
@@ -133,7 +133,7 @@ class ActivationOffload:
             "recast": 0,
             "shared": 0,
         }
-        if self.cuda:
+        if self.streamed:
             self.d2h_stream = self.dm.Stream(self.device)
             self.h2d_stream = self.dm.Stream(self.device)
             self._store = self._store_device
@@ -150,8 +150,7 @@ class ActivationOffload:
                 self.skip.add(t.untyped_storage().data_ptr())
 
     def rebuild(self, tensors: Iterable[Tensor]) -> None:
-        """The kept storages become exactly these tensors' (after storages were
-        replaced, e.g. parameter dtype changes, so no freed address stays kept)."""
+        """The kept storages become exactly these tensors'."""
         self.skip = set()
         self.exclude(tensors)
 
@@ -262,16 +261,16 @@ class ActivationOffload:
             # device buffers come from the consumer (current) stream's pool
             self.h2d_stream.wait_stream(self.dm.current_stream(self.device))
         for pk in packets:
-            if pk.gpu is not None:
+            if pk.device_copy is not None:
                 continue
-            gpu = torch.empty(pk.host.shape, dtype=pk.host.dtype, device=self.device)
+            copy = torch.empty(pk.host.shape, dtype=pk.host.dtype, device=self.device)
             self.h2d_stream.wait_event(pk.d2h)
             with self.dm.stream(self.h2d_stream):
-                gpu.copy_(pk.host, non_blocking=True)
-            gpu.record_stream(self.h2d_stream)
+                copy.copy_(pk.host, non_blocking=True)
+            copy.record_stream(self.h2d_stream)
             ev = self.dm.Event()
             ev.record(self.h2d_stream)
-            pk.gpu, pk.h2d = gpu, ev
+            pk.device_copy, pk.h2d = copy, ev
             self._give(pk.flat, ev)
             pk.given = True
             self._pace("h2d", block, ev)
@@ -280,7 +279,7 @@ class ActivationOffload:
         """The packet's device copy; once fetched it stays with the packet (freed with
         it), so a saved tensor read more often than it was saved never re-reads the
         recycled host buffer."""
-        if pk.gpu is None:
+        if pk.device_copy is None:
             if pk.given:
                 raise RuntimeError(
                     "activation offload: a packet's host buffer was recycled before "
@@ -291,7 +290,7 @@ class ActivationOffload:
             self._prefetch(pk.block - 1)
         self.dm.current_stream(self.device).wait_event(pk.h2d)
         pk.users -= 1
-        return pk.gpu
+        return pk.device_copy
 
     def reset(self) -> None:
         """Drop packets of a step that never ran backward (their buffers return)."""

@@ -10,8 +10,8 @@ from kohakumoss.adapters.train import tlora
 
 @contextmanager
 def evaluated(targets):
-    """Every module in eval mode (no rank dropout, every DyLoRA block) and no T-LoRA
-    mask installed; both restored on exit. Bound forwards are not re-bound."""
+    """Every module in eval mode (full rank, every DyLoRA block) with the T-LoRA masks
+    cleared; both restored on exit. Bound forwards are not re-bound."""
     masks = tlora.saved_masks()
     tlora.clear_masks()
     modes = [(t.lyco, t.lyco.training) for t in targets]

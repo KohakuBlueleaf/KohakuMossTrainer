@@ -28,7 +28,7 @@ MSVC_FIX = (
     "install VS Build Tools 2022 with the C++ workload: winget install "
     "Microsoft.VisualStudio.2022.BuildTools --override "
     '"--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --passive" '
-    "(no developer prompt needed: the toolchain imports vcvars64 itself)"
+    "(the toolchain imports vcvars64 itself)"
 )
 SDK_GLOB = r"%ProgramFiles(x86)%\Windows Kits\10\Include\*\um"
 SDK_FIX = (

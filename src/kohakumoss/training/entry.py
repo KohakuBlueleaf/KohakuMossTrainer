@@ -5,7 +5,6 @@ from functools import partial
 from pathlib import Path
 
 import torch
-import torch.distributed as dist
 
 from kohakumoss.adapters.lycoris.tuning import (
     restore_lycoris_tuning,
@@ -77,8 +76,10 @@ from kohakumoss.training.step import LayoutTransform
 from kohakumoss.tuning.prewarm import prewarm_devices, release_workspaces, tunes
 from kohakumoss.types.plans import ParallelPlan
 from kohakumoss_data import DataConfig, build_loader
+from kohakumoss_kernels.dist import dist_rank, initialized
 from kohakumoss_kernels.run_state import reset_run_state
 from kohakumoss_kernels.tuning import decisions, window
+from kohakumoss_kernels.tuning.tuner import clear_caps
 from kohakumoss_kernels.tuning.tuner import set_mode as set_tune_mode
 
 _device_type = default_device_type
@@ -92,7 +93,7 @@ def run(g: dict):
     shutdown.install()
     setup()
     k = check(g)
-    if layout_of(k).spawns and not dist.is_initialized():
+    if layout_of(k).spawns and not initialized():
         plan = ParallelPlan(
             kind=k["PARALLEL"],
             backend=k["DIST_BACKEND"],
@@ -103,8 +104,7 @@ def run(g: dict):
             bind=k["DIST_BIND"],
         )
         return spawn(worker_env, plan, k, device_type=_device_type())
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    world = dist.get_world_size() if dist.is_initialized() else 1
+    rank, world = dist_rank()
     return worker(k, rank, world)
 
 
@@ -158,7 +158,7 @@ def _start(k: dict, layout: Layout, rank: int, device: torch.device):
     """(output dir, precision, the LyCORIS tuning switch to restore): the run directory
     and its files on rank 0, the per-run process state, the run line."""
     allocator = configure_allocator(device)
-    torch.manual_seed(k["SEED"])  # identical model + adapter init on every rank
+    torch.manual_seed(k["SEED"])
     output_dir = str(Path(k["OUTPUT_DIR"]) / run_name(k))
     if rank == 0:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -189,7 +189,7 @@ def _start(k: dict, layout: Layout, rank: int, device: torch.device):
 def _data(k: dict, layout: Layout, rank: int, world: int, device):
     """(data knobs, token-layout transform, training loader): the catalog scan and
     batch plan over `layout`'s data ranks (rank 0 writes the catalog first)."""
-    data_rank = layout.stream_rank(rank)
+    data_rank = layout.data_rank(rank)
     data_world = layout.data_world(world)
     kd = data_knobs(k, device)
     data_cfg = DataConfig.from_knobs(kd)
@@ -231,11 +231,11 @@ def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
     device = device or _device(k, rank)
     output_dir, prec, lycoris_tuning = _start(k, layout, rank, device)
     device_use = build_device_use(device)
-    data_rank = layout.stream_rank(rank)
+    data_rank = layout.data_rank(rank)
     data_world = layout.data_world(world)
     kd, tokens, loader = _data(k, layout, rank, world, device)
     ranks_meet("data")
-    torch.manual_seed(k["SEED"])  # the build's init does not depend on the scan
+    torch.manual_seed(k["SEED"])
     with timed(log, "building model, adapters and encoders"):
         built = build_model(k, device, prec, world, loader.dataset.text_tokens_max())
     log_object(log, "training memory plan", built.plan)
@@ -267,7 +267,7 @@ def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
         normalizer,
         autocast,
         device,
-        stream_rank=data_rank,
+        data_rank=data_rank,
         forward=hooks.forward,
         recorder=recorder,
     )
@@ -293,7 +293,7 @@ def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
 
     def make_step(sampler: FixedSigma):
         return build_step(
-            k, built, normalizer, autocast, device, sampler, stream_rank=data_rank
+            k, built, normalizer, autocast, device, sampler, data_rank=data_rank
         )
 
     rng_devices = stage_devices if layout.stage_rng else warm
@@ -339,6 +339,7 @@ def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
         logger.close()
         restore_lycoris_tuning(lycoris_tuning)
         window.reopen()
+        clear_caps()
     return state
 
 

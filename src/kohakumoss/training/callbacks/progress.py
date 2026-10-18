@@ -10,8 +10,8 @@ from kohakumoss.logging.log import bar
 from kohakumoss.memory.device_use import NoDeviceUse
 from kohakumoss.memory.timeline import NoTimeline
 from kohakumoss.training.state import TrainState
+from kohakumoss_common.units import GIB
 
-GIB = 2**30
 POSTFIX = ("loss", "lr", "grad_norm", "s/it", "samples/s", "tokens/s", "vram")
 
 

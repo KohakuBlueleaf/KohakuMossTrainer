@@ -4,7 +4,6 @@ per card on disk so each card is probed once. See docs/internals/tuning.md.
 """
 
 import dataclasses
-import json
 import math
 import os
 from functools import cache
@@ -13,10 +12,10 @@ from pathlib import Path
 import torch
 from torch._guards import detect_fake_mode
 
-from kohakumoss_common.io import write_json_atomic
+from kohakumoss_common.io import read_json, write_json_atomic
 from kohakumoss_common.log import get_logger
 from kohakumoss_kernels.hardware.arch import Arch, _cuda_arch, arch_of
-from kohakumoss_kernels.hardware.current import rng_kept, synchronize
+from kohakumoss_kernels.hardware.current import rng_kept, synchronize, with_index
 
 _UNWRITABLE: set[str] = set()
 log = get_logger(__name__)
@@ -28,13 +27,6 @@ def cache_dir() -> Path:
     if root:
         return Path(root)
     return Path.home() / ".cache" / "kohakumoss_kernels"
-
-
-def read_json(path: Path) -> dict | None:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -181,9 +173,7 @@ def planning_device(device: torch.device | str) -> Device:
 @cache
 def measure_rates(device: torch.device | str) -> Device:
     """The measured description of `device`, from the on-disk cache when present."""
-    device = torch.device(device)
-    if device.type == "cuda" and device.index is None:
-        device = torch.device("cuda", torch.cuda.current_device())
+    device = with_index(device)
     dev = query(device)
     if dev.kind == "cpu":
         return dev

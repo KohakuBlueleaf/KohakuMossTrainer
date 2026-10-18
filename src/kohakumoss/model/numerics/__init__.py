@@ -8,7 +8,6 @@ from kohakumoss.model.numerics.fold import (
     record_row_scales,
     same_fold,
     unfold,
-    unfolded_state_dict,
 )
 from kohakumoss.model.numerics.fp16fix import (
     MODES as FP16_FIX_MODES,
@@ -41,5 +40,4 @@ __all__ = [
     "fold",
     "output_row_scales",
     "unfold",
-    "unfolded_state_dict",
 ]

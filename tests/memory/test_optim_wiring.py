@@ -30,11 +30,11 @@ CASES = (
 
 
 def assert_wiring(resolve) -> None:
-    for plan, hooks, (name, fused, resident, host_adamw, has_ddp) in CASES:
+    for plan, hooks, (name, fused, device_states, host_adamw, has_ddp) in CASES:
         w = resolve(plan, MemoryEngines(plan), "adamw", hooks)
         assert w.name == name
         assert w.fused is fused
-        assert w.resident_states is resident
+        assert w.device_states is device_states
         assert w.host_adamw is host_adamw
         assert (w.ddp is not None) is has_ddp
         assert not w.gpu_blocks and not w.sharded and not w.streamed

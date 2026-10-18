@@ -53,7 +53,7 @@ def test_factory_builds_the_real_cache(tmp_path):
     path = next(p for p in (root / "base", root) if (p / "text_encoder").is_dir())
     encode = build_encoder(
         "kohakumoss.encoders.text.text_encoder",
-        {"path": str(path / "text_encoder"), "plan": {"memory": "stream"}},
+        {"path": str(path / "text_encoder"), "plan": {"memory": "ring"}},
     )
     assert encode.encoder_id == "qwen3.5-9b"
     with pytest.raises(ValueError, match="TEXT_ENCODER_SPEC"):

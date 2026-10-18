@@ -1,4 +1,4 @@
-"""Scaling-run layer for scripts/train/moss.py on GPUs without bf16 (V100, 2080 Ti): the
+"""Scaling-run layer for scripts/train/moss.py on fp16-only GPUs (V100, 2080 Ti): the
 bf16 scaling layer with fp16 compute and the online residual-stream fix (c = 1/16).
 See docs/guides/multi-gpu.md (scaling runs)."""
 

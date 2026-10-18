@@ -16,6 +16,7 @@ from kohakumoss.memory.knob_map import (
     PLACEMENT_KNOBS,
     knob_fields,
     mixing_problems,
+    primary_names,
 )
 from kohakumoss.memory.profiles import PROFILES
 from kohakumoss.model.io.load import read_fp16_fix
@@ -264,7 +265,8 @@ def validate(k: dict) -> list[str]:
 
 
 def check(g: dict) -> dict:
-    """Knobs from globals; raises one SystemExit listing every problem."""
-    k = collect(g)
+    """Knobs from globals (MEMORY_PROFILE in its primary spelling); raises one
+    SystemExit listing every problem."""
+    k = primary_names(collect(g))
     exit_on(validate(k))
     return k

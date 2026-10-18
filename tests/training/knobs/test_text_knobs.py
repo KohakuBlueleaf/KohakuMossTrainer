@@ -26,10 +26,11 @@ def test_plan_fields_and_choices():
     def flagged(k, needle):
         assert any(needle in m for m in text_problems(k)), text_problems(k)
 
-    flagged(_knobs(TEXT_ENCODE={"memroy": "stream"}), "unknown text-encoder plan")
+    flagged(_knobs(TEXT_ENCODE={"memroy": "ring"}), "unknown text-encoder plan")
     flagged(_knobs(TEXT_ENCODE={"layout": "packed", "forward": "hf"}), "forward='hf'")
     flagged(_knobs(TEXT_ENCODE={"dtype": "fp32"}), "dtype='fp32'")
-    must_fail(
-        lambda: flagged(_knobs(TEXT_ENCODE={"memory": "stream"}), "text-encoder"),
-        "a valid plan flagged",
-    )
+    for memory in ("ring", "stream"):
+        must_fail(
+            lambda: flagged(_knobs(TEXT_ENCODE={"memory": memory}), "text-encoder"),
+            "a valid plan flagged",
+        )

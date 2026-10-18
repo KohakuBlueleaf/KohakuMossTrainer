@@ -13,8 +13,8 @@ from kohakumoss.cli.config import starter
 from kohakumoss.cli.config.validate import TRAIN, compose
 from kohakumoss.encoders.specs import latent_encoder_kwargs, text_encoder_kwargs
 from kohakumoss.encoders.text.factory import text_encoder_spec
-from kohakumoss.encoders.vae import vae_encoder_spec
 from kohakumoss.training.build.model import data_knobs
+from tests._util.encoder_specs import vae_encoder_spec
 from tests._util.negative import must_fail
 
 pytestmark = pytest.mark.cpu

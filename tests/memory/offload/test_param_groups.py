@@ -9,10 +9,10 @@ import pytest
 import torch
 
 from kohakumoss.offload.optim.cpu_optim import CPUAdamW
-from kohakumoss.offload.optim.fused_step import PerParamOptimizer
 from kohakumoss.offload.optim.gpu_adamw import HostStateAdamW, MasterAdamW
 from tests._util.devices import DEVICES
 from tests._util.negative import must_fail
+from tests._util.per_param import PerParamOptimizer
 
 HP = [
     dict(lr=1e-2, weight_decay=0.1),

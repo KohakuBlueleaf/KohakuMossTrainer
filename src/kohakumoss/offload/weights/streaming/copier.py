@@ -27,7 +27,7 @@ class H2DCopier:
         stats: dict,
         timer: SpanTimer,
     ):
-        device, dm, cuda = dev.device, dev.dm, dev.cuda
+        device, dm, side = dev.device, dev.dm, dev.streamed
         self.device = device
         self.dm = dm
         self.trainable = trainable
@@ -37,7 +37,7 @@ class H2DCopier:
         self.staging: list[dict[str, Tensor]] = [{}, {}]
         self.staged: list = [None, None]
         self.stage_next = 0
-        if not cuda:
+        if not side:
             self.copy, self.wait, self.mark_free = self.copy_host, nothing, nothing
             return
         self.h2d = dm.Stream(device)

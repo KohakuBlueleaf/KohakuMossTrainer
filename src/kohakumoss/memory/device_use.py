@@ -7,8 +7,9 @@ docs/guides/logging.md#vram."""
 import torch
 
 from kohakumoss.logging.log import log_table
+from kohakumoss_common.units import GIB
+from kohakumoss_kernels.hardware.current import device_module
 
-GIB = 2**30
 PARTS = ("other", "context", "non_torch", "fragmented", "cached", "allocated")
 WHAT = {
     "other": "other processes and the driver, before this process's context",
@@ -20,10 +21,6 @@ WHAT = {
 }
 
 
-def _mem(device: torch.device):
-    return torch.cuda if device.type == "cuda" else torch.xpu
-
-
 def _nvml_used(device: torch.device) -> int | None:
     """Device-wide used bytes from NVML / SMI without creating a context, else None."""
     used = getattr(torch.cuda, "device_memory_used", None)
@@ -31,18 +28,18 @@ def _nvml_used(device: torch.device) -> int | None:
         return None
     try:
         return int(used(device))
-    except Exception:  # noqa: BLE001 - no NVML / pynvml: the context is not separated
+    except Exception:  # noqa: BLE001 - NVML query failed: SMI-only accounting
         return None
 
 
 class DeviceUse:
-    """Construct before the process's first allocation on `device`. Without NVML the
-    other processes are not separated from the context (`other` is 0, `context` holds
-    both). `mem` (torch.cuda / torch.xpu) and `nvml_used` are injectable."""
+    """Construct before the process's first allocation on `device`. With SMI only,
+    `context` holds the other processes too (`other` is 0). `mem` (torch.cuda /
+    torch.xpu) and `nvml_used` are injectable."""
 
     def __init__(self, device, mem=None, nvml_used=_nvml_used):
         self.device = torch.device(device)
-        self.mem = mem if mem is not None else _mem(self.device)
+        self.mem = mem if mem is not None else device_module(self.device)
         before = nvml_used(self.device)
         after = self.used()
         self.separated = before is not None
@@ -107,6 +104,7 @@ class NoDeviceUse:
 
 def build_device_use(device):
     device = torch.device(device)
-    if device.type in ("cuda", "xpu") and hasattr(_mem(device), "mem_get_info"):
+    mod = device_module(device)
+    if mod is not None and hasattr(mod, "mem_get_info"):
         return DeviceUse(device)
     return NoDeviceUse()

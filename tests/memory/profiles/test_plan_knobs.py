@@ -166,9 +166,9 @@ def test_ddp_runs_every_memory_profile(linux, algo):
         kw["EXPORT_FORMATS"] = ("merged",)
     check_every_profile("ddp", **kw)
     must_fail(lambda: check_every_profile("fsdp", **kw), "FSDP2 with streaming")
-    profiles = ("minimal", "ckpt-stream2-actoff-optcpu-gradoff")
+    profiles = ("minimal", "ckpt-ring2-actoff-optcpu-gradoff")
     if algo == "full":
-        profiles = ("ckpt-stream4-actoff-optstream-gradoff", "ckpt-stream4-optcpu")
+        profiles = ("ckpt-ring4-actoff-optstream-gradoff", "ckpt-ring4-optcpu")
     for name in profiles:
         k = runnable(MEMORY_PROFILE=name, PARALLEL="ddp", **MULTI, **kw)
         assert validate(k) == [], (name, validate(k))

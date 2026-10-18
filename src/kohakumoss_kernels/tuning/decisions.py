@@ -28,9 +28,11 @@ def _times(timings: dict[str, float]) -> str:
     )
 
 
-def queued(kernel: str, key: str) -> None:
-    """A provisional binding: the problem waits for a retune (not a decision)."""
-    log.debug(f"queued {kernel} {key}")
+def undecided(kernel: str, key: str) -> None:
+    """A binding that is not a decision (DEBUG only): provisional (a kernel-vs-compile
+    problem queued for the retune) or untimed for the process (frozen, deferred, over
+    the budget)."""
+    log.debug(f"undecided {kernel} {key}")
 
 
 def record(

@@ -13,4 +13,4 @@ use_config("../parallel/parallel_fsdp.py")
 RUN_NAME = "full-fsdp-4xv100"
 DEVICES = (0, 1, 2, 3)
 MAX_TOKENS = 8192
-TEXT_ENCODE = {"memory": "stream", "dtype": "fp16", "ahead": 4}
+TEXT_ENCODE = {"memory": "ring", "dtype": "fp16", "ahead": 4}

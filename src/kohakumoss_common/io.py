@@ -1,5 +1,5 @@
-"""File helpers without torch: the atomic JSON write every package uses, and a
-safetensors metadata read."""
+"""File helpers without torch: the atomic JSON write every package uses, a JSON read
+that tolerates a missing or partial file, and a safetensors metadata read."""
 
 import itertools
 import json
@@ -47,6 +47,15 @@ def write_json_atomic(
         replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def read_json(path: str | Path) -> dict | None:
+    """The UTF-8 JSON in `path`; None when it is missing, unreadable or not JSON."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
 
 
 def read_safetensors_metadata(path: str | Path) -> dict[str, str]:

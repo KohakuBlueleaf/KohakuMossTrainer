@@ -71,15 +71,3 @@ def make_renderer(
         else _keep_all
     )
     return JsonRenderer(tuple(order), select, FORMATS[style])
-
-
-def json_to_text(
-    data: dict,
-    rng: np.random.Generator,
-    style: str = "lines",
-    order: tuple[str, ...] = (),
-    field_dropout: float = 0.0,
-    keep: tuple[str, ...] = (),
-) -> str:
-    """One-off rendering (builds a renderer; templates hold a bound one instead)."""
-    return make_renderer(style, order, field_dropout, keep)(data, rng)

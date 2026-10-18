@@ -14,6 +14,7 @@ from kohakumoss.encoders.specs import cache_specs
 from kohakumoss.encoders.text import QwenTextEncoder, text_plan
 from kohakumoss.encoders.text.encoder import default_auto_memory
 from kohakumoss.encoders.text.plan import DTYPES as TEXT_DTYPES
+from kohakumoss.encoders.text.plan import MEMORY_ALIASES as TEXT_MEMORY_ALIASES
 from kohakumoss.encoders.text.plan import resolve_dtype
 from kohakumoss.encoders.vae import FluxVae, resolve_vae_dtype
 from kohakumoss.logging.log import get_logger, hl
@@ -27,7 +28,7 @@ from kohakumoss.model.numerics import output_row_scales
 from kohakumoss.model.numerics.fp16fix import apply_fp16_fix
 from kohakumoss.model.opset import OpSet
 from kohakumoss.offload.accel import module as accel_module
-from kohakumoss.offload.accel import streamed
+from kohakumoss.offload.accel import streamed, with_index
 from kohakumoss.offload.encoders.report import encoder_lines
 from kohakumoss.offload.encoders.vae import place_vae
 from kohakumoss.parallel.launch import dist_rank, gate_name, rank0_value
@@ -204,9 +205,8 @@ def seeded_rng(seed: int, device: torch.device):
     with rng_kept([device]):
         torch.random.default_generator.manual_seed(seed)
         if streamed(device):
-            dm = accel_module(device)
-            index = dm.current_device() if device.index is None else device.index
-            dm.default_generators[index].manual_seed(seed)
+            index = with_index(device).index
+            accel_module(device).default_generators[index].manual_seed(seed)
         yield
 
 
@@ -305,10 +305,11 @@ def encoder_memory(k: dict, which: str, default: str, plan=None) -> str:
     """The placement of encoder `which` ("text" / "vae"): its TEXT_ENCODE /
     VAE_ENCODE `memory` when set; else `default` (the text encoder's `auto`: the
     fastest placement that fits next to the DiT step, whatever the plan), and for the
-    VAE offload when `plan` streams the DiT blocks."""
+    VAE offload when `plan` streams the DiT blocks. A text `memory` comes in its
+    primary spelling (`MEMORY_ALIASES`)."""
     given = dict(k.get(ENCODER_KNOBS[which]) or {}).get("memory")
     if given is not None:
-        return given
+        return TEXT_MEMORY_ALIASES.get(given, given) if which == "text" else given
     if streamed_base(plan):
         return STREAMED_BASE_ENCODERS.get(which, default)
     return default

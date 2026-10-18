@@ -93,5 +93,5 @@ def test_catalog_is_the_full_product():
         assert names == _full_product()
 
     check(set(catalog()))
-    hand_picked = set(catalog()) - {"nockpt-stream2-actoff-optcpu-gradoff"}
+    hand_picked = set(catalog()) - {"nockpt-ring2-actoff-optcpu-gradoff"}
     must_fail(lambda: check(hand_picked), "a hand-picked catalog missing one entry")

@@ -121,12 +121,13 @@ SAFE = {
 
 
 def _candidates(dev, kind, d, esize, heads, segs, max_len):
-    """Seed tiles first (legal ones), then the planner's ranking. When nothing will be
-    timed (tracing, TUNE=off) a small tile that fits every sm80+ card leads."""
+    """Seed tiles first (legal ones), then the planner's ranking. When the pick will be
+    untimed (tracing, TUNE=off, a backward / recompute, a frozen or deferring tuner) a
+    small tile that fits every sm80+ card leads."""
     seeds = [c for c in _seeds(dev, kind) if _fits(c, dev, kind, d, esize)]
     ranked = _ranked(dev, kind, d, esize, heads, segs, max_len)
     order = seeds + [c for c in ranked if c not in seeds]
-    if not tuning.timing_allowed(in_backward=kind != "fwd"):
+    if not tuning.will_time(in_backward=kind != "fwd"):
         order = [SAFE[kind]] + [c for c in order if c != SAFE[kind]]
     return order
 

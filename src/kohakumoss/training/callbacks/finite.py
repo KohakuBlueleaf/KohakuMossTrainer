@@ -2,7 +2,6 @@
 
 from collections.abc import Callable
 
-from kohakumoss.training.callbacks.repro import no_record
 from kohakumoss.training.state import TrainState
 from kohakumoss_common.calls import nothing
 
@@ -22,7 +21,7 @@ class NonFiniteGuard:
         patience: int,
         floor: float,
         dump_dir: str = "",
-        record: Callable = no_record,
+        record: Callable = nothing,
         forget: Callable[[], None] = nothing,
     ):
         self.patience = patience

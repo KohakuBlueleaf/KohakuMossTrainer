@@ -15,9 +15,9 @@ import torch.distributed as dist
 
 from kohakumoss.model.flops import forward_flops, peak_tflops, step_flops
 from kohakumoss.parallel.telemetry.trace import ProfilerWindow, StepTrace
+from kohakumoss_common.units import GIB
 from kohakumoss_kernels.hardware.memory import close_window, device_used, open_window
 
-GIB = 2**30
 COUNTS = ("step", "samples", "tokens", "text_tokens", "joint_sq")
 PEAKS = ("vram_peak_alloc_gib", "vram_peak_reserved_gib", "device_used_gib")
 HOST = ("host_rss_gib", "host_private_gib", "host_shared_gib")

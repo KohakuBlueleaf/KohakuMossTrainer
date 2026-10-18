@@ -68,14 +68,14 @@ def check_reread(off: ActivationOffload) -> None:
 
 def _early_release(self, pk: Packet) -> torch.Tensor:
     """The device copy dropped once `users` reads happened, re-fetched on another."""
-    if pk.gpu is None:
+    if pk.device_copy is None:
         self.pending.setdefault(pk.block, []).append(pk)
         self._fetch(pk.block)
-    gpu = pk.gpu
+    copy = pk.device_copy
     pk.users -= 1
     if pk.users == 0:
-        pk.gpu = None
-    return gpu
+        pk.device_copy = None
+    return copy
 
 
 def test_second_unpack_reads_the_packet_not_the_recycled_buffer(monkeypatch):

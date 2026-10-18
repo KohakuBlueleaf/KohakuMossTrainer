@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
-from safetensors.torch import load_file
 from torch import Tensor, nn
 
 from kohakumoss.logging.log import get_logger, hl
@@ -18,7 +17,6 @@ from kohakumoss.model.io.source import (
     CheckpointSource,
     DictSource,
     ModelKeyView,
-    checkpoint_files,
     transformer_dir,
 )
 from kohakumoss.model.numerics.fold import adopt_fold
@@ -40,7 +38,6 @@ __all__ = [
     "load_state_into",
     "read_config",
     "read_fp16_fix",
-    "read_state",
 ]
 
 
@@ -63,16 +60,6 @@ class LoadReport:
 def base_keys(cfg: MossArchConfig) -> list[str]:
     """State-dict keys of a plain MossBackbone of `cfg` (adapter keys excluded)."""
     return list(MossBackbone(cfg, device="meta").state_dict().keys())
-
-
-def read_state(
-    path: str | Path, device: torch.device | str = "cpu"
-) -> dict[str, Tensor]:
-    """Every tensor of a .safetensors file or an HF transformer dir, in memory."""
-    state = {}
-    for f in checkpoint_files(path):
-        state.update(load_file(str(f), device=str(device)))
-    return state
 
 
 def read_fp16_fix(path: str | Path) -> dict | None:

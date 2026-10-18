@@ -65,7 +65,7 @@ def test_queued_measured_second_pattern(op):
     with collecting(logging.DEBUG) as logs:
         op(torch.randn(256, 512))
         assert op.pending
-        queued = [r for r in logs.records if r.getMessage().startswith("queued")]
+        queued = [r for r in logs.records if r.getMessage().startswith("undecided")]
         assert queued and all(r.levelno == logging.DEBUG for r in queued)
         assert choice.retune_pending() == 1
         op(torch.randn(200, 512))

@@ -9,15 +9,12 @@ import torch
 from torch import Tensor
 
 from kohakumoss.diffusion.timestep.shift import shift_sigma
-
-
-def _identity(sigma: Tensor) -> Tensor:
-    return sigma
+from kohakumoss_common.calls import identity
 
 
 def bind_shift(shift: float):
     """`sigma -> shifted sigma`, the identity for shift 1."""
-    return _identity if shift == 1.0 else partial(shift_sigma, shift=shift)
+    return identity if shift == 1.0 else partial(shift_sigma, shift=shift)
 
 
 class UniformTimestep:

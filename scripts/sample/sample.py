@@ -10,7 +10,7 @@ The knobs are named and valued as scripts/train/moss.py's.
         --set OUT=out/samples
     kogine run scripts/sample/sample.py --config <sample config> --set TEXT_DEVICE=cpu
     kogine run scripts/sample/sample.py --config <sample config> \
-        --set TEXT_ENCODE={"memory":"stream","precision":"int8"} --set MEMORY_PROFILE=low
+        --set TEXT_ENCODE={"memory":"ring","precision":"int8"} --set MEMORY_PROFILE=low
 
 The text encoder follows TEXT_ENCODE (TextEncoderPlan fields; docs/internals/text-encoder.md),
 the VAE VAE_ENCODE (VaePlan fields; docs/internals/offload.md#vae); an unset memory of
@@ -50,23 +50,22 @@ ADAPTER_MODE = "merge"  # "merge" | "bypass"
 PRECISION = "bf16"  # compute dtype: "bf16" | "fp16" | "fp32" | "auto" (bf16 where supported, else fp16)
 FP16_FIX = "none"  # "none" | "online" | "fp32_residual" (an fp16-fix TRANSFORMER carries its fold)
 FP16_FIX_KWARGS = {}  # e.g. {"c": 0.0625, "clamp": True}
-TUNE = "off"  # "off" (stored per-card decisions, else fixed defaults; nothing timed) | "table" (missing decisions also tuned on first use, then stored; no prewarm)
+TUNE = "off"  # "off" (stored per-card decisions, else fixed defaults; nothing timed) | "table" (missing decisions also tuned on first use, then stored)
 
 # ===================== DEVICES =====================
 DEVICE = "cuda"
 TEXT_DEVICE = ""  # text encoder device, e.g. "cpu"; "" = DEVICE
 TEXT_ENCODE = {}  # TextEncoderPlan fields, as in training:
-#   "memory": "auto" (default) | "resident" | "offload" | "stream" | "cpu"; "dtype": "auto" | "bf16" | "fp16"
+#   "memory": "auto" (default) | "resident" | "offload" | "ring" | "cpu"; "dtype": "auto" | "bf16" | "fp16"
 #   "precision": "compute" | "int8" | "fp8" | "fp8_compute" | "mxfp8"; "quant_group", "fp8_recipe", "layout", "stored", ...
 #   "free_after_use": True drops the text encoder after its first pass
 VAE_ENCODE = (
     {}
 )  # VaePlan fields, as in training: "memory": "auto" (default) | "resident" | "offload" | "stream" | "cpu"; "tile": True (tiled decode)
-VAE_DTYPE = "auto"  # "auto" (bf16, fp16 without bf16) | "bf16" | "fp16" | "fp32"
+VAE_DTYPE = "auto"  # "auto" (bf16, fp16 on fp16-only GPUs) | "bf16" | "fp16" | "fp32"
 MEMORY_PROFILE = ""  # DiT memory profile: "" (resident) | a catalog profile | "speed" | "balanced" | "low" | "minimal" | "manual" | "auto" (the fastest that fits)
 MEMORY_OVERRIDES = {}  # MemoryPlan fields
 # MEMORY_PROFILE="manual": these set the DiT placement (None = the default in brackets); with a profile they stay None.
-# Inference has no backward, so checkpointing, activation and optimizer knobs do not apply here.
 STREAM = None  # "off" (resident) | "ring" (block weights streamed through device slots)  [off]
 STREAM_RESIDENT = None  # device block slots when streaming (>= 2)  [0]
 PINNED = None  # pinned host memory for the streamed weights  [True]

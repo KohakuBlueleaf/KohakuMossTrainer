@@ -1,4 +1,4 @@
-"""Multi-GPU sanity + link measurement: spawn one process per device (no torchrun), run
+"""Multi-GPU sanity + link measurement: spawn one process per device itself, run
 the gradient-reducer check and the all_reduce / all_gather / reduce_scatter / p2p hop
 sweeps.
 
@@ -13,8 +13,8 @@ import tempfile
 import torch
 
 from kohakumoss.logging.log import get_logger, setup
-from kohakumoss.parallel.telemetry import selftest
 from kohakumoss.parallel.launch import default_backend, spawn
+from kohakumoss.parallel.telemetry import selftest
 from kohakumoss.types.plans import ParallelPlan
 from kohakumoss_common.knobs import check_script
 

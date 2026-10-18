@@ -28,7 +28,7 @@ options (defaults in brackets; see train.ps1 for each one's meaning):
                --fused-step on|off
   --fp8-recipe row|tensor|block [row]   --fp8-dgrad fp8|16bit [16bit]
   --target-area PIXELS [1048576]   --max-tokens N [8192]
-  --text-memory auto|stream|offload|resident [auto]
+  --text-memory auto|ring|offload|resident [auto] ("stream" is accepted for ring)
   --cache off|online|offline [off]   --cache-dir DIR
   --sample-every N [0]   --sample-prompt TEXT   --save-every N [0]
   --tune table|off [table]   --tune-only   --kernel OP=BACKEND (repeatable)
@@ -103,7 +103,7 @@ while [ $# -gt 0 ]; do
     --fp8-dgrad) choice fp8-dgrad "$2" fp8 16bit; fp8_dgrad=$2; shift ;;
     --target-area) target_area=$2; shift ;;
     --max-tokens) max_tokens=$2; shift ;;
-    --text-memory) choice text-memory "$2" auto stream offload resident; text_memory=$2; shift ;;
+    --text-memory) choice text-memory "$2" auto ring stream offload resident; text_memory=$2; shift ;;
     --cache) choice cache "$2" off online offline; cache=$2; shift ;;
     --cache-dir) cache_dir=$2; shift ;;
     --sample-every) sample_every=$2; shift ;;

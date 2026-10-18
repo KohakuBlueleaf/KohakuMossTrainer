@@ -20,9 +20,9 @@ DOC = ROOT / "docs" / "concepts" / "profiles.md"
 BEGIN, END = "<!-- catalog:begin -->", "<!-- catalog:end -->"
 SHORT = {
     "speed": "nockpt-resident",
-    "balanced": "ckpt-stream16",
-    "low": "ckpt-stream4-actoff-optstream",
-    "minimal": "ckpt-stream2-actoff-optstream-gradoff",
+    "balanced": "ckpt-ring16",
+    "low": "ckpt-ring4-actoff-optstream",
+    "minimal": "ckpt-ring2-actoff-optstream-gradoff",
 }
 
 
@@ -37,7 +37,7 @@ def test_docs_table_is_the_generated_table():
     text = DOC.read_text(encoding="utf-8")
     check(text)
     lines = text.splitlines()
-    dropped = "\n".join(line for line in lines if "`ckpt-stream8-optcpu`" not in line)
+    dropped = "\n".join(line for line in lines if "`ckpt-ring8-optcpu`" not in line)
     must_fail(lambda: check(dropped), "docs table missing one catalog row")
 
 

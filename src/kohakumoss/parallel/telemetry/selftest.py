@@ -23,19 +23,15 @@ from kohakumoss.offload.weights.shared import (
     owned,
 )
 from kohakumoss.parallel.ddp import AsyncReducer, GradReducer
+from kohakumoss_common.units import MIB
+from kohakumoss_kernels.hardware.current import synchronize
 
 SHAPES = ((3, 5), (7,), (2, 4, 6), (1,), (33, 9))
-MIB = 2**20
 
 
 def _write(path: str, rank: int, payload: dict) -> None:
     with open(f"{path}.{rank}.json", "w", encoding="utf-8") as f:
         json.dump(payload, f)
-
-
-def _sync(device) -> None:
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
 
 
 def _coefficients(rank: int, micro: int, device) -> list[torch.Tensor]:
@@ -140,7 +136,7 @@ def async_worker(
     reducer.finish()
     flat = torch.full((7,), float(env.rank + 1), device=env.device)
     reducer.reduce_flat(flat)
-    _sync(env.device)
+    synchronize(env.device)
     want = [torch.zeros(s, device=env.device) for s in SHAPES]
     for r in range(env.world):
         for m in range(micro):
@@ -270,11 +266,11 @@ def orphan_worker(env, pid_path: str, detach: bool = False) -> None:
 def _timed(fn, device, iters: int = 10) -> float:
     for _ in range(3):
         fn()
-    _sync(device)
+    synchronize(device)
     t0 = time.perf_counter()
     for _ in range(iters):
         fn()
-    _sync(device)
+    synchronize(device)
     return (time.perf_counter() - t0) / iters
 
 

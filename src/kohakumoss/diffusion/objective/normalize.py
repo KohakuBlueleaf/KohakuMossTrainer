@@ -9,12 +9,8 @@ from collections.abc import Callable
 import torch
 from torch import Tensor
 
+from kohakumoss_common.calls import identity
 from kohakumoss_common.devices import streamed_type
-
-
-def identity_reduce(t: Tensor) -> Tensor:
-    """The single-process reduce: `t` unchanged."""
-    return t
 
 
 def all_reduce_sum(t: Tensor) -> Tensor:
@@ -28,7 +24,7 @@ class TokenNormalizer:
 
     def __init__(
         self,
-        reduce: Callable[[Tensor], Tensor] = identity_reduce,
+        reduce: Callable[[Tensor], Tensor] = identity,
         world_factor: int = 1,
     ):
         self.reduce = reduce

@@ -6,7 +6,6 @@ import contextlib
 import time
 
 import torch
-import torch.distributed as dist
 
 from kohakumoss.adapters.lycoris.tuning import set_lycoris_tuning
 from kohakumoss.logging.log import get_logger, hl, log_table
@@ -22,6 +21,7 @@ from kohakumoss.tuning.lengths import (
 )
 from kohakumoss.types.seqinfo import build_seqinfo
 from kohakumoss_common.units import GIB
+from kohakumoss_kernels.dist import dist_rank, initialized
 from kohakumoss_kernels.hardware.current import rng_kept
 from kohakumoss_kernels.hardware.memory import (
     allocated,
@@ -132,9 +132,10 @@ class ModelPrewarm:
     def __call__(self, devices: list[torch.device]) -> int:
         """Rank 0 measures; every rank then binds from rank 0's broadcast tables (the
         other ranks wait on the store for rank 0's measurement, not in a collective)."""
-        distributed = dist.is_available() and dist.is_initialized()
+        distributed = initialized()
+        rank = dist_rank()[0]
         gate = gate_name("prewarm") if distributed else None
-        if distributed and dist.get_rank() != 0:
+        if distributed and rank != 0:
             take_working(gate, devices)
             devices = []
         problems, workings = 0, []
@@ -158,7 +159,7 @@ class ModelPrewarm:
         if self.backward:
             self.backbone.zero_grad(set_to_none=True)
         if distributed:
-            if dist.get_rank() == 0:
+            if rank == 0:
                 share_working(gate, workings)
             broadcast(0)
         return problems
@@ -336,8 +337,8 @@ def log_prewarm(reports: dict, took: float, device) -> None:
 
 def prewarm_devices(device: torch.device) -> list[torch.device]:
     """Devices the prewarm tunes: the training device (ops on further threaded stage
-    devices are tuned between steps on first use); none on CPU, where every op is the
-    untuned eager reference."""
+    devices bind the same card's tables, else their first candidate untimed); none on
+    CPU, where every op is the untuned eager reference."""
     if device.type == "cpu":
         return []
     return [device]
@@ -388,16 +389,16 @@ class AdapterPrewarm:
                 f"{hl(', '.join(peaks) or '-')}"
             )
         decisions.flush("after the adapter prewarm")
-        go_capped(budgets)
+        end_prewarm(budgets)
         return measured
 
 
-def go_capped(budgets: dict) -> None:
+def end_prewarm(budgets: dict) -> None:
     """The end of the prewarm: kernel configs are fixed (`window.freeze`: a key first
     met later binds untimed), the tuning windows after it (text-encoder prewarm, first
     sampler step, retune steps) time within `budgets` (device -> bytes,
-    `tuner.set_cap`), and LyCORIS binds its stored or model-ranked tiles without
-    tuning (no LyCORIS tile tune inside a step)."""
+    `tuner.set_cap`), and LyCORIS binds its stored or model-ranked tiles untimed, so
+    every LyCORIS tile tune runs before step 0."""
     for device, nbytes in budgets.items():
         set_cap(device, nbytes)
     freeze()

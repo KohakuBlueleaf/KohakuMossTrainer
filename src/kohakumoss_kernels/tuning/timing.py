@@ -64,7 +64,7 @@ def graph_ms(
     fn: Callable[[], object], device: torch.device, calls: int = 5, iters: int = 10
 ) -> float:
     """Device ms per call replayed from a thread-local CUDA graph of `calls` launches
-    (no host launch cost), freed after the measurement; plain timing when capture fails
+    (device time only), freed after the measurement; plain timing when capture fails
     or off CUDA."""
     fn()
     synchronize(device)

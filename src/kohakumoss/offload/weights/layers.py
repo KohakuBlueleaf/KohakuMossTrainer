@@ -27,6 +27,14 @@ def tensor_bytes(tensors) -> int:
     return sum(t.nbytes for t in tensors)
 
 
+def module_bytes(module) -> int:
+    """Parameter + buffer bytes of a module (`module_tensors`; 0 for None or a
+    non-module)."""
+    if not isinstance(module, nn.Module):
+        return 0
+    return tensor_bytes(module_tensors(module).values())
+
+
 def host_copy(t: Tensor, pinned: bool, dtype: torch.dtype | None = None) -> Tensor:
     """A contiguous host copy of `t` in `dtype` (default its own), pinned when `pinned`;
     a contiguous host tensor already in `dtype` is returned as is."""
@@ -65,48 +73,49 @@ def find_layer_list(module: nn.Module) -> nn.ModuleList:
 class _Pool:
     """Ring of device slots for layers sharing one parameter signature."""
 
-    def __init__(self, template: list[Tensor], resident: int):
+    def __init__(self, template: list[Tensor], n_slots: int):
         self.template = template
-        self.resident = resident
+        self.n_slots = n_slots
         self.slots: list[list[Tensor]] = []
-        self.held: list[int | None] = [None] * resident
+        self.held: list[int | None] = [None] * n_slots
         self.next = 0
         self.ready: list = []
         self.free: list = []
 
-    def open(self, device, cuda: bool) -> None:
+    def open(self, device, side: bool) -> None:
         self.slots = [
             [torch.empty(t.shape, dtype=t.dtype, device=device) for t in self.template]
-            for _ in range(self.resident)
+            for _ in range(self.n_slots)
         ]
-        self.held = [None] * self.resident
+        self.held = [None] * self.n_slots
         self.next = 0
-        if cuda:
-            events = SlotEvents(module(device), device, self.resident)
+        if side:
+            events = SlotEvents(module(device), device, self.n_slots)
             self.ready, self.free = events.ready, events.free
 
     def close(self) -> None:
         self.slots = []
-        self.held = [None] * self.resident
+        self.held = [None] * self.n_slots
 
 
 class LayerStreamer:
-    """Streams `layers` through `resident` device slots per layer signature.
+    """Streams `layers` through `slots` device slots per layer signature.
 
-    `open()` allocates the slots (implicitly on the first entry), `close()` waits for
-    the device and frees them; `h2d_bytes` counts every host-to-device byte copied."""
+    `open()` allocates the slots (implicitly on the first entry), `close()` orders the
+    compute stream after the last H2D copy, points every layer back at its host copy
+    and drops the slots; `h2d_bytes` counts every host-to-device byte copied."""
 
     def __init__(
         self,
         layers: Sequence[nn.Module],
         device: torch.device | str,
-        resident: int = 2,
+        slots: int = 2,
         pinned: bool = True,
         hooks: bool = True,
     ):
         self.layers = list(layers)
         self.device = with_index(device)
-        self.cuda = streamed(self.device)
+        self.streamed = streamed(self.device)
         self.dm = module(self.device)
         self.host: list[list[Tensor]] = []
         self.targets: list[list[Tensor]] = []
@@ -117,12 +126,12 @@ class LayerStreamer:
             params = module_tensors(layer)
             hosts = []
             for t in params.values():
-                h = host_copy(t, pinned and self.cuda)
+                h = host_copy(t, pinned and self.streamed)
                 t.data = h
                 hosts.append(h)
             sig = tuple((n, tuple(t.shape), t.dtype) for n, t in zip(params, hosts))
             if sig not in pools:
-                pools[sig] = _Pool(hosts, resident)
+                pools[sig] = _Pool(hosts, slots)
             self.pool_of.append(pools[sig])
             self.host.append(hosts)
             self.targets.append(list(params.values()))
@@ -131,7 +140,7 @@ class LayerStreamer:
         self.slot_of: dict[int, int] = {}
         self.is_open = False
         self.h2d_bytes = 0
-        if self.cuda:
+        if self.streamed:
             self.stream = self.dm.Stream(self.device)
             self._copy, self._wait, self._free = (
                 self._copy_device,
@@ -158,18 +167,18 @@ class LayerStreamer:
 
     def slot_bytes(self) -> int:
         """Device bytes the open ring holds."""
-        return sum(p.resident * tensor_bytes(p.template) for p in self.pools)
+        return sum(p.n_slots * tensor_bytes(p.template) for p in self.pools)
 
     def open(self) -> None:
         for pool in self.pools:
-            pool.open(self.device, self.cuda)
+            pool.open(self.device, self.streamed)
         self.slot_of.clear()
         self.is_open = True
 
     def close(self) -> None:
         if not self.is_open:
             return
-        if self.cuda:
+        if self.streamed:
             self.dm.current_stream(self.device).wait_stream(self.stream)
         for i, targets in enumerate(self.targets):
             for t, h in zip(targets, self.host[i]):

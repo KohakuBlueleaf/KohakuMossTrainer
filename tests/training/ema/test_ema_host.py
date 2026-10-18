@@ -12,7 +12,7 @@ import torch
 from kohakumoss.memory.profiles import resolve
 from kohakumoss.model import resolve_config
 from kohakumoss.training.build import loop
-from kohakumoss.training.build.loop import build_ema_for, ema_wait
+from kohakumoss.training.build.loop import build_ema_for, ema_before_read
 from kohakumoss.training.ema import averagers
 from kohakumoss.training.ema.averagers import decay_count
 from kohakumoss_common.calls import nothing
@@ -70,6 +70,7 @@ def check_waits(ema, log: list, monkeypatch) -> None:
 
     monkeypatch.setattr(averagers.torch, "_foreach_lerp_", spy)
     ema.update(0)
+    getattr(ema, "join", nothing)()
     assert log and log[0] == "write-back landed", log
 
 
@@ -79,7 +80,7 @@ def test_update_waits_for_the_write_back(monkeypatch):
     named = [("w", torch.nn.Parameter(torch.ones(3)))]
     ema = build_ema_for({"EMA": 0.9}, _built(named), bundle)
     check_waits(ema, log, monkeypatch)
-    assert ema_wait(SimpleNamespace(blocks=None)) is nothing
+    assert ema_before_read(SimpleNamespace(blocks=None)) is nothing
     log2 = []
     blind = build_ema_for({"EMA": 0.9}, _built(named), SimpleNamespace(blocks=None))
     must_fail(lambda: check_waits(blind, log2, monkeypatch), "no wait")

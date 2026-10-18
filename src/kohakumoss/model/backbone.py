@@ -208,11 +208,6 @@ def runs_on(mask: Tensor, seq: SeqInfo) -> Tensor:
     return (~mask).index_select(0, seq.seg_joint.long()).unsqueeze(-1)
 
 
-def all_linears(model: nn.Module) -> dict[str, MossLinear]:
-    """Every MossLinear by dotted path."""
-    return {n: m for n, m in model.named_modules() if isinstance(m, MossLinear)}
-
-
 def compute_dtype(model: MossBackbone) -> torch.dtype:
     """Dtype of the joint-block weights (the activation dtype of the trunk)."""
     return model.layers[0].proj["q"].weight_like.dtype

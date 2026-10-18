@@ -54,11 +54,12 @@ class MemoryPlan:
 class TextEncoderPlan:
     """Text-encoder placement, precision and batching (training and inference).
 
-    memory: resident | offload (whole model to the device per pass) | stream (layer
-    ring of `stream_resident` slots, prefetching) | cpu (runs on the host) | auto
-    (resolved by the memory planner); `free_after_use` drops the model after its first
-    pass. precision: compute | int8 | fp8 (weight-only, per output channel or per
-    `quant_group` input columns) | fp8_compute (fp8 GEMMs, `fp8_recipe` tensor | row |
+    memory: resident | offload (whole model to the device per pass) | ring (a layer
+    ring of `stream_resident` slots, prefetching; "stream" is its alias) | cpu (runs on
+    the host) | auto (resolved by the memory planner); `free_after_use` drops the model
+    after its first pass. precision: compute | int8 | fp8 (weight-only, per output
+    channel or per `quant_group` input columns) | fp8_compute (fp8 GEMMs, `fp8_recipe`
+    tensor | row |
     block scaling, sm89+) | mxfp8 (MX block-scaled GEMMs, sm89+); fp8 compute weights
     are quantized once, activations per call. `dtype` bf16 | fp16 | auto (bf16, or
     fp16 where the device has no bf16). `batch` prompts / `max_tokens` tokens per

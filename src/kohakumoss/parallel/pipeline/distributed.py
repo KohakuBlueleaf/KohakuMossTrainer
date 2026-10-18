@@ -16,6 +16,7 @@ from kohakumoss.memory.runners import PlainRunner
 from kohakumoss.parallel.pipeline.parts import PartsCtx
 from kohakumoss.parallel.telemetry.timing import build_clock
 from kohakumoss.types.seqinfo import SeqInfo, build_seqinfo
+from kohakumoss_common.calls import nothing
 from kohakumoss_data.config import DataConfig, pipeline_problems
 
 SCHEDULES = {
@@ -328,14 +329,6 @@ class TimedStage(pipelining.PipelineStage):
         return out
 
 
-def _no_capture(sigma: Tensor, seq: SeqInfo) -> None:
-    return None
-
-
-def _no_install(state) -> None:
-    return None
-
-
 class PipelineEngine:
     """This rank's stages and schedule; `step(microbatches, denom)` runs forward +
     backward of the step and returns its loss on every rank.
@@ -366,11 +359,11 @@ class PipelineEngine:
             raise ValueError("; ".join(problems))
         self.rank, self.world, self.device, self.shape = rank, world, device, shape
         self.dtype = compute_dtype
-        self.boundary = getattr(parts, "stream_dtype", compute_dtype)
+        self.boundary = getattr(parts, "residual_dtype", compute_dtype)
         self.cond_grad = parts.conditioning_trainable()
         self.group = group
-        self.capture: Callable = _no_capture
-        self.install: Callable = _no_install
+        self.capture: Callable = nothing
+        self.install: Callable = nothing
         self.states: list = [None] * shape.microbatches
         ids = stage_ids(rank, world, schedule, per_rank)
         n_stages = world * len(ids)
@@ -477,7 +470,7 @@ class PipelineEngine:
                 "pipeline ranks drew different micro-batches (layout / sigma digests "
                 "differ): every stage must see the same step"
             )
-        self._check = _no_check
+        self._check = nothing
 
     def step(self, microbatches: list[MicroBatch], denom: float) -> Tensor:
         """One forward + backward over the step; the step's loss (summed over its
@@ -542,7 +535,3 @@ class TokenLoss:
     def __call__(self, pred: Tensor, data: MicroBatch, seg: Tensor) -> Tensor:
         loss = self.token_loss(pred, data.target, seg, data.weight, None)
         return loss * self.scaler.scale
-
-
-def _no_check(microbatches) -> None:
-    return None

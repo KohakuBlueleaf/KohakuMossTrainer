@@ -21,7 +21,7 @@ options (defaults in brackets; see sample.ps1 for each one's meaning):
   --prompt TEXT   --negative TEXT [blurry, distortion]   --size HxW [1024x1024]
   --steps N [50]   --cfg X [3.0]   --seed N [0]   --count N [4]   --batch N [4]   --prompts-file FILE
   --precision bf16|fp16 [bf16]   --fp16-fix online|fp32_residual|none [online]
-  --text-memory auto|resident|offload|stream|cpu [auto]
+  --text-memory auto|resident|offload|ring|cpu [auto]
   --text-precision compute|int8|fp8|fp8_compute|mxfp8 [compute]   --text-fp8-recipe row|tensor|block [row]
   --free-text-encoder
   --base-precision compute|int8|fp8|fp8_compute|mxfp8 [compute]   --fp8-recipe row|tensor|block [row]
@@ -83,7 +83,7 @@ while [ $# -gt 0 ]; do
     --prompts-file) prompts_file=$2; shift ;;
     --precision) choice precision "$2" bf16 fp16; precision=$2; shift ;;
     --fp16-fix) choice fp16-fix "$2" online fp32_residual none; fp16_fix=$2; shift ;;
-    --text-memory) choice text-memory "$2" auto resident offload stream cpu; text_memory=$2; shift ;;
+    --text-memory) choice text-memory "$2" auto resident offload ring stream cpu; text_memory=$2; shift ;;
     --text-precision) choice text-precision "$2" compute int8 fp8 fp8_compute mxfp8; text_precision=$2; shift ;;
     --text-fp8-recipe) choice text-fp8-recipe "$2" row tensor block; text_fp8_recipe=$2; shift ;;
     --free-text-encoder) free_text=1 ;;

@@ -12,6 +12,7 @@ from kohakumoss_kernels.tuning.tuner import (
     set_mode,
     table,
     timing_allowed,
+    will_time,
 )
 
 __all__ = [
@@ -27,4 +28,5 @@ __all__ = [
     "set_mode",
     "table",
     "timing_allowed",
+    "will_time",
 ]

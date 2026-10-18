@@ -1,7 +1,7 @@
 """Device-memory bookkeeping (CUDA / XPU; no-ops on the host): returning free blocks to
 the driver, peak windows (`window`, `open_window` / `close_window`) that nest without
 losing an enclosing window's peak, a block's working memory under an optional bound
-(`working`), and the bytes the allocator returned to the driver (`returned`). See
+(`working`), and the device's free / used bytes (`mem_info`, `device_used`). See
 docs/internals/kernel-dev.md#peak-windows.
 """
 
@@ -117,12 +117,6 @@ def restart_window(w: Window) -> tuple[int, int]:
     return out
 
 
-def read_window(w: Window) -> tuple[int, int]:
-    """(peak allocated, peak reserved) of an open window so far."""
-    fold(w.device)
-    return w.alloc, w.reserved
-
-
 def close_window(w: Window) -> tuple[int, int]:
     """Close `w`; its (peak allocated, peak reserved) bytes."""
     fold(w.device)
@@ -150,12 +144,12 @@ def tuning_budget(device: torch.device | str, peak: int = 0) -> int | None:
     `peak` (the device peak of the run's own work at its planned sizes, e.g. the kernel
     prewarm's; 0: unknown) and at most BUDGET_FRACTION of the memory the device has
     free; None on the host. See docs/internals/tuning.md#working-memory-bound."""
-    mod = _accel(device)
-    if mod is None or not hasattr(mod, "mem_get_info"):
+    info = mem_info(device)
+    if info is None:
         return None
     device = torch.device(device)
-    room = int(BUDGET_FRACTION * mod.mem_get_info(device)[0])
-    allocated = mod.memory_allocated(device)
+    room = int(BUDGET_FRACTION * info[0])
+    allocated = _accel(device).memory_allocated(device)
     if peak > allocated:
         room = min(room, peak - allocated)
     return room
@@ -205,15 +199,6 @@ def working(device: torch.device | str, bound: int | None = None):
         w.peak = max(close_window(win)[0] - start, 0)
 
 
-def returned(device: torch.device | str) -> int:
-    """Bytes the allocator has returned to the driver on `device` since the process
-    started (0 on the host or without the allocator statistic)."""
-    mod = _accel(device)
-    if mod is None or not hasattr(mod, "memory_stats"):
-        return 0
-    return int(mod.memory_stats(device).get("reserved_bytes.all.freed", 0))
-
-
 def allocated(device: torch.device | str) -> int:
     """Bytes of live tensors on `device` now."""
     mod = _accel(device)
@@ -226,18 +211,17 @@ def reserved(device: torch.device | str) -> int:
     return 0 if mod is None else mod.memory_reserved(device)
 
 
+def mem_info(device: torch.device | str) -> tuple[int, int] | None:
+    """(free, total) bytes of the whole `device` from the driver; None on the host or
+    without `mem_get_info`."""
+    mod = _accel(device)
+    if mod is None or not hasattr(mod, "mem_get_info"):
+        return None
+    free, total = mod.mem_get_info(device)
+    return int(free), int(total)
+
+
 def device_used(device: torch.device | str) -> int:
     """Bytes in use on the whole device (every process; what nvidia-smi shows)."""
-    mod = _accel(device)
-    if mod is None or not hasattr(mod, "mem_get_info"):
-        return 0
-    free, total = mod.mem_get_info(device)
-    return total - free
-
-
-def device_total(device: torch.device | str) -> int:
-    """Bytes of memory `device` has (0 on the host)."""
-    mod = _accel(device)
-    if mod is None or not hasattr(mod, "mem_get_info"):
-        return 0
-    return mod.mem_get_info(device)[1]
+    info = mem_info(device)
+    return 0 if info is None else info[1] - info[0]

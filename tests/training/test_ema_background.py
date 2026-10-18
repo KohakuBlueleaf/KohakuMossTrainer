@@ -71,7 +71,7 @@ def check_background(make) -> None:
         seen.append(threading.current_thread().name)
         gate.wait(5)
 
-    ema.wait = held
+    ema.before_read = held
     with torch.no_grad():
         p.fill_(2.0)
     ema.update(0)

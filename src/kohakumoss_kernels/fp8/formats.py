@@ -125,22 +125,6 @@ def dequantize(q: Tensor, scale: Tensor, recipe: str, dtype: torch.dtype) -> Ten
     return out.to(dtype)
 
 
-def scale_numel(recipe: str, rows: int, k: int, role: str = "act") -> int:
-    """Elements of the scale tensor of a [rows, K] operand."""
-    match recipe, role:
-        case "tensor", _:
-            return 1
-        case "row", _:
-            return rows
-        case "block", "act":
-            return rows * (k // BLOCK)
-        case "block", _:
-            return cdiv(rows, BLOCK) * (k // BLOCK)
-        case "mx", _:
-            return rows * (k // MX_BLOCK)
-    raise ValueError(f"fp8 recipe {recipe!r} not in {RECIPES}")
-
-
 def swizzle_mx(scale: Tensor) -> Tensor:
     """[rows, K/32] uint8 -> the flat 128x4-tile SWIZZLE_32_4_4 layout the vendor
     block-scaled GEMM reads (zero-padded to whole tiles)."""

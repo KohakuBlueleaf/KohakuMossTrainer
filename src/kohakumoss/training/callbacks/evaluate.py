@@ -36,9 +36,10 @@ def _plain(value) -> bool:
 class SampleGrid:
     """Every `every` steps: run the inference pipeline on the live training model.
 
-    `pipeline(**settings) -> list[PIL.Image]` is `MossPipeline.from_components(...)` over
-    the training backbone (no reload; adapters at the training multiplier). The model is
-    put in eval mode and restored to train mode after; images and `settings.json` go to
+    `pipeline(**settings) -> list[PIL.Image]` is `MossPipeline.from_components(...)`
+    over the training backbone (the loaded modules, adapters at the training
+    multiplier). The model is put in eval mode and restored to train mode after; images
+    and `settings.json` go to
     `<output>/samples/step_X/` and through the logger, and `<output>/samples/grid.png`
     is recomposed from every sampled step: prompts on the columns, steps on the rows.
     """

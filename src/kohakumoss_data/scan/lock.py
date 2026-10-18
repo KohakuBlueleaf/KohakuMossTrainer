@@ -9,7 +9,7 @@ import socket
 import time
 from ctypes import wintypes
 
-from kohakumoss_common.io import write_json_atomic
+from kohakumoss_common.io import read_json, write_json_atomic
 
 LOCK, READY = ".lock", ".ready"
 HOST = socket.gethostname()
@@ -61,18 +61,10 @@ KERNEL32 = kernel32() if os.name == "nt" else None
 pid_alive = _alive_windows if os.name == "nt" else _alive_posix
 
 
-def _read_json(path: str) -> dict | None:
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
-        return None
-
-
 def stale(path: str) -> bool:
     """The lock of `path` is held by a dead process on this host (a lock from another
     host is never stale), or is unreadable and older than UNREADABLE_STALE seconds."""
-    owner = _read_json(path + LOCK)
+    owner = read_json(path + LOCK)
     if owner is None:
         return os.path.exists(path + LOCK) and _age(path + LOCK) > UNREADABLE_STALE
     return owner.get("host") == HOST and not pid_alive(int(owner.get("pid", -1)))
@@ -121,7 +113,7 @@ def write_ready(path: str, info: dict) -> None:
 
 
 def read_ready(path: str) -> dict | None:
-    return _read_json(path + READY)
+    return read_json(path + READY)
 
 
 def clear_ready(path: str) -> None:

@@ -17,12 +17,12 @@ ARCH_OVERRIDES = {}  # MossArchConfig field overrides
 TEXT_ENCODER = ""  # "" = <WEIGHTS>/text_encoder; path to Qwen3.5 dir
 TEXT_DEVICE = ""  # GPU the text encoder runs on ("" = the training device); "cpu" only with TEXT_CACHE="offline"
 TEXT_ENCODE = {}  # TextEncoderPlan fields (docs/internals/text-encoder.md):
-#   "memory": "auto" (default: fastest that fits next to the DiT step) | "resident" | "offload" (whole TE in per pass) | "stream" (layer ring)
+#   "memory": "auto" (default: fastest that fits next to the DiT step) | "resident" | "offload" (whole TE in per pass) | "ring" (layer ring; "stream" is accepted too)
 #   "stream_resident": 2 (ring slots per layer kind), "pinned": True
 #   "precision": "compute" | "int8" | "fp8" (weight-only) | "fp8_compute" | "mxfp8" (fp8 GEMMs, sm89+); "quant_group": 0 (per channel) | 64 | 128
-#   "stored": "" | a pre-quantized text-encoder file of that precision (scripts/export/text_quant.py; no quantizing at load)
+#   "stored": "" | a pre-quantized text-encoder file of that precision (scripts/export/text_quant.py; its stored bases attach at load)
 #   "fp8_recipe": "row" | "tensor" | "block" (fp8_compute scaling)
-#   "dtype": "bf16" | "fp16" | "fp32"; "batch": 32 prompts / "max_tokens": 16384 tokens per kernel call
+#   "dtype": "auto" (bf16 where supported, else fp16) | "bf16" | "fp16"; "batch": 32 prompts / "max_tokens": 16384 tokens per kernel call
 #   "layout": "packed" (varlen) | "padded" | "single"; "forward": "kernels" | "hf" (transformers modules; single / padded)
 #   "ahead": 1 (TEXT_CACHE "online" / "off": host batches encoded per TE pass); "ahead_device": "host" | "device" (where results wait)
 #   "kernels": {} (op -> backend, e.g. {"gated_delta_rule_varlen": "triton"})
@@ -57,7 +57,7 @@ TEXT_DROP = 0.1  # probability a sample uses the empty-prompt embedding
 LATENT_CACHE = "offline"  # "off" | "offline" | "online"
 TEXT_CACHE = "offline"  # "off" | "offline" | "online"
 CACHE_DIR = ""  # "" = <dataset>/cache; directory for latent / text vaults
-CACHE_DTYPE = "bf16"  # "bf16" | "fp8"
+CACHE_DTYPE = "bf16"  # "bf16" | "fp16" | "fp32" | "fp8"
 CAPTION_VARIANTS = 4  # cached caption renderings per image
 FLIP = False  # horizontal flip augmentation
 CROP = "center"  # "center" | "random" (offline latent caches need "center")
@@ -75,7 +75,7 @@ MAX_TEXT_TOKENS = 4096  # cap on a caption's text tokens in planning
 PREFETCH = 2  # batches prefetched per loader worker
 PIN_MEMORY = True  # pin host batches for async H2D copies
 NUM_WORKERS = 4
-DATA_RESCAN = False  # catalog cache: False (re-probe changed / new files) | True (re-probe all) | "never" (no walk)
+DATA_RESCAN = False  # catalog cache: False (re-probe changed / new files) | True (re-probe all) | "never" (the cached catalog as is)
 DATA_SCAN_WORKERS = 8  # worker processes probing image headers on a (re)scan
 DATA_WAIT = 3600.0  # seconds a non-writer rank waits for the catalog writer
 SEED = 0
@@ -89,9 +89,7 @@ ALGO_KWARGS = (
     {}
 )  # e.g. {"factor": 8} for lokr, {"constraint": 0.0} for oft (DIM is the OFT block size)
 DORA = False
-DORA_DETACH = (
-    False  # True detaches the DoRA weight norm in training (no fused DoRA kernel then)
-)
+DORA_DETACH = False  # True detaches the DoRA weight norm in training (the DoRA layers then run LyCORIS's unfused path)
 DROPOUT = {"input": 0.0, "rank": 0.0, "module": 0.0}
 ADAPTER_MODE = "bypass"  # "bypass" | "merge"
 LORAPLUS_RATIO = 1.0  # lr ratio of up / down factors (LoRA+); 1.0 = off
@@ -117,7 +115,7 @@ LR = 1e-4
 BETAS = (0.9, 0.95)
 EPS = 1e-8
 WEIGHT_DECAY = 0.01
-WD_RULES = "moss"  # "moss" (no wd on bias/norm/1-D, decay-to-one on last q/k norm) | "none" | "all"
+WD_RULES = "moss"  # "moss" (wd on 2-D weights only, decay-to-one on last q/k norm) | "none" | "all"
 SCHEDULE = {"mode": "cosine", "warmup": 100, "end": -1}  # AnySchedule config
 GRAD_CLIP = 1.0
 EMA = 0.0  # 0 = off; e.g. 0.9999
@@ -133,7 +131,7 @@ FP16_FIX_KWARGS = (
 # ===================== MEMORY =====================
 MEMORY_PROFILE = "balanced"  # a catalog profile (kohakumoss-config list; docs/concepts/profiles.md) | "speed" | "balanced" | "low" | "minimal" | "auto" | "manual"
 MEMORY_AUTO_FORCE = False  # "auto" with no profile that fits: False = error, True = run the last one anyway (WARNING)
-STEP_RELEASE = "none"  # between-step release of free cached device memory: "none" (no release in the training loop) | "empty_cache" (every step; synchronises) | N (every N steps)
+STEP_RELEASE = "none"  # between-step release of free cached device memory: "none" (the allocator keeps its cached blocks between steps) | "empty_cache" (every step; synchronises) | N (every N steps)
 # MEMORY_PROFILE="manual": the knobs below set the plan (None = the default in brackets); with a profile they must stay None.
 CHECKPOINT = (
     None  # "none" | "block" | "sub-block" | "selective" | "partial:<fraction>"  [block]
@@ -183,7 +181,7 @@ KERNELS = (
     {}
 )  # op -> backend, e.g. {"attention_varlen": "triton", "lycoris": "torch"}; empty = arch priority
 TUNE = "table"  # "table" (stored decisions; missing ones tuned in the prewarm before step 0, then stored) | "off" (stored decisions, else fixed defaults; nothing timed)
-RETUNE_STEPS = 3  # TUNE="table": the kernel-vs-compile retune runs after each of the first N steps; after them nothing is tuned (a later new shape binds untimed)
+RETUNE_STEPS = 3  # TUNE="table": the kernel-vs-compile retune runs after each of the first N steps; after them no kernel-vs-compile shape is queued, and outside the first sample grid's first sampler step a new shape binds untimed
 COMPILE = "off"  # "off" | "block" | "model"
 
 # ===================== RUNTIME =====================

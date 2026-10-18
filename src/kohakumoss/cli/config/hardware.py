@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
+from kohakumoss_common.units import gib
 from kohakumoss_kernels.hardware.arch import arch_of
 
 
@@ -13,11 +14,6 @@ class Accelerator:
     vram_gib: float  # device 0, exact (presets.holds applies the tolerance)
     bf16: bool
     count: int
-
-
-def gib(total_bytes: int) -> float:
-    """Exact GiB of a byte count."""
-    return total_bytes / 1024**3
 
 
 def detect() -> Accelerator:

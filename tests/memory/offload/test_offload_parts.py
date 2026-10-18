@@ -17,14 +17,14 @@ def _parts(masters):
     grads = GradOffload([used, unused], pinned=False)
     grads.start(False)
     (used * 3.0).sum().backward()
-    grads.flush()
+    grads.drain()
     by_id = {id(used): "used", id(unused): "unused"}
     by_id.update({id(m): f"master{i}" for i, m in enumerate(masters)})
     parts = optimizers._offload_parts(grads, True, False, masters, by_id)
     return parts, grads, used, unused
 
 
-def test_host_optimizer_grads_include_streamed_masters(monkeypatch):
+def test_cpu_adamw_grads_include_streamed_masters(monkeypatch):
     master = torch.nn.Parameter(torch.ones(3))
     master.grad = torch.full((3,), 2.0)
 

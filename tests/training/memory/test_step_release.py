@@ -99,7 +99,7 @@ def _released_steps(fake, callback=CacheReleaseStats) -> list[float]:
     release = StepRelease(
         "cuda",
         1,
-        release=lambda d: fake.set(4.0, next(after)),
+        empty=lambda d: fake.set(4.0, next(after)),
         clock=lambda: 1.0 * next(ticks),
     )
     cb = callback("cuda", 10, release)
@@ -131,7 +131,7 @@ def test_negative_a_cumulative_release_counter(fake):
 
 def test_a_step_without_its_release_reports_zero(fake):
     after = iter((7.0,))
-    release = StepRelease("cuda", 2, release=lambda d: fake.set(4.0, next(after)))
+    release = StepRelease("cuda", 2, empty=lambda d: fake.set(4.0, next(after)))
     cb = CacheReleaseStats("cuda", 1, release)
     state = TrainState()
     fake.set(6.0, 10.0)
@@ -176,7 +176,7 @@ def check_step_release(build) -> None:
     (every,) = _releases(build("empty_cache"))
     assert every.every == 1
     calls = []
-    every.release = calls.append
+    every.empty = calls.append
     for _ in range(3):
         every.on_step_end(TrainState(), None)
     assert len(calls) == 3

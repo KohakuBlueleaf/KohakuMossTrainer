@@ -172,7 +172,7 @@ def test_ring_stream_takes_no_host_sync_per_block(model, batch, monkeypatch):
     fwd_bwd(model, batch)
     resident = count(lambda: fwd_bwd(model, batch))
     plan = MemoryPlan(checkpoint="none", stream="ring", stream_resident=2)
-    engine = apply_to_backbone(model, plan, "cuda", DTYPE, training=True).stream
+    engine = apply_to_backbone(model, plan, "cuda", DTYPE, training=True).weight_stream
     model.bind_ops()
     depth = model.cfg.depth
     check_no_block_syncs(stream_step(model, batch, engine, count), resident, depth)

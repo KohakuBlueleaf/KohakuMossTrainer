@@ -5,8 +5,8 @@ sizes and the VAE's weights, against the accelerator's measured peak."""
 import torch
 
 from kohakumoss.memory.estimate import GIB, Workload, estimate_inference
-from kohakumoss.offload.encoders.report import module_bytes
 from kohakumoss.offload.encoders.vae import vae_act_bytes
+from kohakumoss.offload.weights.layers import module_bytes
 from kohakumoss.types.plans import MemoryPlan
 from kohakumoss_kernels.hardware.memory import device_used
 
@@ -28,10 +28,11 @@ def working_set(backbone, plan: MemoryPlan, tokens: int) -> int:
 
 def estimated(backbone, plan: MemoryPlan, tokens: int, place, pixels: int):
     """Per phase of a generate call, GiB on the device: "encode" (the DiT's placed
-    weights + the text encoder's pass), "sampling" (the DiT forward of `tokens` + what
-    stays resident between passes), "decode" (the DiT weights + one VAE pass over
-    `pixels`), "peak" the largest; plus the parts "dit", "te_resident", "te_pass",
-    "vae". `place` holds the pipeline's text encoder and VAE."""
+    weights + the text encoder's pass + a resident VAE), "sampling" (the DiT forward of
+    `tokens` + what stays resident between passes), "decode" (the DiT weights + a
+    resident text encoder + one VAE pass over `pixels`), "peak" the largest; plus the
+    parts "dit", "te_resident", "te_pass", "vae". `place` holds the pipeline's text
+    encoder and VAE."""
     est = dit_estimate(backbone, plan, tokens)
     weights = est.parts.get("weights", 0)
     te, vae = place.text_encoder, place.vae

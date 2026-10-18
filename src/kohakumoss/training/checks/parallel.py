@@ -199,7 +199,7 @@ def threaded_plan_problems(k: dict, plan) -> list[str]:
     """PARALLEL='threaded' with a memory plan: resident, per-step optimizer, and no
     per-micro-batch adapter state under the async schedule's recompute."""
     p = _in_backward_steps(k, plan) + _resident(k, plan)
-    stepped = k["ALGO"] != "full" and config_from_knobs(k).step_state
+    stepped = k["ALGO"] != "full" and config_from_knobs(k).has_step_state
     async_recompute = k["PIPELINE_SCHEDULE"] == "async" and plan.checkpoint != "none"
     if async_recompute and stepped:
         p.append(

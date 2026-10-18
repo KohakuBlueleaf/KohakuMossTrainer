@@ -166,7 +166,7 @@ def test_ddp_layer_keeps_the_vram_profile(tmp_path):
     """The VRAM layer's catalog profile runs unchanged under the ddp layer."""
     out, _ = new_train(tmp_path, "--gpus", "2", "--vram", "12", "--precision", "bf16")
     _, k = config_knobs(out, ROOT)
-    assert k["MEMORY_PROFILE"] == "ckpt-stream4-actoff-optstream-gradoff"
+    assert k["MEMORY_PROFILE"] == "ckpt-ring4-actoff-optstream-gradoff"
     assert not k.get("MEMORY_OVERRIDES"), k.get("MEMORY_OVERRIDES")
 
 

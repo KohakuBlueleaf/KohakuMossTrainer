@@ -369,7 +369,7 @@ def _cap_only(budgets):
 
 @pytest.mark.cpu
 def test_prewarm_end_caps_every_later_tune():
-    check_capped_after_prewarm(prewarm.go_capped)
+    check_capped_after_prewarm(prewarm.end_prewarm)
     must_fail(lambda: check_capped_after_prewarm(_cap_only), "LyCORIS left tuning")
 
 

@@ -25,7 +25,7 @@ def operand(w: Tensor | None, like: Tensor) -> Tensor | None:
 
 def stacked(a: Tensor, b: Tensor, like: Tensor) -> Tensor:
     """[a; b] (a's rows, then b's) in `like`'s dtype, each weight cast once into one
-    buffer (no copy in the storage dtype)."""
+    buffer."""
     out = like.new_empty(a.shape[0] + b.shape[0], *a.shape[1:])
     out[: a.shape[0]].copy_(a)
     out[a.shape[0] :].copy_(b)

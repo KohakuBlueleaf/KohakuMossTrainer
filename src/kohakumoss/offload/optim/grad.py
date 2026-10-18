@@ -1,5 +1,5 @@
 """Gradient offload: per-parameter gradients summed in fp32 host memory across the
-GRAD_ACC micro-batches, finished at `flush()` or inside the last backward
+GRAD_ACC micro-batches, finished at `drain()` or inside the last backward
 (`start(last, final)`). A step's first gradient of a parameter is copied into its sum
 and later ones added, so a sum is never zeroed; `filled` marks the sums holding this
 step's gradients. See docs/internals/offload.md."""
@@ -35,7 +35,7 @@ def _event_after(device: torch.device):
 RING_SLOTS = 3
 
 
-def ring_bytes(largest: int) -> int:
+def grad_ring_bytes(largest: int) -> int:
     """Device bytes of the staging ring of a device's largest offloaded parameter."""
     return RING_SLOTS * 4 * largest
 
@@ -82,10 +82,10 @@ class GradOffload:
         for p in self.params:
             largest[p.device] = max(largest.get(p.device, 0), p.numel())
         for p in self.params:
-            cuda = streamed(p.device)
-            host = torch.zeros(p.shape, dtype=torch.float32, pin_memory=pinned and cuda)
+            side = streamed(p.device)
+            host = torch.zeros(p.shape, dtype=torch.float32, pin_memory=pinned and side)
             lane = _Lane(host)
-            if cuda:
+            if side:
                 stream = self._stream(p.device)
                 offload = partial(self._offload_device, lane, stream, id(p))
                 ring = self.rings.get(p.device)
@@ -171,7 +171,7 @@ class GradOffload:
         p.grad = None
 
     @torch.no_grad()
-    def settle(self) -> None:
+    def finish_unhooked(self) -> None:
         """After the last backward started with a `final`: finish every parameter whose
         hook did not fire in it but whose sum holds earlier micro-batches' gradients
         (their sum becomes its gradient)."""
@@ -183,13 +183,13 @@ class GradOffload:
                 self.finishes[id(p)](p)
 
     def finish(self) -> None:
-        """`settle`, then the compute stream waits for every in-backward update
+        """`finish_unhooked`, then the compute stream waits for every in-backward update
         (before the next forward reads the parameters)."""
-        self.settle()
+        self.finish_unhooked()
         for device, ring in self.rings.items():
             ring.dm.current_stream(device).wait_stream(ring.opt)
 
-    def flush(self) -> None:
+    def drain(self) -> None:
         """Land every in-flight copy (call after the last micro-batch's backward)."""
         self.acc.drain()
 

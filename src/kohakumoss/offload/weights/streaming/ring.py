@@ -8,7 +8,7 @@ from kohakumoss.offload.weights.streaming.copier import H2DCopier
 
 
 class SlotRing:
-    """`resident` device slots, each one block's tensors (`layout`: key -> (shape,
+    """`n_slots` device slots, each one block's tensors (`layout`: key -> (shape,
     dtype)); a load takes the least recently used slot not holding the active block or
     one of the first `keep` blocks (kept once loaded). `copier` fills a slot from
     `host[i]` and orders it against the compute stream."""
@@ -18,24 +18,24 @@ class SlotRing:
         host: list[dict[str, Tensor]],
         layout: dict[str, tuple[torch.Size, torch.dtype]],
         device: torch.device,
-        resident: int,
+        n_slots: int,
         keep: int,
         copier: H2DCopier,
         stats: dict,
     ):
         self.host = host
         self.n = len(host)
-        self.resident = resident
+        self.n_slots = n_slots
         self.keep = keep
         self.copier = copier
         self.stats = stats
         self.slots = [
             {k: torch.empty(s, dtype=d, device=device) for k, (s, d) in layout.items()}
-            for _ in range(resident)
+            for _ in range(n_slots)
         ]
         self.slot_of: dict[int, int] = {}
-        self.held: list[int | None] = [None] * resident
-        self.age = [0] * resident
+        self.held: list[int | None] = [None] * n_slots
+        self.age = [0] * n_slots
         self.clock = 0
         self.active: int | None = None
 
@@ -51,7 +51,7 @@ class SlotRing:
         """The oldest slot not holding the active block or a kept block."""
         candidates = [
             s
-            for s in range(self.resident)
+            for s in range(self.n_slots)
             if self.held[s] is None
             or (self.held[s] != self.active and self.held[s] >= self.keep)
         ]
@@ -92,7 +92,7 @@ class SlotRing:
     def forget(self) -> None:
         """No slot holds a block: the next use of every block reloads it."""
         self.slot_of.clear()
-        self.held = [None] * self.resident
+        self.held = [None] * self.n_slots
 
     def storages(self) -> list[Tensor]:
         """Ring slot tensors (to exclude from activation offload)."""

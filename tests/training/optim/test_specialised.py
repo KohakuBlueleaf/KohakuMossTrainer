@@ -9,7 +9,6 @@ import torch
 from kohakumoss.diffusion.objective import HuberLoss, L1Loss
 from kohakumoss.diffusion.objective.loss import _masked_sum, _plain_sum
 from kohakumoss.diffusion.timestep import LogitNormalTimestep, MossTimestep
-from kohakumoss.diffusion.timestep.simple import _identity
 from kohakumoss.precision import DynamicScaler, NoScaler, build_precision
 from kohakumoss.training.callbacks import CallbackRunner
 from kohakumoss.training.checkpoint import CheckpointManager
@@ -17,7 +16,7 @@ from kohakumoss.training.drivers.common import last_flags
 from kohakumoss.training.ema import ConstantEMA
 from kohakumoss.training.ema.averagers import _fixed_decay, _warm_decay
 from kohakumoss.training.optim import build_bundle
-from kohakumoss_common.calls import nothing
+from kohakumoss_common.calls import identity, nothing
 from tests._util.negative import must_fail
 
 pytestmark = pytest.mark.cpu
@@ -29,8 +28,8 @@ def test_losses_samplers_ema_bind_once():
     assert L1Loss(None, masked=True).reduce is _masked_sum
     assert MossTimestep().sample.__func__ is MossTimestep._single
     assert MossTimestep(schedule="tech_report").sample.__func__ is MossTimestep._staged
-    assert LogitNormalTimestep(shift=1.0).shift is _identity
-    assert LogitNormalTimestep(shift=3.0).shift is not _identity
+    assert LogitNormalTimestep(shift=1.0).shift is identity
+    assert LogitNormalTimestep(shift=3.0).shift is not identity
     p = torch.nn.Parameter(torch.zeros(2))
     assert ConstantEMA([("p", p)], (0.9,), warmup=False).rules[0].func is _fixed_decay
     assert ConstantEMA([("p", p)], (0.9,), warmup=True).rules[0].func is _warm_decay

@@ -1,6 +1,6 @@
 """Values built from a live tensor (segment bounds, tile plans), reused while that tensor
 object is alive at the same in-place version and dropped with it; an inference tensor
-(no version counter) is built every call."""
+is rebuilt every call."""
 
 import weakref
 from collections.abc import Callable

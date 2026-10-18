@@ -1,8 +1,7 @@
-"""Data-side types and protocols. No model code, no torch.distributed."""
+"""Data-side types."""
 
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Protocol
 
 import numpy as np
 from torch import Tensor
@@ -92,33 +91,3 @@ class HostBatch:
     def pin_memory(self) -> "HostBatch":
         """DataLoader pin-memory hook."""
         return self.pin()
-
-
-class Source(Protocol):
-    """A dataset backend that can enumerate records and open their image bytes."""
-
-    def scan(self) -> Iterator[CatalogRow]: ...
-
-    def open(self, locator: str) -> bytes: ...
-
-
-class Planner(Protocol):
-    """Decides batch `index` for `rank` of `world` from the catalog."""
-
-    def plan(self, index: int, rank: int, world: int) -> BatchPlan: ...
-
-
-class CaptionTemplate(Protocol):
-    """Renders a caption string for a row with a seeded generator."""
-
-    def render(self, row: CatalogRow, rng: np.random.Generator) -> str: ...
-
-
-class Cache(Protocol):
-    """Content-addressed tensor cache (latents or text embeddings)."""
-
-    def key(self, row: CatalogRow, item: PlanItem) -> str: ...
-
-    def get(self, key: str) -> Tensor | None: ...
-
-    def put(self, key: str, value: Tensor) -> None: ...

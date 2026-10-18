@@ -146,7 +146,7 @@ class MossPipeline:
         cusolver = owned and self.device.type == "cuda"
         self._linalg = cusolver_linalg if cusolver else nullcontext
         self.memory_plan = MemoryPlan()
-        self.stream = None
+        self.weight_stream = None
 
     @classmethod
     def from_components(
@@ -244,7 +244,7 @@ class MossPipeline:
             sources=sources,
         )
         pipe.memory_plan = loaded.plan
-        pipe.stream = loaded.stream
+        pipe.weight_stream = loaded.weight_stream
         pipe.log_placement()
         return pipe
 
@@ -411,9 +411,17 @@ class MossPipeline:
             f"estimated peak {hl(peak_gib)} (the largest phase)",
             ("phase", "GiB", "on the device"),
             [
-                ("text encode", est["encode"], "DiT weights + text-encoder pass"),
+                (
+                    "text encode",
+                    est["encode"],
+                    "DiT weights + text-encoder pass + resident VAE",
+                ),
                 ("sampling", est["sampling"], f"DiT forward of {batch_max} tokens"),
-                ("decode", est["decode"], "DiT weights + VAE pass"),
+                (
+                    "decode",
+                    est["decode"],
+                    "DiT weights + resident text encoder + VAE pass",
+                ),
             ],
         )
         return est
@@ -437,7 +445,7 @@ class MossPipeline:
         """One packed batch through the sampler under the sampling autocast, timed per
         step; returns (sample result, step stats)."""
         sigmas = moss_sigmas(steps, shift).tolist()
-        clock = StepClock(self.device, len(sigmas) - 1, self.stream)
+        clock = StepClock(self.device, len(sigmas) - 1, self.weight_stream)
         clock.start()
         autocast = sampling_autocast(self.backbone, self.device)
         with (

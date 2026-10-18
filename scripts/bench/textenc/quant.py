@@ -6,7 +6,7 @@ samples (same seeds).
 
     python scripts/bench/textenc/quant.py --root <weights>/base \
         --precisions compute,int8,fp8,int8:128,fp8:128,fp8_compute \
-        --memory stream --out runs/bench/textenc
+        --memory ring --out runs/bench/textenc
 
 `--ref64` takes a saved list of fp64 embeddings of `--probe` prompts (one tensor per
 prompt, e.g. from the fp64 kernel forward on the host); without it the fp64 columns
@@ -102,7 +102,7 @@ def main():
     ap.add_argument("--root", required=True, help="pipeline dir (text_encoder/ ...)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--precisions", default="compute,int8,fp8,int8:128,fp8:128")
-    ap.add_argument("--memory", default="stream")
+    ap.add_argument("--memory", default="ring")
     ap.add_argument("--dtype", default="bf16")
     ap.add_argument("--ref64", default="", help="torch.save'd fp64 embeddings")
     ap.add_argument("--probe", default="", help="JSON list of the --ref64 prompts")

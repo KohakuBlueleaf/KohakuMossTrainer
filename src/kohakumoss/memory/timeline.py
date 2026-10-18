@@ -9,6 +9,7 @@ a prewarm replay, an encoder pass) cuts them. Every read is host-side allocator 
 
 import torch
 
+from kohakumoss_common.units import gib
 from kohakumoss_kernels.hardware.memory import open_window, restart_window
 
 
@@ -36,12 +37,11 @@ class VramTimeline:
     def report(self) -> dict[str, float]:
         """GiB per phase (`vram_<phase>_peak`, `vram_<phase>_after`) and overall since
         the last report (`vram_peak_alloc`, `vram_peak_reserved`)."""
-        gib = 1024**3
-        out = {f"vram_{k}_peak": v / gib for k, v in self.peaks.items()}
-        out.update({f"vram_{k}_after": v / gib for k, v in self.after.items()})
+        out = {f"vram_{k}_peak": gib(v) for k, v in self.peaks.items()}
+        out.update({f"vram_{k}_after": gib(v) for k, v in self.after.items()})
         alloc, held = restart_window(self.window)
-        out["vram_peak_alloc"] = alloc / gib
-        out["vram_peak_reserved"] = held / gib
+        out["vram_peak_alloc"] = gib(alloc)
+        out["vram_peak_reserved"] = gib(held)
         self.peaks.clear()
         self.after.clear()
         return out

@@ -146,13 +146,3 @@ def config_problems(config: Path, root: Path | None = None) -> list[str]:
 def blocking(found: list[str]) -> list[str]:
     """The problems a missing path does not explain."""
     return [p for p in found if MISSING not in p]
-
-
-def shipped_configs(root: Path) -> list[Path]:
-    """Every config file under configs/ except the written ones (configs/user/)."""
-    user = root / USER_DIR
-    return sorted(
-        p
-        for p in (root / "configs").rglob("*.py")
-        if user not in p.parents and "__pycache__" not in p.parts
-    )

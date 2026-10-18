@@ -70,17 +70,17 @@ class _StreamedFp8Linear(Function):
 
 
 class StreamedWeight:
-    """Frozen BaseWeight backed by the engine's ring slot for (block, key)."""
+    """Frozen BaseWeight backed by the weight_stream's ring slot for (block, key)."""
 
-    def __init__(self, engine, block: int, key: str, shape):
-        self.engine = engine
+    def __init__(self, weight_stream, block: int, key: str, shape):
+        self.weight_stream = weight_stream
         self.block = block
         self.key = key
         self.shape = torch.Size(shape)
 
     def weight_now(self, dtype: torch.dtype) -> Tensor:
         """The slot's weight in `dtype`, outside autograd."""
-        return self.engine.slot(self.block, self.key).to(dtype)
+        return self.weight_stream.slot(self.block, self.key).to(dtype)
 
     def weight(self, dtype: torch.dtype) -> Tensor:
         return self.weight_now(dtype)
@@ -92,28 +92,29 @@ class StreamedWeight:
         return _StreamedLinear.apply(x, bias, self)
 
     def materialize(self) -> Tensor:
-        return self.engine.host[self.block][self.key]
+        return self.weight_stream.host[self.block][self.key]
 
 
 class StreamedParamWeight(StreamedWeight):
     """Trainable streamed weight: gradients flow to the host fp32 master."""
 
-    def __init__(self, engine, block, key, shape, master: nn.Parameter):
-        super().__init__(engine, block, key, shape)
+    def __init__(self, weight_stream, block, key, shape, master: nn.Parameter):
+        super().__init__(weight_stream, block, key, shape)
         self.master = master
 
     def weight(self, dtype: torch.dtype) -> Tensor:
-        w = self.engine.slot(self.block, self.key)
-        return _SlotParam.apply(self.master, w, self.engine, (self.block, self.key)).to(
-            dtype
-        )
+        w = self.weight_stream.slot(self.block, self.key)
+        return _SlotParam.apply(
+            self.master, w, self.weight_stream, (self.block, self.key)
+        ).to(dtype)
 
     def weight_grad(self, g: Tensor, x: Tensor) -> None:
-        """g^T x in the slot's dtype, handed to the engine like the slot gradient."""
-        slot = self.engine.slot(self.block, self.key)
+        """g^T x in the slot's dtype, handed to the weight stream like the slot
+        gradient."""
+        slot = self.weight_stream.slot(self.block, self.key)
         g2 = g.reshape(-1, g.shape[-1]).to(slot.dtype)
         x2 = x.reshape(-1, x.shape[-1]).to(slot.dtype)
-        self.engine.on_grad((self.block, self.key), g2.t() @ x2)
+        self.weight_stream.on_grad((self.block, self.key), g2.t() @ x2)
 
     def materialize(self) -> Tensor:
         return self.master.detach()
@@ -123,12 +124,12 @@ class StreamedQuantWeight(StreamedWeight):
     """Streamed int8/fp8 base: the ring carries `q` and `scale`, dequantized on use."""
 
     def weight_now(self, dtype: torch.dtype) -> Tensor:
-        q = self.engine.slot(self.block, self.key + ":q")
-        scale = self.engine.slot(self.block, self.key + ":scale")
+        q = self.weight_stream.slot(self.block, self.key + ":q")
+        scale = self.weight_stream.slot(self.block, self.key + ":scale")
         return dequantize(q, scale, dtype)
 
     def materialize(self) -> Tensor:
-        host = self.engine.host[self.block]
+        host = self.weight_stream.host[self.block]
         return dequantize(
             host[self.key + ":q"], host[self.key + ":scale"], torch.float32
         )
@@ -140,11 +141,11 @@ class StreamedComputeWeight(StreamedWeight):
     input gradient (`fp8_linear`'s backend launcher), bound to the ring's device and
     `dtype`."""
 
-    def __init__(self, engine, block, key, base: ComputeWeight, dtype):
-        super().__init__(engine, block, key, base.shape)
+    def __init__(self, weight_stream, block, key, base: ComputeWeight, dtype):
+        super().__init__(weight_stream, block, key, base.shape)
         self.recipe = base.recipe
         self.present = frozenset(base.tensors())
-        device, recipe = engine.device, self.recipe
+        device, recipe = weight_stream.device, self.recipe
         self.infer = registry.resolve("fp8_linear_infer", device, dtype, recipe=recipe)
         self.train = registry.resolve("fp8_linear", device, dtype, recipe=recipe)
 
@@ -156,51 +157,51 @@ class StreamedComputeWeight(StreamedWeight):
             raise AttributeError(name)
         if name not in self.present:
             return None
-        return self.engine.slot(self.block, f"{self.key}:{name}")
+        return self.weight_stream.slot(self.block, f"{self.key}:{name}")
 
     def weight(self, dtype: torch.dtype) -> Tensor:
         return fp8_dequantize(self.q, self.scale, self.recipe, dtype)
 
     def materialize(self) -> Tensor:
-        host = self.engine.host[self.block]
+        host = self.weight_stream.host[self.block]
         q, scale = host[f"{self.key}:q"], host[f"{self.key}:scale"]
         return fp8_dequantize(q, scale, self.recipe, torch.float32)
 
 
 class _Enter(Function):
     @staticmethod
-    def forward(ctx, x, engine, index):
-        ctx.engine, ctx.index = engine, index
+    def forward(ctx, x, weight_stream, index):
+        ctx.weight_stream, ctx.index = weight_stream, index
         return x.view_as(x)
 
     @staticmethod
     def backward(ctx, grad):
-        ctx.engine.release(ctx.index)
+        ctx.weight_stream.release(ctx.index)
         return grad, None, None
 
 
 class _Exit(Function):
     @staticmethod
-    def forward(ctx, y, engine, index):
-        ctx.engine, ctx.index = engine, index
+    def forward(ctx, y, weight_stream, index):
+        ctx.weight_stream, ctx.index = weight_stream, index
         return y.view_as(y)
 
     @staticmethod
     def backward(ctx, grad):
-        engine = ctx.engine
-        engine.ensure(ctx.index)
-        engine.prefetch(ctx.index - 1)
-        engine.on_block_backward(ctx.index)
+        weight_stream = ctx.weight_stream
+        weight_stream.ensure(ctx.index)
+        weight_stream.prefetch(ctx.index - 1)
+        weight_stream.on_block_backward(ctx.index)
         return grad, None, None
 
 
 class _SlotParam(Function):
     @staticmethod
-    def forward(ctx, param, slot, engine, key):
-        ctx.engine, ctx.key = engine, key
+    def forward(ctx, param, slot, weight_stream, key):
+        ctx.weight_stream, ctx.key = weight_stream, key
         return slot.view_as(slot)
 
     @staticmethod
     def backward(ctx, grad):
-        ctx.engine.on_grad(ctx.key, grad)
+        ctx.weight_stream.on_grad(ctx.key, grad)
         return None, None, None, None

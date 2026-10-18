@@ -6,9 +6,7 @@ from typing import Any, Protocol
 import torch
 from torch import Tensor, nn
 
-from kohakumoss.types.batch import DeviceBatch
 from kohakumoss.types.seqinfo import SeqInfo
-from kohakumoss.types.step import StepOut
 
 
 class BaseWeight(Protocol):
@@ -124,44 +122,3 @@ class StatefulLoader(Protocol):
     def state_dict(self) -> dict[str, int]: ...
 
     def load_state_dict(self, state: dict[str, int]) -> None: ...
-
-
-class TimestepSampler(Protocol):
-    """Draws sigma in [0, 1] per sample."""
-
-    def sample(self, batch: int, generator: torch.Generator, step: int) -> Tensor: ...
-
-
-class Objective(Protocol):
-    """Loss from prediction, target and layout; returns (fp32 sum, token count)."""
-
-    def __call__(
-        self, pred: Tensor, target: Tensor, seq: SeqInfo, weight: Tensor, mask
-    ) -> tuple[Tensor, Tensor]: ...
-
-
-class Step(Protocol):
-    """Driver-independent training step: `denom` is the step's global loss-token
-    count (the loss divisor), `step` the optimiser step index."""
-
-    def __call__(self, batch: DeviceBatch, denom: Tensor, step: int = 0) -> StepOut: ...
-
-
-class Callback(Protocol):
-    """Hooks the drivers call; every hook is optional."""
-
-    def on_step_end(self, state: Any, out: StepOut) -> None: ...
-
-
-class Logger(Protocol):
-    """Metric sink (rank 0)."""
-
-    def log(self, metrics: dict[str, float], step: int) -> None: ...
-
-    def close(self) -> None: ...
-
-
-class Driver(Protocol):
-    """Owns the loop: optimiser, schedule, scaler, EMA, callbacks, checkpoints."""
-
-    def run(self, step: Step, loader: Iterator, **parts) -> None: ...

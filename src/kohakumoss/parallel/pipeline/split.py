@@ -120,7 +120,7 @@ def _measured(parts, shape, device, autocast, runner, warmup, iters) -> StageCos
     used = int((hw[:, 0] * hw[:, 1]).sum() + text_len.sum())
     seq = padded_layout(hw, text_len, None, used, shape).to(device)
     grad = parts.conditioning_trainable()
-    dtype = parts.stream_dtype
+    dtype = parts.residual_dtype
     x = torch.randn(shape.tokens, shape.dim, device=device, dtype=dtype)
     x.requires_grad_()
     mod = 0.1 * torch.randn(shape.slots, 6, shape.dim, device=device)

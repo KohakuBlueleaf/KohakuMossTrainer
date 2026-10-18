@@ -92,8 +92,8 @@ class TextPrewarm:
 
 def attach_text_prewarm(k: dict, built, dataset=None) -> None:
     """Under TUNE="table", the online text encoder (TEXT_CACHE "online" / "off") on an
-    accelerator tunes its ops right before its first pass, so a run whose captions all
-    hit the text cache tunes nothing; `dataset` gives the longest caption estimate."""
+    accelerator tunes its ops right before its first pass; `dataset` gives the longest
+    caption estimate."""
     te = built.text_encoder
     if not tunes(k) or te is None or k["TEXT_CACHE"] == "offline":
         return

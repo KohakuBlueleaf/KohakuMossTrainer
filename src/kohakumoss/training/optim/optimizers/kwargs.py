@@ -1,6 +1,6 @@
-"""Optimiser knob checks: OPTIMIZER names an algorithm + implementation (never an
-internal placement builder), OPTIMIZER_KWARGS against the chosen builder's signature,
-rounding against PRECISION, the EMA spec."""
+"""Optimiser knob checks: OPTIMIZER names an algorithm + implementation,
+OPTIMIZER_KWARGS against the chosen builder's signature, rounding against PRECISION,
+the EMA spec."""
 
 import inspect
 

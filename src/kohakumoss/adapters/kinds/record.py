@@ -10,6 +10,8 @@ from enum import Enum
 
 from torch import nn
 
+from kohakumoss_common.calls import nothing
+
 
 class Stacking(str, Enum):
     """How a kind's delta composes with the base and with other stacked adapters (see
@@ -22,10 +24,6 @@ class Stacking(str, Enum):
 
 
 STACKING = tuple(s.value for s in Stacking)
-
-
-def no_path(*args):
-    return None
 
 
 def always(m: float) -> bool:
@@ -46,11 +44,11 @@ class Kind:
     # (t, m) -> a (dW, db) builder at multiplier m, or None where m * dW is exact.
     diff_weight_at: Callable | None = None
     # (t, ops) -> W -> dW at multiplier 1 from the kernel ops, or None.
-    kernel_diff_weight: Callable = no_path
+    kernel_diff_weight: Callable = nothing
     # (t, ops) -> W -> W + dW (the base add inside the op), or None.
-    kernel_merged_weight: Callable = no_path
+    kernel_merged_weight: Callable = nothing
     # (t, ctx) -> the bypass forward from the kernel ops, or None.
-    kernel_bypass: Callable = no_path
+    kernel_bypass: Callable = nothing
     # (t, ctx) -> the merge forward, in place of the default W + dW one.
     kernel_merge: Callable | None = None
     # (t, ctx) -> the forward over module methods, in place of the module bypass.
@@ -60,11 +58,11 @@ class Kind:
     # t -> the tensors ComfyUI evaluates to dW, in place of the native set.
     comfy_tensors: Callable | None = None
     # (lyco, file tensors) -> undo our comfy export's conversions on a loaded module.
-    undo_comfy: Callable = no_path
+    undo_comfy: Callable = nothing
     # tensors -> the names whose uniform scaling scales dW.
-    uniform_scale_tensors: Callable = no_path
+    uniform_scale_tensors: Callable = nothing
     # tensors -> the names whose output rows scale dW's rows.
-    row_scale_tensors: Callable = no_path
+    row_scale_tensors: Callable = nothing
     stacking: Stacking = Stacking.DENSE
     # m -> whether the bypass at multiplier m equals the merged delta at m.
     bypass_exact_at: Callable[[float], bool] = always
@@ -76,7 +74,7 @@ class Kind:
     training_dependent: bool = False
     # (t, generator) -> this step's random draws of the layer.
     draw_step: Callable | None = None
-    # No rank (DIM is unused).
+    # Rankless kind: DIM is ignored.
     rankless: bool = False
 
 

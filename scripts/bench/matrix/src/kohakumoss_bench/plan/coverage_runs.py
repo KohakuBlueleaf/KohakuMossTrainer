@@ -88,7 +88,7 @@ MEMORY_CASES = {
         "TEXT_CACHE": "online",
         "CACHE_DIR": "{self}/cache",
         "VAE_ENCODE": {"memory": "stream"},
-        "TEXT_ENCODE": {"memory": "stream"},
+        "TEXT_ENCODE": {"memory": "ring"},
     },
 }
 
@@ -97,7 +97,7 @@ FP8_CASES = {
     "text-fp8-compute": {
         "TEXT_CACHE": "online",
         "CACHE_DIR": "{self}/cache",
-        "TEXT_ENCODE": {"memory": "stream", "precision": "fp8_compute"},
+        "TEXT_ENCODE": {"memory": "ring", "precision": "fp8_compute"},
     },
 }
 

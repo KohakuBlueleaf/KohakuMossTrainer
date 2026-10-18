@@ -23,7 +23,7 @@ def test_cpu_adamw_from_host_grads_matches(device):
         ref.step()
         for g in gs:
             (b * g).sum().backward()
-        off.flush()
+        off.drain()
         assert b.grad is None
         host.step()
         off.zero()

@@ -7,4 +7,4 @@ from kohakuengine import use_config
 
 use_config("scale_full_fp16.py")
 
-MEMORY_PROFILE = "ckpt-stream4-actoff-optstream-gradoff"
+MEMORY_PROFILE = "ckpt-ring4-actoff-optstream-gradoff"

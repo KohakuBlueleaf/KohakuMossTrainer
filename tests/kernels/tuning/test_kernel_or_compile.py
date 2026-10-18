@@ -9,9 +9,9 @@ from kohakumoss.types.seqinfo import build_seqinfo
 from kohakumoss_kernels import registry
 from kohakumoss_kernels.backends.compile import choice
 from kohakumoss_kernels.backends.compile.ops import compiled_op
-from kohakumoss_kernels.backends.compile.prewarm import prewarm_block_ops
 from kohakumoss_kernels.backends.eager import ffn, norm, rope
 from kohakumoss_kernels.tuning import tuner
+from tests._util.blockops_prewarm import prewarm_block_ops
 from tests._util.error_stats import assert_no_regression
 from tests._util.negative import must_fail
 

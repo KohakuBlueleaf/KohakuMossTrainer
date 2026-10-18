@@ -1,22 +1,22 @@
 """Between-step allocator release and accounting (CUDA / XPU): STEP_RELEASE "none"
-(default) returns no memory to the driver inside the training loop; "empty_cache"
-returns the free cached blocks after every optimizer step and an integer N after every
-N steps (explicit opt-ins: a release synchronises and blocks); the step metrics report
-what the allocator returned. See docs/internals/offload.md#between-step-release."""
+(default) keeps the allocator's cached blocks; "empty_cache" returns the free cached
+blocks after every optimizer step and an integer N after every N steps; the step
+metrics report what the allocator returned. See
+docs/internals/offload.md#between-step-release."""
 
 import time
 
 import torch
 
+from kohakumoss_common.units import GIB
 from kohakumoss_kernels.hardware.memory import reserved, trim
 
-GIB = 2**30
 DEFAULT = "none"
 RELEASE_NAMES = {"none": 0, "empty_cache": 1}
 
 
 def release_every(value) -> int:
-    """STEP_RELEASE as a step period: 0 (never) for "none", 1 for "empty_cache", N for
+    """STEP_RELEASE as a step period: 0 for "none", 1 for "empty_cache", N for
     an integer N >= 1."""
     if isinstance(value, str):
         return RELEASE_NAMES[value]
@@ -37,19 +37,20 @@ def release_problems(value) -> list[str]:
 
 class StepRelease:
     """Every `every` steps, after the optimizer step: the device's free cached blocks
-    go back to the driver (`release(device)`, a synchronise + empty_cache); keeps what
-    its last release returned (`released` bytes, host seconds)."""
+    go back to the driver (`empty(device)`, default `trim`: a synchronise +
+    empty_cache); keeps what its last release returned (`released` bytes, host
+    seconds)."""
 
-    def __init__(self, device, every: int, release=trim, clock=time.perf_counter):
+    def __init__(self, device, every: int, empty=trim, clock=time.perf_counter):
         self.device = torch.device(device)
         self.every = every
-        self.release = release
+        self.empty = empty
         self.clock = clock
         self.released, self.secs = 0, 0.0
 
     def on_step_end(self, state, out) -> None:
         began, before = self.clock(), reserved(self.device)
-        self.release(self.device)
+        self.empty(self.device)
         self.released = max(before - reserved(self.device), 0)
         self.secs = self.clock() - began
 

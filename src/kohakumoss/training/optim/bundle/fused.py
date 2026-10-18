@@ -9,11 +9,7 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from kohakumoss.training.optim.bundle.base import (
-    close_optimizers,
-    no_agree,
-    step_reducer,
-)
+from kohakumoss.training.optim.bundle.base import close_optimizers, step_reducer
 from kohakumoss.training.optim.bundle.mirror import LRHolder
 from kohakumoss.training.optim.bundle.nonfinite import flag_report, param_names
 from kohakumoss.training.optim.optimizers.skip import (
@@ -22,7 +18,7 @@ from kohakumoss.training.optim.optimizers.skip import (
     put_back,
     restore_host,
 )
-from kohakumoss_common.calls import nothing
+from kohakumoss_common.calls import identity, nothing
 
 
 def _unclipped(inv: Tensor) -> Tensor:
@@ -119,10 +115,10 @@ class FusedStepBundle:
         schedule_factory: Callable[[Optimizer], object],
         scaler,
         groups: list[dict],
-        agree: Callable[[Tensor], Tensor] = no_agree,
+        agree: Callable[[Tensor], Tensor] = identity,
         before: Callable[[], None] = nothing,
         after: Callable[[], None] = nothing,
-        reduce_loss: Callable[[Tensor], Tensor] = no_agree,
+        reduce_loss: Callable[[Tensor], Tensor] = identity,
         clip: float = 0.0,
         shared=None,
         device: torch.device | None = None,

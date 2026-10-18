@@ -2,7 +2,7 @@
 `<n>.weight` (the q codes) plus `<n>.weight_scale` (and `<n>.bias`), every other tensor
 in the save dtype, the precision / recipe / layer list in the safetensors metadata
 (`kohakumoss_text_quant`). Loading builds the model from its config without reading the
-dense weights and attaches the stored bases, so nothing is quantized at load. See
+dense weights and attaches the stored bases. See
 docs/internals/text-encoder.md#pre-quantized-text-encoder."""
 
 import json

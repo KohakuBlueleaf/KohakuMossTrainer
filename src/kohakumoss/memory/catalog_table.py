@@ -4,6 +4,7 @@ for the MOSS base DiT at 1 MP, LoRA and full FT. See docs/concepts/profiles.md."
 from kohakumoss.memory.estimate import GIB, Workload, estimate
 from kohakumoss.memory.profiles import CATALOG, ORDER, PROFILES, resolve
 from kohakumoss.types.arch import PRESETS, MossArchConfig
+from kohakumoss_common.markdown import md_table
 
 IMG_TOKENS = 4096
 TXT_TOKENS = 300
@@ -53,7 +54,7 @@ def rows(
     for name in (*ORDER, *CATALOG) if names is None else names:
         p = PROFILES[name]
         stream = p.get("stream", "off")
-        weights = "resident" if stream == "off" else f"stream {p['stream_resident']}"
+        weights = "resident" if stream == "off" else f"ring {p['stream_resident']}"
         fused = " fused" if p.get("fused_step") else ""
         out.append(
             (
@@ -75,5 +76,4 @@ def markdown(
 ) -> str:
     """The table of `names` (default: every profile) as markdown lines (header, rule,
     rows)."""
-    lines = [HEADER, ("---",) * len(HEADER), *rows(arch, names)]
-    return "\n".join("| " + " | ".join(cells) + " |" for cells in lines)
+    return "\n".join(md_table(HEADER, rows(arch, names)))

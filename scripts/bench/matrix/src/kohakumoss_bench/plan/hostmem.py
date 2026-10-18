@@ -14,7 +14,7 @@ from kohakumoss.memory.estimate import (
     saved_per_token,
     total_params,
 )
-from kohakumoss.memory.profiles import PROFILES, checkpoint_mode
+from kohakumoss.memory.profiles import PROFILES, checkpoint_mode, profile_name
 from kohakumoss.types.arch import PRESETS
 from kohakumoss_bench.plan.config import Run
 
@@ -34,7 +34,7 @@ MANUAL = {
 def placement(knobs: dict) -> dict:
     """The memory-plan fields of a run's knobs: its profile (`auto` sized as `AUTO`),
     or the manual knobs, with MEMORY_OVERRIDES applied."""
-    profile = knobs.get("MEMORY_PROFILE", "balanced")
+    profile = profile_name(knobs.get("MEMORY_PROFILE", "balanced"))
     if profile == "manual":
         out = {f: knobs[k] for k, f in MANUAL.items() if knobs.get(k) is not None}
     else:

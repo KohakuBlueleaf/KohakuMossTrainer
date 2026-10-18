@@ -13,4 +13,4 @@ use_config("../precision/precision_bf16.py")
 RUN_NAME = "lora-xpu-b50"
 BASE_PRECISION = "int8"
 MAX_TOKENS = 6144
-TEXT_ENCODE = {"memory": "stream", "ahead": 4, "batch": 16, "max_tokens": 8192}
+TEXT_ENCODE = {"memory": "ring", "ahead": 4, "batch": 16, "max_tokens": 8192}

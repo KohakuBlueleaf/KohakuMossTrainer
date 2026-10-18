@@ -37,7 +37,7 @@ class HfForward:
         self.text = text_model
         self.placement = placement
         self.pad_id = pad_id
-        self.host_embed = placement.name in ("offload", "stream")
+        self.host_embed = placement.name in ("offload", "ring")
 
     def _run(self, ids: Tensor, mask: Tensor | None) -> Tensor:
         dev = self.placement.device

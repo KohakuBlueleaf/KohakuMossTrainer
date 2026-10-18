@@ -1,6 +1,5 @@
-"""Prewarm of the block ops: each op forward + backward on scratch MOSS-shaped inputs
-before training, so kernel configs and kernel-vs-compile choices are measured and
-stored, and a failing backend falls back before step 0."""
+"""Prewarm of the block ops on scratch MOSS-shaped inputs (test helper): each op forward
+(+ backward) so kernel configs and kernel-vs-compile choices are measured and stored."""
 
 import time
 from collections.abc import Callable
@@ -10,18 +9,12 @@ import torch
 
 from kohakumoss_common.log import get_logger, hl, log_table
 from kohakumoss_kernels.backends.compile.choice import retune_pending
+from kohakumoss_kernels.bench.blockops import segment_ids
 from kohakumoss_kernels.hardware.current import rng_kept, synchronize
 from kohakumoss_kernels.registry import Bound, exercise
 
-log = get_logger(__name__)
+log = get_logger("kohakumoss_kernels.backends.compile.prewarm")
 BLOCK_ORDER = ("rms_norm_mod", "rms_norm", "gated_residual", "situ_glu", "qk_norm_rope")
-
-
-def segment_ids(lengths: list[int], device) -> torch.Tensor:
-    """Per-token sample index (int32 [sum(lengths)]) of samples packed in order."""
-    return torch.cat(
-        [torch.full((n,), i, dtype=torch.int32) for i, n in enumerate(lengths)]
-    ).to(device)
 
 
 def _positions(n: int, device) -> torch.Tensor:
@@ -42,8 +35,8 @@ def prewarm_block_ops(
     backward: bool = True,
 ) -> int:
     """`ops` maps op names (registry names) to resolved callables; `lengths` lists
-    batches of per-sample joint lengths; `backward=False` (inference) runs forward only
-    under `no_grad`. Returns how many problems were measured."""
+    batches of per-sample joint lengths; `backward=False` runs forward only under
+    `no_grad`. Returns how many problems were measured."""
     device = torch.device(device)
     hd = dim // heads
     bands = 1 / (10000.0 ** (torch.arange(hd // 8, device=device) / (hd // 8)))

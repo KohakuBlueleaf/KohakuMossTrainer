@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from kohakumoss_kernels.fp8 import RECIPES, dequantize, quantize, swizzle_mx
-from kohakumoss_kernels.fp8.formats import scale_numel
+from tests._util.fp8 import scale_numel
 from tests._util.negative import must_fail
 
 pytestmark = pytest.mark.cpu

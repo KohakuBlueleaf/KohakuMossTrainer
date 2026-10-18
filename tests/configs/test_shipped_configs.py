@@ -7,12 +7,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from kohakumoss.cli.config.validate import (
-    blocking,
-    config_problems,
-    shipped_configs,
-    target_script,
-)
+from kohakumoss.cli.config.validate import blocking, config_problems, target_script
+from tests._util.configs import shipped_configs
 from tests._util.negative import must_fail
 
 pytestmark = pytest.mark.cpu

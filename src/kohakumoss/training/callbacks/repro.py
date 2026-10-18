@@ -79,7 +79,3 @@ class StepRecorder:
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(repro_record(p, denom, named, step), path)
         return path
-
-
-def no_record(dump_dir: str, step: int, names=()) -> None:
-    return None

@@ -1,10 +1,10 @@
 """Triton qk_norm_rope: per-head RMSNorm of q and k, then multi-axis split-half RoPE
-with sin/cos computed in-kernel from token positions (no table), forward and backward.
+with sin/cos computed in-kernel from token positions, forward and backward.
 
 Rows are (token, head) pairs; one program owns ROWS rows of both q and k, so the angles
 are computed once for the pair. The backward rotates the gradient back, applies the
 RMSNorm backward with the saved fp32 rstd, and writes per-program fp32 partials of the
-q/k weight gradients that are summed afterwards (no atomics).
+q/k weight gradients that are summed afterwards in a second pass.
 See docs/internals/fp16.md.
 """
 

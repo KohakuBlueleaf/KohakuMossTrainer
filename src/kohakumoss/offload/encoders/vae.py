@@ -9,8 +9,7 @@ from dataclasses import dataclass, fields, replace
 import torch
 from torch import Tensor, nn
 
-from kohakumoss.offload.accel import module as accel
-from kohakumoss.offload.accel import streamed, with_index
+from kohakumoss.offload.accel import free_bytes, streamed, with_index
 from kohakumoss.offload.encoders.placement import HostCopies
 from kohakumoss.offload.weights.layers import (
     LayerStreamer,
@@ -165,7 +164,7 @@ class _Stream:
     def __init__(self, inner: nn.Module, device: torch.device):
         parts = [getattr(inner, n) for n in ("encoder", "decoder") if hasattr(inner, n)]
         lists = [find_layer_list(m) for m in (parts or [inner])]
-        self.streamers = [LayerStreamer(lst, device, resident=2) for lst in lists]
+        self.streamers = [LayerStreamer(lst, device, slots=2) for lst in lists]
         self.rest = _Offload(
             inner, device, tensor_ids([b for lst in lists for b in lst])
         )
@@ -272,7 +271,7 @@ def place_vae(
     device = torch.device(device)
     if plan.memory == "auto":
         if streamed(device):
-            free, _ = accel(device).mem_get_info(with_index(device))
+            free = free_bytes(with_index(device))
             plan = choose_vae_plan(plan, vae_bytes(vae.vae), free, reserve, pixels)
         else:
             plan = replace(plan, memory="resident")

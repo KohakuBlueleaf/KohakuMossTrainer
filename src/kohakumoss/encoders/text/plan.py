@@ -12,7 +12,8 @@ from kohakumoss_kernels import ops as kernel_ops
 from kohakumoss_kernels.dtypes import BY_NAME
 from kohakumoss_kernels.hardware.arch import arch_of
 
-MEMORY = ("resident", "offload", "stream", "cpu", "auto")
+MEMORY = ("resident", "offload", "ring", "cpu", "auto")
+MEMORY_ALIASES = {"stream": "ring"}
 PRECISION = ("compute", "int8", "fp8", *COMPUTE)
 LAYOUT = ("single", "padded", "packed")
 FORWARD = ("kernels", "hf")
@@ -23,7 +24,8 @@ AHEAD_DEVICE = ("host", "device")
 def text_plan(
     spec: dict | TextEncoderPlan | None = None, **overrides
 ) -> TextEncoderPlan:
-    """A TextEncoderPlan from a plan, a dict of its fields, or defaults, plus overrides;
+    """A TextEncoderPlan from a plan, a dict of its fields, or defaults, plus overrides,
+    with `memory` in its primary spelling (`MEMORY_ALIASES`: "stream" is "ring");
     raises listing every unknown field."""
     if isinstance(spec, TextEncoderPlan):
         base, values = spec, {}
@@ -36,7 +38,8 @@ def text_plan(
         raise ValueError(
             f"unknown text-encoder plan fields {unknown}; valid {sorted(known)}"
         )
-    return replace(base, **values)
+    plan = replace(base, **values)
+    return replace(plan, memory=MEMORY_ALIASES.get(plan.memory, plan.memory))
 
 
 def resolve_dtype(plan: TextEncoderPlan, device: torch.device | str) -> TextEncoderPlan:
@@ -57,7 +60,7 @@ def plan_problems(
 ) -> list[str]:
     """Every problem with `plan` (empty = valid). In training, the encoder may run on
     the host only for the offline cache pass: online / uncached text encodes on the
-    GPU (offload / stream). `arch(device)` gives the CUDA arch (default arch_of)."""
+    GPU (offload / ring). `arch(device)` gives the CUDA arch (default arch_of)."""
     p = []
     for name, value, opts in (
         ("memory", plan.memory, MEMORY),
@@ -77,8 +80,8 @@ def plan_problems(
         )
     if plan.batch < 1 or plan.ahead < 1 or plan.max_tokens < 0:
         p.append("text-encoder batch >= 1, ahead >= 1 and max_tokens >= 0")
-    if plan.memory == "stream" and plan.stream_resident < 2:
-        p.append("text-encoder stream needs stream_resident >= 2")
+    if plan.memory == "ring" and plan.stream_resident < 2:
+        p.append("text-encoder ring needs stream_resident >= 2")
     if plan.quant_group and plan.precision not in ("int8", "fp8"):
         p.append(
             "text-encoder quant_group is a weight-only layout: precision int8 / fp8 "
@@ -117,7 +120,7 @@ def plan_problems(
         p.append(
             "the text encoder runs on the CPU only for the offline cache pass; with "
             f"TEXT_CACHE={text_cache!r} it encodes during training on the GPU: set "
-            "TEXT_ENCODE memory to 'offload' / 'stream' / 'resident' (or 'auto')"
+            "TEXT_ENCODE memory to 'offload' / 'ring' / 'resident' (or 'auto')"
         )
     return p
 
