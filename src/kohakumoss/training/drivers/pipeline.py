@@ -62,7 +62,8 @@ class ThreadedDriver(NativeDriver):
         with step.autocast():
             total = self.pipe.step(jobs, loss_fn, states).to(device) / scale
         bundle.observe(total)
-        return StepOut(total, denom, {"sigma_mean": preps[-1].sigma.mean()})
+        out = StepOut(total, denom, {"sigma_mean": preps[-1].sigma.mean()})
+        return out.detached()
 
 
 class PipelineDriver(NativeDriver):
@@ -88,9 +89,10 @@ class PipelineDriver(NativeDriver):
             loss = self.engine.step(mbs, float(max(count, 1)))
         total = loss / bundle.scaler.scale
         bundle.observe(total)
-        return StepOut(
+        out = StepOut(
             total, torch.tensor(count), {"sigma_mean": preps[-1].sigma.mean()}
         )
+        return out.detached()
 
     def _micro(self, hb, p):
         """Engine micro-batch: device tensors plus the host layout (the grid and

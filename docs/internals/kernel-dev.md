@@ -209,7 +209,19 @@ tensor needing grad) runs through `registry._Guarded`:
   modified in place since the forward raises autograd's version error instead of
   recomputing on the new values;
 - checkpointed and offloaded calls (saved-tensor hooks) keep their own graph semantics
-  and are not guarded.
+  and are not guarded;
+- the backward releases the forward's leaves, outputs and arguments (they are kept
+  as `ctx` attributes, which autograd does not free): a graph that outlives its
+  backward (a driver holding the step's loss into the next step) keeps none of them.
+  Without the release, an uncheckpointed step 1 keeps its whole activation set into
+  step 2's forward;
+- a good backward marks the op proven, and `registry.settle_guards()` at the step
+  boundary (`finish_step`, `MemorySession.step`) binds its plain path, so one step
+  (every micro-batch of it) runs one call path per op. Outside a step
+  (`registry.exercise`, the prewarm) a good backward unguards the op at once.
+
+The drivers also return each step's `StepOut` detached (`StepOut.detached()`), so no
+step's graph is held past its backward whatever else keeps `ctx` attributes.
 
 **Call paths.** A `Bound` binds its call path once per state instead of testing it per
 call:
@@ -220,8 +232,8 @@ call:
 | `guard` on | the guarded path (the per-call `_records_grad` test) |
 | otherwise | the implementation directly inside the fallback's `try` |
 
-Setting `guard` (the first good backward, a fallback) and entering or leaving a
-recording (`recording.on_change`) rebind every live `Bound`.
+Setting `guard` (`settle_guards` after a good backward, a fallback) and entering or
+leaving a recording (`recording.on_change`) rebind every live `Bound`.
 
 ### What counts as a failure
 

@@ -10,6 +10,7 @@ from kohakumoss.offload.optim.cpu_optim import CPUAdamW
 from kohakumoss.offload.optim.gpu_adamw import HostStateAdamW, MasterAdamW
 from kohakumoss.training.memory.optimizers import build_memory_optim, device_optimizer
 from kohakumoss.types.plans import MemoryPlan, PrecisionConfig
+from kohakumoss_kernels.registry import settle_guards
 
 CONSTANT = {"mode": "constant"}
 
@@ -93,7 +94,11 @@ class MemorySession:
             self.bundle.backward(loss)
 
     def step(self) -> bool:
-        return self.bundle.step()
+        """The optimiser step; the kernels proven in this step bind their plain call
+        path (`settle_guards`)."""
+        ok = self.bundle.step()
+        settle_guards()
+        return ok
 
     def masters(self, model: nn.Module) -> dict[str, Tensor]:
         """fp32 masters of every trainable parameter by name (for checks / checkpoints)."""

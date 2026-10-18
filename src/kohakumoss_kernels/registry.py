@@ -93,6 +93,8 @@ recorded_failures = status.recorded_failures
 
 
 _LIVE: "weakref.WeakSet[Bound]" = weakref.WeakSet()
+# ops whose guarded backward succeeded, unguarded at the next `settle_guards`
+PROVEN: "weakref.WeakSet[Bound]" = weakref.WeakSet()
 
 
 class Bound:
@@ -276,7 +278,10 @@ def _backprop(outs, leaves, grads) -> tuple:
 class _Guarded(torch.autograd.Function):
     """Runs a `Bound` op's implementation on detached leaves and its backward through
     autograd.grad; a backend failure in that backward falls the op back and recomputes
-    forward + backward with the next backend from the saved inputs (version-checked)."""
+    forward + backward with the next backend from the saved inputs (version-checked).
+    The backward releases the forward's leaves, outputs and arguments, so the graph
+    keeps none of them after it; a good backward marks the op proven (`settle_guards`
+    then binds its plain path)."""
 
     @staticmethod
     def forward(ctx, op, kwargs, *args):
@@ -296,25 +301,43 @@ class _Guarded(torch.autograd.Function):
         op = ctx.op
         try:
             got = _backprop(ctx.outs, ctx.leaves, grads)
-            op.guard = False
+            PROVEN.add(op)
         except CAUGHT as err:
             saved = iter(ctx.saved_tensors)
             args = [next(saved) if s is None else s[0] for s in ctx.slots]
             op.fall_back(err, args, ctx.kwargs)
             got = _grads(op.fn, ctx.kwargs, _leaves(args), grads)
+        finally:
+            ctx.op = ctx.kwargs = ctx.leaves = ctx.outs = ctx.slots = None
         return (None, None, *got)
+
+
+def settle_guards() -> int:
+    """Bind the plain call path of every op whose guarded backward succeeded (at a step
+    boundary, so one step runs one call path per op); returns how many."""
+    ops = list(PROVEN)
+    PROVEN.clear()
+    for op in ops:
+        op.guard = False
+    return len(ops)
 
 
 def exercise(op: Bound, run: Callable[[Bound], object]) -> object:
     """`run(op)` (the prewarm: a forward + backward on scratch inputs) as build time
     (`status.build_phase`); a backend failure raised anywhere in it, the backward
-    included, falls `op` back and runs it again."""
+    included, falls `op` back and runs it again; a good backward unguards `op` there
+    (no step is running)."""
     with status.build_phase():
         while True:
             try:
-                return run(op)
+                out = run(op)
             except CAUGHT as err:
                 op.fall_back(err)
+                continue
+            if op in PROVEN:
+                PROVEN.discard(op)
+                op.guard = False
+            return out
 
 
 def register(

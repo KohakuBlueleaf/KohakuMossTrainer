@@ -306,11 +306,14 @@ def test_negative_live_backward_without_guard(broken_backend):
 
 
 def test_guard_drops_after_a_good_backward(broken_backend):
-    """After one successful backward the op calls its implementation directly."""
+    """After one successful backward the op stays guarded to the step's end
+    (`settle_guards`), then calls its implementation directly."""
     registry.register(OP, "triton", lambda x: x * 2)
     fn = registry.resolve(OP, "cpu", torch.float32)
     assert fn.guard
     _fwd_bwd(fn)
+    assert fn.guard, "the call path changed inside the step"
+    assert registry.settle_guards() >= 1
     assert not fn.guard and fn.backend == "triton"
 
 

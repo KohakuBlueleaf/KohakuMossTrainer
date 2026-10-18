@@ -11,6 +11,7 @@ import torch
 from kohakumoss.training.build.loop import build_ema_for
 from kohakumoss.training.drivers.common import micro_steps
 from kohakumoss.training.ema.averagers import BackgroundEMA, ConstantEMA, NoEMA
+from kohakumoss.types.step import StepOut
 from tests._util.negative import must_fail
 
 pytestmark = pytest.mark.cpu
@@ -106,7 +107,7 @@ class _Recorder:
 
 def check_join_first(ema, rec: _Recorder) -> None:
     """Each backward follows a join of the background EMA."""
-    out = SimpleNamespace(loss=torch.zeros(()))
+    out = StepOut(torch.zeros(()), torch.ones(()))
     micro_steps(
         lambda b, d, i: out,
         lambda hb: hb,

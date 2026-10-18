@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterable, Iterator
 from kohakumoss.training.state import TrainState
 from kohakumoss.training.step import image_token_count, image_tokens_per_sample
 from kohakumoss_common.calls import nothing
+from kohakumoss_kernels.registry import settle_guards
 
 
 def no_accumulate(last: bool):
@@ -57,7 +58,8 @@ def account(state: TrainState, group: list) -> None:
 def micro_steps(
     step, batcher, accumulate, lasts, bundle, group, denom, index: int, ema=None
 ):
-    """Forward + backward of one optimiser step's micro-batches; the last StepOut.
+    """Forward + backward of one optimiser step's micro-batches; the last StepOut, with
+    no autograd graph attached (each micro-batch's graph ends with its backward).
     `ema.join` (an EMA updating in the background) runs before each backward."""
     join = getattr(ema, "join", nothing)
     out = None
@@ -67,15 +69,18 @@ def micro_steps(
             out = step(batch, denom, index)
             join()
             bundle.backward(out.loss)
+            out = out.detached()
     return out
 
 
 def finish_step(state: TrainState, group: list, bundle, ema, runner, out) -> None:
     """After a group's backward: count it, apply the optimiser step (EMA on success),
+    bind the plain call path of the kernels proven in this step (`settle_guards`),
     advance `state.step`, record the step and run the callbacks."""
     account(state, group)
     if bundle.step():
         ema.update(state.step)
+    settle_guards()
     state.step += 1
     record(state, bundle)
     runner.run(state, out)
