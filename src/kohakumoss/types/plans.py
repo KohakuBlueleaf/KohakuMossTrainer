@@ -102,6 +102,5 @@ class ParallelPlan:
     stages: tuple[int, ...] = ()
     schedule: str = "1f1b"
     microbatches: int = 1
-    token_budgets: tuple[int, ...] = ()
     timeout_s: float = 600.0
     bind: str = "lazy"
