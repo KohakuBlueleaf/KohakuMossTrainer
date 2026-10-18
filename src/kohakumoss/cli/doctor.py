@@ -1,4 +1,5 @@
-"""Environment report: OS, Python, torch, GPUs and their arch, toolchain, kernel matrix.
+"""Environment report: OS, Python, torch, GPUs and their arch, toolchain, kernel matrix,
+and what the install lacks for this machine with the command that fixes it.
 
     kohakumoss-doctor [--json report.json] [--memory]
 
@@ -18,9 +19,11 @@ import sys
 
 import torch
 
-from kohakumoss.training.memory.profiles import ORDER
-from kohakumoss.training.memory.profiles import resolve as resolve_profile
-from kohakumoss_kernels import available, health, registry
+from kohakumoss.cli.missing import missing
+from kohakumoss.logging.log import render
+from kohakumoss.memory.profiles import ORDER
+from kohakumoss.memory.profiles import resolve as resolve_profile
+from kohakumoss_kernels import available, registry, status
 from kohakumoss_kernels import ops as kernel_ops
 from kohakumoss_kernels.hardware.arch import arch_of
 from kohakumoss_kernels.hardware.toolchain import compilers
@@ -154,6 +157,11 @@ def report(memory: bool = False) -> dict:
     kinds = device_kinds()
     extra = {"memory_plans": memory_plans(kinds[0])} if memory else {}
     kernels = {dev: kernel_matrix(dev) for dev in kinds}
+    toolchain = msvc()
+    smoke = {
+        k: None if v is None else _no_paths(v)[:300]
+        for k, v in status.status_report().items()
+    }
     return {
         **extra,
         "os": platform.system(),
@@ -162,13 +170,11 @@ def report(memory: bool = False) -> dict:
         "torch_cuda": torch.version.cuda,
         "packages": versions(),
         "devices": devices(),
-        "msvc": msvc(),
+        "missing": missing(toolchain, smoke),
+        "msvc": toolchain,
         "compilers": {k: _no_paths(v) for k, v in compilers().items()},
         "kernels": kernels,
-        "backend_health": {
-            k: None if v is None else _no_paths(v)[:300]
-            for k, v in health.health_report().items()
-        },
+        "backend_status": smoke,
         "backend_failures": backend_failures(),
     }
 
@@ -187,8 +193,8 @@ def _print(rep: dict) -> None:
         print(f"  MSVC: {rep['msvc']}")
     for backend, compiler in rep["compilers"].items():
         print(f"  compiler {backend:15s} {compiler}")
-    for key, why in rep["backend_health"].items():
-        print(f"  health {key:20s} {'ok' if why is None else why}")
+    for key, why in rep["backend_status"].items():
+        print(f"  status {key:20s} {'ok' if why is None else why}")
     for key, error in rep["backend_failures"].items():
         print(f"  FAILED {key}: {error}")
     for dev, tables in rep["kernels"].items():
@@ -196,6 +202,16 @@ def _print(rep: dict) -> None:
             for op, row in table.items():
                 ok = ", ".join(b for b, v in row.items() if v) or "none"
                 print(f"  {dev:7s} {dtype:8s} {op:24s} {ok}")
+    _print_missing(rep["missing"])
+
+
+def _print_missing(rows: list[dict]) -> None:
+    if not rows:
+        print("missing: nothing")
+        return
+    print("missing:")
+    for row in rows:
+        print(f"  - {row['what']}\n      fix: {row['fix']}")
 
 
 def main() -> None:
@@ -211,11 +227,12 @@ def main() -> None:
     )
     args = parser.parse_args()
     if args.clear_failures:
-        health.clear_failures()
+        status.clear_failures()
     rep = report(args.memory)
     _print(rep)
     for profile, plan in rep.get("memory_plans", {}).items():
-        print(f"  profile {profile}: {plan}")
+        print(f"  profile {profile}:")
+        print("\n".join(render(plan, depth=2)))
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(rep, f, indent=2)

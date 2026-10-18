@@ -1,6 +1,7 @@
-"""Inference: MossPipeline (text-to-image with the official sampler) and residency modes."""
+"""Inference: MossPipeline (text-to-image with the official sampler) and the components
+it holds."""
 
+from kohakumoss.inference.components import Components
 from kohakumoss.inference.pipeline import GenerateResult, MossPipeline
-from kohakumoss.inference.residency import RESIDENCY
 
-__all__ = ["RESIDENCY", "GenerateResult", "MossPipeline"]
+__all__ = ["Components", "GenerateResult", "MossPipeline"]

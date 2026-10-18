@@ -1,4 +1,5 @@
-"""Helpers for parity / probe runs against the official reference implementation."""
+"""The official implementation shipped with the weights, probe prompts, and the relative
+error the parity probes report."""
 
 import importlib.util
 from pathlib import Path
