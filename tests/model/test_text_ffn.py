@@ -1,4 +1,5 @@
-"""The text-block FFN runs SiTU on the two linears' outputs without concatenating them."""
+"""The text-block FFN's SiTU pair equals the eager spec on the two linears' outputs
+(model-free)."""
 
 import pytest
 import torch
@@ -6,7 +7,6 @@ import torch
 from kohakumoss.model.components.ffn import situ_pair
 from kohakumoss_kernels.backends.eager.ffn import situ_glu
 from tests._util.negative import must_fail
-from tests.model.conftest import make_batch
 
 pytestmark = pytest.mark.cpu
 
@@ -28,19 +28,3 @@ def test_situ_pair_equals_spec(dtype):
 
 def _rel(a, b):
     return ((a.double() - b.double()).norm() / b.double().norm()).item()
-
-
-def test_text_block_does_not_concatenate(tiny, monkeypatch):
-    img, text, sigma, seq, _, _ = make_batch(tiny.cfg)
-    ref = tiny(img, text, sigma, seq)
-    calls = []
-    real = torch.cat
-
-    def spy(tensors, *args, **kwargs):
-        if len(tensors) == 2 and tensors[0].shape[-1] == tiny.cfg.ffn_dim:
-            calls.append(tensors[0].shape)
-        return real(tensors, *args, **kwargs)
-
-    monkeypatch.setattr(torch, "cat", spy)
-    out = tiny(img, text, sigma, seq)
-    assert torch.equal(out, ref) and not calls

@@ -2,15 +2,15 @@
 
 import pytest
 
-from kohakumoss.training.memory.estimate import (
+from kohakumoss.memory.estimate import (
     Workload,
     block_params,
     estimate,
     saved_per_token,
     total_params,
 )
-from kohakumoss.training.memory.planner import auto_plan
-from kohakumoss.training.memory.profiles import PROFILES, resolve, validate
+from kohakumoss.memory.planner import NothingFits, auto_plan
+from kohakumoss.memory.profiles import ORDER, PROFILES, resolve, validate
 from kohakumoss.types.arch import PRESETS
 from kohakumoss.types.plans import MemoryPlan
 from tests._util.negative import must_fail
@@ -27,16 +27,35 @@ def test_every_profile_resolves(name):
 
 
 def test_quant_resolves_per_arch_and_overrides_apply():
-    plan = resolve("low", {"checkpoint": "selective"}, device="cpu")
+    plan = resolve(
+        "low", {"checkpoint": "selective", "base_precision": "quant"}, device="cpu"
+    )
     assert plan.base_precision == "int8"
     assert plan.checkpoint == "selective"
 
 
+@pytest.mark.parametrize("name", list(PROFILES))
+def test_no_profile_sets_a_precision(name):
+    assert resolve(name, device="cpu").base_precision == "compute"
+
+
 def test_invalid_combinations_listed_together():
     with pytest.raises(ValueError) as err:
-        resolve("balanced", {"stream": "ring", "checkpoint": "none", "compile": "x"})
+        resolve("balanced", {"stream": "ring", "stream_resident": 1, "compile": "x"})
     msg = str(err.value)
-    assert "checkpointed" in msg and "compile" in msg
+    assert "stream_resident" in msg and "compile" in msg
+
+
+@pytest.mark.parametrize("precision", ["compute", "int8", "fp8_compute", "mxfp8"])
+@pytest.mark.parametrize("checkpoint", ["none", "partial:0.5", "selective"])
+def test_streaming_needs_no_checkpointing(precision, checkpoint):
+    plan = MemoryPlan(
+        checkpoint=checkpoint,
+        stream="ring",
+        stream_resident=2,
+        base_precision=precision,
+    )
+    assert validate(plan) == []
 
 
 def test_unknown_override_rejected():
@@ -54,7 +73,6 @@ def test_inference_drops_activation_knobs_and_allows_streaming():
     assert plan.checkpoint == "none" and not plan.act_offload
     assert plan.stream == "ring"
     assert validate(plan, inference=True) == []
-    assert validate(plan) != []
 
 
 def test_param_count_matches_release():
@@ -72,18 +90,18 @@ def test_estimate_orders_profiles():
     assert saved_per_token(BASE, "none") == 12 * 3072 + 3 * 8192
 
 
-def test_auto_picks_fastest_fitting_and_uses_probe():
+def test_auto_picks_fastest_fitting_or_forces_the_last():
     work = Workload(BASE, img_tokens=4096, txt_tokens=300, trainable_params=74_000_000)
     est = {n: estimate(work, resolve(n)).total for n in PROFILES}
     budget = (est["balanced"] + est["speed"]) // 2
     plan, report = auto_plan(work, "cpu", budget=budget)
     assert plan.profile == "balanced" and report.chosen == "balanced"
 
-    def probe(p: MemoryPlan) -> int:
-        return budget + 1
-
-    plan, report = auto_plan(work, "cpu", budget=budget, probe=probe)
-    assert plan.profile != "balanced"
+    tight = min(est.values()) - 1
+    with pytest.raises(NothingFits):
+        auto_plan(work, "cpu", budget=tight)
+    plan, report = auto_plan(work, "cpu", budget=tight, force=True)
+    assert plan.profile == ORDER[-1] and report.forced
 
     def wrong_order_check():
         p, _ = auto_plan(work, "cpu", budget=est["speed"] * 2)

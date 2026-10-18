@@ -1,10 +1,17 @@
-"""Token budgets and stage splits for heterogeneous devices."""
+"""Token budgets and stage splits for heterogeneous devices, and a speed measurement
+that leaves the caller's random stream alone."""
 
 import itertools
 
 import pytest
+import torch
 
-from kohakumoss.parallel.balance import split_layers, token_budgets
+from kohakumoss.parallel.pipeline.balance import (
+    _matmul_tflops,
+    measure_speed,
+    split_layers,
+    token_budgets,
+)
 from tests._util.negative import must_fail
 
 pytestmark = pytest.mark.cpu
@@ -52,3 +59,21 @@ def test_even_split_is_caught_as_suboptimal():
 def test_split_respects_caps():
     bounds = split_layers([1.0] * 6, [10.0, 1.0], caps=[3.0, 6.0])
     assert bounds[0][1] <= 3
+
+
+def check_rng_untouched(measure) -> None:
+    """A speed measurement leaves the caller's CPU random stream where it was."""
+    torch.manual_seed(123)
+    want = torch.rand(4)
+    torch.manual_seed(123)
+    assert measure() > 0
+    assert torch.equal(torch.rand(4), want), "the measurement moved the generator"
+
+
+def test_measure_speed_keeps_the_rng():
+    cpu = torch.device("cpu")
+    check_rng_untouched(lambda: measure_speed(cpu, 64, 1))
+    must_fail(
+        lambda: check_rng_untouched(lambda: _matmul_tflops(cpu, 64, 1)),
+        "draws on the caller's generator",
+    )

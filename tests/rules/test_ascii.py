@@ -32,8 +32,10 @@ def test_python_source_is_ascii():
 
 def test_check_sees_a_non_ascii_comment(tmp_path):
     (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "ok.py").write_text("x = 1\n")
-    (tmp_path / "src" / "bad.py").write_text("x = 1\n# delta " + chr(0x394) + "W\n")
+    (tmp_path / "src" / "ok.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "src" / "bad.py").write_text(
+        "x = 1\n# delta " + chr(0x394) + "W\n", encoding="utf-8"
+    )
     must_fail(lambda: _assert_empty(offenders(tmp_path)), "a non-ASCII comment")
     assert offenders(tmp_path) == {"src/bad.py": [2]}
 

@@ -1,13 +1,11 @@
-"""Encoders: latent patch layout against an explicit index map; prompt template."""
-
-import os
-from pathlib import Path
+"""Latent patch layout against an explicit index map (model-free). The prompt template
+on the real text encoder runs in tests/integration/test_infer_real.py."""
 
 import pytest
 import torch
-from transformers import AutoTokenizer
 
 from kohakumoss.encoders.vae import patchify, unpatchify
+from tests._util.negative import must_fail
 
 
 def _patchify_loop(z):
@@ -20,24 +18,23 @@ def _patchify_loop(z):
     return out
 
 
+def _patchify_ji(z):
+    """The (j, i) channel order: a layout bug the check must catch."""
+    b, c, hh, ww = z.shape
+    z = z.reshape(b, c, hh // 2, 2, ww // 2, 2).permute(0, 1, 5, 3, 2, 4)
+    return z.reshape(b, c * 4, hh // 2, ww // 2)
+
+
+def check_layout(patch, unpatch, z) -> None:
+    """`patch` equals the index-map loop; `unpatch` inverts both."""
+    p = patch(z)
+    assert torch.equal(p, _patchify_loop(z)), "patch layout"
+    assert torch.equal(unpatch(p), z), "unpatch of patch"
+    assert torch.equal(unpatch(_patchify_loop(z)), z), "unpatch of the index map"
+
+
 @pytest.mark.cpu
 def test_patch_layout():
-    z = torch.randn(2, 3, 6, 8)
-    p = patchify(z)
-    assert torch.equal(p, _patchify_loop(z))
-    assert torch.equal(unpatchify(p), z)
-    swapped = z.transpose(-1, -2).contiguous().transpose(-1, -2)
-    assert not torch.equal(patchify(swapped.flip(-1)), _patchify_loop(z))
-
-
-@pytest.mark.real_weights
-def test_prompt_template():
-    root = Path(os.environ["KOHAKUMOSS_WEIGHTS"]) / "base"
-    tok = AutoTokenizer.from_pretrained(str(root / "tokenizer"))
-    text = tok.apply_chat_template(
-        [{"role": "user", "content": "a cat"}],
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=True,
-    )
-    assert text == "<|im_start|>user\na cat<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    z = torch.arange(2 * 3 * 6 * 8, dtype=torch.float32).reshape(2, 3, 6, 8)
+    check_layout(patchify, unpatchify, z)
+    must_fail(lambda: check_layout(_patchify_ji, unpatchify, z), "(j, i) order")

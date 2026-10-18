@@ -11,8 +11,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from kohakumoss.inference.reference import official_module, rel_error
 from kohakumoss.model import load_backbone
+from kohakumoss.probe.official import official_module, rel_error
 from kohakumoss.types.seqinfo import build_seqinfo
 
 pytestmark = [pytest.mark.real_weights, pytest.mark.cuda, pytest.mark.slow]

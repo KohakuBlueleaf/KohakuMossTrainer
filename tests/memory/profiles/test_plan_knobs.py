@@ -1,14 +1,16 @@
 """MemoryPlan problems are knob problems: resolved at validation (one exit, before any
 weight load), with the PARALLEL / OPTIMIZER / COMPILE combinations that cannot run."""
 
+import sys
+
 import pytest
 
+from kohakumoss.memory.profiles import PROFILES
 from kohakumoss.training import knobs as knobs_mod
-from kohakumoss.training.entry import run
 from kohakumoss.training.knobs import plan_problems, validate
-from kohakumoss.training.optim import factory as optim_factory
-from tests.training.test_entry_smoke import smoke_knobs
-from tests.training.test_knobs import runnable
+from kohakumoss.training.optim.optimizers import factory as optim_factory
+from tests._util.negative import must_fail
+from tests.training.knobs.test_knobs import runnable
 
 pytestmark = pytest.mark.cpu
 MULTI = dict(DEVICES=(0, 1))
@@ -23,11 +25,11 @@ CASES = {
         dict(
             MEMORY_OVERRIDES={
                 "stream": "ring",
-                "checkpoint": "none",
+                "stream_resident": 1,
                 "optim_state": "x",
             }
         ),
-        ("every block checkpointed", "optim_state 'x'"),
+        ("stream_resident >= 2", "optim_state 'x'"),
     ),
     "base_precision_16bit_removed": (
         dict(MEMORY_OVERRIDES={"base_precision": "fp16"}),
@@ -52,14 +54,22 @@ CASES = {
         ),
         ("stream='swap' steps blocks inside backward",),
     ),
-    "ddp_swap": (
+    "fsdp_fused_step": (
         dict(
-            ALGO="full",
-            PARALLEL="ddp",
-            MEMORY_OVERRIDES={"stream": "swap", "stream_resident": 2},
+            PARALLEL="fsdp",
+            DIST_BACKEND="nccl",
+            MEMORY_OVERRIDES={"fused_step": True},
             **MULTI,
         ),
-        ("does not reduce streamed",),
+        ("PARALLEL='fsdp' needs fused_step=False",),
+    ),
+    "pipeline_grad_offload": (
+        dict(
+            PARALLEL="threaded",
+            MEMORY_OVERRIDES={"grad_offload": True},
+            **MULTI,
+        ),
+        ("PARALLEL='threaded' needs grad_offload=False",),
     ),
     "fsdp_stream_states": (
         dict(
@@ -122,22 +132,82 @@ def test_plan_problem_absent_without_the_knob(name):
     assert not _has(validate(runnable()), *needles)
 
 
-def test_8bit_states_need_bitsandbytes(monkeypatch):
-    """optim_state='8bit' without the package is a knob problem, and `auto` skips the
-    profiles that need it."""
-    monkeypatch.setattr(optim_factory, "bnb", None)
-    needle = "optim_state='8bit' needs the bitsandbytes package"
-    assert _has(validate(runnable(MEMORY_PROFILE="low")), needle)
-    assert not _has(validate(runnable(MEMORY_PROFILE="balanced")), needle)
-    plans, _ = knobs_mod._plans(runnable(MEMORY_PROFILE="auto"))
-    runnable_low = [
-        q for q in plans if q.profile == "low" and not plan_problems(runnable(), q)
+@pytest.fixture
+def linux(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+
+
+def _added(kind: str, profile: str, **kw) -> list[str]:
+    """Plan problems PARALLEL=`kind` over two devices adds to the single-device run."""
+    single = runnable(MEMORY_PROFILE=profile, **kw)
+    multi = runnable(MEMORY_PROFILE=profile, PARALLEL=kind, **MULTI, **kw)
+    plans, _ = knobs_mod._plans(single)
+    return [
+        m
+        for q in plans
+        for m in plan_problems(multi, q)
+        if m not in plan_problems(single, q)
     ]
-    assert not runnable_low
 
 
-@pytest.mark.slow
-def test_auto_profile_builds_and_trains(tmp_path):
-    knobs = smoke_knobs(tmp_path, MEMORY_PROFILE="auto", STEPS=2)
-    assert validate(knobs) == []
-    assert run(knobs).step == 2
+def check_every_profile(kind: str, **kw) -> None:
+    for name in PROFILES:
+        if name != "manual":
+            assert _added(kind, name, **kw) == [], name
+
+
+@pytest.mark.parametrize("algo", ["lora", "full"])
+def test_ddp_runs_every_memory_profile(linux, algo):
+    """Every memory plan that runs on one device runs under DDP (streaming, offload
+    and in-backward steps included); FSDP2 keeps its restrictions. The 8 GB / 6 GB
+    and full-finetune streaming profiles validate whole under DDP."""
+    kw = {"ALGO": algo}
+    if algo == "full":
+        kw["EXPORT_FORMATS"] = ("merged",)
+    check_every_profile("ddp", **kw)
+    must_fail(lambda: check_every_profile("fsdp", **kw), "FSDP2 with streaming")
+    profiles = ("minimal", "ckpt-stream2-actoff-optcpu-gradoff")
+    if algo == "full":
+        profiles = ("ckpt-stream4-actoff-optstream-gradoff", "ckpt-stream4-optcpu")
+    for name in profiles:
+        k = runnable(MEMORY_PROFILE=name, PARALLEL="ddp", **MULTI, **kw)
+        assert validate(k) == [], (name, validate(k))
+
+
+def test_full_ft_muon_runs_on_a_resident_profile():
+    """Muon (whole-matrix steps after backward) validates on a resident profile; the
+    streamed full-FT profile is rejected with the knobs that would fit."""
+    muon = dict(ALGO="full", OPTIMIZER="muon", EXPORT_FORMATS=("merged",))
+
+    def check(profile: str) -> None:
+        assert validate(runnable(MEMORY_PROFILE=profile, **muon)) == []
+
+    check("ckpt-resident")
+    problems = validate(runnable(MEMORY_PROFILE="balanced", **muon))
+    assert _has(problems, "trains blocks with AdamW", "ckpt-resident")
+    must_fail(lambda: check("balanced"), "muon on swapped, fused blocks")
+
+
+def test_8bit_is_an_optimizer_not_a_placement(monkeypatch):
+    """B12: OPTIM_STATE places AdamW states only ('8bit' is no placement);
+    OPTIMIZER='adamw8bit' without bitsandbytes is a knob problem; the internal
+    placement builders are not OPTIMIZER names."""
+    monkeypatch.setattr(optim_factory, "bnb", None)
+    eight = runnable(MEMORY_OVERRIDES={"optim_state": "8bit", "fused_step": True})
+    assert _has(validate(eight), "optim_state '8bit' not in")
+    needle = "OPTIMIZER='adamw8bit' needs the bitsandbytes package"
+    assert _has(validate(runnable(OPTIMIZER="adamw8bit")), needle)
+    assert not _has(validate(runnable(OPTIMIZER="adamw8bit_kernel")), needle)
+    for name in ("cpu_adamw", "host_state_adamw", "master_adamw"):
+        assert _has(validate(runnable(OPTIMIZER=name)), "is the placement of")
+    plans, _ = knobs_mod._plans(runnable(MEMORY_PROFILE="auto"))
+    assert not [q for q in plans if q.optim_state not in ("gpu", "stream", "cpu")]
+    assert not plan_problems(runnable(), plans[0])
+    must_fail(
+        lambda: _yes(_has(validate(runnable(OPTIMIZER="adamw")), "is the placement")),
+        "plain adamw rejected",
+    )
+
+
+def _yes(flag: bool) -> None:
+    assert flag

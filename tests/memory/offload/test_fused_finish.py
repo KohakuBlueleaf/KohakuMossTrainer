@@ -4,23 +4,25 @@ updated one even when the side stream is slow. The compute stream is a created s
 the legacy default stream's implicit synchronisation would hide a missing wait."""
 
 import sys
+import time
 
 import pytest
 import torch
 
-from kohakumoss.offload.grad import GradOffload
-from kohakumoss.training.optim.build import build_bundle
-from kohakumoss.types.plans import PrecisionPolicy
+from kohakumoss.offload.optim.grad import GradOffload
+from kohakumoss.training.optim.bundle.build import build_bundle
+from kohakumoss.types.plans import PrecisionConfig
 from tests._util.negative import must_fail
 
 pytestmark = pytest.mark.cuda
 SLEEP = 200_000_000
+SLEEP_S = 0.2
 HYPER = {"lr": 1e-1, "betas": (0.9, 0.999), "eps": 1e-8}
 
 
 def _bundle(name, params):
     groups = [{"params": params, "lr": 1e-1, "weight_decay": 0.0}]
-    policy = PrecisionPolicy(compute=torch.float32, scaler=False)
+    prec = PrecisionConfig(compute=torch.float32, scaler=False)
     return build_bundle(
         groups,
         params[0].device,
@@ -28,7 +30,7 @@ def _bundle(name, params):
         HYPER,
         {"mode": "constant"},
         10,
-        policy,
+        prec,
         0.0,
         fused_step=True,
     )
@@ -83,8 +85,35 @@ def _grad_offload(finish: bool):
             _slow_current_stream(bundle)
             if not finish:
                 bundle.finishers = []
-        bundle.arm(True)
+        bundle.start(True)
         (p * 1.0).sum().backward()
+        if warm:
+            bundle.step()
+            torch.cuda.synchronize()
+            before = p.detach().clone()
+    return p, bundle, before
+
+
+def _slow_host_worker(opt):
+    update = opt._update_async
+
+    def slow(*args):
+        time.sleep(SLEEP_S)
+        update(*args)
+
+    opt._update_async = slow
+
+
+def _cpu_adamw(finish: bool):
+    p = torch.nn.Parameter(torch.ones(1 << 16, device="cuda"))
+    bundle = _bundle("cpu_adamw", [p])
+    for warm in (True, False):
+        if not warm:
+            _slow_host_worker(bundle.shared)
+            if not finish:
+                bundle.finishers = []
+        p.grad = torch.ones_like(p)
+        bundle.step_param(p)
         if warm:
             bundle.step()
             torch.cuda.synchronize()
@@ -100,8 +129,8 @@ WDDM = pytest.mark.skipif(
 
 @pytest.mark.parametrize(
     "make",
-    [pytest.param(_host_state, marks=WDDM), _grad_offload],
-    ids=["host_state", "grad_offload"],
+    [pytest.param(_host_state, marks=WDDM), _grad_offload, _cpu_adamw],
+    ids=["host_state", "grad_offload", "cpu_adamw"],
 )
 def test_step_waits_for_side_stream_updates(make):
     def check(finish: bool):

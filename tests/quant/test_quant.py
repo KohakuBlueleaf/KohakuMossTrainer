@@ -84,10 +84,30 @@ def test_comfy_quantized_state_loads():
     assert model.blk.lin.base is quant["blk.lin"]
 
 
-def test_quantize_torch_linears_on_plain_modules():
-    m = nn.Sequential(nn.Linear(256, 256), nn.ReLU(), nn.Linear(256, 300))
+def _close(got: torch.Tensor, ref: torch.Tensor, bound: float = 2e-2) -> None:
+    rel = ((got - ref).norm() / ref.norm()).item()
+    assert rel < bound, rel
+
+
+@torch.no_grad()
+def test_quantize_torch_linears_on_plain_linears():
+    """Every large plain nn.Linear of a module tree (nested too) is replaced and
+    computes its own layer within the int8 bound; a small one stays dense."""
+    holder = nn.ModuleDict(
+        {
+            "a": nn.Linear(256, 256),
+            "inner": nn.ModuleDict({"b": nn.Linear(256, 300, bias=False)}),
+            "small": nn.Linear(100, 300),
+        }
+    )
     x = torch.randn(3, 256)
-    ref = m(x)
-    assert quantize_torch_linears(m, "int8", torch.float32) == 2
-    assert isinstance(m[0], QuantLinear)
-    assert ((m(x) - ref).norm() / ref.norm()) < 2e-2
+    refs = {"a": holder["a"](x), "b": holder["inner"]["b"](x)}
+    bias = holder["a"].bias.clone()
+    assert quantize_torch_linears(holder, "int8", torch.float32) == 2
+    assert type(holder["small"]) is nn.Linear
+    got = {"a": holder["a"], "b": holder["inner"]["b"]}
+    for name, layer in got.items():
+        assert isinstance(layer, QuantLinear), name
+        _close(layer(x), refs[name])
+    assert torch.equal(got["a"].bias, bias) and got["b"].bias is None
+    must_fail(lambda: _close(got["b"](x)[:, :256], refs["a"]), "another layer's output")

@@ -1,10 +1,10 @@
-"""Sampler: schedule equals the official grid snap; Euler + CFG on the tiny model."""
+"""Sampler schedule, model-free: equals the official grid snap. Euler + CFG on the real
+model runs in tests/integration/test_infer_real.py."""
 
 import pytest
 import torch
 
-from kohakumoss.diffusion.sampling import moss_sigmas, sample_latents
-from kohakumoss.diffusion.sampling.sample import unpack
+from kohakumoss.diffusion.sampling import moss_sigmas
 
 pytestmark = pytest.mark.cpu
 
@@ -34,25 +34,3 @@ def test_schedule_matches_official(steps, shift):
     assert ours[-1] == 0 and torch.equal(ours[:-1], ref)
     grid = torch.arange(1, 1001) / 1000
     assert all(((grid - s).abs().min() < 1e-6) for s in ref)
-
-
-def test_sampler_runs_and_guidance_changes_result(tiny):
-    cfg = tiny.cfg
-    g = torch.Generator().manual_seed(0)
-    pos = [
-        torch.randn(5, cfg.text_dim, generator=g),
-        torch.randn(9, cfg.text_dim, generator=g),
-    ]
-    neg = [torch.randn(2, cfg.text_dim, generator=g)] * 2
-    kw = dict(size=(64, 48), steps=4, seeds=(1, 2), device="cpu")
-    a = sample_latents(tiny, pos, neg, cfg=3.0, **kw)
-    b = sample_latents(tiny, pos, neg, cfg=1.0, **kw)
-    c = sample_latents(tiny, pos, neg, cfg=3.0, skip_layers=(), **kw)
-    assert a.latents.shape == (2 * 4 * 3, cfg.latent_channels)
-    assert torch.isfinite(a.latents).all()
-    assert not torch.allclose(a.latents, b.latents)
-    assert not torch.allclose(a.latents, c.latents)
-    imgs = unpack(a.latents, a.hw)
-    assert imgs[0].shape == (1, cfg.latent_channels, 4, 3)
-    again = sample_latents(tiny, pos, neg, cfg=3.0, **kw)
-    assert torch.equal(a.latents, again.latents)

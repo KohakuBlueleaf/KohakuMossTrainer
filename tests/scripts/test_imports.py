@@ -1,4 +1,6 @@
-"""Every script imports from the installed packages alone: no repo root, no script dir."""
+"""Every script imports from the installed packages alone: no repo root, no script dir.
+Modules of a dev package under scripts/ (a directory with `__init__.py`, e.g. the bench
+matrix's `kohakumoss_bench`) are package modules, not scripts."""
 
 import json
 import os
@@ -12,7 +14,9 @@ pytestmark = [pytest.mark.cpu, pytest.mark.slow]
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = sorted(
-    p for p in (ROOT / "scripts").rglob("*.py") if not p.name.startswith("_")
+    p
+    for p in (ROOT / "scripts").rglob("*.py")
+    if not p.name.startswith("_") and not (p.parent / "__init__.py").exists()
 )
 CHECK = """
 import json, runpy, sys, traceback

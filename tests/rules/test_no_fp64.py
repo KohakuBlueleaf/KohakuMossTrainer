@@ -13,11 +13,11 @@ FP64 = re.compile(
     r"float64|\.double\(\)|torch\.double\b|\bfp64\b|\bf64\b|\bF64\b|np\.double\b"
 )
 REFERENCE = {
-    "kohakumoss_kernels/precision.py",
+    "kohakumoss_kernels/error_stats.py",
     "kohakumoss_kernels/bench/blockops.py",
     "kohakumoss_kernels/backends/eager/_acc.py",
-    "kohakumoss/inference/reference.py",
-    "kohakumoss/parallel/selftest.py",
+    "kohakumoss/probe/official.py",
+    "kohakumoss/parallel/telemetry/selftest.py",
 }
 
 

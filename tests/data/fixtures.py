@@ -40,6 +40,20 @@ def make_kohya(root: str) -> dict[str, int]:
     return layout
 
 
+def make_tree(root: str, folders: int, per: int) -> list[str]:
+    """Kohya folders `2_f<k>` with `per` small PNGs each, every one with a `.txt`
+    sidecar; returns the locators in walk order."""
+    out = []
+    for k in range(folders):
+        folder = f"2_f{k}"
+        for i in range(per):
+            stem = os.path.join(root, folder, f"i{i:03d}")
+            write(stem + ".png", png_bytes(16 + i % 5, 16, k * 1000 + i))
+            write(stem + ".txt", f"tag_a, tag_{k}_{i}")
+            out.append(f"{folder}/i{i:03d}.png")
+    return out
+
+
 def make_folder(root: str) -> int:
     write(os.path.join(root, "a", "x.png"), png_bytes(32, 32, 1))
     write(os.path.join(root, "a", "x.caption"), "a red square")
