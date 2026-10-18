@@ -188,22 +188,22 @@ modes: none (VAE and text encoder every step), latent cache, latent + text cache
 
 | setup | GPU | no cache | latent cache | latent + text cache |
 | --- | --- | --- | --- | --- |
-| LoRA r32, `balanced` | RTX 5090 | 0.70 / 6.63 / 5.27 - 9.46 | 0.73 / 6.63 / 6.03 - 9.32 | 1.14 / 6.63 / 7.06 - 9.54 |
+| LoRA r32, `balanced` | RTX 5090 | 1.01 / 21.41 / 20.81 - 24.24 (5) | 0.73 / 6.63 / 6.03 - 9.32 | 1.14 / 6.63 / 7.06 - 9.54 |
 | | RTX 4090 (2) | 0.49 / 6.57 / 5.84 - 9.42 | 0.52 / 6.57 / 5.94 - 10.14 | 0.73 / 6.57 / 7.40 - 9.91 |
 | | RTX 3090 | 0.31 / 6.58 / 5.66 - 9.03 | 0.33 / 6.58 / 5.66 - 8.91 | 0.39 / 6.58 / 6.40 - 9.01 |
 | | RTX 2080 Ti | 0.14 / 6.58 / 4.78 - 8.80 | 0.15 / 6.58 / 5.54 - 8.86 | 0.22 / 6.58 / 5.55 - 8.90 |
 | | Tesla T10 | not measured (1) | 0.14 / 6.58 / 4.75 - 8.83 | 0.19 / 6.58 / 5.81 - 8.82 |
-| LoKr 16, `balanced` | RTX 5090 | 0.67 / 6.09 / 5.83 - 8.79 | 0.70 / 6.09 / 5.83 - 8.78 | 1.06 / 6.09 / 5.82 - 9.21 |
+| LoKr 16, `balanced` | RTX 5090 | 0.94 / 20.87 / 19.84 - 23.59 (5) | 0.70 / 6.09 / 5.83 - 8.78 | 1.06 / 6.09 / 5.82 - 9.21 |
 | | RTX 4090 (2) | 0.43 / 6.23 / 7.15 - 10.34 | 0.45 / 6.23 / 5.48 - 9.65 | 0.60 / 6.23 / 5.76 - 9.64 |
 | | RTX 3090 | 0.29 / 6.05 / 5.46 - 8.42 | 0.30 / 6.05 / 5.46 - 8.34 | 0.36 / 6.05 / 5.46 - 8.83 |
 | | RTX 2080 Ti | 0.14 / 6.03 / 5.34 - 8.26 | 0.14 / 6.03 / 5.34 - 8.26 | 0.20 / 6.03 / 5.34 - 8.38 |
 | | Tesla T10 | 0.12 / 6.03 / 4.52 - 8.23 | not measured | 0.17 / 6.03 / 4.52 - 8.23 |
-| LoRA r32, `vram_8g` (8 GB cap) | RTX 5090 | not measured | not measured | 0.98 / 2.18 / 2.63 - 3.20 |
+| LoRA r32, `vram_8g` (8 GB cap, measured at 4096 tokens) | RTX 5090 | not measured | not measured | 0.98 / 2.18 / 2.63 - 3.20 |
 | | RTX 4090 (2) | 0.64 / 2.14 / 2.45 - 5.33 | 0.62 / 2.13 / 2.05 - 4.63 | 0.60 / 2.13 / 2.61 - 2.99 |
 | | RTX 3090 | 0.37 / 2.14 / 2.27 - 3.78 | 0.37 / 2.13 / 2.27 - 3.75 | 0.37 / 2.13 / 2.27 - 2.83 |
 | | RTX 2080 Ti | not measured | not measured | 0.18 / 2.14 / 1.91 - 2.75 |
 | | Tesla T10 | not measured | not measured | 0.16 / 2.13 / 2.12 - 2.67 |
-| LoRA r32, `vram_6g` (6 GB cap) | RTX 5090 | n/a (3) | n/a (3) | 0.96 / 2.16 / 2.63 - 3.18 |
+| LoRA r32, `vram_6g` (6 GB cap, measured at 4096 tokens) | RTX 5090 | n/a (3) | n/a (3) | 0.96 / 2.16 / 2.63 - 3.18 |
 | | RTX 4090 (2) | n/a (3) | n/a (3) | 0.58 / 2.11 / 0.24 - 1.29 |
 | | RTX 3090 | n/a (3) | n/a (3) | 0.36 / 2.11 / 1.93 - 2.81 |
 | | RTX 2080 Ti | n/a (3) | n/a (3) | 0.18 / 2.11 / 2.15 - 2.73 |
@@ -243,13 +243,15 @@ measured):
 
 How measured: each run is 40 steps of the train script on the real weights and a
 kohya-style dataset at a 1 MP target area, packed to 8192 tokens per step (the
-`vram_8g` / `vram_6g` rows: the layer's 4352); samples/s and tok/s are medians over the
-steps after step 10. "step peak"
-is torch's per-step peak of allocated memory; the nvidia-smi peaks are the training
+`vram_8g` / `vram_6g` rows: 4096, the layers' budget at measuring time; they now ship
+4352, not re-measured); samples/s and tok/s are medians over the steps after step 10.
+"step peak" is torch's per-step peak of allocated memory; the nvidia-smi peaks are the training
 process's, sampled every 500 ms, split at the first step into startup + kernel prewarm
 and the step loop. The 8 GB / 6 GB rows run with the allocator capped at the target.
-Caches-off rows were measured with the text encoder streamed; this release keeps it
-resident where it fits, which is faster on 32 GB+ cards. First-run kernel tuning runs
+The cells that run the text encoder every step (no cache, latent cache) were measured
+with it streamed, except the RTX 5090 no-cache cells; this release keeps it resident
+where it fits, which is faster on 32 GB+ cards (the RTX 5090 no-cache cells, footnote
+5). First-run kernel tuning runs
 before step 0 and is not in samples/s; the tuning prewarm is bounded by the kernel
 prewarm's planned-maximum replay and on these rows peaks at or within 0.8 GiB of the
 step peak (footnote 4). The runs used the v0.1.0 release code (the runtime of commits
@@ -262,6 +264,8 @@ extra bench rows added.
 process's own.
 (3) The 6 GB layer requires both offline caches.
 (4) "yes": a startup + kernel-prewarm peak (torch or nvidia-smi) was above the steps'.
+(5) Measured on the committed release tree with the text encoder resident (`auto`
+placement): its 15.6 GiB of weights stay on the card, so the step peak includes them.
 <!-- release-tables:speed-vram:end -->
 
 <!-- release-tables:inference:begin -->
