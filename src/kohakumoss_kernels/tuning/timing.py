@@ -5,17 +5,10 @@ from collections.abc import Callable
 
 import torch
 
-from kohakumoss_kernels.hardware.current import on_device
+from kohakumoss_kernels.hardware.current import on_device, synchronize
 
 WARMUP_MS = 25.0
 CAPTURE = "thread_local"
-
-
-def _sync(device: torch.device) -> None:
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    elif device.type == "xpu":
-        torch.xpu.synchronize(device)
 
 
 def _elapsed_ms(fn: Callable[[], object], calls: int, device: torch.device) -> float:
@@ -70,10 +63,11 @@ def l2_flush(device: torch.device, l2_bytes: int) -> torch.Tensor:
 def graph_ms(
     fn: Callable[[], object], device: torch.device, calls: int = 5, iters: int = 10
 ) -> float:
-    """Device ms per call replayed from a CUDA graph of `calls` launches (no host
-    launch cost); falls back to plain timing when capture fails or off CUDA."""
+    """Device ms per call replayed from a thread-local CUDA graph of `calls` launches
+    (no host launch cost), freed after the measurement; plain timing when capture fails
+    or off CUDA."""
     fn()
-    _sync(device)
+    synchronize(device)
     if device.type != "cuda":
         return best_ms(fn, device, iters)
     graph = torch.cuda.CUDAGraph()
@@ -82,6 +76,11 @@ def graph_ms(
             for _ in range(calls):
                 fn()
     except RuntimeError:
-        _sync(device)
+        synchronize(device)
+        graph.reset()
         return best_ms(fn, device, iters)
-    return best_ms(graph.replay, device, iters) / calls
+    try:
+        return best_ms(graph.replay, device, iters) / calls
+    finally:
+        synchronize(device)
+        graph.reset()

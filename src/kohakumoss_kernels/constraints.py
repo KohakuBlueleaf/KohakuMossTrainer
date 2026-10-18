@@ -14,7 +14,7 @@ def requires(
     dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16),
     extra: Callable[[OpQuery], str | None] | None = None,
 ) -> Callable[[OpQuery], str | None]:
-    """A `supports` function gating on device kind, sm range, dtype and an extra rule."""
+    """A `supports` function gating on device kind, sm range, dtype and an extra check."""
 
     def supports(query: OpQuery) -> str | None:
         arch = query.arch

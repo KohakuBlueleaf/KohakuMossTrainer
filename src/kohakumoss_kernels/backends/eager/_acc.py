@@ -1,4 +1,4 @@
-"""Accumulation dtype of the eager spec: at least fp32, fp64 for fp64 references."""
+"""Accumulation dtype of the eager reference: at least fp32, fp64 for fp64 references."""
 
 import torch
 from torch import Tensor

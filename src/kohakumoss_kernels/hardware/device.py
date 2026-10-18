@@ -13,7 +13,13 @@ from pathlib import Path
 import torch
 from torch._guards import detect_fake_mode
 
+from kohakumoss_common.io import write_json_atomic
+from kohakumoss_common.log import get_logger
 from kohakumoss_kernels.hardware.arch import Arch, _cuda_arch, arch_of
+from kohakumoss_kernels.hardware.current import rng_kept, synchronize
+
+_UNWRITABLE: set[str] = set()
+log = get_logger(__name__)
 
 
 def cache_dir() -> Path:
@@ -32,11 +38,25 @@ def read_json(path: Path) -> dict | None:
 
 
 def write_json(path: Path, data: dict) -> None:
-    """Atomic write: a reader never sees a half-written table."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data, indent=1, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, path)
+    """Atomic write (`kohakumoss_common.io.write_json_atomic`): a reader never sees a
+    half-written table. Raises OSError."""
+    write_json_atomic(path, data, indent=1, sort_keys=True)
+
+
+def save_json(path: Path, data: dict) -> bool:
+    """`write_json`, an OSError logged at WARNING (once per path) instead of raised;
+    whether the file was written."""
+    try:
+        write_json(path, data)
+        return True
+    except OSError as err:
+        if str(path) not in _UNWRITABLE:
+            _UNWRITABLE.add(str(path))
+            log.warning(
+                f"cannot write {path} ({type(err).__name__}: {err}); the values stay "
+                "in memory for this process"
+            )
+        return False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -110,17 +130,10 @@ def query(device: torch.device | str) -> Device:
             return Device("cpu", "cpu", 0, os.cpu_count() or 1, 0, 0, 0, 0, 0)
 
 
-def _sync(device: torch.device) -> None:
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    elif device.type == "xpu":
-        torch.xpu.synchronize(device)
-
-
 def _rate(fn, device: torch.device, reps: int) -> float:
     """Best seconds per call over a few rounds of `reps` calls."""
     fn()
-    _sync(device)
+    synchronize(device)
     best = math.inf
     for _ in range(3):
         start = torch.Event(device=device, enable_timing=True)
@@ -129,7 +142,7 @@ def _rate(fn, device: torch.device, reps: int) -> float:
         for _ in range(reps):
             fn()
         end.record()
-        _sync(device)
+        synchronize(device)
         best = min(best, start.elapsed_time(end) / 1e3 / reps)
     return best
 
@@ -160,12 +173,13 @@ def tracing() -> bool:
 
 
 def planning_device(device: torch.device | str) -> Device:
-    """`probe(device)` when real work may run, else the unmeasured `query(device)`."""
-    return query(device) if tracing() else probe(device)
+    """`measure_rates(device)` when real work may run, else the unmeasured
+    `query(device)`."""
+    return query(device) if tracing() else measure_rates(device)
 
 
 @cache
-def probe(device: torch.device | str) -> Device:
+def measure_rates(device: torch.device | str) -> Device:
     """The measured description of `device`, from the on-disk cache when present."""
     device = torch.device(device)
     if device.type == "cuda" and device.index is None:
@@ -178,6 +192,7 @@ def probe(device: torch.device | str) -> Device:
     if data is not None:
         names = {f.name for f in dataclasses.fields(Device)}
         return Device(**{k: v for k, v in data.items() if k in names})
-    dev = measure(dev, device)
-    write_json(path, dataclasses.asdict(dev))
+    with rng_kept([device]):
+        dev = measure(dev, device)
+    save_json(path, dataclasses.asdict(dev))
     return dev

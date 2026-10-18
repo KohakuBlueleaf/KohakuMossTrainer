@@ -1,29 +1,36 @@
-"""Op registry: backends register implementations; callers resolve once at build time.
-
-An implementation is a callable with the op's eager signature that supports autograd
-and torch.compile. `supports(query)` returns None when it can serve the query, or the
-reason it cannot. `resolve` walks the backend priority for the query's arch, skipping
-backends that fail their health check on the device or have a recorded failure for the
-op, and returns a `Bound` op that falls back along the priority when its implementation
-cannot run. See docs/internals/kernel-dev.md.
+"""Op registry: backends register implementations; callers `resolve` once at build time
+to a `Bound` op that falls back along the arch's backend priority. See
+docs/internals/kernel-dev.md#registry.
 """
 
 import importlib
-import warnings
+import threading
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import torch
 
-from kohakumoss_kernels import health
-from kohakumoss_kernels.errors import LAUNCH_ERRORS, BackendUnavailable, unavailable
+from kohakumoss_common.log import debug_once, get_logger, info_once, warning_once
+from kohakumoss_kernels import cache_tag, status
+from kohakumoss_kernels.dtypes import short
+from kohakumoss_kernels.errors import (
+    LAUNCH_ERRORS,
+    BackendUnavailable,
+    InputError,
+    is_sticky_error,
+    unavailable,
+)
 from kohakumoss_kernels.hardware.arch import Arch, arch_of
+from kohakumoss_kernels.hardware.current import saved_tensor_hooks_active
+from kohakumoss_kernels.recording import RECORDS, on_change, record
 
 BACKENDS = ("tilelang", "triton", "compile", "eager")
+log = get_logger(__name__)
 
 DEFAULT_PRIORITY: dict[str, tuple[str, ...]] = {
-    "sm70": ("tilelang", "compile", "eager"),
-    "sm75": ("tilelang", "compile", "eager"),
+    "sm70": ("tilelang", "triton", "compile", "eager"),
+    "sm75": ("tilelang", "triton", "compile", "eager"),
     "sm80": ("triton", "tilelang", "compile", "eager"),
     "sm86": ("triton", "tilelang", "compile", "eager"),
     "sm89": ("triton", "tilelang", "compile", "eager"),
@@ -34,6 +41,9 @@ DEFAULT_PRIORITY: dict[str, tuple[str, ...]] = {
     "cpu": ("eager",),
 }
 CAUGHT = (BackendUnavailable, *LAUNCH_ERRORS)
+_LOAD_LOCK = threading.RLock()
+_LOADED: list[bool] = []
+_LOADING: list[bool] = []
 
 
 @dataclass(frozen=True)
@@ -77,15 +87,21 @@ class NoImplementationError(RuntimeError):
     """No registered backend can serve the query; the message lists every reason."""
 
 
-failures = health.failures
-recorded_failures = health.recorded_failures
+# the doctor's view of recorded failures
+failures = status.failures
+recorded_failures = status.recorded_failures
+
+
+_LIVE: "weakref.WeakSet[Bound]" = weakref.WeakSet()
 
 
 class Bound:
-    """A resolved op: calls its implementation directly. When the implementation
-    cannot run here (`BackendUnavailable`, a Triton build / resource error) the
-    failure is recorded, a warning names it, and the op rebinds to the next backend of
-    `order` and runs again; a pinned backend re-raises."""
+    """A resolved op: calls its implementation directly; a build / launch failure
+    (forward, or backward until one has succeeded) records it, logs a WARNING and
+    rebinds this op and every live `Bound` of the same query on the failed backend to
+    the next backend of `order`. The call path (recording, guarded, plain) is bound
+    when the recording state or `guard` changes. See
+    docs/internals/kernel-dev.md#fallback."""
 
     def __init__(self, query: OpQuery, device, order: tuple[str, ...], backend: str):
         self.op = query.op
@@ -94,25 +110,73 @@ class Bound:
         self.order = order
         self.backend = backend
         self.fn = _STATE.impls[query.op][backend].fn
+        self.guard = len(order) > 1
+        _LIVE.add(self)
+
+    @property
+    def guard(self) -> bool:
+        """Whether calls that record a plain autograd graph run through `_Guarded`."""
+        return self._guard
+
+    @guard.setter
+    def guard(self, on: bool) -> None:
+        self._guard = on
+        self.rebind()
+
+    def rebind(self) -> None:
+        """Bind the call path for the current recording state and `guard`."""
+        if RECORDS:
+            self._call = self._record
+        elif self._guard:
+            self._call = self._guarded
+        else:
+            self._call = self._plain
 
     def __call__(self, *args, **kwargs):
+        return self._call(*args, **kwargs)
+
+    def _plain(self, *args, **kwargs):
         try:
             return self.fn(*args, **kwargs)
         except CAUGHT as err:
-            self.fall_back(err)
+            self.fall_back(err, args, kwargs)
+        return self(*args, **kwargs)
+
+    def _guarded(self, *args, **kwargs):
+        try:
+            if _records_grad(args):
+                return _Guarded.apply(self, kwargs, *args)
+            return self.fn(*args, **kwargs)
+        except CAUGHT as err:
+            self.fall_back(err, args, kwargs)
         return self(*args, **kwargs)
 
     def __getattr__(self, name: str):
-        if name == "fn":
+        if name in ("fn", "_guard", "_call"):
             raise AttributeError(name)
         return getattr(self.fn, name)
 
-    def fall_back(self, err: BaseException) -> None:
+    def _record(self, *args, **kwargs):
+        """Inside `recording()`: snapshot this call and answer with the eager reference,
+        so nothing is built or tuned."""
+        record(self, args, kwargs)
+        eager = _STATE.impls[self.op].get("eager")
+        return (eager.fn if eager is not None else self.fn)(*args, **kwargs)
+
+    def fall_back(self, err: BaseException, args=None, kwargs=None) -> None:
         """Record that the current backend cannot run this op and rebind to the next
-        one (re-raises `err` when none is left or the backend was pinned)."""
+        one (re-raises `err` when none is left or the backend was pinned). With the
+        failing call's `args`, raises `InputError` instead when the eager reference
+        rejects them too: nothing is recorded and the op stays bound."""
+        if is_sticky_error(err, self.device):
+            raise err
+        if args is not None:
+            self._check_inputs(err, args, kwargs or {})
         err = unavailable(self.op, err, self.backend)
         arch = self.query.arch.name
-        health.record(self.op, self.backend, arch, err)
+        status.record(
+            self.op, self.backend, arch, err, self.query.dtype, self.query.static
+        )
         rest = self.order[self.order.index(self.backend) + 1 :]
         if not rest:
             raise err
@@ -120,23 +184,137 @@ class Bound:
             name, _ = _first(self.query, self.device, rest)
         except NoImplementationError as none_left:
             raise none_left from err
-        warnings.warn(
-            f"kohakumoss_kernels: {self.op} on {arch}: backend {self.backend} failed, "
-            f"using {name}: {err}"[:4000],
-            stacklevel=3,
+        failed = self.backend
+        siblings = [
+            op
+            for op in list(_LIVE)
+            if op is not self
+            and op.backend == failed
+            and op.query == self.query
+            and op.order == self.order
+        ]
+        for op in (self, *siblings):
+            op._switch(name)
+        log.warning(
+            f"{self.op} on {arch}/{short(self.query.dtype)}: backend {failed} failed, "
+            f"using {name} ({len(siblings) + 1} bound ops): {err}"[:4000]
         )
+
+    def _switch(self, name: str) -> None:
         self.backend = name
         self.fn = _STATE.impls[self.op][name].fn
+        self.guard = name != self.order[-1]
+
+    def _check_inputs(self, err: BaseException, args, kwargs) -> None:
+        """Raise `InputError` when the eager reference also fails on `args`."""
+        eager = _STATE.impls[self.op].get("eager")
+        if eager is None or self.backend == "eager":
+            return
+        try:
+            with torch.no_grad():
+                eager.fn(*_leaves(args), **kwargs)
+        except torch.OutOfMemoryError:
+            return
+        except Exception as rejected:  # noqa: BLE001
+            raise InputError(self.op, self.backend, err, rejected) from err
+
+
+def _rebind_live() -> None:
+    for op in list(_LIVE):
+        op.rebind()
+
+
+on_change(_rebind_live)
+
+
+def _records_grad(args) -> bool:
+    """A call that records a plain autograd graph: grad on, not traced, no saved-tensor
+    hooks (checkpoint / offload keep their own graph semantics), a tensor needing grad.
+    """
+    return (
+        torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
+        and not saved_tensor_hooks_active()
+        and any(isinstance(a, torch.Tensor) and a.requires_grad for a in args)
+    )
+
+
+def _leaves(args) -> list:
+    return [
+        a.detach().requires_grad_(a.requires_grad) if isinstance(a, torch.Tensor) else a
+        for a in args
+    ]
+
+
+def _grads(fn, kwargs, leaves, grads) -> tuple:
+    """Gradients of fn(*leaves) for the upstream `grads`, per leaf (None if unused)."""
+    with torch.enable_grad():
+        out = fn(*leaves, **kwargs)
+    outs = out if isinstance(out, tuple) else (out,)
+    return _backprop(outs, leaves, grads)
+
+
+def _backprop(outs, leaves, grads) -> tuple:
+    need = [
+        i
+        for i, a in enumerate(leaves)
+        if isinstance(a, torch.Tensor) and a.requires_grad
+    ]
+    pairs = [(o, g) for o, g in zip(outs, grads) if g is not None and o.requires_grad]
+    got = torch.autograd.grad(
+        [o for o, _ in pairs],
+        [leaves[i] for i in need],
+        [g for _, g in pairs],
+        allow_unused=True,
+    )
+    result = [None] * len(leaves)
+    for i, g in zip(need, got):
+        result[i] = g
+    return tuple(result)
+
+
+class _Guarded(torch.autograd.Function):
+    """Runs a `Bound` op's implementation on detached leaves and its backward through
+    autograd.grad; a backend failure in that backward falls the op back and recomputes
+    forward + backward with the next backend from the saved inputs (version-checked)."""
+
+    @staticmethod
+    def forward(ctx, op, kwargs, *args):
+        leaves = _leaves(args)
+        with torch.enable_grad():
+            out = op.fn(*leaves, **kwargs)
+        ctx.save_for_backward(*(a for a in args if isinstance(a, torch.Tensor)))
+        ctx.slots = [None if isinstance(a, torch.Tensor) else (a,) for a in args]
+        ctx.op, ctx.kwargs, ctx.leaves = op, kwargs, leaves
+        ctx.outs = out if isinstance(out, tuple) else (out,)
+        if isinstance(out, tuple):
+            return tuple(o.detach() for o in out)
+        return out.detach()
+
+    @staticmethod
+    def backward(ctx, *grads):
+        op = ctx.op
+        try:
+            got = _backprop(ctx.outs, ctx.leaves, grads)
+            op.guard = False
+        except CAUGHT as err:
+            saved = iter(ctx.saved_tensors)
+            args = [next(saved) if s is None else s[0] for s in ctx.slots]
+            op.fall_back(err, args, ctx.kwargs)
+            got = _grads(op.fn, ctx.kwargs, _leaves(args), grads)
+        return (None, None, *got)
 
 
 def exercise(op: Bound, run: Callable[[Bound], object]) -> object:
-    """`run(op)` (e.g. a forward + backward on scratch inputs); a backend failure raised
-    anywhere in it, the backward included, falls `op` back and runs it again."""
-    while True:
-        try:
-            return run(op)
-        except CAUGHT as err:
-            op.fall_back(err)
+    """`run(op)` (the prewarm: a forward + backward on scratch inputs) as build time
+    (`status.build_phase`); a backend failure raised anywhere in it, the backward
+    included, falls `op` back and runs it again."""
+    with status.build_phase():
+        while True:
+            try:
+                return run(op)
+            except CAUGHT as err:
+                op.fall_back(err)
 
 
 def register(
@@ -159,6 +337,12 @@ def set_priority(arch_name: str, order: tuple[str, ...] | list[str]) -> None:
     _STATE.priority[arch_name] = tuple(order)
 
 
+def reset_priority() -> None:
+    """Every arch entry back to its default backend order (`set_priority` undone)."""
+    _STATE.priority.clear()
+    _STATE.priority.update(DEFAULT_PRIORITY)
+
+
 def _reason(name: str, query: OpQuery, device) -> str | None:
     """Why backend `name` cannot serve `query` on `device`, or None."""
     if name in _STATE.unavailable:
@@ -169,15 +353,16 @@ def _reason(name: str, query: OpQuery, device) -> str | None:
     why = impl.reason(query)
     if why is not None:
         return why
-    failed = health.failed(query.op, name, query.arch.name)
+    failed = status.failed(query.op, name, query.arch.name, query.dtype, query.static)
     if failed is not None:
         return f"failed here ({failed[:300]})"
-    sick = health.healthy(name, device)
-    return None if sick is None else f"cannot build on {device} ({sick[:300]})"
+    why = status.probe(name, device)
+    return None if why is None else f"cannot build on {device} ({why[:300]})"
 
 
 def available(op: str, device: torch.device | str, dtype: torch.dtype, **static):
     """`{backend: None | reason}` for `op` on `device` (the doctor's view)."""
+    load_backends()
     query = OpQuery(op, arch_of(device), dtype, tuple(sorted(static.items())))
     return {b: _reason(b, query, device) for b in BACKENDS}
 
@@ -189,6 +374,12 @@ def _first(query: OpQuery, device, order: tuple[str, ...]) -> tuple[str, Impl]:
         why = _reason(name, query, device)
         if why is None:
             return name, _STATE.impls[query.op][name]
+        if why.startswith("failed here"):
+            warning_once(
+                log.name,
+                f"{query.op} on {query.arch.name}/{short(query.dtype)}: backend "
+                f"{name} skipped, {why}",
+            )
         reasons.append(f"{name}: {why}")
     raise NoImplementationError(
         f"{query.op} on {query.arch.name}/{query.dtype}: " + "; ".join(reasons)
@@ -203,17 +394,33 @@ def resolve(
     **static,
 ) -> Bound:
     """The implementation of `op` for (device, dtype, static), resolved once; a pinned
-    `backend` gets no fallback."""
+    `backend` gets no fallback. The first call loads the backends (`load_backends`)."""
+    load_backends()
     query = OpQuery(op, arch_of(device), dtype, tuple(sorted(static.items())))
     order = (backend,) if backend else _STATE.priority[query.arch.name]
     name, _ = _first(query, device, order)
+    once = debug_once if torch.device(device).type == "cpu" else info_once
+    once(log.name, f"{op} on {query.arch.name}/{short(dtype)}: backend {name}")
     return Bound(query, device, order, name)
 
 
 def load_backends() -> None:
-    """Import every backend package; a failed import marks that backend unavailable."""
-    for name in BACKENDS:
+    """Once per process, on the first kernel build: set the compile-cache key tag and
+    import every backend package (each sets up the host toolchain); a failed import
+    marks that backend unavailable. See docs/internals/kernel-dev.md#lazy-backends."""
+    if _LOADED:
+        return
+    with _LOAD_LOCK:
+        if _LOADED or _LOADING:
+            return
+        _LOADING.append(True)
         try:
-            importlib.import_module(f"kohakumoss_kernels.backends.{name}")
-        except ImportError as err:
-            mark_unavailable(name, str(err))
+            cache_tag.apply()
+            for name in BACKENDS:
+                try:
+                    importlib.import_module(f"kohakumoss_kernels.backends.{name}")
+                except ImportError as err:
+                    mark_unavailable(name, str(err))
+        finally:
+            _LOADING.clear()
+        _LOADED.append(True)

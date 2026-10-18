@@ -1,21 +1,22 @@
 """TileLang optimizer step kernels (sm70+): AdamW over fp32 / 16-bit states and 8-bit
-blockwise states, nearest / stochastic (bf16) / Kahan writeback. Spec:
-kohakumoss_kernels/optim/reference.py.
+blockwise states, nearest / stochastic (bf16) / Kahan writeback; the gradient in its own
+dtype. Eager reference: kohakumoss_kernels/optim/reference.py. The trainer's optimizers
+do not call these ops (benches and tests); see docs/internals/kernel-dev.md#optimizer.
 """
 
 import tilelang.language as T
 import torch
 
-from kohakumoss_kernels.backends.tilelang._blockops import DTYPE, compiled
+from kohakumoss_kernels.backends.tilelang.blocks._blockops import DTYPE, F32, compiled
 from kohakumoss_kernels.constraints import requires
-from kohakumoss_kernels.optim import looped_multi
+from kohakumoss_kernels.optim import looped_multi, reference
+from kohakumoss_kernels.optim.choice import kernel_or_reference
 from kohakumoss_kernels.optim.reference import BLOCK as QBLOCK
 from kohakumoss_kernels.optim.reference import MODES
 from kohakumoss_kernels.registry import register
 
 __all__ = ["adamw_step", "adamw8bit_step"]
 
-F32 = "float32"
 U64 = "uint64"
 BLOCK, THREADS = 1024, 256
 
@@ -29,19 +30,19 @@ def _hash(idx, seed):
     return h ^ (h >> 16)
 
 
-def _adamw_prim(mode, pt, mt, ct):
+def _adamw_prim(mode, pt, gt, mt, ct):
     n = T.dynamic("n")
 
     @T.prim_func
     def main(
         p: T.Tensor((n,), pt),
-        g: T.Tensor((n,), pt),
+        g: T.Tensor((n,), gt),
         m: T.Tensor((n,), mt),
         r: T.Tensor((n,), mt),
         c: T.Tensor((n,), ct),
         lr: T.float32,
-        b1: T.float32,
-        b2: T.float32,
+        ob1: T.float32,
+        ob2: T.float32,
         eps: T.float32,
         wd: T.float32,
         c1: T.float32,
@@ -56,9 +57,9 @@ def _adamw_prim(mode, pt, mt, ct):
                 if mode == 2:
                     pv = pv + T.cast(c[ii], F32)
                 gv = T.cast(g[ii], F32)
-                mv = b1 * T.cast(m[ii], F32) + (1.0 - b1) * gv
+                mv = (1.0 - ob1) * T.cast(m[ii], F32) + ob1 * gv
                 rv0 = T.cast(r[ii], F32)
-                rv = T.sqrt(b2 * rv0 * rv0 + (1.0 - b2) * gv * gv)
+                rv = T.sqrt((1.0 - ob2) * rv0 * rv0 + ob2 * gv * gv)
                 new = pv - lr * ((mv * c1) / (rv * c2 + eps) + wd * pv)
                 if idx < n:
                     m[idx] = T.cast(mv, mt)
@@ -79,9 +80,11 @@ def _adamw_prim(mode, pt, mt, ct):
 
 
 def _scalars(lr, beta1, beta2, eps, wd, step):
+    """Kernel scalars: lr, 1 - beta1, 1 - beta2 (complements formed on the host, as the
+    torch reference forms them), eps, wd and the bias corrections."""
     c1 = 1.0 / (1.0 - beta1**step)
     c2 = 1.0 / (1.0 - beta2**step) ** 0.5
-    return float(lr), float(beta1), float(beta2), float(eps), float(wd), c1, c2
+    return float(lr), 1.0 - beta1, 1.0 - beta2, float(eps), float(wd), c1, c2
 
 
 def adamw_step(
@@ -92,31 +95,30 @@ def adamw_step(
         return
     code = MODES.index(mode)
     c = comp if comp is not None else p
-    kernel = compiled(
-        _adamw_prim, p.device, code, DTYPE[p.dtype], DTYPE[m.dtype], DTYPE[c.dtype]
-    )
+    dts = (DTYPE[p.dtype], DTYPE[g.dtype], DTYPE[m.dtype], DTYPE[c.dtype])
+    kernel = compiled(_adamw_prim, p.device, code, *dts)
     kernel(
         p.view(-1), g.view(-1), m.view(-1), r.view(-1), c.view(-1),
         *_scalars(lr, beta1, beta2, eps, wd, step), int(seed) & 0xFFFFFFFF,
     )  # fmt: skip
 
 
-def _adamw8_prim(mode, pt, ct):
+def _adamw8_prim(mode, pt, gt, ct):
     n = T.dynamic("n")
     nb = T.dynamic("nb")
 
     @T.prim_func
     def main(
         p: T.Tensor((n,), pt),
-        g: T.Tensor((n,), pt),
+        g: T.Tensor((n,), gt),
         mq: T.Tensor((n,), "int8"),
         ms: T.Tensor((nb,), F32),
         rq: T.Tensor((n,), "uint8"),
         rs: T.Tensor((nb,), F32),
         c: T.Tensor((n,), ct),
         lr: T.float32,
-        b1: T.float32,
-        b2: T.float32,
+        ob1: T.float32,
+        ob2: T.float32,
         eps: T.float32,
         wd: T.float32,
         c1: T.float32,
@@ -142,9 +144,9 @@ def _adamw8_prim(mode, pt, ct):
                 tm = T.abs(qm) / 127.0
                 sg = T.if_then_else(qm < 0, -1.0, T.if_then_else(qm > 0, 1.0, 0.0))
                 tr = T.cast(rq[ii], F32) / 255.0
-                mv = b1 * (tm * tm * ms[bx] * sg) + (1.0 - b1) * gv
+                mv = (1.0 - ob1) * (tm * tm * ms[bx] * sg) + ob1 * gv
                 r0 = tr * tr * rs[bx]
-                rv = T.sqrt(b2 * r0 * r0 + (1.0 - b2) * gv * gv)
+                rv = T.sqrt((1.0 - ob2) * r0 * r0 + ob2 * gv * gv)
                 nv[i] = pv - lr * ((mv * c1) / (rv * c2 + eps) + wd * pv)
                 mf[i] = T.if_then_else(ok, mv, 0.0)
                 rf[i] = T.if_then_else(ok, rv, 0.0)
@@ -189,7 +191,8 @@ def adamw8bit_step(
         return
     code = MODES.index(mode)
     c = comp if comp is not None else p
-    kernel = compiled(_adamw8_prim, p.device, code, DTYPE[p.dtype], DTYPE[c.dtype])
+    dts = (DTYPE[p.dtype], DTYPE[g.dtype], DTYPE[c.dtype])
+    kernel = compiled(_adamw8_prim, p.device, code, *dts)
     kernel(
         p.view(-1), g.view(-1), mq, ms, rq, rs, c.view(-1),
         *_scalars(lr, beta1, beta2, eps, wd, step), int(seed) & 0xFFFFFFFF,
@@ -197,6 +200,28 @@ def adamw8bit_step(
 
 
 _SUPPORTS = requires(kinds=("cuda",), min_sm=70, dtypes=(torch.float16, torch.float32))
-register("adamw_step", "tilelang", adamw_step, _SUPPORTS)
-register("adamw_step_multi", "tilelang", looped_multi(adamw_step), _SUPPORTS)
-register("adamw8bit_step", "tilelang", adamw8bit_step, _SUPPORTS)
+register(
+    "adamw_step",
+    "tilelang",
+    kernel_or_reference("tilelang", "adamw_step", adamw_step, reference.adamw_step),
+    _SUPPORTS,
+)
+register(
+    "adamw_step_multi",
+    "tilelang",
+    kernel_or_reference(
+        "tilelang",
+        "adamw_step_multi",
+        looped_multi(adamw_step),
+        looped_multi(reference.adamw_step),
+    ),
+    _SUPPORTS,
+)
+register(
+    "adamw8bit_step",
+    "tilelang",
+    kernel_or_reference(
+        "tilelang", "adamw8bit_step", adamw8bit_step, reference.adamw8bit_step
+    ),
+    _SUPPORTS,
+)

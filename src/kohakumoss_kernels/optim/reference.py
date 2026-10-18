@@ -1,11 +1,6 @@
-"""Torch reference of the optimizer step kernels (the spec; also the CPU path).
-
-AdamW keeps `m` and `r = sqrt(v)` (so the squared magnitude never reaches 16-bit
-storage). Writeback rounding of the parameter: `nearest`, `stochastic` (bf16: add a
-random 16-bit integer to the fp32 bit pattern, then truncate) or `kahan` (a
-compensation buffer in the parameter dtype carries what rounding dropped).
-The 8-bit variant stores m and r per block of `BLOCK` values as int8 / uint8 codes of
-a square-root companding of value / block absmax.
+"""Torch reference of the optimizer step kernels (what each computes; also the CPU
+path): AdamW on `m` and `r = sqrt(v)`, writeback `MODES`, 8-bit blockwise states. See
+docs/internals/kernel-dev.md#optimizer.
 """
 
 import torch
@@ -37,6 +32,7 @@ def sr_bf16(x: Tensor, seed: int) -> Tensor:
 
 
 def _write(p: Tensor, value: Tensor, comp: Tensor | None, mode: str, seed: int) -> None:
+    """Round fp32 `value` into `p` by writeback `mode`."""
     match mode:
         case "nearest":
             p.copy_(value)
@@ -95,6 +91,7 @@ def quant(x: Tensor, signed: bool) -> tuple[Tensor, Tensor]:
 
 
 def dequant(q: Tensor, scale: Tensor, signed: bool) -> Tensor:
+    """fp32 values of the blockwise codes `q` with block scales `scale` (flat)."""
     n = q.numel()
     pad = (-n) % BLOCK
     qf = torch.nn.functional.pad(q.float(), (0, pad)).view(-1, BLOCK)

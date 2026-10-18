@@ -1,10 +1,6 @@
-"""Bench harness of the block ops: backend vs eager composition vs torch.compile of it.
-
-Each case reports forward and forward+backward device time (best of N, L2 flushed,
-boost clocks warmed), the absolute and relative error of every output and input
-gradient vs an fp64 run of the eager spec, and whether each contender meets the
-precision bar against the eager composition (`kohakumoss_kernels.precision`). Rows go to
-`runs/kernel/<op>-<card>.json`.
+"""Bench harness of the block ops: backend vs eager composition vs torch.compile of it,
+forward and forward + backward time and error statistics against fp64, rows to
+`runs/kernel/<op>-<card>.json`. See docs/internals/kernel-dev.md#benches.
 """
 
 import argparse
@@ -16,9 +12,12 @@ import torch
 
 from kohakumoss_kernels import registry
 from kohakumoss_kernels.backends.compile.ops import COMPILED, compiled_op
-from kohakumoss_kernels.hardware.device import probe
-from kohakumoss_kernels.precision import error, judge
+from kohakumoss_kernels.backends.compile.prewarm import segment_ids
+from kohakumoss_kernels.error_stats import stats, worse
+from kohakumoss_kernels.hardware.device import measure_rates
 from kohakumoss_kernels.tuning.timing import best_ms, graph_ms, l2_flush
+
+__all__ = ["contenders", "dtypes", "measure", "parse", "report", "segment_ids"]
 
 
 def parse() -> argparse.Namespace:
@@ -76,7 +75,7 @@ def measure(
     device: torch.device,
 ) -> dict:
     """Timing + accuracy of every entry of `fns` on one case."""
-    flush = l2_flush(device, probe(device).l2_bytes)
+    flush = l2_flush(device, measure_rates(device).l2_bytes)
     with torch.no_grad():
         shapes = _tuple(reference(*args))
     gouts = [torch.randn(o.shape, device=device).to(o.dtype) for o in shapes]
@@ -85,23 +84,24 @@ def measure(
     torch.autograd.backward(ref_outs, [g.double() for g in gouts])
     refs = [o.detach() for o in ref_outs] + _grads(ref_leaves, grads)
     row: dict = {"case": name, "dtype": str(dtype).split(".")[-1]}
-    selector = fns.pop("_selector", None)
+    selector = fns.get("_selector")
     if selector is not None:
         try:
             row["selected"] = selector.decide(*_leaves(args, grads))
         except Exception as err:  # noqa: BLE001
             row["selected"] = f"error: {type(err).__name__}: {err}"[:200]
-    results: dict[str, list] = {}
+    results: dict[str, list[dict]] = {}
     for label, fn in fns.items():
+        if label == "_selector":
+            continue
         try:
             leaves = _leaves(args, grads)
             outs = _tuple(fn(*leaves))
             torch.autograd.backward(outs, [g.clone() for g in gouts])
             got = [o.detach() for o in outs] + _grads(leaves, grads)
-            results[label] = got
-            errs = [error(t, r) for t, r in zip(got, refs)]
-            row[f"{label}.err_abs"] = [e.abs for e in errs]
-            row[f"{label}.err_rel"] = [e.rel for e in errs]
+            results[label] = [stats(t, r) for t, r in zip(got, refs)]
+            del got, outs, leaves
+            row[f"{label}.stats"] = results[label]
             with torch.no_grad():
                 row[f"{label}.fwd_ms"] = best_ms(
                     lambda: fn(*args), device, iters, flush
@@ -122,9 +122,8 @@ def measure(
             row[f"{label}.error"] = f"{type(err).__name__}: {err}"[:300]
     if "eager" in results:
         for label, got in results.items():
-            row[f"{label}.bar_ok"] = all(
-                judge(t, e, r).ok for t, e, r in zip(got, results["eager"], refs)
-            )
+            tables = [{"kernel": k, "eager": e} for k, e in zip(got, results["eager"])]
+            row[f"{label}.worse"] = [worse(t) for t in tables]
     for base in ("eager", "compile", "compile_dyn"):
         if f"{base}.fwd_ms" in row and "backend.fwd_ms" in row:
             for m in ("fwd", "fwdbwd", "fwd_graph", "fwdbwd_graph"):
@@ -138,9 +137,8 @@ def contenders(
     op: str, backend: str, eager_fn: Callable, device, dtype, use_compile: bool = True
 ) -> dict[str, Callable]:
     """The backend's kernel, the eager composition, torch.compile of it (static
-    shapes) and the registered compile path (dynamic shapes, the one the race
-    measures against); the registered (raced) entry is kept under `_selector` for
-    the selection column."""
+    shapes) and the registered compile path (dynamic shapes); a registered entry that
+    chooses per shape is kept under `_selector` for the selection column."""
     registered = registry.resolve(
         op, device, dtype, backend=None if backend == "auto" else backend
     )
@@ -159,7 +157,7 @@ def contenders(
 
 
 def report(op: str, rows: list[dict], out_dir: str, device: torch.device) -> Path:
-    card = probe(device).key
+    card = measure_rates(device).key
     path = Path(out_dir) / f"{op}-{card}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -173,7 +171,7 @@ def report(op: str, rows: list[dict], out_dir: str, device: torch.device) -> Pat
                 cells.append(
                     f"{label} dev {r[f'{label}.fwd_graph_ms']:.3f}/{r[f'{label}.fwdbwd_graph_ms']:.3f}"
                     f" wall {r[f'{label}.fwd_ms']:.3f}/{r[f'{label}.fwdbwd_ms']:.3f}ms "
-                    f"bar {'ok' if r.get(f'{label}.bar_ok', True) else 'FAIL'}"
+                    f"worse {sum(map(bool, r.get(f'{label}.worse', [])))}"
                 )
             elif f"{label}.error" in r:
                 cells.append(f"{label} ERROR {r[f'{label}.error'][:120]}")

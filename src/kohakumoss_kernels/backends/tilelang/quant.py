@@ -10,12 +10,7 @@ weight shape); outputs are caller-allocated.
 import tilelang.language as T
 
 from kohakumoss_kernels import registry
-from kohakumoss_kernels.backends.tilelang._blockops import (
-    DTYPE,
-    CompileError,
-    compiled,
-    tuned,
-)
+from kohakumoss_kernels.backends.tilelang.blocks._blockops import DTYPE, compiled, tuned
 from kohakumoss_kernels.constraints import requires
 from kohakumoss_kernels.quant import (
     PYTORCH_PATHS,
@@ -23,7 +18,8 @@ from kohakumoss_kernels.quant import (
     pytorch_path,
     register_launchers,
 )
-from kohakumoss_kernels.tuning import decided, select, tuner
+from kohakumoss_kernels.tuning import decided, tuner
+from kohakumoss_kernels.tuning.buckets import pow2
 
 F32 = "float32"
 I8 = "int8"
@@ -111,13 +107,6 @@ _RESOLVED: dict[tuple, object] = {}
 tuner.on_reset(_RESOLVED.clear)
 
 
-def pow2_bucket(n: int, floor: int = 32) -> int:
-    b = floor
-    while b < n:
-        b *= 2
-    return b
-
-
 def _fwd_runner(c, dev, n, k, has_bias, dtype):
     """(x, q, scale, bias) -> y for one config: the kernel or a PyTorch path."""
     ref = pytorch_path(c, "fwd")
@@ -163,7 +152,7 @@ def _dgrad_runner(c, dev, n, k, dtype):
 def fwd(x, q, scale, bias):
     m, k = x.shape
     n = q.shape[0]
-    key = ("fwd", x.device.index, pow2_bucket(m, 32), n, k, x.dtype, bias is not None)
+    key = ("fwd", x.device.index, pow2(m, 32), n, k, x.dtype, bias is not None)
     run = _RESOLVED.get(key)
     if run is None:
         dev = x.device
@@ -186,21 +175,18 @@ def fwd(x, q, scale, bias):
 def dgrad(g, q, scale):
     m, n = g.shape
     k = q.shape[1]
-    key = ("dgrad", g.device.index, pow2_bucket(m, 32), n, k, g.dtype)
+    key = ("dgrad", g.device.index, pow2(m, 32), n, k, g.dtype)
     run = _RESOLVED.get(key)
     if run is None:
         dev = g.device
         args = (dev, n, k, g.dtype)
         table_key = f"m{key[2]}_n{n}_k{k}_{g.dtype}"
-        c = select(
+        c = tuned(
             "quant_dgrad_tl",
             dev,
             table_key,
-            lambda: [*_CFGS, *PYTORCH_PATHS],
-            lambda c: lambda: _dgrad_runner(c, *args)(g, q, scale),
-            shortlist=len(_CFGS) + len(PYTORCH_PATHS),
-            errors=(RuntimeError, CompileError),
-            in_backward=True,
+            [*_CFGS, *PYTORCH_PATHS],
+            lambda c: _dgrad_runner(c, *args)(g, q, scale),
         )
         run = _dgrad_runner(c, *args)
         if decided("quant_dgrad_tl", dev, table_key):
@@ -208,7 +194,7 @@ def dgrad(g, q, scale):
     return run(g, q, scale)
 
 
-def _rule(query):
+def _int8_only(query):
     fmt = query.get("fmt", "int8")
     return None if fmt == "int8" else f"tilelang quant serves int8 only, not {fmt}"
 
@@ -218,5 +204,5 @@ registry.register(
     "quant_linear",
     "tilelang",
     make_quant_linear("tilelang"),
-    supports=requires(kinds=("cuda",), min_sm=70, extra=_rule),
+    supports=requires(kinds=("cuda",), min_sm=70, extra=_int8_only),
 )

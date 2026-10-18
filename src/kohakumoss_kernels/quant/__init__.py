@@ -4,7 +4,8 @@
 register a (forward, dgrad) launcher pair here; `make_quant_linear(backend)` is
 the op the registry hands out: a custom op (compile-safe) whose autograd gives
 the input gradient through the dgrad kernel and the bias gradient as a column
-sum. The base itself never receives a gradient.
+sum, saving only `q` and `scale` for backward. The base itself never receives a
+gradient. The eager entry is the same op over the reference launchers.
 """
 
 import functools
@@ -27,17 +28,16 @@ def dequantize(q: Tensor, scale: Tensor, dtype: torch.dtype) -> Tensor:
     return (q.to(torch.float32) * scale.float()[:, None]).to(dtype)
 
 
-def quant_linear_reference(
-    x: Tensor, q: Tensor, scale: Tensor, bias: Tensor | None, fmt: str
-) -> Tensor:
-    """The spec: dequantize, then a dense linear (what PyTorch alone does)."""
-    b = None if bias is None else bias.to(x.dtype)
-    return F.linear(x, dequantize(q, scale, x.dtype), b)
-
-
 def _fwd_ref(x: Tensor, q: Tensor, scale: Tensor, bias: Tensor | None) -> Tensor:
     b = None if bias is None else bias.to(x.dtype)
     return F.linear(x, dequantize(q, scale, x.dtype), b)
+
+
+def quant_linear_reference(
+    x: Tensor, q: Tensor, scale: Tensor, bias: Tensor | None, fmt: str
+) -> Tensor:
+    """The eager reference: dequantize, then a dense linear (what PyTorch alone does)."""
+    return _fwd_ref(x, q, scale, bias)
 
 
 def _dgrad_ref(g: Tensor, q: Tensor, scale: Tensor) -> Tensor:
@@ -95,7 +95,6 @@ def _setup(ctx, inputs, output):
     x, q, scale, bias, backend = inputs
     ctx.save_for_backward(q, scale)
     ctx.backend = backend
-    ctx.has_bias = bias is not None
     ctx.bias_dtype = None if bias is None else bias.dtype
 
 
@@ -106,7 +105,7 @@ def _backward(ctx, grad):
     if ctx.needs_input_grad[0]:
         gx = _quant_dgrad(g, q, scale, ctx.backend)
     gb = None
-    if ctx.has_bias and ctx.needs_input_grad[3]:
+    if ctx.bias_dtype is not None and ctx.needs_input_grad[3]:
         gb = g.float().sum(0).to(ctx.bias_dtype)
     return gx, None, None, gb, None
 
@@ -128,7 +127,8 @@ def make_quant_linear(backend: str) -> Callable:
 
 
 def fmt_supported(fmt: str, sm: int) -> str | None:
-    """Arch rule per storage format: int8 everywhere a backend runs, fp8 from sm89."""
+    """Why `fmt` cannot run on `sm`, or None: int8 everywhere a backend runs, fp8
+    from sm89."""
     if fmt not in FORMATS:
         return f"unknown quant format {fmt!r}"
     if fmt == "fp8" and sm < 89:
@@ -136,4 +136,6 @@ def fmt_supported(fmt: str, sm: int) -> str | None:
     return None
 
 
-registry.register("quant_linear", "eager", quant_linear_reference)
+register_launchers("eager", _fwd_ref, _dgrad_ref)
+quant_linear_eager = make_quant_linear("eager")
+registry.register("quant_linear", "eager", quant_linear_eager)

@@ -11,7 +11,6 @@ import triton
 import triton.language as tl
 
 from kohakumoss_kernels import registry, tuning
-from kohakumoss_kernels.backends.triton._common import pow2_bucket
 from kohakumoss_kernels.constraints import requires
 from kohakumoss_kernels.hardware.current import on_device
 from kohakumoss_kernels.quant import (
@@ -22,6 +21,7 @@ from kohakumoss_kernels.quant import (
     register_launchers,
 )
 from kohakumoss_kernels.tuning import tuner
+from kohakumoss_kernels.tuning.buckets import pow2
 
 
 @triton.jit
@@ -143,7 +143,7 @@ _TILES = (
 
 def _candidates(m: int) -> list[dict]:
     """Tiles that fit the problem first, then the dequantize+matmul path."""
-    fits = [t for t in _TILES if t[0] <= max(32, pow2_bucket(m, 32))]
+    fits = [t for t in _TILES if t[0] <= max(32, pow2(m, 32))]
     ranked = sorted(fits, key=lambda t: -(t[0] * t[1]) if m >= 1024 else t[0])
     out = [dict(zip(("bm", "bn", "bk", "warps", "stages"), t)) for t in ranked]
     return [*out, *PYTORCH_PATHS]
@@ -154,63 +154,29 @@ def _launch_fwd(cfg, x, q, scale, bias, y):
     n = q.shape[0]
     grid = (triton.cdiv(m, cfg["bm"]) * triton.cdiv(n, cfg["bn"]),)
     with on_device(x.device):
-        _launch_fwd_kernel(grid, cfg, x, q, scale, bias, y, m, n, k)
-
-
-def _launch_fwd_kernel(grid, cfg, x, q, scale, bias, y, m, n, k):
-    _fwd_kernel[grid](
-        x,
-        q,
-        scale,
-        bias if bias is not None else scale,
-        y,
-        m,
-        n,
-        k,
-        *x.stride(),
-        *q.stride(),
-        *y.stride(),
-        HAS_BIAS=bias is not None,
-        BM=cfg["bm"],
-        BN=cfg["bn"],
-        BK=cfg["bk"],
-        GROUP_M=8,
-        num_warps=cfg["warps"],
-        num_stages=cfg["stages"],
-    )
+        _fwd_kernel[grid](
+            x, q, scale, bias if bias is not None else scale, y, m, n, k,
+            *x.stride(), *q.stride(), *y.stride(),
+            HAS_BIAS=bias is not None, BM=cfg["bm"], BN=cfg["bn"], BK=cfg["bk"],
+            GROUP_M=8, num_warps=cfg["warps"], num_stages=cfg["stages"],
+        )  # fmt: skip
 
 
 def _launch_dgrad(cfg, g, q, scale, dx):
     m, n = g.shape
     k = q.shape[1]
+    # output columns (K) tile by `bn`, reduction (N) by `bk`
     grid = (triton.cdiv(m, cfg["bm"]) * triton.cdiv(k, cfg["bn"]),)
     with on_device(g.device):
-        _launch_dgrad_kernel(grid, cfg, g, q, scale, dx, m, n, k)
-
-
-def _launch_dgrad_kernel(grid, cfg, g, q, scale, dx, m, n, k):
-    _dgrad_kernel[grid](
-        g,
-        q,
-        scale,
-        dx,
-        m,
-        n,
-        k,
-        *g.stride(),
-        *q.stride(),
-        *dx.stride(),
-        BM=cfg["bm"],
-        BK=cfg["bn"],
-        BN=cfg["bk"],
-        GROUP_M=8,
-        num_warps=cfg["warps"],
-        num_stages=cfg["stages"],
-    )
+        _dgrad_kernel[grid](
+            g, q, scale, dx, m, n, k, *g.stride(), *q.stride(), *dx.stride(),
+            BM=cfg["bm"], BK=cfg["bn"], BN=cfg["bk"],
+            GROUP_M=8, num_warps=cfg["warps"], num_stages=cfg["stages"],
+        )  # fmt: skip
 
 
 def _key(m, n, k, x, q, bias) -> str:
-    return f"m{pow2_bucket(m, 32)}_n{n}_k{k}_{x.dtype}_{q.dtype}_b{bias is not None}"
+    return f"m{pow2(m, 32)}_n{n}_k{k}_{x.dtype}_{q.dtype}_b{bias is not None}"
 
 
 _RESOLVED: dict[tuple, object] = {}
@@ -250,7 +216,7 @@ def fwd(x, q, scale, bias):
     key = (
         "fwd",
         x.device.index,
-        pow2_bucket(m, 32),
+        pow2(m, 32),
         n,
         k,
         x.dtype,
@@ -267,7 +233,6 @@ def fwd(x, q, scale, bias):
             lambda: _candidates(m),
             lambda c: lambda: _fwd_runner(c)(x, q, scale, bias),
             shortlist=len(_TILES) + len(PYTORCH_PATHS),
-            errors=(Exception,),
         )
         run = _fwd_runner(cfg)
         # bind only a settled pick
@@ -279,7 +244,7 @@ def fwd(x, q, scale, bias):
 def dgrad(g, q, scale):
     m = g.shape[0]
     n, k = q.shape
-    key = ("dgrad", g.device.index, pow2_bucket(m, 32), n, k, g.dtype, q.dtype)
+    key = ("dgrad", g.device.index, pow2(m, 32), n, k, g.dtype, q.dtype)
     run = _RESOLVED.get(key)
     if run is None:
         table_key = _key(m, n, k, g, q, None)
@@ -290,7 +255,6 @@ def dgrad(g, q, scale):
             lambda: _candidates(m),
             lambda c: lambda: _dgrad_runner(c)(g, q, scale),
             shortlist=len(_TILES) + len(PYTORCH_PATHS),
-            errors=(Exception,),
             in_backward=True,
         )
         run = _dgrad_runner(cfg)
@@ -299,7 +263,7 @@ def dgrad(g, q, scale):
     return run(g, q, scale)
 
 
-def _rule(query):
+def _format_supported(query):
     return fmt_supported(query.get("fmt", "int8"), query.arch.sm)
 
 
@@ -308,5 +272,5 @@ registry.register(
     "quant_linear",
     "triton",
     make_quant_linear("triton"),
-    supports=requires(kinds=("cuda", "xpu"), min_sm=80, extra=_rule),
+    supports=requires(kinds=("cuda", "xpu"), min_sm=80, extra=_format_supported),
 )

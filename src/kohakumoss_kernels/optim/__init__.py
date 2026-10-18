@@ -1,9 +1,6 @@
-"""Optimizer step ops for the training optimisers (AdamW over fp32 / 16-bit states,
-8-bit blockwise states; nearest / stochastic / Kahan parameter writeback).
-
-`resolve(device, dtype)` binds the backend implementations once; the returned
-`OptimOps` is called directly. The reference module is the spec. `adamw_multi` steps
-a whole list of same-dtype tensors (tensor t seeded with `seed + t * 1000003`).
+"""Optimizer step ops (AdamW over fp32 / 16-bit states and 8-bit blockwise states;
+nearest / stochastic / Kahan parameter writeback), bound once by `resolve`;
+`reference` defines what each op computes. See docs/internals/kernel-dev.md#optimizer.
 """
 
 from collections.abc import Callable
@@ -15,6 +12,7 @@ from torch import Tensor
 from kohakumoss_kernels import registry
 from kohakumoss_kernels.optim import reference
 from kohakumoss_kernels.optim.reference import BLOCK, MODES
+from kohakumoss_kernels.tuning.buckets import cdiv
 
 __all__ = [
     "BLOCK",
@@ -31,7 +29,8 @@ SEED_STRIDE = 1000003
 
 
 def looped_multi(single: Callable) -> Callable:
-    """A multi-tensor AdamW from a per-tensor one (same per-tensor seeds)."""
+    """A multi-tensor AdamW from a per-tensor one; tensor t is seeded with
+    `seed + t * SEED_STRIDE`."""
 
     def multi(
         params, grads, ms, rs, comps, lr, b1, b2, eps, wd, step, mode="nearest", seed=0
@@ -72,7 +71,7 @@ def resolve(device, dtype: torch.dtype, backend: str | None = None) -> OptimOps:
 def new_8bit_state(p: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Zero (m codes int8, m scales, r codes uint8, r scales) for parameter `p`."""
     n = p.numel()
-    blocks = -(-n // BLOCK)
+    blocks = cdiv(n, BLOCK)
     dev = p.device
     return (
         torch.zeros(n, device=dev, dtype=torch.int8),

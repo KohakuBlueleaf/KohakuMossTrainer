@@ -1,4 +1,4 @@
-"""Op names and their eager signatures: the contract every backend implements.
+"""Op names and their eager signatures, implemented by every backend.
 
 Segment ids `seg` are nondecreasing (sample-major packing); segment reductions rely on it.
 
@@ -15,11 +15,28 @@ Segment ids `seg` are nondecreasing (sample-major packing); segment reductions r
     token_mse(pred[N,C], target[N,C], seg[N] int32, weight[B] f32, mask[N] f32 | None)
         -> f32 scalar sum of weight[seg]*mask*mean_c((pred-target)^2)
 
-Optional fused ops (dense base, no adapter; the composition of the primitives is the spec):
+Optional fused ops (dense base, no adapter; the composition of the primitives is the
+eager reference):
 
     linear_qk_rope(y, wq, wk, q_weight, k_weight, pos, bands, eps, heads) -> (q, k)
     linear_situ(y, w_up_gate, bias) -> situ_glu(y W^T + b)
     linear_gated_residual(a, w, bias, x, gate, seg, r) -> gated_residual(x, a W^T + b, ...)
+
+Text-encoder ops (Qwen3.5 Gated DeltaNet + causal GQA attention; forward only):
+
+    causal_conv_varlen(x[N,C], weight[C,W], cu_seqlens[B+1] int32)
+        -> silu(depthwise causal conv of width W, left padding reset per segment)[N,C]
+    gated_delta_rule_varlen(q[N,Hk,Dk], k[N,Hk,Dk], v[N,Hv,Dv], a[N,Hv], b[N,Hv],
+                            a_log[Hv], dt_bias[Hv], cu_seqlens[B+1] int32,
+                            max_seqlen: int) -> o[N,Hv,Dv]
+        g = -exp(a_log) * softplus(a + dt_bias), beta = sigmoid(b), q and k l2-normalised
+        (q also by Dk^-1/2), value head h reads key head h // (Hv/Hk);
+        S_t = exp(g_t) S_{t-1} + beta_t k_t (v_t - exp(g_t) S_{t-1}^T k_t)^T,
+        o_t = S_t^T q_t, S reset at every segment start.
+    rms_norm_gated(x[N,D], z[N,D], weight[D], eps) -> x / rms(x) * weight * silu(z)
+    attention_varlen_causal(q[N,H,Dh], k[N,Hkv,Dh], v[N,Hkv,Dh], cu_seqlens[B+1] int32,
+                            max_seqlen: int, scale: float) -> o[N,H,Dh]
+        causal inside segments; query head h reads kv head h // (H/Hkv).
 
 Adapter math and kernels come from the lycoris-lora package. Shapes are flat
 token-major; outputs are in the input activation dtype; reductions are >= fp32.
@@ -33,5 +50,11 @@ RESIDUAL = ("gated_residual",)
 LOSS = ("token_mse",)
 FUSED = ("linear_qk_rope", "linear_situ", "linear_gated_residual")
 OPTIM = ("adamw_step", "adamw8bit_step", "adamw_step_multi")
-QUANT = ("quant_linear",)
-ALL = NORM + ROPE + ATTENTION + FFN + RESIDUAL + LOSS + FUSED + OPTIM + QUANT
+QUANT = ("quant_linear", "fp8_linear", "fp8_linear_infer", "fp8_linear_train")
+TEXT = (
+    "causal_conv_varlen",
+    "gated_delta_rule_varlen",
+    "rms_norm_gated",
+    "attention_varlen_causal",
+)
+ALL = NORM + ROPE + ATTENTION + FFN + RESIDUAL + LOSS + FUSED + OPTIM + QUANT + TEXT

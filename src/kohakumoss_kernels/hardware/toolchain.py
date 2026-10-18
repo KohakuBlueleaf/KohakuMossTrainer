@@ -16,7 +16,7 @@ from pathlib import Path
 
 import torch
 
-from kohakumoss_kernels.hardware.device import cache_dir, read_json, write_json
+from kohakumoss_kernels.hardware.device import cache_dir, read_json, save_json
 from kohakumoss_kernels.hardware.xpu_triton import utf8_sources
 
 try:
@@ -34,6 +34,7 @@ VCVARS = Path("VC", "Auxiliary", "Build", "vcvars64.bat")
 CL_GLOB = r"*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe"
 PATH_LISTS = ("PATH", "INCLUDE", "LIB", "LIBPATH")
 MSVC_NAME = "cl.EXE"
+NO_MSVC = "MSVC (x64 C++ tools) not found; install VS Build Tools with 'Desktop C++'"
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,7 @@ def installed(package: str) -> bool:
 
 
 def version(dist: str) -> str | None:
+    """Installed version of distribution `dist`, or None."""
     try:
         return importlib.metadata.version(dist)
     except importlib.metadata.PackageNotFoundError:
@@ -75,16 +77,28 @@ def _version_key(path: str) -> tuple:
     return tuple(int(x) if x.isdigit() else 0 for x in ver.split("."))
 
 
+@cache
 def _vswhere(*args: str) -> list[str]:
+    """vswhere's output lines for `args`: once per process, and across processes from
+    `<cache>/toolchain/vswhere.json` while every listed path (a Visual Studio install)
+    still exists."""
     if not VSWHERE.exists():
         return []
+    store = cache_dir() / "toolchain" / "vswhere.json"
+    key = " ".join(args)
+    saved = (read_json(store) or {}).get(key)
+    if saved and all(Path(p).exists() for p in saved):
+        return list(saved)
     out = subprocess.run(
         [str(VSWHERE), "-prerelease", "-products", "*", *args],
         capture_output=True,
         text=True,
         check=False,
     ).stdout
-    return [line.strip() for line in out.splitlines() if line.strip()]
+    lines = [line.strip() for line in out.splitlines() if line.strip()]
+    if lines:
+        save_json(store, {**(read_json(store) or {}), key: lines})
+    return lines
 
 
 @cache
@@ -185,7 +199,7 @@ def _windows_toolchain() -> Toolchain:
             delta = _run_vcvars(script)
             source = "vcvars"
             if _dirs_exist(delta):
-                write_json(cache_dir() / "toolchain" / "vcvars.json", {key: delta})
+                save_json(cache_dir() / "toolchain" / "vcvars.json", {key: delta})
         _apply(delta)
     cl = shutil.which("cl")
     if cl is None:
@@ -195,10 +209,11 @@ def _windows_toolchain() -> Toolchain:
         os.environ["CXX"] = _msvc_cxx(cxx if cxx and os.path.isfile(cxx) else cl)
     elif shutil.which(cxx) is not None:
         source = "env"
+    # A TileLang compiler query made before this point re-reads CXX on its next call.
+    tilelang_cc = sys.modules.get("tilelang.contrib.cc")
+    if tilelang_cc is not None:
+        tilelang_cc.get_cplus_compiler.cache_clear()
     return Toolchain(True, source, os.environ["CXX"], os.environ.get("VCToolsVersion"))
-
-
-NO_MSVC = "MSVC (x64 C++ tools) not found; install VS Build Tools with 'Desktop C++'"
 
 
 @cache

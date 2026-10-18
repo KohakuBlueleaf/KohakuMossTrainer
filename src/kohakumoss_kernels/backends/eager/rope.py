@@ -5,7 +5,7 @@ from torch import Tensor
 
 from kohakumoss_kernels.backends.eager._acc import acc_dtype
 
-__all__ = ["qk_norm_rope", "rope_sin_cos"]
+__all__ = ["qk_norm_rope"]
 
 
 def rope_sin_cos(

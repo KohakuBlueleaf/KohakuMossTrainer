@@ -1,18 +1,24 @@
-"""Prewarm of the block ops: run each op forward + backward on scratch MOSS-shaped
-inputs (so kernel configs are tuned and kernel-vs-compile choices are measured and
-stored) before training, outside any no_grad / checkpoint / graph capture. A backend
-that fails here, the backward included, falls back before step 0."""
+"""Prewarm of the block ops: each op forward + backward on scratch MOSS-shaped inputs
+before training, so kernel configs and kernel-vs-compile choices are measured and
+stored, and a failing backend falls back before step 0."""
 
+import time
 from collections.abc import Callable
 from functools import partial
 
 import torch
 
-from kohakumoss_kernels.backends.compile.race import retune_pending
+from kohakumoss_common.log import get_logger, hl, log_table
+from kohakumoss_kernels.backends.compile.choice import retune_pending
+from kohakumoss_kernels.hardware.current import rng_kept, synchronize
 from kohakumoss_kernels.registry import Bound, exercise
 
+log = get_logger(__name__)
+BLOCK_ORDER = ("rms_norm_mod", "rms_norm", "gated_residual", "situ_glu", "qk_norm_rope")
 
-def _segments(lengths: list[int], device) -> torch.Tensor:
+
+def segment_ids(lengths: list[int], device) -> torch.Tensor:
+    """Per-token sample index (int32 [sum(lengths)]) of samples packed in order."""
     return torch.cat(
         [torch.full((n,), i, dtype=torch.int32) for i, n in enumerate(lengths)]
     ).to(device)
@@ -33,17 +39,30 @@ def prewarm_block_ops(
     heads: int = 24,
     ffn_dim: int = 8192,
     train_params: bool = False,
+    backward: bool = True,
 ) -> int:
     """`ops` maps op names (registry names) to resolved callables; `lengths` lists
-    batches of per-sample joint lengths. Returns how many problems were measured."""
+    batches of per-sample joint lengths; `backward=False` (inference) runs forward only
+    under `no_grad`. Returns how many problems were measured."""
     device = torch.device(device)
     hd = dim // heads
     bands = 1 / (10000.0 ** (torch.arange(hd // 8, device=device) / (hd // 8)))
-    with torch.enable_grad():
+    names = [n for n in BLOCK_ORDER if n in ops]
+    total, done = len(names) * len(lengths), 0
+    spent: dict[str, float] = {}
+    start = time.perf_counter()
+    log.info(f"prewarm block ops on {device}: {len(names)} ops x {len(lengths)} sizes")
+    grad, run = (
+        (torch.enable_grad, _forward_backward)
+        if backward
+        else (torch.no_grad, _forward)
+    )
+    train_params = train_params and backward
+    with grad(), rng_kept([device]):
         for lens in lengths:
             n, b = sum(lens), len(lens)
-            seg = _segments(lens, device)
-            x = torch.randn(n, dim, device=device).to(dtype).requires_grad_()
+            seg = segment_ids(lens, device)
+            x = torch.randn(n, dim, device=device).to(dtype).requires_grad_(backward)
             mod = torch.randn(b, dim, device=device).requires_grad_(train_params)
             w = torch.ones(dim, device=device).requires_grad_(train_params)
             calls = {
@@ -53,7 +72,7 @@ def prewarm_block_ops(
                 "situ_glu": (
                     torch.randn(n, 2 * ffn_dim, device=device)
                     .to(dtype)
-                    .requires_grad_(),
+                    .requires_grad_(backward),
                 ),
                 "qk_norm_rope": (
                     x.view(n, heads, hd),
@@ -68,16 +87,33 @@ def prewarm_block_ops(
             for name, args in calls.items():
                 if name not in ops:
                     continue
-                step = partial(_forward_backward, args=args)
+                done += 1
+                log.info(f"tuning {name} {hl(f'{done}/{total}')} ({hl(f'{n} tokens')})")
+                step = partial(run, args=args)
                 op = ops[name]
+                began = time.perf_counter()
                 if isinstance(op, Bound):
                     exercise(op, step)
                 else:
                     step(op)
-    return retune_pending()
+                synchronize(device)
+                spent[name] = spent.get(name, 0.0) + time.perf_counter() - began
+    measured = retune_pending()
+    took = time.perf_counter() - start
+    rows = [(name, round(s, 2)) for name, s in spent.items()]
+    log_table(log, "prewarm block ops per op", ("op", "secs"), rows)
+    log.info(
+        f"prewarm block ops: done in {hl(f'{took:.2f}s')}, "
+        f"{hl(measured)} kernel-vs-compile problems measured"
+    )
+    return measured
 
 
 def _forward_backward(op: Callable, args: tuple) -> None:
     out = op(*args)
     outs = out if isinstance(out, tuple) else (out,)
     torch.autograd.backward([o.float().sum() for o in outs])
+
+
+def _forward(op: Callable, args: tuple) -> None:
+    op(*args)

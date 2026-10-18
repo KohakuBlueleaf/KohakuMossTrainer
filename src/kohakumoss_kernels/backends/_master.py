@@ -23,7 +23,16 @@ def operand(w: Tensor | None, like: Tensor) -> Tensor | None:
     return w.to(like.dtype).contiguous()
 
 
+def stacked(a: Tensor, b: Tensor, like: Tensor) -> Tensor:
+    """[a; b] (a's rows, then b's) in `like`'s dtype, each weight cast once into one
+    buffer (no copy in the storage dtype)."""
+    out = like.new_empty(a.shape[0] + b.shape[0], *a.shape[1:])
+    out[: a.shape[0]].copy_(a)
+    out[a.shape[0] :].copy_(b)
+    return out
+
+
 def weight_grad(g: Tensor, x: Tensor, dtype: torch.dtype) -> Tensor:
-    """g^T x for g [M, N], x [M, K] (16-bit): fp32 accumulation and output, rounded once
-    to the weight's storage `dtype`."""
-    return torch.mm(g.t(), x, out_dtype=torch.float32).to(dtype)
+    """g^T x for g [M, N], x [M, K] (16-bit), accumulated in fp32 and stored in the
+    weight's storage `dtype` (fp32 or x's dtype)."""
+    return torch.mm(g.t(), x, out_dtype=dtype)

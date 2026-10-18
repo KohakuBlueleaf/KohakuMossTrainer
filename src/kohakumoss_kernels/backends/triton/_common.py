@@ -5,7 +5,7 @@ from torch.library import wrap_triton
 
 from kohakumoss_kernels.hardware.current import on_device
 
-_PLAIN = (torch.Tensor, torch.nn.Parameter)
+PLAIN = (torch.Tensor, torch.nn.Parameter)
 
 
 class Launcher:
@@ -20,19 +20,28 @@ class Launcher:
 
     def _launch(self, grid, args, kwargs):
         first = next(a for a in args if isinstance(a, torch.Tensor))
-        if type(first) in _PLAIN:
+        if type(first) in PLAIN:
             with on_device(first.device):
                 return self.fn[grid](*args, **kwargs)
         return wrap_triton(self.fn)[grid](*args, **kwargs)
 
 
-def cdiv(a: int, b: int) -> int:
-    return -(-a // b)
+def eager_function(name: str, impl, setup, backward, nondiff: tuple[int, ...] = ()):
+    """An autograd.Function over a triton_op's forward body `impl`, its `setup_context`
+    and a backward that calls the backward body: the same computation without the
+    custom-op dispatch, for calls outside torch.compile. `nondiff` indexes the outputs
+    that get no gradient. See docs/internals/kernel-dev.md."""
 
+    def forward(ctx, *inputs):
+        out = impl(*inputs)
+        setup(ctx, inputs, out)
+        if nondiff:
+            ctx.mark_non_differentiable(*(out[i] for i in nondiff))
+            ctx.set_materialize_grads(False)
+        return out
 
-def pow2_bucket(n: int, floor: int = 64) -> int:
-    """Smallest power of two >= max(n, floor): the tuning key of a length."""
-    b = floor
-    while b < n:
-        b *= 2
-    return b
+    return type(
+        name,
+        (torch.autograd.Function,),
+        {"forward": staticmethod(forward), "backward": staticmethod(backward)},
+    )

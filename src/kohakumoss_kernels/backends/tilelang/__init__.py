@@ -1,16 +1,17 @@
-"""TileLang backend (the sm70 / sm75 tensor-core path; also raced on sm80+). Every
-public submodule registers its ops on import; a failing submodule is recorded in
-`FAILED` and the rest still register. Without a host compiler for nvcc the backend is
-marked unavailable."""
+"""TileLang backend (the sm70 / sm75 tensor-core path; next after Triton on sm80+).
+Every public module of the package tree registers its ops on import; a module whose
+import fails on a missing module (ImportError) is recorded in `FAILED`, logged at
+WARNING, and the rest still register; any other error in a module propagates. Without a
+host compiler for nvcc the backend is marked unavailable."""
 
 import importlib
 import pkgutil
-import warnings
 
 import tilelang  # noqa: F401  (an ImportError marks the whole backend unavailable)
 import torch
 
-from kohakumoss_kernels import health
+from kohakumoss_common.log import get_logger
+from kohakumoss_kernels import status
 from kohakumoss_kernels.hardware.toolchain import ensure_toolchain
 from kohakumoss_kernels.registry import mark_unavailable
 
@@ -28,13 +29,16 @@ def check(device: torch.device) -> None:
 
 if not TOOLCHAIN.ok:
     mark_unavailable("tilelang", TOOLCHAIN.detail)
-health.register_check("tilelang", check)
+status.register_check("tilelang", check)
 
-for _info in pkgutil.iter_modules(__path__):
-    if _info.name.startswith("_"):
+for _info in pkgutil.walk_packages(__path__, f"{__name__}."):
+    _name = _info.name.removeprefix(f"{__name__}.")
+    if _info.ispkg or any(p.startswith("_") for p in _name.split(".")):
         continue
     try:
-        importlib.import_module(f"{__name__}.{_info.name}")
-    except Exception as _err:  # noqa: BLE001
-        FAILED[_info.name] = f"{type(_err).__name__}: {_err}"
-        warnings.warn(f"kohakumoss_kernels tilelang.{_info.name}: {FAILED[_info.name]}")
+        importlib.import_module(_info.name)
+    except ImportError as _err:
+        FAILED[_name] = f"{type(_err).__name__}: {_err}"
+        get_logger(__name__).warning(
+            f"kohakumoss_kernels tilelang.{_name}: {FAILED[_name]}"
+        )
