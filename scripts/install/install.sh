@@ -8,7 +8,8 @@ PYTHON=3.12
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 if command -v nvidia-smi >/dev/null 2>&1; then
-  if ! read -r major minor < <(nvidia-smi | sed -n 's/.*CUDA Version: *\([0-9]*\)\.\([0-9]*\).*/\1 \2/p' | head -1); then
+  # "CUDA Version: X.Y", or "CUDA UMD Version: X.Y" on newer drivers
+  if ! read -r major minor < <(nvidia-smi | sed -n 's/.*CUDA \(UMD \)\{0,1\}Version: *\([0-9]*\)\.\([0-9]*\).*/\2 \3/p' | head -1); then
     echo "could not read the CUDA version from nvidia-smi; install by hand: docs/guides/install.md#manual-install" >&2; exit 1
   fi
   ver=$((major * 100 + minor))
