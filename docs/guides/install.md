@@ -167,8 +167,8 @@ shared drive):
 | `optim` | `prodigyopt`, `schedulefree` | `OPTIMIZER="prodigy"` / `"schedule_free"` |
 | `parquet` | `pyarrow` | the `parquet` dataset source |
 | `board` / `wandb` | `kohakuboard` / `wandb` | `LOGGER="board"` / `"wandb"` |
-| `dev` | pytest, ruff, black, lpips | tests and lint |
-| `bench` | matplotlib, pandas | benches |
+| `dev` | pytest, ruff, black, lpips + `bench` | tests and lint (the script tests import every script) |
+| `bench` | matplotlib, pandas | benches, the fp16-fix charts |
 | `baselines` | flash-linear-attention, causal-conv1d | comparison benches only |
 
 The real-GPU bench matrix (`scripts/bench/matrix/`,

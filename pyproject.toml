@@ -44,7 +44,7 @@ optim = ["prodigyopt", "schedulefree"]
 parquet = ["pyarrow"]
 board = ["kohakuboard"]
 wandb = ["wandb"]
-dev = ["pytest", "ruff", "black", "lpips"]
+dev = ["pytest", "ruff", "black", "lpips", "kohakumoss[bench]"]
 bench = ["matplotlib", "pandas"]
 # default sets per accelerator (docs/guides/install.md)
 cuda = ["kohakumoss[kernels-cuda,lightning,quant]"]
