@@ -1,0 +1,46 @@
+name: Feature Request
+description: Suggest a new feature or improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for your idea! Please describe what you'd like to see. English only.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What problem does this solve? What's the use case?
+      placeholder: I want to... / It would be useful if...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How do you think this should work? Name the slot it fits (a registry entry, a knob, a memory profile, a kernel backend) if you can.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Have you tried other approaches? What workarounds exist?
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Training / adapters
+        - Memory profiles / offload
+        - Multi-GPU
+        - Kernels / tuning
+        - Data / caches
+        - Sampling / export
+        - Config CLI
+        - Documentation
+        - Other
