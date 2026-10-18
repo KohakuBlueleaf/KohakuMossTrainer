@@ -2,14 +2,11 @@
 every rank's and micro-batch's gradient into in-place bucket views (gloo on CPU, nccl
 on two GPUs), and the link sweeps run on two GPUs."""
 
-import os
 import sys
-import tempfile
 
 import pytest
 import torch
 
-from kohakumoss.parallel.launch import spawn
 from kohakumoss.parallel.telemetry import selftest
 from kohakumoss.types.plans import ParallelPlan
 from tests._util.negative import must_fail
@@ -18,10 +15,8 @@ TOL = 1e-6
 
 
 def _run(worker, devices, device_type, *args, backend="auto"):
-    path = os.path.join(tempfile.mkdtemp(), "res")
     plan = ParallelPlan(kind="test", backend=backend, devices=tuple(devices))
-    spawn(worker, plan, path, *args, device_type=device_type)
-    return selftest.read_results(path, len(devices))
+    return selftest.spawn_results(worker, plan, *args, device_type=device_type)
 
 
 def check_sum(results: list[dict]) -> None:

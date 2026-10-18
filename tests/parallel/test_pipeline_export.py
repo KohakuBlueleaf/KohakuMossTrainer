@@ -3,14 +3,11 @@ live trainable set holds every rank's trained stage entries (each rank trained i
 key), not only its own."""
 
 import json
-import os
-import tempfile
 
 import pytest
 import torch
 
-from kohakumoss.parallel.launch import spawn
-from kohakumoss.parallel.telemetry.selftest import read_results
+from kohakumoss.parallel.telemetry.selftest import spawn_results
 from kohakumoss.training.drivers.pipeline import PipelineParts
 from kohakumoss.training.ema.averagers import NoEMA
 from kohakumoss.types.plans import ParallelPlan
@@ -55,10 +52,8 @@ def export_worker(env, path: str, merge: bool) -> None:
 
 
 def _run(merge: bool) -> dict:
-    path = os.path.join(tempfile.mkdtemp(), "res")
     plan = ParallelPlan(kind="test", backend="gloo", devices=(0, 1))
-    spawn(export_worker, plan, path, merge, device_type="cpu")
-    return read_results(path, 2)[0]
+    return spawn_results(export_worker, plan, merge, device_type="cpu")[0]
 
 
 def check_merged(rank0: dict) -> None:

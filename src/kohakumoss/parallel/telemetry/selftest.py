@@ -7,6 +7,7 @@ import json
 import multiprocessing as mp
 import os
 import sys
+import tempfile
 import time
 from functools import partial
 
@@ -23,6 +24,7 @@ from kohakumoss.offload.weights.shared import (
     owned,
 )
 from kohakumoss.parallel.ddp import AsyncReducer, GradReducer
+from kohakumoss.parallel.launch import spawn
 from kohakumoss_common.units import MIB
 from kohakumoss_kernels.hardware.current import synchronize
 
@@ -337,6 +339,16 @@ def read_results(path: str, world: int) -> list[dict]:
     return out
 
 
+def spawn_results(worker, plan, *args, device_type: str = "cuda") -> list[dict]:
+    """Every rank's results of `worker(env, path, *args)` run through the launcher on
+    `plan`'s devices; the result files live in a temporary directory removed
+    afterwards."""
+    with tempfile.TemporaryDirectory(prefix="kohakumoss_results_") as root:
+        path = os.path.join(root, "res")
+        spawn(worker, plan, path, *args, device_type=device_type)
+        return read_results(path, len(plan.devices))
+
+
 __all__ = [
     "async_worker",
     "collective_worker",
@@ -346,5 +358,6 @@ __all__ = [
     "orphan_worker",
     "raise_worker",
     "read_results",
+    "spawn_results",
     "zero_worker",
 ]

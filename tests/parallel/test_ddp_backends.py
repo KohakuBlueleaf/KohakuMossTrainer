@@ -5,8 +5,6 @@ skips the sync on all micro-batches but the last; the rank-0 gates wait on the s
 the timeout / bind / backend knobs and their checks."""
 
 import json
-import os
-import tempfile
 
 import pytest
 import torch
@@ -15,8 +13,8 @@ from torch import nn
 
 from kohakumoss.parallel import ddp
 from kohakumoss.parallel.ddp import AsyncReducer, GradReducer, wrap_torch_ddp
-from kohakumoss.parallel.launch import release_ranks, spawn, wait_for_rank0
-from kohakumoss.parallel.telemetry.selftest import read_results
+from kohakumoss.parallel.launch import release_ranks, wait_for_rank0
+from kohakumoss.parallel.telemetry.selftest import spawn_results
 from kohakumoss.training.build.parallel import _NoSync, reduce_dtype
 from kohakumoss.training.knobs import plan_problems, validate
 from kohakumoss.types.plans import MemoryPlan, ParallelPlan
@@ -116,10 +114,8 @@ def torch_ddp_worker(env, path: str, hooked: bool) -> None:
 
 
 def _run_torch_ddp(hooked: bool) -> list[dict]:
-    path = os.path.join(tempfile.mkdtemp(), "res")
     plan = ParallelPlan(kind="test", backend="gloo", devices=(0, 1))
-    spawn(torch_ddp_worker, plan, path, hooked, device_type="cpu")
-    return read_results(path, 2)
+    return spawn_results(torch_ddp_worker, plan, hooked, device_type="cpu")
 
 
 def check_summed(results: list[dict]) -> None:

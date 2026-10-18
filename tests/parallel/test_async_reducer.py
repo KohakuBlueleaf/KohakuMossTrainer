@@ -3,15 +3,12 @@ order, one dtype, the byte cap), host-tensor broadcast runs, and the side-stream
 AsyncReducer summing every rank's last-micro-batch gradient into the delivered views
 (gloo on CPU, nccl on two GPUs)."""
 
-import os
 import sys
-import tempfile
 
 import pytest
 import torch
 
 from kohakumoss.parallel.ddp import _chunks, plan_buckets
-from kohakumoss.parallel.launch import spawn
 from kohakumoss.parallel.telemetry import selftest
 from kohakumoss.types.plans import ParallelPlan
 from tests._util.negative import must_fail
@@ -43,10 +40,8 @@ def test_broadcast_chunks_keep_order_and_cap():
 
 
 def _run(worker, devices, device_type, *args, backend="auto"):
-    path = os.path.join(tempfile.mkdtemp(), "res")
     plan = ParallelPlan(kind="test", backend=backend, devices=tuple(devices))
-    spawn(worker, plan, path, *args, device_type=device_type)
-    return selftest.read_results(path, len(devices))
+    return selftest.spawn_results(worker, plan, *args, device_type=device_type)
 
 
 def check_sum(results: list[dict]) -> None:

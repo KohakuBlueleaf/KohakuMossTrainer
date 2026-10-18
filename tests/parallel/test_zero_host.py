@@ -2,15 +2,12 @@
 plan of the host optimiser shards, the shared region's view layout, and the owner step
 over shared masters against the all-reduce reference (two processes, gloo on CPU)."""
 
-import os
 import sys
-import tempfile
 
 import pytest
 import torch
 
 from kohakumoss.offload.weights.shared import aligned, block_owners, nbytes_of, owned
-from kohakumoss.parallel.launch import spawn
 from kohakumoss.parallel.telemetry import selftest
 from kohakumoss.types.plans import ParallelPlan
 from tests._util.negative import must_fail
@@ -41,10 +38,8 @@ def test_region_layout_is_aligned():
 def _run(*args):
     if sys.platform == "win32":
         pytest.skip("shared host masters are Linux-only (multi-GPU)")
-    path = os.path.join(tempfile.mkdtemp(), "res")
     plan = ParallelPlan(kind="test", backend="gloo", devices=(0, 1))
-    spawn(selftest.zero_worker, plan, path, *args, device_type="cpu")
-    return selftest.read_results(path, 2)
+    return selftest.spawn_results(selftest.zero_worker, plan, *args, device_type="cpu")
 
 
 def check_owner_step(results: list[dict]) -> None:
