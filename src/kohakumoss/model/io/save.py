@@ -100,9 +100,14 @@ def save_diffusers(
     out_dir: str | Path,
     dtype: torch.dtype = torch.bfloat16,
     shard_bytes: int = 5_000_000_000,
+    keep_fold: bool = False,
 ) -> None:
-    """HF transformer folder: config.json + shards + index (official layout)."""
-    write_diffusers(export_state(model, dtype), out_dir, model.cfg, shard_bytes)
+    """HF transformer folder: config.json + shards + index (official layout).
+    `keep_fold` writes the folded weights and records the fold on every shard and in
+    the index (the fp16-fix checkpoint as a diffusers dir)."""
+    state = export_state(model, dtype, keep_fold=keep_fold)
+    meta = fp16_fix_metadata(model) if keep_fold else {}
+    write_diffusers(state, out_dir, model.cfg, shard_bytes, meta or None)
 
 
 def write_diffusers(
@@ -110,8 +115,10 @@ def write_diffusers(
     out_dir: str | Path,
     cfg: MossArchConfig,
     shard_bytes: int = 5_000_000_000,
+    metadata: dict[str, str] | None = None,
 ) -> None:
-    """Shards + index + config.json of `cfg` for a ready state dict (bare keys)."""
+    """Shards + index + config.json of `cfg` for a ready state dict (bare keys);
+    `metadata` goes on every shard (with format=pt) and into the index metadata."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     shards: list[dict[str, Tensor]] = [{}]
@@ -125,12 +132,14 @@ def write_diffusers(
         size += nbytes
     n = len(shards)
     weight_map = {}
+    shard_meta = {"format": "pt", **metadata} if metadata else None
     for i, shard in enumerate(shards, 1):
         name = f"diffusion_pytorch_model-{i:05d}-of-{n:05d}.safetensors"
-        save_file(shard, str(out_dir / name))
+        save_file(shard, str(out_dir / name), shard_meta)
         weight_map.update({k: name for k in shard})
     total = sum(t.nbytes for t in state.values())
-    index = {"metadata": {"total_size": total}, "weight_map": weight_map}
+    meta = {"total_size": total, **(metadata or {})}
+    index = {"metadata": meta, "weight_map": weight_map}
     (out_dir / INDEX).write_text(json.dumps(index, indent=2), encoding="utf-8")
     config = {
         "_class_name": "MOSSImageTransformer",

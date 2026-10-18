@@ -1,0 +1,406 @@
+"""Model-card assets of the fp16-fix study: charts (svg + webp, transparent, readable on
+light and dark pages) and labelled image triptychs (webp) from the outputs of
+fp16_study.py, fp16_quality.py, the ComfyUI runner and scripts/export/fp16_fix.py, plus
+one merged report per variant.
+
+    kogine run scripts/probe/fp16_charts.py --set RUNS=<fp16 runs dir> --set OUT=<staging>
+
+RUNS holds study/<variant>/, quality/<variant>/, comfy/<variant>/ and
+export/<variant>_export.json (fp16_fix.py REPORT).
+"""
+
+import json
+import math
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+from kohakumoss_common.knobs import check_script
+
+RUNS = ""  # fp16 runs dir (see the module docstring)
+OUT = ""  # staging dir: images/, reports/
+VARIANTS = ("base", "sft")
+PANEL = 512  # triptych panel size in pixels
+FP16_MAX = 65504.0
+INK = "#8a8a8a"  # axes / text grey, readable on white and on black
+COLORS = {
+    "orig": "#e4572e",
+    "sampled": "#f3a712",
+    "fixed": "#2e86ab",
+    "folded": "#29bf12",
+    "o": "#a663cc",
+    "ffn_down": "#2e86ab",
+    "ffn_up_gate": "#29bf12",
+    "logit": "#f3a712",
+    "text": "#e4572e",
+}
+
+
+def style() -> None:
+    plt.rcParams.update(
+        {
+            "figure.facecolor": "none",
+            "axes.facecolor": "none",
+            "savefig.transparent": True,
+            "text.color": INK,
+            "axes.labelcolor": INK,
+            "axes.edgecolor": INK,
+            "xtick.color": INK,
+            "ytick.color": INK,
+            "grid.color": INK,
+            "grid.alpha": 0.25,
+            "legend.frameon": False,
+            "font.size": 11,
+        }
+    )
+
+
+def save(fig, out: Path, name: str) -> list[str]:
+    """`name`.svg and `name`.webp (rendered at 2x) under out/images."""
+    d = out / "images"
+    d.mkdir(parents=True, exist_ok=True)
+    fig.savefig(d / f"{name}.svg", bbox_inches="tight")
+    png = d / f"{name}.tmp.png"
+    fig.savefig(png, dpi=200, bbox_inches="tight")
+    Image.open(png).save(d / f"{name}.webp", "WEBP", quality=92, method=6)
+    png.unlink()
+    plt.close(fig)
+    return [f"images/{name}.svg", f"images/{name}.webp"]
+
+
+def fp16_line(ax) -> None:
+    ax.axhline(FP16_MAX, color="#d62828", ls="--", lw=1.2)
+    ax.text(0.5, FP16_MAX * 1.25, "fp16 max 65504", color="#d62828", fontsize=9)
+
+
+def stream_chart(variant: str, study: dict, out: Path) -> list[str]:
+    """Per-block max |x| of the joint stream (probe grid, sampling trajectories, the
+    fixed fp16 run) and of the block's other values, log scale, fp16 limit marked."""
+    probe = study["probe"]
+    c = probe["chosen_c"]
+    row = next(r for r in study["sweep"] if r["c"] == c)
+    pb, ps = probe["per_block"], probe["per_block_sampled"]
+    x = np.arange(len(pb["stream"]))
+    fig, (a, b) = plt.subplots(2, 1, figsize=(10, 7.5), sharex=True)
+    a.semilogy(
+        x,
+        pb["stream"],
+        "o-",
+        ms=3,
+        color=COLORS["orig"],
+        label="official, probe grid (fp32)",
+    )
+    a.semilogy(
+        x,
+        ps["stream"],
+        "s-",
+        ms=3,
+        color=COLORS["sampled"],
+        label="official, real sampling (fp32)",
+    )
+    a.semilogy(
+        x,
+        row["per_block"]["stream"],
+        "^-",
+        ms=3,
+        color=COLORS["fixed"],
+        label=f"fp16-fixed (c = 1/{round(1 / c)}), fp16 run",
+    )
+    fp16_line(a)
+    a.set_ylabel("max |x|, joint residual stream")
+    a.set_title(
+        f"MOSS-Image-{variant.upper() if variant == 'sft' else variant.title()}: residual stream per block"
+    )
+    a.grid(True, which="both")
+    a.legend(loc="lower right", fontsize=9)
+    for site in ("o", "ffn_down", "ffn_up_gate", "logit"):
+        if site in pb:
+            b.semilogy(
+                x, pb[site], "o-", ms=3, color=COLORS[site], label=f"{site} (fp32)"
+            )
+    fp16_line(b)
+    b.set_ylabel("max |x|")
+    b.set_xlabel("joint block")
+    b.grid(True, which="both")
+    b.legend(loc="lower right", fontsize=9, ncol=2)
+    return save(fig, out, f"{variant}_stream_per_block")
+
+
+def plain_chart(variant: str, study: dict, out: Path) -> list[str]:
+    """Plain fp16 on the official weights: share of non-finite outputs per resolution x
+    sigma (over the prompts) and the first block whose output is non-finite."""
+    rows = study["plain"]["fp16_forward_rows"]
+    res = [tuple(r) for r in study["resolutions"]]
+    sig = study["sigmas"]
+    grid = np.zeros((len(res), len(sig)))
+    for i, r in enumerate(res):
+        for j, s in enumerate(sig):
+            cell = [
+                q["nonfinite"] for q in rows if tuple(q["res"]) == r and q["sigma"] == s
+            ]
+            grid[i, j] = sum(cell) / max(len(cell), 1)
+    first = [q["first_bad_block"] for q in rows if q["first_bad_block"] is not None]
+    fig, (a, b) = plt.subplots(
+        1, 2, figsize=(12, 3.8), gridspec_kw={"width_ratios": [1.3, 1]}
+    )
+    im = a.imshow(grid, vmin=0, vmax=1, cmap="magma", aspect="auto")
+    a.set_xticks(range(len(sig)), [str(s) for s in sig])
+    a.set_yticks(range(len(res)), [f"{h}x{w}" for h, w in res])
+    a.set_xlabel("sigma")
+    a.set_title("plain fp16: share of non-finite outputs")
+    for i in range(len(res)):
+        for j in range(len(sig)):
+            a.text(
+                j,
+                i,
+                f"{grid[i, j]:.0%}",
+                ha="center",
+                va="center",
+                color="#ffffff" if grid[i, j] < 0.6 else "#000000",
+                fontsize=8,
+            )
+    fig.colorbar(im, ax=a, fraction=0.04)
+    if first:
+        b.hist(first, bins=np.arange(-0.5, 42.5, 1), color=COLORS["orig"])
+    b.set_xlabel("first joint block with a non-finite output")
+    b.set_ylabel("forwards")
+    b.set_title(f"{len(first)} of {len(rows)} forwards overflow")
+    b.grid(True)
+    return save(fig, out, f"{variant}_plain_fp16")
+
+
+def sweep_chart(variant: str, study: dict, out: Path) -> list[str]:
+    """Error vs fp32 and headroom against c; weight / stream underflow; stock-eps error."""
+    sweep = study["sweep"]
+    cs = [r["c"] for r in sweep]
+    xs = [math.log2(c) for c in cs]
+    labels = [f"1/{round(1 / c)}" for c in cs]
+    chosen = math.log2(study["probe"]["chosen_c"])
+    n = len(sweep[0]["vs_fp32"])
+    bf16 = study["plain"]["bf16_vs_fp32"][:n]
+    bf16_lpips = sum(r["lpips"] for r in bf16) / len(bf16)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    a = axes[0]
+    a.plot(
+        xs,
+        [r["mean_lpips"] for r in sweep],
+        "o-",
+        color=COLORS["fixed"],
+        label="fp16-fixed vs fp32",
+    )
+    a.axhline(
+        bf16_lpips, color=COLORS["sampled"], ls=":", label="official bf16 vs fp32"
+    )
+    a.set_ylabel(f"mean LPIPS vs fp32 ({n} images)")
+    a.legend(fontsize=9)
+    b = axes[1]
+    b.semilogy(xs, [r["headroom"] for r in sweep], "o-", color=COLORS["folded"])
+    b.axhline(1.0, color="#d62828", ls="--", lw=1)
+    b.set_ylabel("headroom = 65504 / fp16 stream max")
+    d = axes[2]
+    tot = [r["weights"]["total"] for r in sweep]
+    d.semilogy(
+        xs,
+        [max((t["flushed"] + t["subnormal"]) / t["n"], 1e-12) for t in tot],
+        "o-",
+        color=COLORS["o"],
+        label="scaled weights: subnormal or flushed",
+    )
+    d.semilogy(
+        xs,
+        [max(r["stream"]["subnormal_frac"], 1e-12) for r in sweep],
+        "s-",
+        color=COLORS["ffn_up_gate"],
+        label="stream values: subnormal",
+    )
+    eps = [max(q["stock_rel"] for q in study["eps"][str(c)]) for c in cs]
+    d.semilogy(
+        xs,
+        [max(e, 1e-12) for e in eps],
+        "^-",
+        color=COLORS["text"],
+        label="stock-eps rel. error (fp32)",
+    )
+    d.set_ylabel("fraction / relative error")
+    d.legend(fontsize=8)
+    for ax in axes:
+        ax.axvline(chosen, color=INK, ls="--", lw=1)
+        ax.set_xticks(xs, labels)
+        ax.set_xlabel("c")
+        ax.grid(True, which="both")
+    fig.suptitle(f"choosing c ({variant}): dashed line = chosen c")
+    return save(fig, out, f"{variant}_c_sweep")
+
+
+def font(size: int):
+    try:
+        return ImageFont.truetype("DejaVuSans.ttf", size)
+    except OSError:
+        return ImageFont.load_default(size)
+
+
+def label(img: Image.Image, text: str) -> Image.Image:
+    img = img.resize((PANEL, PANEL), Image.LANCZOS).convert("RGB")
+    d = ImageDraw.Draw(img)
+    f = font(20)
+    w = d.textlength(text, font=f)
+    d.rectangle((0, 0, w + 16, 32), fill=(0, 0, 0))
+    d.text((8, 5), text, fill=(255, 255, 255), font=f)
+    return img
+
+
+def triptych(paths: list[tuple[Path, str]], dest: Path) -> bool:
+    """Labelled panels side by side as webp; False when a panel is missing."""
+    if not all(p.is_file() for p, _ in paths):
+        return False
+    panels = [label(Image.open(p), t) for p, t in paths]
+    out = Image.new("RGB", (PANEL * len(panels), PANEL))
+    for i, p in enumerate(panels):
+        out.paste(p, (i * PANEL, 0))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    out.save(dest, "WEBP", quality=88, method=6)
+    return True
+
+
+def lpips_of(q: dict, runtime: str, name: str, key: str) -> float | None:
+    rows = q.get(runtime, {}).get("vs_fp32", {}).get(name, {}).get("rows", [])
+    return next((r["lpips"] for r in rows if r["key"] == key), None)
+
+
+def gallery(variant: str, quality: dict, runs: Path, out: Path) -> list[dict]:
+    """fp16-fixed | official bf16 | fp32 per runtime, prompt and seed; LoRA pairs."""
+    made = []
+    dirs = {
+        "kohakumoss": runs / "quality" / variant / "images" / "kohakumoss",
+        "diffusers": runs / "quality" / variant / "images" / "diffusers",
+        "comfyui": runs / "comfy" / variant,
+    }
+    for rt, d in dirs.items():
+        for p in range(len(quality["prompts"])):
+            for s in quality["seeds"]:
+                key = f"p{p}_s{s}"
+                lf = lpips_of(quality, rt, "fix_fp16", key)
+                lb = lpips_of(quality, rt, "bf16", key)
+                tf = "fp16-fixed" + (f"  LPIPS {lf:.3f}" if lf is not None else "")
+                tb = "official bf16" + (f"  LPIPS {lb:.3f}" if lb is not None else "")
+                dest = out / "images" / "gallery" / f"{variant}_{rt}_{key}.webp"
+                ok = triptych(
+                    [
+                        (d / f"fix_fp16_{key}.png", tf),
+                        (d / f"bf16_{key}.png", tb),
+                        (d / f"fp32_{key}.png", "fp32 reference"),
+                    ],
+                    dest,
+                )
+                if ok:
+                    made.append(
+                        {
+                            "runtime": rt,
+                            "key": key,
+                            "file": str(dest.relative_to(out)),
+                            "lpips_fix": lf,
+                            "lpips_bf16": lb,
+                        }
+                    )
+        for i in range(4):
+            key = f"p0_s{quality['seeds'][0]}"
+            if not (d / f"bf16_lora{i}_{key}.png").is_file():
+                break
+            for p in range(len(quality["prompts"])):
+                key = f"p{p}_s{quality['seeds'][0]}"
+                dest = out / "images" / "gallery" / f"{variant}_{rt}_lora{i}_{key}.webp"
+                if triptych(
+                    [
+                        (d / f"fix_fp16_lora{i}_{key}.png", "fp16-fixed + LoRA"),
+                        (d / f"bf16_lora{i}_{key}.png", "official bf16 + LoRA"),
+                        (d / f"bf16_{key}.png", "official bf16, no LoRA"),
+                    ],
+                    dest,
+                ):
+                    made.append(
+                        {
+                            "runtime": rt,
+                            "key": key,
+                            "lora": i,
+                            "file": str(dest.relative_to(out)),
+                        }
+                    )
+    return made
+
+
+def failure(variant: str, runs: Path, out: Path) -> list[str]:
+    """Plain fp16 on the official weights next to bf16 and the fixed fp16, prompt 0."""
+    d = runs / "study" / variant / "images"
+    c = json.loads((runs / "study" / variant / "report.json").read_text())["probe"][
+        "chosen_c"
+    ]
+    made = []
+    for p in range(2):
+        dest = out / "images" / f"{variant}_plain_fp16_p{p}.webp"
+        if triptych(
+            [
+                (d / f"official_fp16_p{p}.png", "official weights, fp16"),
+                (d / f"official_bf16_p{p}.png", "official weights, bf16"),
+                (d / f"fix_c{round(1 / c)}_p{p}.png", "fp16-fixed, fp16"),
+            ],
+            dest,
+        ):
+            made.append(str(dest.relative_to(out)))
+    return made
+
+
+def sweep_strip(variant: str, study: dict, runs: Path, out: Path) -> list[str]:
+    """Prompt 0 at every swept c next to fp32."""
+    d = runs / "study" / variant / "images"
+    made = []
+    panels = [
+        (
+            d / f"fix_c{round(1 / r['c'])}_p0.png",
+            f"c = 1/{round(1 / r['c'])}  LPIPS {r['vs_fp32'][0]['lpips']:.3f}",
+        )
+        for r in study["sweep"]
+    ]
+    panels.append((d / "fp32_p0.png", "fp32 reference"))
+    for i in range(0, len(panels), 4):
+        dest = out / "images" / f"{variant}_c_sweep_p0_{i // 4}.webp"
+        if triptych(panels[i : i + 4], dest):
+            made.append(str(dest.relative_to(out)))
+    return made
+
+
+def main() -> None:
+    check_script(globals())
+    if not RUNS or not OUT:
+        raise SystemExit("set RUNS and OUT")
+    runs, out = Path(RUNS), Path(OUT)
+    style()
+    for variant in VARIANTS:
+        study = json.loads((runs / "study" / variant / "report.json").read_text())
+        qpath = runs / "quality" / variant / "quality.json"
+        quality = json.loads(qpath.read_text()) if qpath.is_file() else {}
+        epath = runs / "export" / f"{variant}_export.json"
+        export = json.loads(epath.read_text()) if epath.is_file() else {}
+        assets = {
+            "stream": stream_chart(variant, study, out),
+            "plain": plain_chart(variant, study, out),
+            "sweep": sweep_chart(variant, study, out),
+            "plain_examples": failure(variant, runs, out),
+            "sweep_strip": sweep_strip(variant, study, runs, out),
+            "gallery": gallery(variant, quality, runs, out) if quality else [],
+        }
+        merged = {
+            "study": study,
+            "quality": quality,
+            "export": export,
+            "assets": assets,
+        }
+        rep = out / "reports" / f"{variant}_fp16_fix.json"
+        rep.parent.mkdir(parents=True, exist_ok=True)
+        rep.write_text(json.dumps(merged, indent=1), encoding="utf-8")
+        print(f"{variant}: {sum(len(v) for v in assets.values())} assets, {rep}")
+
+
+if __name__ == "__main__":
+    main()

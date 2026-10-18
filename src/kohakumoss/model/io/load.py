@@ -17,6 +17,7 @@ from kohakumoss.model.io.source import (
     CheckpointSource,
     DictSource,
     ModelKeyView,
+    checkpoint_files,
     transformer_dir,
 )
 from kohakumoss.model.numerics.fold import adopt_fold
@@ -63,12 +64,31 @@ def base_keys(cfg: MossArchConfig) -> list[str]:
 
 
 def read_fp16_fix(path: str | Path) -> dict | None:
-    """The fp16-fix record of a single-file checkpoint, if it carries one."""
+    """The fp16-fix record a checkpoint carries (a single file, or a diffusers
+    transformer dir: every shard, and the index when it has one, must hold the same
+    record), else None; a dir whose shards disagree raises ValueError."""
     path = Path(path)
-    if not path.is_file():
+    if path.is_file():
+        meta = read_safetensors_metadata(path)
+        return json.loads(meta[FP16_FIX_KEY]) if FP16_FIX_KEY in meta else None
+    if not path.is_dir():
         return None
-    meta = read_safetensors_metadata(path)
-    return json.loads(meta[FP16_FIX_KEY]) if FP16_FIX_KEY in meta else None
+    try:
+        files = checkpoint_files(path)
+    except FileNotFoundError:
+        return None
+    found = {f.name: read_safetensors_metadata(f).get(FP16_FIX_KEY) for f in files}
+    index = transformer_dir(path) / INDEX
+    if index.is_file():
+        meta = json.loads(index.read_text(encoding="utf-8")).get("metadata", {})
+        if FP16_FIX_KEY in meta:
+            found[INDEX] = meta[FP16_FIX_KEY]
+    records = set(found.values())
+    if records == {None}:
+        return None
+    if len(records) != 1:
+        raise ValueError(f"fp16-fix record differs across the files of {path}: {found}")
+    return json.loads(records.pop())
 
 
 def read_config(path: str | Path) -> dict | None:
