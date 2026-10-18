@@ -1,8 +1,5 @@
-"""json -> text rendering for structured captions (field order, field dropout).
-
-`make_renderer` selects the format and the dropout rule once; rendering a caption
-then runs only the selected functions.
-"""
+"""json -> text rendering for structured captions (field order, field dropout); the
+format and dropout are bound once by `make_renderer`."""
 
 import json
 from dataclasses import dataclass

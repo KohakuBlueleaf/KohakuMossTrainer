@@ -7,7 +7,6 @@ from kohakumoss_data.sources import (
     kohya,
     moss_shard,
     parquet,
-    synthetic,
     webdataset,
 )
 
@@ -18,6 +17,5 @@ __all__ = [
     "kohya",
     "moss_shard",
     "parquet",
-    "synthetic",
     "webdataset",
 ]

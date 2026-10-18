@@ -19,12 +19,13 @@ from kohakumoss_data.types import (
 
 
 def build_loader(
-    cfg: DataConfig, rank: int = 0, world: int = 1, transform=None
+    cfg: DataConfig, rank: int = 0, world: int = 1, transform=None, writer: bool = True
 ) -> Loader:
     """The StatefulLoader for `cfg` on `rank` of `world`; `transform` runs on each
-    batch in the worker (see `Loader`)."""
+    batch in the worker (see `Loader`); `writer`: this process updates the catalog
+    files (one writer per run)."""
     return Loader(
-        MossDataset(cfg),
+        MossDataset(cfg, writer=writer),
         rank=rank,
         world=world,
         num_workers=cfg.num_workers,

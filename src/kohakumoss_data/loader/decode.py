@@ -1,13 +1,12 @@
-"""Image decode: EXIF orientation, alpha compositing, crop then resize to the target.
-
-`Decoder` resolves the background colour and the resampling filter once; per image
-only the image's own properties (mode, size, the plan's flip) decide what runs.
-"""
+"""Image decode: EXIF orientation, crop, alpha compositing, resize to the target; the
+background colour and resampling filter are resolved once per `Decoder`."""
 
 import io
 
 import numpy as np
 from PIL import Image, ImageOps
+
+from kohakumoss_data.format.header import has_alpha
 
 BACKGROUNDS = {"white": (255, 255, 255), "black": (0, 0, 0), "gray": (127, 127, 127)}
 RESAMPLE = {
@@ -16,19 +15,18 @@ RESAMPLE = {
     "bilinear": Image.Resampling.BILINEAR,
     "box": Image.Resampling.BOX,
 }
-ALPHA_MODES = ("RGBA", "LA", "PA")
 
 
-def background_rgb(spec) -> tuple[int, int, int]:
+def background_rgb(background) -> tuple[int, int, int]:
     """`white | black | gray | (r, g, b)` -> RGB tuple."""
-    if isinstance(spec, str):
-        return BACKGROUNDS[spec]
-    return tuple(int(c) for c in spec)
+    if isinstance(background, str):
+        return BACKGROUNDS[background]
+    return tuple(int(c) for c in background)
 
 
 def to_rgb(img: Image.Image, background: tuple[int, int, int]) -> Image.Image:
     """RGB image; transparent pixels are composited over `background`."""
-    if img.mode in ALPHA_MODES or (img.mode == "P" and "transparency" in img.info):
+    if has_alpha(img):
         rgba = img.convert("RGBA")
         base = Image.new("RGBA", rgba.size, background + (255,))
         return Image.alpha_composite(base, rgba).convert("RGB")
@@ -50,8 +48,8 @@ class Decoder:
         flip: bool,
     ) -> np.ndarray:
         with Image.open(io.BytesIO(data)) as raw:
-            img = to_rgb(ImageOps.exif_transpose(raw), self.background)
-        img = img.crop(crop_ltrb)
+            ImageOps.exif_transpose(raw, in_place=True)
+            img = to_rgb(raw.crop(crop_ltrb), self.background)
         th, tw = target_hw
         if img.size != (tw, th):
             img = img.resize((tw, th), self.resample, reducing_gap=3.0)

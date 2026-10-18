@@ -1,10 +1,6 @@
-"""MossDataset: sources + catalog + captions + planner + caches -> HostBatch per index.
-
-Everything fixed by the config (cache modes, text-length rule, text-dropout rule,
-decoder, write-back) is bound at construction; `materialize` only calls the bound
-functions. What still branches per batch is data: the seeded dropout draw and, in
-online mode, whether the cache actually holds a key.
-"""
+"""MossDataset: sources + catalog + captions + planner + caches -> HostBatch per index;
+the cache modes, text lengths, text dropout, decoder and write-back are bound at
+construction."""
 
 import math
 import os
@@ -13,33 +9,119 @@ from functools import partial
 import numpy as np
 import torch
 
+from kohakumoss_common.calls import nothing
+from kohakumoss_common.log import get_logger
+from kohakumoss_common.registry import build
+from kohakumoss_data.cache.settings import offline_miss, record
 from kohakumoss_data.cache.store import LengthTable
 from kohakumoss_data.cache.tensor_cache import LatentCache, TextCache
 from kohakumoss_data.caption.template import build_template
-from kohakumoss_data.config import DataConfig, resolved_cache_dir
+from kohakumoss_data.catalog.vault import is_catalog_vault
+from kohakumoss_data.config import (
+    TOKEN_BUDGETS,
+    DataConfig,
+    catalog_cache_dir,
+    encoder_key_id,
+    resolved_cache_dir,
+)
 from kohakumoss_data.format.catalog import Catalog, read_catalog
 from kohakumoss_data.loader.decode import Decoder
-from kohakumoss_data.registry import PLANNERS, SOURCES, build
+from kohakumoss_data.registry import PLANNERS, SOURCES
 from kohakumoss_data.resolution.geometry import Geometry
-from kohakumoss_data.resolution.item import keep_indices
+from kohakumoss_data.resolution.keep import keep_indices
+from kohakumoss_data.scan.paths import scan_path
+from kohakumoss_data.scan.runner import scan_catalog
+from kohakumoss_data.scan.walk import rows_of
 from kohakumoss_data.seeds import rng_of
 from kohakumoss_data.types import HostBatch, PlanItem
 
-DATASET_KEYS = ("weight", "caption", "loss_weight", "catalog")
+DATASET_KEYS = ("weight", "caption", "loss_weight", "catalog", "import_to")
+log = get_logger(__name__)
 
 
-def build_source(spec: dict):
+def source_kwargs(entry: dict) -> dict:
+    """A dataset entry without its dataset-level keys: `source` + its arguments."""
+    return {k: v for k, v in entry.items() if k not in DATASET_KEYS}
+
+
+def build_source(entry: dict):
     """A source from a dataset entry (the dataset-level keys are stripped)."""
-    kwargs = {k: v for k, v in spec.items() if k not in DATASET_KEYS}
-    return build(kwargs, SOURCES, key="source")
+    return build(source_kwargs(entry), SOURCES, key="source")
 
 
-def scan_source(spec: dict, source) -> Catalog:
-    """Rows of one dataset entry, from its prebuilt `catalog` file when given."""
-    path = spec.get("catalog")
-    if path and os.path.exists(path):
+def scan_source(entry: dict, source, cfg: DataConfig, writer: bool = True) -> Catalog:
+    """The catalog of one dataset entry: its prebuilt `catalog` file, the source's own
+    catalog (moss_shard), or a scan through the entry's catalog file in the catalog
+    cache dir (this process writes it when `writer`; uncached without a cache dir)."""
+    path = entry.get("catalog")
+    if path and is_catalog_vault(path):
         return read_catalog(path)
-    return Catalog(list(source.scan()))
+    if path and os.path.exists(path) and getattr(source, "walk", None) is not None:
+        log.warning(
+            f"catalog {path} has another layout: the dataset is scanned instead"
+        )
+    elif path and os.path.exists(path):
+        return read_catalog(path)
+    own = getattr(source, "catalog", None)
+    if own is not None:
+        return own()
+    if getattr(source, "walk", None) is None:
+        return Catalog(list(source.scan()))
+    kwargs = source_kwargs(entry)
+    cache_dir = catalog_cache_dir(cfg)
+    target = scan_path(cache_dir, kwargs) if cache_dir else None
+    return scan_catalog(
+        source,
+        target,
+        writer,
+        cfg.data_rescan,
+        cfg.data_scan_workers,
+        cfg.data_wait,
+        kwargs["source"],
+    )
+
+
+def first_captions(
+    entry: dict, caption: dict, n: int = 1, seed: int = 0, limit: int = 64
+) -> list[str]:
+    """The first `n` non-empty rendered captions (variant 0) among the first `limit`
+    rows of dataset entry `entry`, reading only those rows."""
+    source = build_source(entry)
+    template = build_template(entry.get("caption", caption))
+    if getattr(source, "catalog", None) is not None:
+        catalog = source.catalog()
+        rows = (catalog[i] for i in range(len(catalog)))
+    elif getattr(source, "walk", None) is not None:
+        rows = rows_of(source.walk())
+    else:
+        rows = source.scan()
+    out = []
+    for i, row in enumerate(rows):
+        text = template.render(row, rng_of("caption", seed, i, 0))
+        if text:
+            out.append(text)
+        if len(out) == n or i + 1 == limit:
+            break
+    return out
+
+
+def all_chars(catalog: Catalog) -> np.ndarray:
+    """Every caption-source char count summed (templates without `estimate_chars`)."""
+    return sum(catalog.chars.values())
+
+
+def text_estimate(cfg: DataConfig, catalog: Catalog, templates: list) -> np.ndarray:
+    """Estimated text tokens per row (int64 [N]) from the caption-source char columns:
+    each row's dataset template estimates its caption length, then
+    ceil(chars / text_chars_per_token) + overhead, capped at max_text_tokens."""
+    chars = np.zeros(len(catalog), dtype=np.int64)
+    for k, template in enumerate(templates):
+        rows = catalog.source == k
+        estimate = getattr(template, "estimate_chars", all_chars)
+        chars[rows] = estimate(catalog)[rows]
+    per = np.float32(cfg.text_chars_per_token)
+    tokens = np.ceil(chars.astype(np.float32) / per).astype(np.int64)
+    return np.minimum(tokens + cfg.text_overhead_tokens, cfg.max_text_tokens)
 
 
 def draw_drop(seed: int, p: float, index: int, rank: int, slot: int) -> bool:
@@ -51,42 +133,38 @@ def never_drop(index: int, rank: int, slot: int) -> bool:
     return False
 
 
-def _ignore(batch, value) -> None:
-    return None
-
-
-def _missing(what: str, script: str, found: list) -> KeyError:
-    n = sum(t is None for t in found)
-    return KeyError(
-        f"{n} {what} missing from the offline cache; run {script} "
-        "with the same data config"
-    )
+def _first_missing(found: list) -> int:
+    return next(i for i, t in enumerate(found) if t is None)
 
 
 class MossDataset:
-    """Pure function `materialize(index, rank, world) -> HostBatch`; picklable."""
+    """Pure function `materialize(index, rank, world) -> HostBatch`; picklable.
+    `writer`: this process updates the catalog files (the single writer; a multi-rank
+    trainer passes it on rank 0 only, the others wait and read)."""
 
-    def __init__(self, cfg: DataConfig):
+    def __init__(self, cfg: DataConfig, writer: bool = True):
         if not cfg.datasets:
             raise ValueError("DATASETS is empty")
         self.cfg = cfg
-        self.sources = [build_source(spec) for spec in cfg.datasets]
+        self.sources = [build_source(entry) for entry in cfg.datasets]
         parts = [
-            scan_source(spec, src) for spec, src in zip(cfg.datasets, self.sources)
+            scan_source(entry, src, cfg, writer)
+            for entry, src in zip(cfg.datasets, self.sources)
         ]
-        weights = [float(spec.get("weight", 1.0)) for spec in cfg.datasets]
+        weights = [float(entry.get("weight", 1.0)) for entry in cfg.datasets]
         self.catalog = Catalog.concat(parts, weights)
         self.templates = [
-            build_template(spec.get("caption", cfg.caption)) for spec in cfg.datasets
+            build_template(entry.get("caption", cfg.caption)) for entry in cfg.datasets
         ]
+        self._text_est = text_estimate(cfg, self.catalog, self.templates)
         self.loss_weight = np.array(
-            [float(spec.get("loss_weight", 1.0)) for spec in cfg.datasets]
+            [float(entry.get("loss_weight", 1.0)) for entry in cfg.datasets]
         )
         cache_dir = resolved_cache_dir(cfg)
         self.latents = LatentCache(
             os.path.join(cache_dir, "latents.db") if cache_dir else None,
             cfg.latent_cache,
-            cfg.latent_encoder_id,
+            encoder_key_id(cfg.latent_encoder_id, cfg.latent_encoder_spec),
             cfg.cache_dtype,
             str(cfg.background),
             cfg.resample,
@@ -95,7 +173,7 @@ class MossDataset:
         self.texts = TextCache(
             os.path.join(cache_dir, "text.db") if cache_dir else None,
             cfg.text_cache,
-            cfg.text_encoder_id,
+            encoder_key_id(cfg.text_encoder_id, cfg.text_encoder_spec),
             cfg.cache_dtype,
         )
         self.geometry = Geometry(
@@ -107,6 +185,9 @@ class MossDataset:
             latent_factor=cfg.latent_factor,
         )
         self.decode = Decoder(cfg.background, cfg.resample)
+        for kind, mode in (("latents", cfg.latent_cache), ("text", cfg.text_cache)):
+            if mode == "online":
+                record(cfg, kind)
         offline = cfg.text_cache == "offline"
         self._text_lengths = self.texts.lengths() if offline else LengthTable()
         self._bind()
@@ -114,14 +195,17 @@ class MossDataset:
 
     def _bind(self) -> None:
         cfg = self.cfg
-        if cfg.token_budget not in ("estimate", "exact"):
-            raise ValueError("token_budget must be 'estimate' or 'exact'")
+        if cfg.token_budget not in TOKEN_BUDGETS:
+            raise ValueError(f"token_budget must be one of {TOKEN_BUDGETS}")
         if cfg.token_budget == "exact" and cfg.text_cache != "offline":
             raise ValueError("token_budget='exact' needs text_cache='offline'")
         self.text_len = {
-            ("estimate", "off"): self._text_len_estimate,
-            ("estimate", "online"): self._text_len_estimate,
-            ("estimate", "offline"): self._text_len_cached,
+            ("estimate", "off"): self._text_len_columns,
+            ("estimate", "online"): self._text_len_columns,
+            ("estimate", "offline"): self._text_len_columns,
+            ("render", "off"): self._text_len_estimate,
+            ("render", "online"): self._text_len_estimate,
+            ("render", "offline"): self._text_len_cached,
             ("exact", "offline"): self._text_len_exact,
         }[(cfg.token_budget, cfg.text_cache)]
         self._drop = (
@@ -139,8 +223,8 @@ class MossDataset:
         }[cfg.text_cache]
         latent_online = cfg.latent_cache == "online"
         text_online = cfg.text_cache == "online"
-        self._put_latents = self._write_latents if latent_online else _ignore
-        self._put_text = self._write_text if text_online else _ignore
+        self._put_latents = self._write_latents if latent_online else nothing
+        self._put_text = self._write_text if text_online else nothing
 
     def _planner(self):
         cfg = self.cfg
@@ -166,9 +250,41 @@ class MossDataset:
         template = self.templates[int(self.catalog.source[row_id])]
         return template.render(row, rng_of("caption", self.cfg.seed, row_id, variant))
 
+    def _live_text(self) -> np.ndarray:
+        return self._text_est[np.asarray(self.catalog.live, dtype=bool)]
+
+    def text_tokens_max(self) -> int:
+        """The longest caption of the live rows in estimated text tokens (the estimate
+        columns: chars / text_chars_per_token + overhead, capped at max_text_tokens)."""
+        est = self._live_text()
+        return int(est.max()) if len(est) else 0
+
+    def text_tokens_min(self) -> int:
+        """The shortest text of the live rows in estimated text tokens (the estimate
+        columns the token budget packs by), the dropped caption's ("") included when
+        caption dropout is on; 0 for an empty catalog."""
+        est = self._live_text()
+        mins = [int(est.min())] if len(est) else []
+        if self.cfg.text_drop > 0:
+            mins.append(self.estimate_text_tokens(""))
+        return min(mins, default=0)
+
+    def image_tokens_min(self) -> int:
+        """The smallest planned image grid of the live rows in latent tokens (the
+        resolution planner's per-row targets; 0 for an empty catalog)."""
+        live = np.asarray(self.catalog.live, dtype=bool)
+        grids = [
+            self.geometry.tokens(t) for t, ok in zip(self.planner.targets, live) if ok
+        ]
+        return min(grids, default=0)
+
     def estimate_text_tokens(self, caption: str) -> int:
+        """Estimated text tokens of a rendered caption."""
         n = math.ceil(len(caption) / self.cfg.text_chars_per_token)
         return min(n + self.cfg.text_overhead_tokens, self.cfg.max_text_tokens)
+
+    def _text_len_columns(self, row_id: int, variant: int) -> int:
+        return int(self._text_est[row_id])
 
     def _text_len_estimate(self, row_id: int, variant: int) -> int:
         return self.estimate_text_tokens(self.caption(row_id, variant))
@@ -189,10 +305,12 @@ class MossDataset:
         return known
 
     def open(self, row_id: int) -> bytes:
+        """The encoded image bytes of row `row_id`."""
         source = self.sources[int(self.catalog.source[row_id])]
-        return source.open(self.catalog[row_id].locator)
+        return source.open(self.catalog.locator(row_id))
 
     def pixels(self, item: PlanItem) -> np.ndarray:
+        """uint8 [H, W, 3] of `item`: decoded, cropped, resized, flipped."""
         return self.decode(
             self.open(item.row_id), item.crop_ltrb, item.target_hw, item.flip
         )
@@ -243,7 +361,14 @@ class MossDataset:
     def _latents_offline(self, batch: HostBatch, items) -> None:
         found = self._latent_lookup(batch, items)
         if any(t is None for t in found):
-            raise _missing("latents", "scripts/data/cache_latents.py", found)
+            it = items[_first_missing(found)]
+            row = self.catalog[it.row_id]
+            first = (
+                f"row {it.row_id} {row.locator} {row.w}x{row.h} -> target "
+                f"{it.target_hw[1]}x{it.target_hw[0]} crop {it.crop_ltrb} flip {it.flip}"
+            )
+            n = sum(t is None for t in found)
+            raise offline_miss(self.cfg, "latents", n, first)
         batch.latents = self._gather(found, batch.img_keep)
 
     def _latents_online(self, batch: HostBatch, items) -> None:
@@ -270,7 +395,10 @@ class MossDataset:
     def _text_offline(self, batch: HostBatch, captions: list[str]) -> None:
         found = self._text_lookup(batch, captions)
         if any(t is None for t in found):
-            raise _missing("text embeddings", "scripts/data/cache_text.py", found)
+            caption = captions[_first_missing(found)]
+            first = f"caption {caption[:80]!r}"
+            n = sum(t is None for t in found)
+            raise offline_miss(self.cfg, "text", n, first)
         self._set_text(batch, found)
 
     def _text_online(self, batch: HostBatch, captions: list[str]) -> None:

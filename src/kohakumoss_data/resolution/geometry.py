@@ -1,13 +1,14 @@
-"""Target-size and crop rules shared by every planner.
-
-Sizes are (h, w) in pixels, multiples of `step`; crop boxes are (l, t, r, b) in source
-pixels and have the target's aspect ratio (the box is cropped, then resized).
-"""
+"""Target sizes and crop boxes shared by every planner: sizes are (h, w) pixels,
+multiples of `step`; crop boxes are (l, t, r, b) source pixels with the target's aspect
+(cropped, then resized)."""
 
 import math
 from dataclasses import dataclass
 
 import numpy as np
+
+# Pixels per latent token along each side: the VAE's /8 times the 2x2 patchify.
+LATENT_FACTOR = 16
 
 
 @dataclass(frozen=True)
@@ -16,11 +17,11 @@ class Geometry:
     `center` or `random`; `latent_factor` maps pixels to latent tokens."""
 
     area: int = 1024 * 1024
-    step: int = 16
+    step: int = LATENT_FACTOR
     aspect_range: tuple[float, float] = (0.25, 4.0)
     upscale: str = "never"
     crop: str = "center"
-    latent_factor: int = 16
+    latent_factor: int = LATENT_FACTOR
 
     def __post_init__(self):
         if self.step % self.latent_factor:
@@ -31,6 +32,7 @@ class Geometry:
             raise ValueError(f"crop must be center|random, got {self.crop}")
 
     def tokens(self, hw: tuple[int, int]) -> int:
+        """Latent tokens of a (h, w) pixel size."""
         return (hw[0] // self.latent_factor) * (hw[1] // self.latent_factor)
 
     def clamp_aspect(self, w: int, h: int) -> tuple[int, int]:
@@ -106,7 +108,7 @@ class Geometry:
         return left, top, left + cw, top + ch
 
     def box_fn(self):
-        """The crop rule selected by `crop`: `center_box` or `random_box`."""
+        """The box function selected by `crop`: `center_box` or `random_box`."""
         return {"center": self.center_box, "random": self.random_box}[self.crop]
 
 

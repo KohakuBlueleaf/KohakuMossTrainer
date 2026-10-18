@@ -1,122 +1,56 @@
-"""Catalog: columnar record table (in memory) and its KohakuVault `catalog.db` form.
-
-Row weights are float32: column `weight32`, 4 little-endian bytes per row.
-"""
+"""Catalog files: `write_catalog` writes the catalog layout (kohakumoss_data.catalog);
+`read_catalog` opens one lazily. Only this layout is read: the scan cache rebuilds a
+file of another layout by a rescan; a prebuilt one (a moss_shard dataset's catalog.db)
+is an error naming the import command (REIMPORT)."""
 
 import os
-import struct
 from collections.abc import Iterable
-from dataclasses import fields
 
-import kohakuvault as kv
-import numpy as np
-
+from kohakumoss_data.catalog.table import Catalog, open_catalog
+from kohakumoss_data.catalog.vault import NO_STAMP, CatalogVault, is_catalog_vault
 from kohakumoss_data.types import CatalogRow
 
-COLUMNS = {
-    "locator": "str:utf8",
-    "w": "i64",
-    "h": "i64",
-    "has_alpha": "i64",
-    "group": "str:utf8",
-    "weight32": "bytes:4",
-    "tags": "msgpack",
-    "caption_nl": "msgpack",
-    "artist": "msgpack",
-    "rating": "msgpack",
-    "json": "msgpack",
-    "extra": "msgpack",
-}
-WEIGHT = struct.Struct("<f")
+__all__ = ["REIMPORT", "Catalog", "read_catalog", "remove_vault", "write_catalog"]
+CHUNK = 4096
+REIMPORT = (
+    "import the source again with scripts/data/catalog_build.py (import_to in its "
+    "dataset entry)"
+)
 
 
-def _encode(name: str, row: CatalogRow):
-    match name:
-        case "has_alpha":
-            return int(row.has_alpha)
-        case "weight32":
-            return WEIGHT.pack(row.weight)
-        case _:
-            return getattr(row, name)
-
-
-def _weights(vault: kv.ColumnVault) -> list[float]:
-    """Row weights; a catalog written without `weight32` holds them in `weight`."""
-    names = {column[0] for column in vault.list_columns()}
-    if "weight32" in names:
-        raw = b"".join(vault["weight32"])
-        return np.frombuffer(raw, dtype="<f4").tolist()
-    return [float(w) for w in vault["weight"]]
-
-
-class Catalog:
-    """Rows of one or more sources; `source[i]` indexes `sources`, ids are positions.
-    `weight` is float32 [N]."""
-
-    def __init__(self, rows: list[CatalogRow], source: np.ndarray | None = None):
-        self.rows = rows
-        for i, row in enumerate(rows):
-            row.id = i
-        self.w = np.array([r.w for r in rows], dtype=np.int64)
-        self.h = np.array([r.h for r in rows], dtype=np.int64)
-        self.weight = np.array([r.weight for r in rows], dtype=np.float32)
-        self.source = np.zeros(len(rows), dtype=np.int64) if source is None else source
-
-    def __len__(self) -> int:
-        return len(self.rows)
-
-    def __getitem__(self, index: int) -> CatalogRow:
-        return self.rows[index]
-
-    @classmethod
-    def concat(cls, parts: list["Catalog"], weights: list[float]) -> "Catalog":
-        """Join catalogs; part k's row weights are multiplied by `weights[k]`."""
-        rows, source = [], []
-        for k, (part, scale) in enumerate(zip(parts, weights)):
-            for row in part.rows:
-                row.weight = row.weight * scale
-                rows.append(row)
-                source.append(k)
-        return cls(rows, np.array(source, dtype=np.int64))
-
-
-def write_catalog(path: str, rows: Iterable[CatalogRow]) -> int:
-    """Write rows to a ColumnVault file at `path` (replacing it); returns the row count."""
+def remove_vault(path: str) -> None:
+    """Delete a vault file and its SQLite sidecars."""
     for suffix in ("", "-wal", "-shm"):
         if os.path.exists(path + suffix):
             os.remove(path + suffix)
-    vault = kv.ColumnVault(path)
-    cols = {name: vault.ensure(name, dtype) for name, dtype in COLUMNS.items()}
-    buffers: dict[str, list] = {name: [] for name in COLUMNS}
-    count = 0
+
+
+def write_catalog(path: str, rows: Iterable[CatalogRow]) -> int:
+    """Write rows to a fresh catalog file at `path` (single writer); returns the count."""
+    remove_vault(path)
+    vault = CatalogVault(path, write=True)
+    count, chunk = 0, []
     for row in rows:
-        for name in COLUMNS:
-            buffers[name].append(_encode(name, row))
-        count += 1
-        if count % 4096 == 0:
-            _flush(cols, buffers)
-    _flush(cols, buffers)
-    vault.checkpoint()
+        chunk.append(row)
+        if len(chunk) == CHUNK:
+            count += _append(vault, chunk)
+            chunk = []
+    count += _append(vault, chunk)
+    vault.commit(1, "catalog")
     return count
 
 
-def _flush(cols, buffers) -> None:
-    for name, values in buffers.items():
-        if values:
-            cols[name].extend(values)
-            values.clear()
+def _append(vault: CatalogVault, rows: list[CatalogRow]) -> int:
+    if rows:
+        vault.append(rows, [r.locator for r in rows], [NO_STAMP] * len(rows))
+    return len(rows)
 
 
 def read_catalog(path: str) -> Catalog:
-    """Load a `catalog.db` written by `write_catalog`."""
-    vault = kv.ColumnVault(path)
-    data = {name: list(vault[name]) for name in COLUMNS if name != "weight32"}
-    data["weight"] = _weights(vault)
-    names = {f.name for f in fields(CatalogRow)}
-    rows = []
-    for i in range(len(data["locator"])):
-        values = {name: data[name][i] for name in data if name in names}
-        values["has_alpha"] = bool(values["has_alpha"])
-        values["extra"] = values["extra"] or {}
-        rows.append(CatalogRow(id=i, **values))
-    return Catalog(rows)
+    """The catalog file at `path`, opened lazily; FileNotFoundError when it is absent,
+    ValueError naming REIMPORT when it has another layout."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"no catalog file {path}")
+    if not is_catalog_vault(path):
+        raise ValueError(f"{path} is not a catalog file of this layout; {REIMPORT}")
+    return open_catalog(path)

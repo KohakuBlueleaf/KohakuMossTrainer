@@ -36,10 +36,5 @@ NORMALIZERS = {
 
 
 def normalizer(underscores: bool, do_unescape: bool):
-    """The tag normaliser for (underscore -> space, unescape), selected once."""
+    """The tag normaliser for (underscore -> space, unescape)."""
     return NORMALIZERS[(bool(underscores), bool(do_unescape))]
-
-
-def normalize(tag: str, underscores: bool, do_unescape: bool) -> str:
-    """Optional underscore -> space and unescaping of one tag."""
-    return normalizer(underscores, do_unescape)(tag)

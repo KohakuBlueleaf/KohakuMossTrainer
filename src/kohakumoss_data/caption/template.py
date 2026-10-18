@@ -1,17 +1,22 @@
-"""Caption templates: CatalogRow + seeded generator -> caption string.
-
-Every option (normaliser, dropout, shuffle, json format) is selected into a bound
-function at construction; `render` only calls them. Only the seeded draws vary.
-"""
+"""Caption templates: CatalogRow + seeded generator -> caption string; options
+(normaliser, dropout, shuffle, json format) are bound at construction."""
 
 from functools import partial
 
 import numpy as np
 
+from kohakumoss_common.registry import build
 from kohakumoss_data.caption.json_text import make_renderer
 from kohakumoss_data.caption.tags import normalizer
-from kohakumoss_data.registry import CAPTIONS, build
+from kohakumoss_data.registry import CAPTIONS
 from kohakumoss_data.types import CatalogRow
+
+FIELD_CHARS = {
+    "tags": "tags_chars",
+    "caption_nl": "nl_chars",
+    "artist": "artist_chars",
+    "rating": "rating_chars",
+}
 
 
 def _keep_values(row: CatalogRow, keep: tuple[str, ...]) -> list[str]:
@@ -26,6 +31,23 @@ def _keep_values(row: CatalogRow, keep: tuple[str, ...]) -> list[str]:
             case _:
                 values.append(str(value))
     return values
+
+
+def _field_chars(catalog, name: str) -> np.ndarray:
+    """Char-count column of a row field (0 for a field without one)."""
+    column = FIELD_CHARS.get(name)
+    if column is None:
+        return np.zeros(len(catalog), dtype=np.int64)
+    return catalog.chars[column]
+
+
+def _keep_chars(catalog, keep: tuple[str, ...], sep: int) -> np.ndarray:
+    """Chars of the keep fields, each followed by a `sep`-char separator when present."""
+    out = np.zeros(len(catalog), dtype=np.int64)
+    for name in keep:
+        chars = _field_chars(catalog, name)
+        out += chars + sep * (chars > 0)
+    return out
 
 
 def _all(items: list, rng: np.random.Generator) -> list:
@@ -91,6 +113,7 @@ class TagTemplate:
         return fixed, groups
 
     def tag_list(self, row: CatalogRow, rng: np.random.Generator) -> list[str]:
+        """The caption's tags in order, normalised."""
         fixed, groups = self._split(list(row.tags or []))
         kept = [self._order(self._tags(g, rng), rng) for g in self._groups(groups, rng)]
         body = [t for g in self._order(kept, rng) for t in g]
@@ -99,6 +122,13 @@ class TagTemplate:
 
     def render(self, row: CatalogRow, rng: np.random.Generator) -> str:
         return self.prefix + self.joiner.join(self.tag_list(row, rng)) + self.suffix
+
+    def estimate_chars(self, catalog) -> np.ndarray:
+        """Caption chars per row from the char columns, no dropout (an upper bound
+        up to separator width)."""
+        head = len(self.prefix) + len(self.suffix)
+        keep = _keep_chars(catalog, self.keep, len(self.joiner))
+        return head + keep + catalog.chars["tags_chars"]
 
 
 @CAPTIONS.register("nl")
@@ -117,6 +147,11 @@ class NaturalTemplate:
         lead = (", ".join(head) + ". ") if head else ""
         return lead + row.caption_nl
 
+    def estimate_chars(self, catalog) -> np.ndarray:
+        nl = catalog.chars["nl_chars"]
+        own = _keep_chars(catalog, self.keep, 2) + nl
+        return np.where(nl > 0, own, self.fallback.estimate_chars(catalog))
+
 
 @CAPTIONS.register("mix")
 class MixTemplate:
@@ -133,6 +168,11 @@ class MixTemplate:
         if row.caption_nl and rng.random() < self.p_nl:
             return self.nl.render(row, rng)
         return self.tags.render(row, rng)
+
+    def estimate_chars(self, catalog) -> np.ndarray:
+        return np.maximum(
+            self.nl.estimate_chars(catalog), self.tags.estimate_chars(catalog)
+        )
 
 
 @CAPTIONS.register("json")
@@ -158,7 +198,15 @@ class JsonTemplate:
                 data.setdefault(name, value)
         return self._render(data, rng)
 
+    def estimate_chars(self, catalog) -> np.ndarray:
+        """The json dump plus each listed field with its `key: ` label."""
+        out = catalog.chars["json_chars"].copy()
+        for name in self.fields:
+            chars = _field_chars(catalog, name)
+            out += chars + (len(name) + 3) * (chars > 0)
+        return out
 
-def build_template(spec: dict | str | None):
+
+def build_template(caption: dict | str | None):
     """`{"template": name, **kwargs}` -> template instance (default: tags)."""
-    return build(spec or {"template": "tags"}, CAPTIONS, "template")
+    return build(caption or {"template": "tags"}, CAPTIONS, "template")

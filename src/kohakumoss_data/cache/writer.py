@@ -1,44 +1,45 @@
 """CacheWriter: the trainer's `on_encoded(hb, latents, text, text_len)` hook for online
-caches. It splits a batch's fresh encodings per sample, queues them, and a background
-thread writes them to the vaults; a busy vault (another rank writing) is retried with
-backoff for up to `busy_timeout` seconds.
-
-Written: latents when the batch carried `pixels` (full-grid encodings only; a kept-token
-subset is skipped), text when it carried `prompts` (a sample cut to `text_limit` is
-skipped). See docs/concepts/data.md.
-"""
+caches; a background thread writes full-value encodings to this rank's shard files
+(`<kind>.r<rank>.kv`). See docs/concepts/data.md#caches."""
 
 import queue
 import threading
-import time
 
-import kohakuvault as kv
+import torch
 from torch import Tensor
 
-from kohakumoss_data.cache.store import TensorStore
+from kohakumoss_common.devices import streamed_type
+from kohakumoss_data.cache.store import TensorStore, shard_path
 from kohakumoss_data.types import HostBatch
 
 FLUSH = "flush"
 STOP = "stop"
 
 
-def _nothing(*args) -> list:
+def _no_jobs(*args) -> list:
     return []
 
 
-class CacheWriter:
-    """Background writer for the online latent / text caches of `dataset`."""
+class _Done:
+    """A copy that finished when it was issued (host values)."""
 
-    def __init__(
-        self,
-        dataset,
-        max_pending: int = 8,
-        busy_timeout: float = 600.0,
-        store_retries: int = 4,
-    ):
+    def synchronize(self) -> None:
+        return None
+
+
+DONE = _Done()
+
+
+class CacheWriter:
+    """Background writer for the online latent / text caches of `dataset`, writing the
+    shards of `rank`; latents only at full grid, text only when not cut by
+    `text_limit`. Accelerator encodings are copied into pinned host memory on a side
+    stream when handed over; the queue holds host tensors and the copy's event only."""
+
+    def __init__(self, dataset, max_pending: int = 8, rank: int = 0):
         self._paths = {}
-        self._take_latents = _nothing
-        self._take_text = _nothing
+        self._take_latents = _no_jobs
+        self._take_text = _no_jobs
         if dataset.latents.mode == "online":
             self._paths["latent"] = (
                 dataset.latents.store.path,
@@ -48,19 +49,54 @@ class CacheWriter:
         if dataset.texts.mode == "online":
             self._paths["text"] = (dataset.texts.store.path, dataset.texts.storage)
             self._take_text = self._text_jobs
-        self.busy_timeout = busy_timeout
-        self.store_retries = store_retries
+        self.rank = rank
+        self._streams: dict = {}
         self._queue: queue.Queue = queue.Queue(maxsize=max_pending)
         self.written = 0
-        self.busy_waits = 0
         self.error: BaseException | None = None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
+    def shard(self, kind: str) -> str:
+        """The file this writer writes for `kind` ("latent" / "text")."""
+        return shard_path(self._paths[kind][0], self.rank)
+
     def __call__(self, hb: HostBatch, latents, text, text_len) -> None:
+        self.raise_error()
         jobs = self._take_latents(hb, latents) + self._take_text(hb, text, text_len)
         if jobs:
-            self._queue.put(jobs)
+            self._queue.put(self._to_host(jobs))
+
+    def _side(self, device: torch.device):
+        stream = self._streams.get(device)
+        if stream is None:
+            stream = torch.get_device_module(device).Stream(device)
+            self._streams[device] = stream
+        return stream
+
+    def _to_host(self, jobs: list) -> tuple[list, object]:
+        """(jobs with every value in host memory, the event the writer waits for):
+        accelerator values copied into pinned buffers on a side stream after the
+        current stream's work, others detached as they are."""
+        device = next((v.device for *_, v in jobs if v.device.type != "cpu"), None)
+        if device is None or not streamed_type(device.type):
+            return [(kind, key, v.detach().cpu()) for kind, key, v in jobs], DONE
+        dm = torch.get_device_module(device)
+        side = self._side(device)
+        side.wait_stream(dm.current_stream(device))
+        out = []
+        with dm.stream(side):
+            for kind, key, v in jobs:
+                if v.device.type == "cpu":
+                    out.append((kind, key, v.detach()))
+                    continue
+                host = torch.empty(v.shape, dtype=v.dtype, pin_memory=True)
+                host.copy_(v.detach(), non_blocking=True)
+                v.record_stream(side)
+                out.append((kind, key, host))
+        done = dm.Event()
+        done.record(side)
+        return out, done
 
     def _latent_jobs(self, hb: HostBatch, latents: Tensor | None) -> list:
         if hb.pixels is None or latents is None:
@@ -90,9 +126,13 @@ class CacheWriter:
             if not limit or n < limit
         ]
 
+    def _put(self, store: TensorStore, key: str, value: Tensor) -> None:
+        """Write one encoding (on the writer thread)."""
+        store.put(key, value.detach().cpu())
+
     def _run(self) -> None:
         stores = {
-            kind: TensorStore(path, storage, retries=self.store_retries)
+            kind: TensorStore(path, storage, writes=self.shard(kind))
             for kind, (path, storage) in self._paths.items()
         }
         while True:
@@ -100,47 +140,40 @@ class CacheWriter:
             try:
                 if jobs == FLUSH:
                     for store in stores.values():
-                        self._retry(store.flush)
+                        store.flush()
                 elif jobs == STOP:
                     return
                 else:
-                    for kind, key, value in jobs:
-                        cpu = value.detach().cpu()
-                        self._retry(self._put, stores[kind], key, cpu)
+                    values, done = jobs
+                    done.synchronize()
+                    for kind, key, value in values:
+                        self._put(stores[kind], key, value)
                         self.written += 1
             except BaseException as err:
                 self.error = err
             finally:
                 self._queue.task_done()
 
-    def _retry(self, fn, *args) -> None:
-        deadline = time.monotonic() + self.busy_timeout
-        delay = 0.05
-        while True:
-            try:
-                fn(*args)
-                return
-            except kv.DatabaseBusy:
-                if time.monotonic() + delay > deadline:
-                    raise
-                self.busy_waits += 1
-                time.sleep(delay)
-                delay = min(delay * 2, 2.0)
-
-    def _put(self, store: TensorStore, key: str, value: Tensor) -> None:
-        store.put(key, value)
-
     def pending(self) -> int:
+        """Queued batches not yet written."""
         return self._queue.unfinished_tasks
+
+    def raise_error(self) -> None:
+        """Re-raise a failed background write (checked by every hand-over, `flush` and
+        `close`, so a failure surfaces at the next encoded batch)."""
+        if self.error is not None:
+            raise RuntimeError("online cache write-back failed") from self.error
 
     def flush(self) -> None:
         """Block until every queued write is on disk; re-raise a writer error."""
         self._queue.put(FLUSH)
         self._queue.join()
-        if self.error is not None:
-            raise RuntimeError("online cache write-back failed") from self.error
+        self.raise_error()
 
     def close(self) -> None:
-        self.flush()
-        self._queue.put(STOP)
-        self._thread.join()
+        """Flush, then stop the writer thread (stopped even when the flush raises)."""
+        try:
+            self.flush()
+        finally:
+            self._queue.put(STOP)
+            self._thread.join()

@@ -1,16 +1,12 @@
-"""Over-long policies: what happens to a single sample longer than `max_tokens`.
-
-Each policy maps `(item, image_tokens, text_tokens, max_tokens, keep_seed)` to the fitted
-item or None (dropped). A sample keeps at least one text token and one image token;
-when that cannot fit, it is dropped.
-"""
+"""Over-long fits: `(item, image_tokens, text_tokens, max_tokens, keep_seed)` -> the
+fitted item, or None (dropped). A fitted sample keeps at least one text and one image
+token."""
 
 from dataclasses import replace
 
-from kohakumoss_data.resolution.item import MossPlanItem
-
 
 def drop(item, img: int, text: int, max_tokens: int, keep_seed: int):
+    """Drop the sample."""
     return None
 
 
@@ -28,4 +24,4 @@ def drop_tokens(item, img: int, text: int, max_tokens: int, keep_seed: int):
 
 OVERLONG = {"drop": drop, "truncate_text": truncate_text, "drop_tokens": drop_tokens}
 
-__all__ = ["OVERLONG", "MossPlanItem", "drop", "drop_tokens", "truncate_text"]
+__all__ = ["OVERLONG", "drop", "drop_tokens", "truncate_text"]

@@ -2,10 +2,9 @@
 
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Protocol
 
 import numpy as np
-import torch
 from torch import Tensor
 
 EncodeImages = Callable[[Sequence[np.ndarray], Tensor], Tensor]
@@ -36,13 +35,18 @@ class CatalogRow:
 
 @dataclass(frozen=True)
 class PlanItem:
-    """One sample of a planned batch: source row, target pixel size, crop box, flip."""
+    """One sample of a planned batch: source row, target pixel size (h, w), crop box,
+    flip, caption variant, and its over-long fit (`text_limit` > 0: first text tokens
+    kept; `img_keep` > 0: image tokens kept, drawn by `keep_seed`; 0 = all kept)."""
 
     row_id: int
     target_hw: tuple[int, int]
     crop_ltrb: tuple[int, int, int, int]
     flip: bool = False
     caption_variant: int = 0
+    text_limit: int = 0
+    img_keep: int = 0
+    keep_seed: int = 0
 
 
 @dataclass
@@ -56,20 +60,9 @@ class BatchPlan:
 
 @dataclass
 class HostBatch:
-    """Packed batch on the host (pinned when a GPU consumes it).
-
-    Image tokens are sample-major and row-major over the latent grid `hw` [B, 2].
-    `img_keep[i]` lists the kept grid indices of sample i after random token drop
-    (None = all kept); cached `latents` then hold only the kept tokens, while `pixels`
-    are the full image (the consumer encodes, then gathers `img_keep`).
-    `text_limit[i]` > 0 caps sample i's text tokens: cached `text` is already capped
-    and `text_len` final; with `prompts` the consumer keeps the first `text_limit`
-    rows after encoding and fills `text_len`.
-    `index` / `rank` locate the plan; `latent_keys` / `text_keys` are each sample's
-    cache keys (empty when that cache is off), used by online write-back.
-    `layout` is the consumer's packed-sequence layout, built off the training thread by a
-    loader transform when the text lengths are already final (None otherwise).
-    """
+    """Packed batch on the host (pinned when a GPU consumes it); image tokens are
+    sample-major, row-major over the latent grid `hw` [B, 2]. Fields: see
+    docs/concepts/data.md#hostbatch."""
 
     ids: Tensor
     hw: Tensor
@@ -90,6 +83,7 @@ class HostBatch:
     layout: object | None = None
 
     def pin(self) -> "HostBatch":
+        """Pin every tensor field in place; returns self."""
         for name, value in self.__dict__.items():
             if isinstance(value, Tensor) and not value.is_pinned():
                 setattr(self, name, value.pin_memory())
@@ -128,7 +122,3 @@ class Cache(Protocol):
     def get(self, key: str) -> Tensor | None: ...
 
     def put(self, key: str, value: Tensor) -> None: ...
-
-
-def empty_meta() -> dict[str, Any]:
-    return {"dtype": str(torch.bfloat16)}

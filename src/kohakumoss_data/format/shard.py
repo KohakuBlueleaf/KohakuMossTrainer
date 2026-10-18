@@ -31,6 +31,7 @@ class ShardRecord:
 
 
 def codec_of(name: str) -> int:
+    """The codec id of a file name's extension."""
     ext = os.path.splitext(name)[1].lower().lstrip(".")
     match ext:
         case "jpg" | "jpeg":
@@ -108,13 +109,15 @@ class ShardReader:
         return self._index[shard]
 
     def record(self, locator: str) -> ShardRecord:
+        """The index record at `locator` (`shard:index`)."""
         shard, index = (int(p) for p in locator.split(":"))
         raw = bytes(self._records(shard)[index])
         return ShardRecord(*RECORD.unpack(raw))
 
     def read(self, locator: str) -> bytes:
-        shard, index = (int(p) for p in locator.split(":"))
-        rec = ShardRecord(*RECORD.unpack(bytes(self._records(shard)[index])))
+        """The encoded image bytes at `locator` (`shard:index`)."""
+        shard = int(locator.split(":", 1)[0])
+        rec = self.record(locator)
         handle = self._handles.get(shard)
         if handle is None:
             handle = open(os.path.join(self.dir, f"{shard:05d}.bin"), "rb")

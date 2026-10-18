@@ -1,4 +1,4 @@
-"""Cache keys: every input that changes the cached tensor is part of its key."""
+"""Cache keys over every input that changes the cached tensor."""
 
 from kohakumoss_data.seeds import text_hash
 from kohakumoss_data.types import CatalogRow, PlanItem

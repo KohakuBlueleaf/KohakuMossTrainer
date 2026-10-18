@@ -1,15 +1,12 @@
-"""LatentCache / TextCache: mode + encoder identity + key rules over a TensorStore.
-
-`get` / `put` / `lengths` are bound at construction: the store's methods when the
-cache is on, no-ops when it is off. `as_cached` turns a fresh encoding into exactly
-the value a later cache hit returns.
-"""
+"""LatentCache / TextCache: mode + encoder identity + cache keys over a TensorStore;
+`get` / `put` / `lengths` are the store's when the cache is on, no-ops when off."""
 
 import os
 
 import torch
 from torch import Tensor
 
+from kohakumoss_common.calls import nothing
 from kohakumoss_data.cache.keys import latent_key, text_key
 from kohakumoss_data.cache.store import LengthTable, TensorStore, stored_value
 from kohakumoss_data.types import CatalogRow, PlanItem
@@ -17,19 +14,13 @@ from kohakumoss_data.types import CatalogRow, PlanItem
 MODES = ("off", "offline", "online")
 
 
-def _miss(key: str) -> Tensor | None:
-    return None
-
-
-def _discard(key: str, value: Tensor) -> None:
-    return None
-
-
 def _no_lengths() -> LengthTable:
     return LengthTable()
 
 
 class _Cache:
+    """Mode, encoder id and storage dtype shared by both caches."""
+
     def __init__(self, path: str | None, mode: str, encoder_id: str, storage: str):
         if mode not in MODES:
             raise ValueError(f"cache mode must be one of {MODES}, got {mode}")
@@ -39,7 +30,7 @@ class _Cache:
         self.encoder_id = encoder_id
         self.storage = storage
         self.store = None
-        self.get, self.put, self.lengths = _miss, _discard, _no_lengths
+        self.get, self.put, self.lengths = nothing, nothing, _no_lengths
         if mode != "off":
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             self.store = TensorStore(path, storage)
@@ -52,7 +43,7 @@ class _Cache:
 
 
 class LatentCache(_Cache):
-    """Packed latent tokens [h*w, C] per (image, geometry, flip, decode policy)."""
+    """Packed latent tokens [h*w, C] per (image, geometry, flip, decode mode)."""
 
     def __init__(
         self,
@@ -70,6 +61,7 @@ class LatentCache(_Cache):
         self.draw = draw
 
     def key(self, row: CatalogRow, item: PlanItem) -> str:
+        """The cache key of `item` of `row`."""
         return latent_key(
             row,
             item,
@@ -94,6 +86,7 @@ class TextCache(_Cache):
     """Unpadded text embeddings [L, D] per rendered caption."""
 
     def key(self, caption: str) -> str:
+        """The cache key of a rendered caption."""
         return text_key(caption, self.encoder_id, self.storage)
 
     def as_cached(

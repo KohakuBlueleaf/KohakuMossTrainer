@@ -8,18 +8,18 @@ from kohakumoss_data.cache.tensor_cache import MODES
 from kohakumoss_data.loader.decode import BACKGROUNDS, RESAMPLE
 from kohakumoss_data.registry import PLANNERS
 from kohakumoss_data.resolution.batching import BATCHINGS
+from kohakumoss_data.resolution.geometry import LATENT_FACTOR
 from kohakumoss_data.resolution.overlong import OVERLONG
+from kohakumoss_data.scan.runner import RESCAN
+
+TOKEN_BUDGETS = ("estimate", "render", "exact")
 
 
 @dataclass
 class DataConfig:
-    """`datasets` items are `{"source": name, **source_kwargs, "weight", "caption",
-    "loss_weight", "catalog"}`; `cache_dir` holds `latents.db` / `text.db`.
-    `max_samples` caps samples per token batch (0 = none); `token_budget="exact"` takes
-    every caption length from the offline text cache, so `max_tokens` is a hard bound.
-    `planner_kwargs` override the planner arguments derived from the other fields.
-    `latent_draw` names the VAE draw (`mode` / `sample`) the latents were encoded with.
-    See docs/concepts/data.md."""
+    """Every data knob; `datasets` items are `{"source": name, **source_kwargs,
+    "weight", "caption", "loss_weight", "catalog", "import_to"}`. Each field:
+    docs/concepts/data.md."""
 
     datasets: list[dict] = field(default_factory=list)
     resolution_mode: str = "resize"
@@ -43,9 +43,11 @@ class DataConfig:
     cache_dtype: str = "bf16"
     cache_dir: str = ""
     latent_encoder_id: str = "flux2-vae"
+    latent_encoder_spec: str = ""
     latent_draw: str = "mode"
     text_encoder_id: str = "qwen3.5-9b"
-    latent_factor: int = 16
+    text_encoder_spec: str = ""
+    latent_factor: int = LATENT_FACTOR
     flip: bool = False
     background: str = "white"
     resample: str = "lanczos"
@@ -56,6 +58,9 @@ class DataConfig:
     prefetch: int = 2
     pin_memory: bool = True
     seed: int = 0
+    data_rescan: bool | str = False
+    data_scan_workers: int = 8
+    data_wait: float = 3600.0
 
     @classmethod
     def from_knobs(cls, knobs: dict) -> "DataConfig":
@@ -67,6 +72,12 @@ class DataConfig:
         return cfg
 
 
+def encoder_key_id(encoder_id: str, spec: str) -> str:
+    """The encoder identity a cache key hashes: the encoder id, plus its compute spec
+    (`latent_encoder_spec` / `text_encoder_spec`) when one is set."""
+    return f"{encoder_id}/{spec}" if spec else encoder_id
+
+
 def resolved_cache_dir(cfg: DataConfig) -> str:
     """`cache_dir` when set; "" when both caches are off or no dataset has a path; else
     `<path>/cache` of the first dataset with a `path` (its folder when it is a file)."""
@@ -74,7 +85,17 @@ def resolved_cache_dir(cfg: DataConfig) -> str:
         return cfg.cache_dir
     if cfg.latent_cache == "off" and cfg.text_cache == "off":
         return ""
-    paths = [str(spec["path"]) for spec in cfg.datasets if spec.get("path")]
+    return _default_cache_dir(cfg)
+
+
+def catalog_cache_dir(cfg: DataConfig) -> str:
+    """Where the catalog files live: the resolved cache dir, or the dir it would be
+    with the tensor caches off ("" when no dataset has a path)."""
+    return cfg.cache_dir or _default_cache_dir(cfg)
+
+
+def _default_cache_dir(cfg: DataConfig) -> str:
+    paths = [str(entry["path"]) for entry in cfg.datasets if entry.get("path")]
     if not paths:
         return ""
     path = paths[0]
@@ -94,7 +115,8 @@ def data_problems(cfg: DataConfig) -> list[str]:
         ("LATENT_CACHE", cfg.latent_cache, list(MODES)),
         ("TEXT_CACHE", cfg.text_cache, list(MODES)),
         ("CACHE_DTYPE", cfg.cache_dtype, sorted(STORAGE)),
-        ("TOKEN_BUDGET", cfg.token_budget, ["estimate", "exact"]),
+        ("TOKEN_BUDGET", cfg.token_budget, list(TOKEN_BUDGETS)),
+        ("DATA_RESCAN", cfg.data_rescan, list(RESCAN)),
         ("UPSCALE", cfg.upscale, ["never", "to_area"]),
         ("CROP", cfg.crop, ["center", "random"]),
         ("LATENT_DRAW", cfg.latent_draw, ["mode", "sample"]),
@@ -123,7 +145,9 @@ def data_problems(cfg: DataConfig) -> list[str]:
             "RESOLUTION_MODE='shifted_square')"
         )
     if cfg.size_step % cfg.latent_factor:
-        problems.append("SIZE_STEP must be a multiple of the latent factor (16)")
+        problems.append(
+            f"SIZE_STEP must be a multiple of the latent factor ({cfg.latent_factor})"
+        )
     if cfg.max_tokens < 2:
         problems.append("MAX_TOKENS must be >= 2")
     return problems
@@ -144,7 +168,5 @@ def pipeline_problems(cfg: DataConfig) -> list[str]:
             "pipeline needs TOKEN_BUDGET='exact' (text lengths from the cache)"
         )
     if cfg.text_cache != "offline":
-        problems.append(
-            "TOKEN_BUDGET='exact' needs TEXT_CACHE='offline' (all lengths known)"
-        )
+        problems.append("pipeline needs TEXT_CACHE='offline' (the exact text lengths)")
     return problems

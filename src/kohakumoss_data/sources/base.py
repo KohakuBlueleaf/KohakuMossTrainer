@@ -1,5 +1,7 @@
-"""Shared source helpers: image extensions, sidecar parsing, fingerprints."""
+"""Shared source helpers: image extensions, sidecar parsing, fingerprints, probes,
+manifest keys."""
 
+import hashlib
 import json
 import os
 
@@ -12,16 +14,20 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".jxl", ".avif")
 
 
 def is_image(name: str) -> bool:
+    """`name` has an image extension."""
     return name.lower().endswith(IMAGE_EXTS)
 
 
 def file_fingerprint(path: str) -> str:
-    """Header-only identity of a file: size and mtime (cache key part)."""
+    """Header-only identity of a file (cache key part): its absolute path, size and
+    mtime; a content hash (`hash_content`) is the location-free identity."""
     st = os.stat(path)
-    return f"stat:{st.st_size}:{st.st_mtime_ns}"
+    where = os.path.normcase(os.path.abspath(path))
+    return f"stat:{where}:{st.st_size}:{st.st_mtime_ns}"
 
 
 def read_text(path: str) -> str | None:
+    """A sidecar's stripped text, or None when absent."""
     if not os.path.exists(path):
         return None
     with open(path, encoding="utf-8", errors="replace") as handle:
@@ -76,5 +82,51 @@ def image_row(path: str, locator: str, group: str, hash_content: bool) -> Catalo
 
 
 def read_bytes(path: str) -> bytes:
+    """The bytes of the file at `path`."""
     with open(path, "rb") as handle:
         return handle.read()
+
+
+def probe_file(
+    full: str,
+    locator: str,
+    group: str,
+    hash_content: bool,
+    txt_as: str,
+    weight: float = 1.0,
+    artist: str | None = None,
+) -> list[CatalogRow]:
+    """The row of an image file with its sidecars (a folder / kohya walk item)."""
+    row = image_row(full, locator, group, hash_content)
+    row.weight = weight
+    row.artist = artist
+    apply_sidecars(row, os.path.splitext(full)[0], txt_as)
+    return [row]
+
+
+def probe_manifest(
+    full: str, locator: str, group: str, hash_content: bool, weight: float, meta: dict
+) -> list[CatalogRow]:
+    """The row of a manifest record: the image's header plus the record's metadata."""
+    row = image_row(full, locator, group, hash_content)
+    row.weight = weight
+    apply_json(row, meta)
+    return [row]
+
+
+def content_stamp(text: str) -> int:
+    """A record's content as a signed 63-bit int (a walk-stamp slot)."""
+    digest = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") >> 1
+
+
+class Occurrences:
+    """`locator#n`: the n-th occurrence of a locator in a manifest (stable keys)."""
+
+    def __init__(self):
+        self.seen: dict[str, int] = {}
+
+    def key(self, locator: str) -> str:
+        n = self.seen.get(locator, 0)
+        self.seen[locator] = n + 1
+        return f"{locator}#{n}"

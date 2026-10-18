@@ -8,20 +8,22 @@ from kohakumoss_data.resolution.base import expected_items
 
 
 def catalog_stats(catalog) -> dict:
-    """Row count, effective epoch size, pixel/aspect quantiles, alpha share, groups."""
-    area = (catalog.w * catalog.h).astype(np.float32)
-    aspect = np.divide(catalog.w, catalog.h, dtype=np.float32)
+    """Live-row count, effective epoch size, pixel/aspect quantiles, alpha share,
+    groups, captioned share; from the catalog columns only."""
+    live = catalog.live
+    w, h = catalog.w[live], catalog.h[live]
+    area = (w * h).astype(np.float32)
+    aspect = np.divide(w, h, dtype=np.float32)
     q = (0.05, 0.25, 0.5, 0.75, 0.95)
+    text = sum(catalog.chars[k] for k in ("tags_chars", "nl_chars", "json_chars"))
     return {
-        "rows": len(catalog),
+        "rows": int(live.sum()),
         "epoch_items": expected_items(catalog.weight),
         "megapixels_q": [round(float(v) / 1e6, 3) for v in np.quantile(area, q)],
         "aspect_q": [round(float(v), 3) for v in np.quantile(aspect, q)],
-        "alpha_share": float(np.mean([r.has_alpha for r in catalog.rows])),
-        "groups": len({r.group for r in catalog.rows}),
-        "captioned_share": float(
-            np.mean([bool(r.tags or r.caption_nl or r.json) for r in catalog.rows])
-        ),
+        "alpha_share": float(np.mean(catalog.has_alpha[live])),
+        "groups": len(np.unique(catalog.group_id[live])),
+        "captioned_share": float(np.mean(text[live] > 0)),
     }
 
 
@@ -40,10 +42,10 @@ def plan_stats(dataset, epoch: int = 0, budget: int | None = None) -> dict:
         txt_tokens.append(sum(s[1] for s in split))
         fitted += sum(bool(it.text_limit or it.img_keep) for it in batch)
         for it in batch:
-            row = dataset.catalog[it.row_id]
+            pixels = int(dataset.catalog.w[it.row_id] * dataset.catalog.h[it.row_id])
             left, top, right, bottom = it.crop_ltrb
             box = (right - left) * (bottom - top)
-            crop_loss.append(1.0 - box / (row.w * row.h))
+            crop_loss.append(1.0 - box / pixels)
             upscaled += it.target_hw[0] * it.target_hw[1] > box
             sizes[it.target_hw] += 1
     total = np.array(img_tokens) + np.array(txt_tokens)
