@@ -13,6 +13,7 @@ from diffusers import AutoencoderKLFlux2
 from torch import Tensor, nn
 
 from kohakumoss.encoders.specs import SpecEncoder, vae_spec
+from kohakumoss.encoders.vae.comfy import load_vae_file
 from kohakumoss.offload.encoders.vae import place_vae
 from kohakumoss_kernels import compile_setup
 from kohakumoss_kernels.dtypes import BY_NAME
@@ -93,8 +94,8 @@ def vae_encoder(
     rule), carrying the VAE's `encoder_spec`."""
     if not str(path):
         raise ValueError(
-            "vae_encoder: path is empty; set IMAGE_ENCODER_KWARGS['path'] to the VAE dir "
-            "or a pipeline root"
+            "vae_encoder: path is empty; set IMAGE_ENCODER_KWARGS['path'] to the VAE dir, "
+            "a VAE file or a pipeline root"
         )
     resolved = resolve_vae_dtype(dtype, device)
     spec = {"memory": "auto", "batch": batch, **(plan or {})}
@@ -155,13 +156,18 @@ class FluxVae(nn.Module):
         dtype: torch.dtype = torch.float32,
         mode: str = "mode",
     ) -> "FluxVae":
-        """`path` is the VAE dir or a pipeline root containing `vae/`. Loaded in fp32
-        (the normalisation statistics stay fp32), then the VAE is cast to `dtype`."""
+        """`path` is the VAE dir, a pipeline root containing `vae/`, or one safetensors
+        file (diffusers or BFL keys, e.g. ComfyUI's `flux2-vae_small` / `flux2-vae`).
+        Loaded in fp32 (the normalisation statistics stay fp32), then the VAE is cast to
+        `dtype`."""
         path = Path(path)
-        sub = "vae" if (path / "vae" / "config.json").is_file() else None
-        vae = AutoencoderKLFlux2.from_pretrained(
-            str(path), subfolder=sub, torch_dtype=torch.float32
-        )
+        if path.is_file():
+            vae = load_vae_file(path)
+        else:
+            sub = "vae" if (path / "vae" / "config.json").is_file() else None
+            vae = AutoencoderKLFlux2.from_pretrained(
+                str(path), subfolder=sub, torch_dtype=torch.float32
+            )
         out = cls(vae, mode)
         out.vae.to(dtype)
         return out.to(device)

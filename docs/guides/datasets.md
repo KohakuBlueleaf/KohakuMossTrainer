@@ -103,7 +103,7 @@ the encoder factories (dotted paths; the defaults are the real models):
 
 | factory | loads | `path` |
 | --- | --- | --- |
-| `kohakumoss.encoders.vae_encoder(path, device, dtype, ...)` | the FLUX.2 VAE; returns its `encode_images` with the VAE's compute spec | the `vae/` folder or a pipeline root |
+| `kohakumoss.encoders.vae_encoder(path, device, dtype, ...)` | the FLUX.2 VAE; returns its `encode_images` with the VAE's compute spec | the `vae/` folder, a pipeline root or one VAE file ([weights.md](weights.md#vae)) |
 | `kohakumoss.encoders.text_encoder(path, device, dtype, plan)` | the Qwen3.5 text encoder (`plan`: TextEncoderPlan fields, checked for the device before the weights load) | a pipeline root or the `text_encoder/` folder |
 
 Placement:
