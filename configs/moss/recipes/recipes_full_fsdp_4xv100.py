@@ -7,15 +7,10 @@ fold (c = 1/16), fp32 AdamW masters. Drives scripts/train/moss.py.
 from kohakuengine import use_config
 
 use_config("../_base/base_full.py")
+use_config("../precision/precision_fp16.py")
+use_config("../parallel/parallel_fsdp.py")
 
 RUN_NAME = "full-fsdp-4xv100"
-PRECISION = "fp16"
-FP16_FIX = "online"
-FP16_FIX_KWARGS = {"c": 1 / 16}
-OPTIMIZER = "adamw"
-PARALLEL = "fsdp"
-DIST_BACKEND = "nccl"
 DEVICES = (0, 1, 2, 3)
-SAMPLE_EVERY = 0
-MEMORY_PROFILE = "balanced"
 MAX_TOKENS = 8192
+TEXT_ENCODE = {"memory": "stream", "dtype": "fp16", "ahead": 4}

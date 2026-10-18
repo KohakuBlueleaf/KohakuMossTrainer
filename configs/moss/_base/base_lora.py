@@ -1,4 +1,5 @@
-"""Shared LoRA-family defaults (MOSS recipe objective); recipes override from here."""
+"""Shared LoRA-family defaults for scripts/train/moss.py (MOSS recipe objective); layers,
+recipes and starter configs override from here."""
 
 WEIGHTS = "models/MOSS-Image-Base"
 VARIANT = "base"
@@ -12,6 +13,7 @@ TARGET_AREA = 1024 * 1024
 MAX_TOKENS = 12288
 LATENT_CACHE = "offline"
 TEXT_CACHE = "offline"
+TEXT_ENCODE = {"memory": "stream", "ahead": 4}
 TEXT_DROP = 0.1
 ALGO = "lora"
 PRESET = "attn-mlp"
@@ -37,5 +39,5 @@ STEPS = 4000
 SAVE_EVERY = 500
 LOG_EVERY = 10
 SAMPLE_EVERY = 500
-SAMPLE_PROMPTS = ["1girl, solo, looking at viewer, upper body"]
+SAMPLE_PROMPTS = ["a lighthouse on a rocky coast at sunset"]
 EXPORT_FORMATS = ("comfy", "lycoris")

@@ -7,8 +7,7 @@ Drives scripts/train/moss.py.
 from kohakuengine import use_config
 
 use_config("../_base/base_lora.py")
+use_config("../vram/vram_12g.py")
 
 RUN_NAME = "lora-12g-stream"
-MEMORY_PROFILE = "minimal"
-MEMORY_OVERRIDES = {"base_precision": "int8", "stream": "ring", "stream_resident": 4}
-MAX_TOKENS = 6144
+BASE_PRECISION = "int8"

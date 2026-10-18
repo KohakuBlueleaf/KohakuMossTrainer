@@ -7,8 +7,7 @@ checkpointing. Drives scripts/train/moss.py.
 from kohakuengine import use_config
 
 use_config("../_base/base_lora.py")
+use_config("../vram/vram_24g.py")
+use_config("../precision/precision_bf16.py")
 
 RUN_NAME = "lora-24g-bf16"
-PRECISION = "bf16"
-MEMORY_PROFILE = "balanced"
-MAX_TOKENS = 12288

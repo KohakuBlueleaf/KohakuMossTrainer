@@ -7,10 +7,6 @@ activation offload. Drives scripts/train/moss.py.
 from kohakuengine import use_config
 
 use_config("../_base/base_full.py")
+use_config("../vram/vram_24g_full.py")
 
 RUN_NAME = "full-24g-offload"
-OPTIMIZER = "adamw"
-EMA = 0.0
-MEMORY_PROFILE = "minimal"
-MEMORY_OVERRIDES = {"stream": "swap", "stream_resident": 4, "act_offload": True}
-MAX_TOKENS = 8192

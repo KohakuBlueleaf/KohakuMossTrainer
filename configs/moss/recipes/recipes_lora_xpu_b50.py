@@ -7,9 +7,10 @@ Drives scripts/train/moss.py.
 from kohakuengine import use_config
 
 use_config("../_base/base_lora.py")
+use_config("../vram/vram_16g.py")
+use_config("../precision/precision_bf16.py")
 
 RUN_NAME = "lora-xpu-b50"
-PRECISION = "bf16"
-MEMORY_PROFILE = "low"
-MEMORY_OVERRIDES = {"base_precision": "int8"}
+BASE_PRECISION = "int8"
 MAX_TOKENS = 6144
+TEXT_ENCODE = {"memory": "stream", "ahead": 4, "batch": 16, "max_tokens": 8192}
