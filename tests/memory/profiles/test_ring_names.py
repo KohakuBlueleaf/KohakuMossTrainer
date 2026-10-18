@@ -1,7 +1,7 @@
 """The weight-ring spellings (model-free): the catalog, `kohakumoss-config list` and the
-text-encoder plan use `ring16` .. `ring2` / `ring`; the older `stream16` .. `stream2`
-profile parts and text-encoder memory `stream` resolve once, at knob / plan validation,
-to the primary names."""
+text-encoder and VAE plans use `ring16` .. `ring2` / `ring`; the older `stream16` ..
+`stream2` profile parts and text-encoder / VAE memory `stream` resolve once, at knob /
+plan validation, to the primary names."""
 
 import re
 
@@ -10,7 +10,11 @@ import pytest
 from kohakumoss.encoders.text.plan import MEMORY, text_plan
 from kohakumoss.memory.catalog_table import markdown
 from kohakumoss.memory.profiles import CATALOG, profile_name, resolve
+from kohakumoss.offload.encoders.vae import MEMORY as VAE_MEMORY
+from kohakumoss.offload.encoders.vae import PLACEMENTS as VAE_PLACEMENTS
+from kohakumoss.offload.encoders.vae import VaePlan, vae_plan
 from kohakumoss.training import knobs as train_knobs
+from kohakumoss.training.build.model import encoder_memory
 from tests._util.negative import must_fail
 
 pytestmark = pytest.mark.cpu
@@ -69,3 +73,23 @@ def _unresolved(spec):
 def test_text_encoder_stream_is_the_ring():
     check_text_memory(text_plan)
     must_fail(lambda: check_text_memory(_unresolved), "text memory alias unresolved")
+
+
+def check_vae_memory(plan_of) -> None:
+    """VAE memory "stream" is the ring placement, and "ring" is the listed value."""
+    assert plan_of({"memory": "stream"}).memory == "ring"
+    assert plan_of(VaePlan(memory="stream")).memory == "ring"
+    assert plan_of({"memory": "ring"}).memory == "ring"
+    assert "ring" in VAE_MEMORY and "stream" not in VAE_MEMORY
+    assert set(VAE_PLACEMENTS) == set(VAE_MEMORY) - {"auto"}
+
+
+def _vae_unresolved(spec):
+    return spec if isinstance(spec, VaePlan) else VaePlan(**spec)
+
+
+def test_vae_stream_is_the_ring():
+    check_vae_memory(vae_plan)
+    must_fail(lambda: check_vae_memory(_vae_unresolved), "VAE memory alias unresolved")
+    k = {"VAE_ENCODE": {"memory": "stream"}}
+    assert encoder_memory(k, "vae", "resident") == "ring"

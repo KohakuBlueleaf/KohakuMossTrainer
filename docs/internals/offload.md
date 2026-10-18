@@ -527,9 +527,9 @@ places the FLUX.2 VAE for online latent encoding and for sample decodes
 | --- | --- | --- |
 | `resident` (default) | weights on the device | weights + activations |
 | `offload` | nothing (pinned host copy) | weights moved in, released after the pass |
-| `stream` | nothing | encoder / decoder blocks through 2-slot rings, the rest moved in per pass |
+| `ring` (`stream` is accepted too) | nothing | encoder / decoder blocks through 2-slot rings, the rest moved in per pass |
 | `cpu` | host | host (training: offline latent cache only, i.e. sample decodes) |
-| `auto` | the fastest of resident / offload / stream that fits next to the DiT step reserve | |
+| `auto` | the fastest of resident / offload / ring that fits next to the DiT step reserve | |
 
 `offload` copies the weights in from their pinned host copies on the compute stream at
 the start of a pass and drops the device copies at its end. They were allocated and read
@@ -779,7 +779,7 @@ other devices run the synchronous host paths.
 | GPU AdamW (resident, streamed states, streamed blocks), CPUAdamW, fused per-parameter step | works | works |
 | `MemorySession`, parameter groups | works | works |
 | quantized base (int8 / fp8), streamed quantized base | works (fp8 on sm89) | int8 |
-| text-encoder placements (resident / offload / stream / cpu), encode-ahead | works | works |
+| text-encoder placements (resident / offload / ring / cpu), encode-ahead | works | works |
 | inference plans (`apply_inference_plan`) | works | works |
 | multi-GPU (DDP, FSDP2, pipeline, threaded) | Linux-only by design (rejected by knob validation) | same |
 

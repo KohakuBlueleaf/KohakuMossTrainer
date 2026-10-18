@@ -75,7 +75,7 @@ def te_line(te, path, device) -> tuple[str, dict]:
 
 def vae_line(vae, path, placement: str, device) -> tuple[str, dict]:
     """The VAE under `placement`: resident on the device, parked on the host between
-    passes (offload), its blocks streamed through a layer ring (stream), or run on the
+    passes (offload), its blocks streamed through a layer ring (ring), or run on the
     host (cpu)."""
     size = module_bytes(getattr(vae, "vae", vae))
     match placement:
@@ -83,9 +83,9 @@ def vae_line(vae, path, placement: str, device) -> tuple[str, dict]:
             where = (
                 f"offload (host RAM, moved to {device} per pass, {hl(gib_text(size))})"
             )
-        case "stream":
+        case "ring":
             where = (
-                f"stream (host RAM, {hl(gib_text(size))}; encoder / decoder blocks through "
+                f"ring (host RAM, {hl(gib_text(size))}; encoder / decoder blocks through "
                 f"a 2-layer ring on {device}, the rest moved per pass)"
             )
         case "cpu":

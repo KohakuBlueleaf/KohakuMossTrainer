@@ -1,6 +1,6 @@
 """The sampling memory estimate per phase and the automatic VAE placement, model-free:
 the text-encode, sampling and decode phases each count what the device holds then (the
-peak is the largest), and "auto" tiles the VAE pass before it streams untiled."""
+peak is the largest), and "auto" tiles the VAE pass before it rings untiled."""
 
 from types import SimpleNamespace
 
@@ -49,7 +49,7 @@ def test_each_phase_counts_what_it_holds():
     must_fail(lambda: _phases_add_up(est, 0, vae_bytes, act), "no text-encoder pass")
 
 
-def test_auto_tiles_before_it_streams_untiled():
+def test_auto_tiles_before_it_rings_untiled():
     weights, reserve, pixels = GIB // 4, 2 * GIB, 1024 * 1024
     roomy = choose_vae_plan(VaePlan(memory="auto"), weights, 8 * GIB, reserve, pixels)
     assert roomy == VaePlan(memory="resident")
@@ -57,4 +57,4 @@ def test_auto_tiles_before_it_streams_untiled():
     plan = choose_vae_plan(VaePlan(memory="auto"), weights, tight, reserve, pixels)
     assert plan.tile and plan.memory in ("offload", "resident"), plan
     asked = choose_vae_plan(VaePlan(memory="auto", tile=True), weights, 0, 0, pixels)
-    assert asked.tile and asked.memory == "stream"
+    assert asked.tile and asked.memory == "ring"

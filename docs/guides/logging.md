@@ -97,7 +97,7 @@ lines to `<output>/board/kohakuboard.log` and captures no stdout / stderr.
 - the run summary;
 - the model / adapters / encoders build with its memory plan;
 - the text encoder's and the VAE's placement lines after it (the
-  [inference lines](#what-sampling-shows); a VAE also as `stream (... 2-layer ring on
+  [inference lines](#what-sampling-shows); a VAE also as `ring (... 2-layer ring on
   cuda:0 ...)` or `cpu (... runs on the host)`; `text encoder: not kept,
   TEXT_CACHE='offline'` / `VAE: not loaded, ...` when the run holds none);
 - the kernel prewarm (per-op progress lines, the wall time per op and in total) and the

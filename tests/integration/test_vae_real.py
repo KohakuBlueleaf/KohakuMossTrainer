@@ -1,6 +1,6 @@
 """VAE placements on the real FLUX.2 VAE: the same latents under resident / offload /
-stream (eager encode in each; `compile="auto"` compiles the resident one only), no VAE
-weight on the device between passes for offload / stream, and the
+ring (eager encode in each; `compile="auto"` compiles the resident one only), no VAE
+weight on the device between passes for offload / ring, and the
 latent encode-ahead runs one pass per `ahead` batches."""
 
 import numpy as np
@@ -47,16 +47,16 @@ def test_latents_identical_across_placements(vae_path):
     images, hw = _images(2, 1), _hw(2)
     out = {
         m: _placed(vae_path, m, compile="off").encode_images(images, hw).cpu()
-        for m in ("resident", "offload", "stream")
+        for m in ("resident", "offload", "ring")
     }
     _equal(out["offload"], out["resident"])
-    _equal(out["stream"], out["resident"])
+    _equal(out["ring"], out["resident"])
     other = _placed(vae_path, "offload", compile="off")
     other = other.encode_images(_images(2, 2), hw).cpu()
     must_fail(lambda: _equal(other, out["resident"]), "different images")
 
 
-@pytest.mark.parametrize("memory", ("offload", "stream"))
+@pytest.mark.parametrize("memory", ("offload", "ring"))
 def test_no_vae_weight_on_device_between_passes(vae_path, memory):
     placed = _placed(vae_path, memory)
     placed.encode_images(_images(2, 1), _hw(2))

@@ -61,7 +61,7 @@ TEXT_ENCODE = {}  # TextEncoderPlan fields, as in training:
 #   "free_after_use": True drops the text encoder after its first pass
 VAE_ENCODE = (
     {}
-)  # VaePlan fields, as in training: "memory": "auto" (default) | "resident" | "offload" | "stream" | "cpu"; "tile": True (tiled decode)
+)  # VaePlan fields, as in training: "memory": "auto" (default) | "resident" | "offload" | "ring" | "cpu"; "tile": True (tiled decode)
 VAE_DTYPE = "auto"  # "auto" (bf16, fp16 on fp16-only GPUs) | "bf16" | "fp16" | "fp32"
 MEMORY_PROFILE = ""  # DiT memory profile: "" (resident) | a catalog profile | "speed" | "balanced" | "low" | "minimal" | "manual" | "auto" (the fastest that fits)
 MEMORY_OVERRIDES = {}  # MemoryPlan fields

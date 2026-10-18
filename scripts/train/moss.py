@@ -29,7 +29,7 @@ TEXT_ENCODE = {}  # TextEncoderPlan fields (docs/internals/text-encoder.md):
 # Sample prompts are encoded once at build; with TEXT_CACHE="offline" the TE is freed after that.
 VAE = ""  # "" = <WEIGHTS>/vae
 VAE_ENCODE = {}  # VaePlan fields (docs/internals/offload.md#vae):
-#   "memory": "resident" (default) | "offload" (VAE in per pass) | "stream" (block rings) | "auto" | "cpu" (LATENT_CACHE="offline" only)
+#   "memory": "resident" (default) | "offload" (VAE in per pass) | "ring" (block rings; "stream" is accepted too) | "auto" | "cpu" (LATENT_CACHE="offline" only)
 #   "batch": 1 (same-size images per encode call), "ahead": 1 (LATENT_CACHE "online" / "off": host batches encoded per VAE pass), "tile": False (tiled / sliced encode and decode)
 #   "compile": "auto" (channels_last + torch.compile on a resident CUDA VAE) | "on" | "off"
 VAE_DTYPE = (

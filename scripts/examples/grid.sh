@@ -28,7 +28,7 @@ options (defaults in brackets; see grid.ps1 for each one's meaning):
   --base-precision compute|int8|fp8|fp8_compute|mxfp8 [compute]   --fp8-recipe row|tensor|block [row]
   --memory auto|PROFILE|"" [auto; "" = whole DiT resident]   --text-memory auto|resident|offload|ring|cpu [auto]
   --text-precision compute|int8|fp8|fp8_compute|mxfp8 [compute]   --free-text-encoder
-  --vae-memory auto|resident|offload|stream|cpu [auto]   --vae-dtype auto|bf16|fp16|fp32 [auto]
+  --vae-memory auto|resident|offload|ring|cpu [auto]   --vae-dtype auto|bf16|fp16|fp32 [auto]
   --batch N [4]   --tune off|table [off]   --layout prompt-cols|prompt-rows [prompt-cols]
   --font-size N [0]   --out DIR [runs/examples/grid]   --dry-run
 EOF
@@ -98,7 +98,7 @@ while [ $# -gt 0 ]; do
     --text-memory) choice text-memory "$2" auto resident offload ring stream cpu; text_memory=$2; shift ;;
     --text-precision) choice text-precision "$2" compute int8 fp8 fp8_compute mxfp8; text_precision=$2; shift ;;
     --free-text-encoder) free_text=1 ;;
-    --vae-memory) choice vae-memory "$2" auto resident offload stream cpu; vae_memory=$2; shift ;;
+    --vae-memory) choice vae-memory "$2" auto resident offload ring stream cpu; vae_memory=$2; shift ;;
     --vae-dtype) choice vae-dtype "$2" auto bf16 fp16 fp32; vae_dtype=$2; shift ;;
     --batch) batch=$2; shift ;;
     --tune) choice tune "$2" off table; tune=$2; shift ;;

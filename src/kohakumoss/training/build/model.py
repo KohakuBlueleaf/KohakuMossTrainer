@@ -30,6 +30,7 @@ from kohakumoss.model.opset import OpSet
 from kohakumoss.offload.accel import module as accel_module
 from kohakumoss.offload.accel import streamed, with_index
 from kohakumoss.offload.encoders.report import encoder_lines
+from kohakumoss.offload.encoders.vae import MEMORY_ALIASES as VAE_MEMORY_ALIASES
 from kohakumoss.offload.encoders.vae import place_vae
 from kohakumoss.parallel.launch import dist_rank, gate_name, rank0_value
 from kohakumoss.precision import apply_param_dtypes
@@ -294,6 +295,7 @@ def step_reserve(k: dict, plan) -> int:
 
 STREAMED_BASE_ENCODERS = {"vae": "offload"}
 ENCODER_KNOBS = {"text": "TEXT_ENCODE", "vae": "VAE_ENCODE"}
+ENCODER_ALIASES = {"text": TEXT_MEMORY_ALIASES, "vae": VAE_MEMORY_ALIASES}
 
 
 def streamed_base(plan) -> bool:
@@ -305,11 +307,11 @@ def encoder_memory(k: dict, which: str, default: str, plan=None) -> str:
     """The placement of encoder `which` ("text" / "vae"): its TEXT_ENCODE /
     VAE_ENCODE `memory` when set; else `default` (the text encoder's `auto`: the
     fastest placement that fits next to the DiT step, whatever the plan), and for the
-    VAE offload when `plan` streams the DiT blocks. A text `memory` comes in its
-    primary spelling (`MEMORY_ALIASES`)."""
+    VAE offload when `plan` streams the DiT blocks. A given `memory` comes in its
+    primary spelling (the encoder's `MEMORY_ALIASES`)."""
     given = dict(k.get(ENCODER_KNOBS[which]) or {}).get("memory")
     if given is not None:
-        return TEXT_MEMORY_ALIASES.get(given, given) if which == "text" else given
+        return ENCODER_ALIASES[which].get(given, given)
     if streamed_base(plan):
         return STREAMED_BASE_ENCODERS.get(which, default)
     return default

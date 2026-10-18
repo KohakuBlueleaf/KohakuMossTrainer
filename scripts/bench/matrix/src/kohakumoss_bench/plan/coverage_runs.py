@@ -87,7 +87,7 @@ MEMORY_CASES = {
         "LATENT_CACHE": "online",
         "TEXT_CACHE": "online",
         "CACHE_DIR": "{self}/cache",
-        "VAE_ENCODE": {"memory": "stream"},
+        "VAE_ENCODE": {"memory": "ring"},
         "TEXT_ENCODE": {"memory": "ring"},
     },
 }

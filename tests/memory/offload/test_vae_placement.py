@@ -4,7 +4,7 @@ ahead) run on the real VAE in tests/integration/test_vae_real.py."""
 
 import pytest
 
-from kohakumoss.offload.encoders.vae import choose_vae_memory, vae_plan
+from kohakumoss.offload.encoders.vae import choose_vae_memory
 from kohakumoss.training.checks.encoders import vae_problems
 from tests._util.negative import must_fail
 
@@ -15,7 +15,7 @@ def test_auto_picks_the_fastest_placement_that_fits():
     gib = 1 << 30
     assert choose_vae_memory(gib, 24 * gib, 8 * gib, 1 << 20, False) == "resident"
     assert choose_vae_memory(gib, 10 * gib, 9 * gib, 1 << 20, False) == "offload"
-    assert choose_vae_memory(gib, 3 * gib, 6 * gib, 1 << 20, False) == "stream"
+    assert choose_vae_memory(gib, 3 * gib, 6 * gib, 1 << 20, False) == "ring"
     big = 4096 * 4096
     assert choose_vae_memory(gib, 12 * gib, 4 * gib, big, True) == "resident"
     must_fail(
@@ -42,7 +42,6 @@ def test_vae_knob_problems():
     must_fail(
         lambda: _assert_clean({"memory": "cpu"}, "off"), "CPU VAE with online encoding"
     )
-    assert vae_plan({"memory": "stream"}).memory == "stream"
 
 
 def _assert_clean(spec, cache):

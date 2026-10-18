@@ -131,8 +131,8 @@ def test_vae_lines():
     line, fields = report.vae_line(vae, "w/vae", "offload", "cuda:0")
     _names(line, "VAE: w/vae -> offload (host RAM, moved to cuda:0 per pass, 0.25 GiB)")
     assert fields == {"gib": 0.25}
-    line, _ = report.vae_line(vae, "w/vae", "stream", "cuda:0")
-    _names(line, "VAE: w/vae -> stream (host RAM, 0.25 GiB;", "2-layer ring on cuda:0")
+    line, _ = report.vae_line(vae, "w/vae", "ring", "cuda:0")
+    _names(line, "VAE: w/vae -> ring (host RAM, 0.25 GiB;", "2-layer ring on cuda:0")
     line, _ = report.vae_line(vae, "w/vae", "cpu", "cpu")
     _names(line, "VAE: w/vae -> cpu (host RAM, 0.25 GiB; runs on the host)")
     line, _ = report.vae_line(vae, "w/vae", "gpu", "cuda:0")

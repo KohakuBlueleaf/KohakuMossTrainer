@@ -60,8 +60,8 @@ param(
     # blocks, the rest streamed; fits 8 GB) | low | balanced (16 resident) | any catalog name (see train.ps1)
     # | "" = whole DiT on the GPU (~10 GB in 16 bit).
     [string] $Memory = "auto",
-    # VAE placement: auto = fastest that fits | resident | offload | stream | cpu.
-    [ValidateSet("auto", "resident", "offload", "stream", "cpu")] [string] $VaeMemory = "auto",
+    # VAE placement: auto = fastest that fits | resident | offload | ring (block rings; "stream" is accepted too) | cpu.
+    [ValidateSet("auto", "resident", "offload", "ring", "stream", "cpu")] [string] $VaeMemory = "auto",
     # VAE dtype: auto (bf16 where supported, else fp16) | bf16 | fp16 | fp32.
     [ValidateSet("auto", "bf16", "fp16", "fp32")] [string] $VaeDtype = "auto",
     # Adapters to apply: one or more "path" or "path:multiplier" (LyCORIS / ComfyUI LoRA, LoKr, LoHa ... files).

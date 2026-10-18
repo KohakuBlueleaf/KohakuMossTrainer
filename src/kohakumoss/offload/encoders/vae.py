@@ -1,6 +1,6 @@
-"""VAE placement for training and sampling: resident, offloaded per pass, streamed per
-block, or on the host, chosen by a VaePlan; the encode-ahead pass and sample decodes
-run under the same placement. See docs/internals/offload.md#vae."""
+"""VAE placement for training and sampling: resident, offloaded per pass, its blocks
+through layer rings, or on the host, chosen by a VaePlan; the encode-ahead pass and
+sample decodes run under the same placement. See docs/internals/offload.md#vae."""
 
 import time
 from collections.abc import Sequence
@@ -19,7 +19,8 @@ from kohakumoss.offload.weights.layers import (
 )
 from kohakumoss_common.calls import nothing
 
-MEMORY = ("resident", "offload", "stream", "cpu", "auto")
+MEMORY = ("resident", "offload", "ring", "cpu", "auto")
+MEMORY_ALIASES = {"stream": "ring"}
 COMPILE = ("auto", "on", "off")
 ACT_BYTES_PER_PIXEL = 1024
 
@@ -49,15 +50,20 @@ def compiles(plan: VaePlan, device: torch.device) -> bool:
 
 
 def vae_plan(spec: dict | VaePlan | None = None) -> VaePlan:
-    """A VaePlan from a plan or a dict of its fields; raises listing unknown fields."""
+    """A VaePlan from a plan or a dict of its fields, with `memory` in its primary
+    spelling (`MEMORY_ALIASES`: "stream" is "ring"); raises listing unknown fields."""
     if isinstance(spec, VaePlan):
-        return spec
-    values = dict(spec or {})
-    known = {f.name for f in fields(VaePlan)}
-    unknown = sorted(set(values) - known)
-    if unknown:
-        raise ValueError(f"unknown VAE plan fields {unknown}; valid {sorted(known)}")
-    return VaePlan(**values)
+        plan = spec
+    else:
+        values = dict(spec or {})
+        known = {f.name for f in fields(VaePlan)}
+        unknown = sorted(set(values) - known)
+        if unknown:
+            raise ValueError(
+                f"unknown VAE plan fields {unknown}; valid {sorted(known)}"
+            )
+        plan = VaePlan(**values)
+    return replace(plan, memory=MEMORY_ALIASES.get(plan.memory, plan.memory))
 
 
 def plan_problems(plan: VaePlan, training: bool = False, latent_cache: str = "off"):
@@ -74,7 +80,7 @@ def plan_problems(plan: VaePlan, training: bool = False, latent_cache: str = "of
         p.append(
             "the VAE runs on the CPU only for the offline cache pass; with "
             f"LATENT_CACHE={latent_cache!r} it encodes during training on the GPU: set "
-            "VAE_ENCODE memory to 'offload' / 'stream' / 'resident' (or 'auto')"
+            "VAE_ENCODE memory to 'offload' / 'ring' / 'resident' (or 'auto')"
         )
     return p
 
@@ -95,13 +101,13 @@ def choose_vae_memory(
 ) -> str:
     """The fastest placement that fits: resident (weights next to the DiT step reserve),
     else offload (weights and one pass's activations once the step released its
-    buffers), else stream."""
+    buffers), else ring."""
     act = vae_act_bytes(pixels, tile)
     if weights + reserve + act <= budget:
         return "resident"
     if weights + act <= budget - reserve // 2:
         return "offload"
-    return "stream"
+    return "ring"
 
 
 def choose_vae_plan(
@@ -110,7 +116,7 @@ def choose_vae_plan(
     """`memory='auto'` resolved: the fastest placement that fits untiled (unless `tile`
     is set), else tiled passes with the fastest placement that fits then."""
     untiled = choose_vae_memory(weights, budget, reserve, pixels, plan.tile)
-    if plan.tile or untiled != "stream":
+    if plan.tile or untiled != "ring":
         return replace(plan, memory=untiled)
     tiled = choose_vae_memory(weights, budget, reserve, pixels, True)
     return replace(plan, memory=tiled, tile=True)
@@ -156,10 +162,10 @@ class _Offload:
         self.copies.end()
 
 
-class _Stream:
+class _Ring:
     """Encoder / decoder blocks through layer rings; the rest offloaded per pass."""
 
-    name = "stream"
+    name = "ring"
 
     def __init__(self, inner: nn.Module, device: torch.device):
         parts = [getattr(inner, n) for n in ("encoder", "decoder") if hasattr(inner, n)]
@@ -185,7 +191,7 @@ class _Stream:
 PLACEMENTS = {
     "resident": _Resident,
     "offload": _Offload,
-    "stream": _Stream,
+    "ring": _Ring,
     "cpu": _Resident,
 }
 

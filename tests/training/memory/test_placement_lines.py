@@ -44,11 +44,11 @@ def _messages(built) -> list[str]:
 
 def check_lines(lines: list[str]) -> None:
     assert lines[0].startswith("text encoder: not kept"), lines
-    assert "VAE: " in lines[1] and "stream (host RAM" in lines[1], lines
+    assert "VAE: " in lines[1] and "ring (host RAM" in lines[1], lines
 
 
 def test_lines_name_each_component():
-    check_lines(_messages(_built(vae=_vae("stream"))))
+    check_lines(_messages(_built(vae=_vae("ring"))))
     none = _messages(_built())
     assert none[1].startswith("VAE: not loaded"), none
     must_fail(lambda: check_lines(none), "no VAE read as streamed")

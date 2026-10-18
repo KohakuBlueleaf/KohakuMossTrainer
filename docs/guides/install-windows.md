@@ -116,7 +116,7 @@ See [kernel-dev.md](../internals/kernel-dev.md#fallback).
 | memory profiles, auto planner | works | |
 | activation offload, weight streaming | works | pinned H2D 19.7 / D2H 24.3 GB/s on an RTX 4090 under WDDM; pageable 8.3 / 13.5 |
 | gradient offload, CPU AdamW, fused per-parameter step | works | |
-| text encoder: kernels, batched / packed encode, resident / offload / stream / cpu placements, encode-ahead | works | the same Triton kernels as Linux on sm80+; TileLang on sm70 / sm75 |
+| text encoder: kernels, batched / packed encode, resident / offload / ring / cpu placements, encode-ahead | works | the same Triton kernels as Linux on sm80+; TileLang on sm70 / sm75 |
 | Intel Arc (XPU) kernels | works | Triton (Intel backend) builds with the toolchain above in a plain console; per op and shape the registry times the Triton kernel against `torch.compile` and binds the faster (see [performance](../performance/README.md)); the fp16 `kahan` optimizer writeback drifts on Arc (2e-3 after 200 steps of 1e-5, against under 1e-5 on CUDA); on Arc use bf16 parameters or the `nearest` writeback |
 | multi-GPU (DDP / FSDP2 / pipeline / threaded) | not supported | Linux-only by design |
 

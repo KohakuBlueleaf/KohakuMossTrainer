@@ -106,7 +106,7 @@ pipe = MossPipeline.from_pretrained(
     adapters=[("my_lora.safetensors", 0.8)],
     adapter_mode="merge",        # or "bypass"
     text_plan={"memory": "auto"},  # TE: "auto" | "resident" | "offload" | "ring" | "cpu"
-    vae_plan={"memory": "auto"},   # VAE: "auto" | "resident" | "offload" | "stream" | "cpu"
+    vae_plan={"memory": "auto"},   # VAE: "auto" | "resident" | "offload" | "ring" | "cpu"
 )
 out = pipe.generate(
     ["a cat on a windowsill", "a lighthouse at dusk"],

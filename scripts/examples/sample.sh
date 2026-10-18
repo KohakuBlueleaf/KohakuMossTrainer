@@ -25,7 +25,7 @@ options (defaults in brackets; see sample.ps1 for each one's meaning):
   --text-precision compute|int8|fp8|fp8_compute|mxfp8 [compute]   --text-fp8-recipe row|tensor|block [row]
   --free-text-encoder
   --base-precision compute|int8|fp8|fp8_compute|mxfp8 [compute]   --fp8-recipe row|tensor|block [row]
-  --memory auto|PROFILE|"" [auto; "" = whole DiT resident]   --vae-memory auto|resident|offload|stream|cpu [auto]
+  --memory auto|PROFILE|"" [auto; "" = whole DiT resident]   --vae-memory auto|resident|offload|ring|cpu [auto]
   --vae-dtype auto|bf16|fp16|fp32 [auto]
   --adapter PATH[:MULT] (repeatable)   --adapter-mode merge|bypass [bypass]
   --tune off|table [off]   --tune-only   --out DIR [runs/examples/sample]   --dry-run
@@ -90,7 +90,7 @@ while [ $# -gt 0 ]; do
     --base-precision) choice base-precision "$2" compute int8 fp8 fp8_compute mxfp8; base_precision=$2; shift ;;
     --fp8-recipe) choice fp8-recipe "$2" row tensor block; fp8_recipe=$2; shift ;;
     --memory) memory=$2; shift ;;
-    --vae-memory) choice vae-memory "$2" auto resident offload stream cpu; vae_memory=$2; shift ;;
+    --vae-memory) choice vae-memory "$2" auto resident offload ring stream cpu; vae_memory=$2; shift ;;
     --vae-dtype) choice vae-dtype "$2" auto bf16 fp16 fp32; vae_dtype=$2; shift ;;
     --adapter) adapters+=("$2"); shift ;;
     --adapter-mode) choice adapter-mode "$2" merge bypass; adapter_mode=$2; shift ;;

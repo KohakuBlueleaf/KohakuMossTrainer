@@ -80,8 +80,8 @@ param(
     [ValidateSet("compute", "int8", "fp8", "fp8_compute", "mxfp8")] [string] $TextPrecision = "compute",
     # Free the text encoder after the one encode of every prompt.
     [switch] $FreeTextEncoder,
-    # VAE placement: auto | resident | offload | stream | cpu.
-    [ValidateSet("auto", "resident", "offload", "stream", "cpu")] [string] $VaeMemory = "auto",
+    # VAE placement: auto | resident | offload | ring (block rings; "stream" is accepted too) | cpu.
+    [ValidateSet("auto", "resident", "offload", "ring", "stream", "cpu")] [string] $VaeMemory = "auto",
     # VAE dtype: auto | bf16 | fp16 | fp32.
     [ValidateSet("auto", "bf16", "fp16", "fp32")] [string] $VaeDtype = "auto",
     # Prompts per generate batch (one packed DiT forward per step for the whole batch).
