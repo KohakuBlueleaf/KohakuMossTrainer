@@ -21,7 +21,7 @@ from pathlib import Path
 
 import torch
 
-from kohakumoss_kernels import registry, tuning
+from kohakumoss_kernels import compile_setup, registry, tuning
 from kohakumoss_kernels.hardware.arch import arch_of
 from kohakumoss_kernels.quant import quant_linear_reference
 from kohakumoss_kernels.tuning.buckets import pow2
@@ -141,6 +141,7 @@ def run_case(dev: Device, dtype, fmt, name, n, k, m, backends, unavailable):
     def eager(t):
         return quant_linear_reference(t, q, scale, None, fmt)
 
+    compile_setup.apply()
     paths = {"eager": eager, "compile": torch.compile(eager, dynamic=False)}
     for be in backends:
         op = registry.resolve("quant_linear", d.type, dtype, backend=be, fmt=fmt)

@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 import torch
 
 from kohakumoss_common.log import debug_once, get_logger, info_once, warning_once
-from kohakumoss_kernels import cache_tag, status
+from kohakumoss_kernels import compile_setup, status
 from kohakumoss_kernels.dtypes import short
 from kohakumoss_kernels.errors import (
     LAUNCH_ERRORS,
@@ -405,8 +405,9 @@ def resolve(
 
 
 def load_backends() -> None:
-    """Once per process, on the first kernel build: set the compile-cache key tag and
-    import every backend package (each sets up the host toolchain); a failed import
+    """Once per process, on the first kernel build: apply the compile settings
+    (`compile_setup`: cache key tag, never-quiesced compile pool) and import every
+    backend package (each sets up the host toolchain); a failed import
     marks that backend unavailable. See docs/internals/kernel-dev.md#lazy-backends."""
     if _LOADED:
         return
@@ -415,7 +416,7 @@ def load_backends() -> None:
             return
         _LOADING.append(True)
         try:
-            cache_tag.apply()
+            compile_setup.apply()
             for name in BACKENDS:
                 try:
                     importlib.import_module(f"kohakumoss_kernels.backends.{name}")

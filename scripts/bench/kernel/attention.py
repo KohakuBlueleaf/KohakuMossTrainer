@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 
 import kohakumoss_kernels as kk
+from kohakumoss_kernels import compile_setup
 from kohakumoss_kernels.backends.eager.attention import attention_varlen as sdpa_loop
 from kohakumoss_kernels.backends.varlen_choice import VarlenChoice
 from kohakumoss_kernels.error_stats import stats
@@ -96,6 +97,7 @@ def make_flex(cu, n):
         return seg[qi] == seg[ki]
 
     mask = create_block_mask(doc, None, None, n, n, device=cu.device)
+    compile_setup.apply()
     fn = torch.compile(flex_attention)
 
     def run(q, k, v, cu, max_len, scale):
@@ -116,6 +118,7 @@ def _sm80(device: torch.device) -> bool:
 def implementations(device, dtype, cu, n):
     """{name: fn}: the PyTorch paths, each backend's registry entry (`_chosen`, its
     per-shape choice) and its kernels alone (`_kernels`)."""
+    compile_setup.apply()
     impls = {
         "sdpa_loop": sdpa_loop,
         "sdpa_loop_compiled": torch.compile(sdpa_loop, dynamic=True),

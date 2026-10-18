@@ -14,6 +14,7 @@ from torch import Tensor, nn
 
 from kohakumoss.encoders.specs import SpecEncoder, vae_spec
 from kohakumoss.offload.encoders.vae import place_vae
+from kohakumoss_kernels import compile_setup
 from kohakumoss_kernels.dtypes import BY_NAME
 from kohakumoss_kernels.hardware.arch import arch_of
 
@@ -142,6 +143,7 @@ class FluxVae(nn.Module):
             self.vae.to(memory_format=torch.channels_last)
             self._layout = _channels_last
         if compile:
+            compile_setup.apply()
             self._encode = torch.compile(self.vae.encode, dynamic=True)
             self._decode = torch.compile(self.vae.decode, dynamic=True)
 

@@ -36,6 +36,7 @@ from kohakumoss.inference.placement_report import forward_tokens
 from kohakumoss.logging.log import get_logger, hl, setup
 from kohakumoss.offload.accel import configure_allocator
 from kohakumoss_common.knobs import prompt_list
+from kohakumoss_kernels import compile_setup
 
 log = get_logger("scripts.sample")
 
@@ -125,7 +126,8 @@ def load_items(k: dict) -> list[dict]:
 def main() -> None:
     setup()
     k = knobs.check(globals())
-    log.info(f"allocator {hl(configure_allocator(k['DEVICE']))}")
+    allocator = configure_allocator(k["DEVICE"])
+    log.info(f"allocator {hl(allocator)}, compile pool: {hl(compile_setup.apply())}")
     items = load_items(k)
     memory, overrides = knobs.memory_of(k)
     pipe = MossPipeline.from_pretrained(

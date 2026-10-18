@@ -76,6 +76,7 @@ from kohakumoss.training.step import LayoutTransform
 from kohakumoss.tuning.prewarm import prewarm_devices, release_workspaces, tunes
 from kohakumoss.types.plans import ParallelPlan
 from kohakumoss_data import DataConfig, build_loader
+from kohakumoss_kernels import compile_setup
 from kohakumoss_kernels.dist import dist_rank, initialized
 from kohakumoss_kernels.run_state import reset_run_state
 from kohakumoss_kernels.tuning import decisions, window
@@ -142,6 +143,7 @@ def _device(k: dict, rank: int) -> torch.device:
 
 
 def _compile(backbone, mode: str) -> None:
+    compile_setup.apply()
     match mode:
         case "block":
             for block in backbone.layers:
@@ -158,6 +160,7 @@ def _start(k: dict, layout: Layout, rank: int, device: torch.device):
     """(output dir, precision, the LyCORIS tuning switch to restore): the run directory
     and its files on rank 0, the per-run process state, the run line."""
     allocator = configure_allocator(device)
+    compile_pool = compile_setup.apply()
     torch.manual_seed(k["SEED"])
     output_dir = str(Path(k["OUTPUT_DIR"]) / run_name(k))
     if rank == 0:
@@ -181,7 +184,7 @@ def _start(k: dict, layout: Layout, rank: int, device: torch.device):
     log.info(
         f"run {hl(run_name(k))}: {hl(k['ALGO'])} {hl(k['PRECISION'])} on {device}, "
         f"{hl(k['STEPS'])} steps, output {hl(output_dir, 'path')}, allocator "
-        f"{hl(allocator)}"
+        f"{hl(allocator)}, compile pool: {hl(compile_pool)}"
     )
     return output_dir, prec, lycoris_tuning
 

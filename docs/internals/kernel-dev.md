@@ -260,14 +260,15 @@ builds a kernel pays none of it. The first kernel build (`registry.resolve` or
 `available`, i.e. the first `OpSet.resolve` of a model) runs `registry.load_backends()`
 once per process:
 
-1. it appends the compile-cache key tag (`cache_tag.apply()`,
-   [Compile cache key](#compile-cache-key));
+1. it applies the process's compile settings (`compile_setup.apply()`: the
+   compile-cache key tag, [Compile cache key](#compile-cache-key), and the compile
+   worker pool, [Compile backend](#compile-backend));
 2. it imports the eager, compile, Triton and TileLang backend packages; the Triton and
    TileLang packages set up the host toolchain on import (`ensure_toolchain()`:
    `vcvars64` and `PATH` / `CXX` on Windows, the Intel Triton UTF-8 sources), the
    compile backend at its first CPU probe.
 
-`CompiledOp` also applies the key tag before its first compile.
+`CompiledOp` also applies the settings before its first compile.
 `tests/kernels/registry/test_lazy_backends.py` checks it in a fresh process (negative:
 backends loaded at import).
 
@@ -329,6 +330,24 @@ the pattern), so a bound call computes one key and calls the runner, not the pat
 well. The adapter compile candidate (`adapters/bind/autotuned.py`, `CompiledBody`) binds
 the `CompiledOp` of an autotuned op's operand shapes once per bucket
 (`CompiledBody.at`).
+
+**Compile worker pool.** On Linux inductor compiles Triton kernels in a sidecar
+process with a pool of forked workers (`min(32, cpu count)`); on Windows it compiles
+in-process. Inductor's default quiesces that pool 60 s after its last compile result
+and forks a new one on the next compile, from a sidecar whose previous pool's threads
+are still winding down; a worker forked then can deadlock on an inherited lock, and the
+job it took never returns (`future.result()` has no timeout: the process waits
+forever). `compile_setup.apply()` sets `TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL=0`
+(an environment value already set wins), and puts the value inductor's config reads
+from it in place when that config is already loaded (a plain config assignment holds
+for one thread only), so the pool is created without its idle Timer and lives for the
+process. Every torch.compile site in `src/` calls it first
+(`tests/rules/test_compile_sites.py`), the run line and sample.py log it
+(`compile pool: no quiesce`), and `tests/kernels/registry/test_compile_pool.py` checks
+the pool in a fresh process (negative: inductor's default pool has the Timer). Cost:
+the workers stay up for the process; during an integration training run the 32
+workers held 0.85 GiB proportional (PSS) host memory, 12.6 GB RSS counting the pages they share with the
+sidecar, and the sidecar 0.46 GiB, which it holds either way. No device memory.
 
 ## Fused linear ops
 

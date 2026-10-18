@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from kohakumoss_kernels import registry
+from kohakumoss_kernels import compile_setup, registry
 from kohakumoss_kernels.hardware.current import on_device
 
 FORMATS = {"int8": torch.int8, "fp8": torch.float8_e4m3fn}
@@ -46,6 +46,7 @@ def _dgrad_ref(g: Tensor, q: Tensor, scale: Tensor) -> Tensor:
 
 @functools.cache
 def _compiled(fn: Callable) -> Callable:
+    compile_setup.apply()
     return torch.compile(fn, dynamic=True)
 
 

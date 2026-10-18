@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from kohakumoss_common.log import get_logger
-from kohakumoss_kernels import registry, tuning
+from kohakumoss_kernels import compile_setup, registry, tuning
 from kohakumoss_kernels.backends.triton.fp8.fused import FUSED
 from kohakumoss_kernels.backends.triton.fp8.gemm import (
     dot_scaled_mm,
@@ -155,6 +155,7 @@ def _w16_dgrad(recipe, dy, q, scale):
 
 @functools.cache
 def _compiled(fn):
+    compile_setup.apply()
     return torch.compile(fn, dynamic=True)
 
 
