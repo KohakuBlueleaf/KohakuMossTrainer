@@ -125,3 +125,7 @@ See [kernel-dev.md](../internals/kernel-dev.md#fallback).
 - Set `CUDA_DEVICE_ORDER=PCI_BUS_ID` on machines with several GPUs so device indices
   match `nvidia-smi`.
 - A GPU that also drives the display has less free memory and noisier timings.
+- The CUDA allocator on Windows has no expandable segments; training and sampling set
+  `roundup_power2_divisions:4` instead, which keeps reserved memory flat across batches
+  of different sizes (the run line shows `allocator roundup_power2_divisions:4`;
+  [offload.md](../internals/offload.md#allocator)).

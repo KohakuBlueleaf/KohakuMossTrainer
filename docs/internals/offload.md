@@ -204,12 +204,27 @@ new segments when no split fits, and reserved memory (what nvidia-smi shows) gro
 the run while allocated memory does not. Three parts keep reserved memory near the
 allocated peak and steady from step to step:
 
-- **Expandable segments** (training and `sample.py`, applied by `configure_allocator`
-  in `offload/accel.py` before the run's first allocation): `expandable_segments:True`
-  where the CUDA allocator has them (Linux; segments grow and shrink in place, so a new
-  size never needs a new segment), torch's settings elsewhere. A
-  `PYTORCH_CUDA_ALLOC_CONF` / `PYTORCH_ALLOC_CONF` in the environment wins. The
-  settings in force are logged at the start of the run.
+- **Allocator settings** (training and `sample.py`, applied by `configure_allocator`
+  in `offload/accel.py` before the run's first allocation, CUDA only):
+  - Linux: `expandable_segments:True`. Segments grow and shrink in place, so a new size
+    never needs a new segment.
+  - Everywhere else (Windows, where the CUDA allocator has no expandable segments):
+    `roundup_power2_divisions:4`. Every request is rounded up to one of four sizes per
+    power of two, so a batch a few tokens larger reuses a cached block of its size
+    class instead of reserving a new segment. A single tensor can take up to about 19%
+    more than it asked for.
+
+  A `PYTORCH_CUDA_ALLOC_CONF` / `PYTORCH_ALLOC_CONF` in the environment wins. The
+  settings in force are logged at the start of the run (`allocator <settings>`).
+  Measured with the user's LoRA fp16 setup (`ckpt-ring4-actoff`, 20000-token batches,
+  online text / latent encoding, 60 steps) on an RTX 3090 with expandable segments off,
+  standing in for Windows: reserved memory 7.50 -> 10.51 GiB with torch's defaults (new
+  1.2 GiB segments for the token-sized fp8 / LoRA / FFN-backward outputs once the
+  cached free blocks are split below that size), 7.68 -> 8.00 GiB with the rounding;
+  allocated memory 1.2 GiB after every step in both. The prewarm's tuning-time
+  out-of-memory retries (each one frees the whole cache) drop from 98 to 0.
+  `max_split_size_mb:256` is worse (7.50 -> 22.9 GiB: unsplittable large blocks map a
+  segment per new size).
 - **Side-stream buffers allocated once.** A block allocated while a side stream is
   current belongs to that stream's pool, which the compute stream never draws from. The
   offload engines therefore allocate their device buffers once and copy into them:

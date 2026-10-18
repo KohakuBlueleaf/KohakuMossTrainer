@@ -11,6 +11,7 @@ from kohakumoss_kernels.hardware.current import with_index as with_index
 from kohakumoss_kernels.hardware.memory import mem_info
 
 EXPANDABLE = "expandable_segments:True"
+ROUNDED = "roundup_power2_divisions:4"
 ALLOC_ENV = ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF")
 HEADROOM = 0.92
 _SET_ALLOCATOR = getattr(
@@ -57,19 +58,18 @@ def release_cache(device: torch.device | str) -> None:
 
 def configure_allocator(device: torch.device | str) -> str:
     """Before the run's first allocation: expandable segments for the CUDA caching
-    allocator where it has them (Linux), torch's defaults elsewhere; a
-    PYTORCH_CUDA_ALLOC_CONF / PYTORCH_ALLOC_CONF in the environment wins. Returns the
-    settings in force. See docs/internals/offload.md#allocator."""
+    allocator where it has them (Linux), else power-of-2 rounding of request sizes
+    (ROUNDED); a PYTORCH_CUDA_ALLOC_CONF / PYTORCH_ALLOC_CONF in the environment wins.
+    Returns the settings in force. See docs/internals/offload.md#allocator."""
     device = torch.device(device)
     if device.type != "cuda":
         return f"{device.type} default"
     for name in ALLOC_ENV:
         if os.environ.get(name):
             return f"{name}={os.environ[name]}"
-    if sys.platform != "linux":
-        return "default"
-    _SET_ALLOCATOR(EXPANDABLE)
-    return EXPANDABLE
+    settings = EXPANDABLE if sys.platform == "linux" else ROUNDED
+    _SET_ALLOCATOR(settings)
+    return settings
 
 
 def device_budget(device: torch.device | str) -> int:
