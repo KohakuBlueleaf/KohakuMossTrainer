@@ -25,7 +25,10 @@ validation rejects it on Windows. On Windows the launcher serves the CPU gloo
     `USE_LIBUV=0` is set in every worker.
   - On Windows the store address is `localhost`: the `127.0.0.1` literal fails inside
     the non-libuv store with a formatting error from torch.
-- **File init**: `init="file"` uses a `file://` rendezvous in a fresh temp directory.
+- **File init**: `init="file"` uses a `file://` rendezvous in a fresh temp directory,
+  removed when the job ends (a normal exit, a failing rank, or SIGTERM to the
+  launcher, which then terminates the rank processes). The tcp init creates no
+  directory.
 - **Workers**: `fn` must be a module-level function, because spawned processes import it.
 
 ### Device binding
