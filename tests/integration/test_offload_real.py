@@ -1,5 +1,6 @@
-"""Memory placement on the real backbone and two encoded dataset samples (bf16, a
-forward + backward per step through the plan the trainer installs). Activation
+"""Memory placement on the real backbone and two encoded dataset samples (the card's
+16-bit compute dtype: bf16 where the card has it, else fp16; a forward + backward per
+step through the plan the trainer installs). Activation
 offload: every packed activation comes back in its step's backward, every host buffer
 returns to the pool after the step, and later steps allocate none. Ring weight
 streaming: a streamed forward + backward takes no host sync beyond the resident one's,
@@ -15,31 +16,37 @@ from kohakumoss.memory.runners import build_runner
 from kohakumoss.model import load_backbone
 from kohakumoss.offload.activation import ActivationOffload
 from kohakumoss.types.plans import MemoryPlan
+from kohakumoss_kernels.hardware.arch import arch_of
 from tests._util.negative import must_fail
 
 pytestmark = [pytest.mark.real_weights, pytest.mark.cuda, pytest.mark.slow]
-DTYPE = torch.bfloat16
 STEPS = 3
 
 
 @pytest.fixture(scope="module")
-def model(weights_root):
-    m, report = load_backbone(weights_root / "base", device="cuda", dtype=DTYPE)
+def dtype():
+    """The card's 16-bit compute dtype: bf16 where it has bf16, else fp16."""
+    return torch.bfloat16 if arch_of(torch.device("cuda")).has_bf16 else torch.float16
+
+
+@pytest.fixture(scope="module")
+def model(weights_root, dtype):
+    m, report = load_backbone(weights_root / "base", device="cuda", dtype=dtype)
     assert report.ok
     return m.requires_grad_(False)
 
 
 @pytest.fixture(scope="module")
-def batch(real_batch):
-    return real_batch.on("cuda", DTYPE)
+def batch(real_batch, dtype):
+    return real_batch.on("cuda", dtype)
 
 
 def fwd_bwd(model, batch) -> None:
-    """One training-style step on a frozen backbone: the loss gradient reaches the
-    latents through every block."""
+    """One training-style step on a frozen backbone (autocast to the batch's dtype):
+    the loss gradient reaches the latents through every block."""
     img, text, sigma, seq = batch
     x = img.detach().requires_grad_(True)
-    with torch.autocast("cuda", dtype=DTYPE):
+    with torch.autocast("cuda", dtype=x.dtype):
         out = model(x, text, sigma, seq)
     out.float().square().mean().backward()
 
@@ -89,9 +96,9 @@ def check_released(reports: list[dict]) -> None:
 
 
 @pytest.mark.parametrize("checkpoint", ["none", "block"])
-def test_activation_offload_pools_released(model, batch, checkpoint):
+def test_activation_offload_pools_released(model, batch, dtype, checkpoint):
     plan = MemoryPlan(checkpoint=checkpoint, act_offload=True, stream="off")
-    engines = apply_to_backbone(model, plan, "cuda", DTYPE, training=True)
+    engines = apply_to_backbone(model, plan, "cuda", dtype, training=True)
     model.bind_ops()
     made = count_new_buffers(engines.offload)
     try:
@@ -166,13 +173,13 @@ def check_no_block_syncs(streamed: dict, resident: int, depth: int) -> None:
     assert streamed["host_syncs"] <= resident, (streamed, resident)
 
 
-def test_ring_stream_takes_no_host_sync_per_block(model, batch, monkeypatch):
+def test_ring_stream_takes_no_host_sync_per_block(model, batch, dtype, monkeypatch):
     count = SyncCount(monkeypatch)
     _plain(model)
     fwd_bwd(model, batch)
     resident = count(lambda: fwd_bwd(model, batch))
     plan = MemoryPlan(checkpoint="none", stream="ring", stream_resident=2)
-    engine = apply_to_backbone(model, plan, "cuda", DTYPE, training=True).weight_stream
+    engine = apply_to_backbone(model, plan, "cuda", dtype, training=True).weight_stream
     model.bind_ops()
     depth = model.cfg.depth
     check_no_block_syncs(stream_step(model, batch, engine, count), resident, depth)

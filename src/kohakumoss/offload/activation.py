@@ -171,7 +171,9 @@ class ActivationOffload:
             self.current = prev
             self.seen = {}
 
+    @torch.compiler.disable
     def pack(self, t: Tensor):
+        """The saved-tensors pack hook; always plain Python, never traced by Dynamo."""
         if (
             t.device != self.device
             or t.nbytes < self.min_bytes
@@ -196,7 +198,9 @@ class ActivationOffload:
         self.pending.setdefault(self.current, []).append(pk)
         return pk
 
+    @torch.compiler.disable
     def unpack(self, pk):
+        """The saved-tensors unpack hook; always plain Python, never traced by Dynamo."""
         if isinstance(pk, Tensor):
             return pk
         if isinstance(pk, Recast):
@@ -276,9 +280,9 @@ class ActivationOffload:
             self._pace("h2d", block, ev)
 
     def _load_device(self, pk: Packet) -> Tensor:
-        """The packet's device copy; once fetched it stays with the packet (freed with
-        it), so a saved tensor read more often than it was saved never re-reads the
-        recycled host buffer."""
+        """The packet's device copy (fetched now on a miss; once fetched it stays with
+        the packet, freed with it); every unpack prefetches the previous block, a no-op
+        once that block is fetched."""
         if pk.device_copy is None:
             if pk.given:
                 raise RuntimeError(
@@ -287,7 +291,7 @@ class ActivationOffload:
                 )
             self.pending.setdefault(pk.block, []).append(pk)
             self._fetch(pk.block)
-            self._prefetch(pk.block - 1)
+        self._prefetch(pk.block - 1)
         self.dm.current_stream(self.device).wait_event(pk.h2d)
         pk.users -= 1
         return pk.device_copy
