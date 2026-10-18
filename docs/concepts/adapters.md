@@ -17,7 +17,9 @@ and fused kernels. `kohakumoss.adapters` is a custom applier around it.
 `ia3` | `IA3Module` | `train_on_input`
 `dylora` | `DyLoraModule` | a rank prefix drawn per step while training, every rank in eval
 `tlora` | `TLoraModule` | per-token rank masks set each step; `ADAPTER_MODE="bypass"` only
-`full` | `FullModule` | trains the weight itself; `ADAPTER_MODE="merge"`
+
+`ALGO="full"` is the full finetune ([full-finetune.md](../guides/full-finetune.md)): the
+backbone's own weights train and no LyCORIS module is built.
 
 `ALGO_KWARGS` keys are checked against the LyCORIS module's constructor (and
 `LycorisNetwork`'s): an unknown key, or one with its own knob (`alpha`, `lora_dim`,
@@ -26,7 +28,7 @@ the dropouts), is an error. T-LoRA's mask takes `mask_min_rank`, `mask_alpha` an
 these never reach the module. DoRA rejects input dropout (LyCORIS ignores it).
 
 `TRAIN_NORMS=True` adds a trained delta to the norms the preset covers
-(`adapters.norms.NormDelta`, a parametrization: `weight = original + m * w_norm`,
+(`adapters.train.norms.NormDelta`, a parametrization: `weight = original + m * w_norm`,
 summed in fp32 and rounded once to the norm's dtype).
 
 Each algorithm is one `adapters.kinds.Kind` record (dW builders, fused and eager
@@ -36,7 +38,7 @@ LoRA+ side), registered by kind name, LyCORIS module class and `ALGO` name;
 
 ## Targeting
 
-`PRESET` is resolved by `adapters.presets.resolve_preset` into a full LyCORIS preset
+`PRESET` is resolved by `adapters.build.presets.resolve_preset` into a full LyCORIS preset
 (`target_name` regexes over module paths, which are the checkpoint key paths):
 
 base | layers
@@ -52,64 +54,60 @@ LyCORIS preset key (`target_name`, `name_algo_map`, `module_algo_map`, `exclude_
 `use_fnmatch`) is used as-is; every key is set explicitly on each call, since
 `LycorisNetwork` keeps presets as class state.
 
-On a model whose bases live in quantized or streamed storage, a layer's base is
-materialised on the host only when LyCORIS's constructor reads its weight (DoRA,
-T-LoRA, OFT, BOFT, `full` initialisation), one layer at a time.
+On a model whose bases live in quantized or streamed storage, no dense base weight is
+built: LyCORIS sizes each module from the linear's features, and the construction state
+that reads the base (the DoRA magnitude, the T-LoRA SVD, the OFT / BOFT rescale) is taken
+from one transient copy of each layer's base, one layer at a time.
 
 ## Binding
 
-`apply(model, spec)` builds LyCORIS modules on the matched linears (the target layers
+`apply(model, config)` (an `AdapterConfig`, from the knobs by `config_from_knobs`) builds LyCORIS modules on the matched linears (the target layers
 are `MossLinear`, an `nn.Linear`), registers each as the child `lyco` of its linear
 (FSDP sharding and weight streaming see it with its layer), and installs each layer's
 forward once. Per layer the bound forward is one of:
 
-- the LyCORIS fused op of the kind: `bypass` adds the adapter path to the base output,
-  `merge` builds dW and runs one GEMM on W + dW, summed in fp32 and rounded once;
+- the kind's kernel ops: `bypass` adds the adapter path to the base output, `merge`
+  builds dW and runs one GEMM on W + dW, summed in fp32 and rounded once;
 - the DoRA path for decomposed algorithms: W' = DoRA(W + dW), the decompose step being
-  LyCORIS's `weight_decompose` op;
-- the LyCORIS module's eager body: while training with input or rank dropout (the
-  fused ops carry neither), while training DoRA with `DORA_DETACH`, for GLoRA bypass,
-  OFT at multiplier != 1, DyLoRA, T-LoRA, on CPU / XPU, and (pinned backend only) where
-  the layer is outside a fused kernel's scope (LoHa rank > `lycoris.kernels.MAX_HADA_RANK`,
-  LoKr factors above the kernel bound, OFT block > 32).
+  a weight-decompose kernel op;
+- the LyCORIS module's methods: while training with input or rank dropout (the kernel
+  ops carry neither), while training DoRA with `DORA_DETACH`, for GLoRA bypass, OFT at
+  multiplier != 1, DyLoRA, T-LoRA, and (named fused backend only) where the layer is
+  outside that kernel's scope (LoHa rank above `lycoris.kernels.limits.MAX_HADA_RANK`,
+  LoKr factors above the kernel bound, an OFT block above the backend's bound).
 
+Each kernel op pairs the LyCORIS fused op (`lycoris.kernels.autograd`, by `backend=`)
+with its eager formula (the public `lycoris.functional` entry on backend `"torch"`).
 Forwards that differ between train() and eval() (dropout, DoRA detach, DyLoRA, module
-dropout) re-bind on the mode change, so sampling and validation take the fused path.
-The eager bodies run their sub-ops on the bound tier (`lyco.kernel_backend`): the
-pinned backend, or the device's preferred one.
+dropout) re-bind on the mode change, so sampling and validation take the kernel ops.
+The base add goes inside the op where one takes it
+(docs/internals/adapter-binding.md#forward-wrappers). How a kernel op runs depends on
+`KERNELS.lycoris`:
 
-`apply` opts LyCORIS into its measured, precision-gated tier mode
-(`lycoris.kernels.set_tier_mode("measured")`), sets the compile tier's shape mode
-(`LYCORIS_COMPILE_DYNAMIC`) and turns the race off under `TUNE="off"`
-(`lycoris.kernels.set_tuning`). How a fused op runs depends on `KERNELS.lycoris`:
-
-- `auto` (default): each op is a `bind.race.TierSlot`. On the first call of a shape
-  bucket (LyCORIS's token bucket of the flattened rows, activation dtype, grad pattern)
-  the slot asks `tier.best` with the real operands, which races every fused backend of
-  the device, the compile tier, the eager body and the op's exact extras (LoHa's rank
-  product) on a miss of LyCORIS's tuning table, rejects any candidate outside the eager
-  body's error bar against fp64, and records the fastest. The slot keeps the arm once
-  `tier.is_settled` holds; later calls of the bucket are one dict lookup and the arm.
-  LyCORIS fixes a key's tier at its first call, and a call inside a checkpointed
-  forward or a backward takes the first capable tier without a race, so a checkpoint
-  recompute reruns what its forward ran. A race on all-zero references (freshly
-  zero-initialised factors) is not recorded and its pick stays fixed for the process.
-  `AdapterSet.prewarm(rows, dtype, devices)` therefore races every slot of every layer,
-  streamed ones included, outside any checkpoint on random scratch values of the
-  factors (restored afterwards), over every token bucket and grad pattern; the training
-  build runs it before step 0 unless `TUNE="off"`. IA3 and GLoRA have no tier op: IA3
-  runs the device's preferred fused backend, GLoRA merge its fused merge kernel and
-  GLoRA bypass the eager body.
-- a backend name (`triton` | `tilelang` | `compile` | `torch`): every op calls that
-  backend directly, with no measurement; a name the device cannot run is an error.
+- `auto` (default): on a device with a fused LyCORIS backend each op is an
+  `AutotunedOp`: the fused kernel of the device's most-prior backend against
+  `torch.compile` of the eager formula, measured once per problem bucket by the kernel
+  tuner (forward + backward on detached copies of the real operands), stored per card
+  and bound (docs/internals/adapter-binding.md#autotuned-ops). A call inside a
+  checkpointed forward or a backward runs the kernel unsettled, so a checkpoint
+  recompute reruns what its forward ran. `AdapterSet.prewarm(rows, dtype, devices)`
+  therefore settles every distinct op, streamed layers included, outside any
+  checkpoint on scratch inputs over every token bucket and grad pattern (the factors
+  keep their values and no gradient); the training build runs it before step 0 unless
+  `TUNE="off"`. Precision against PyTorch is checked by the test suite
+  (`tests/adapters/test_kernel_ops.py`), not in the measurement. Without a fused
+  backend (CPU, XPU) every op runs the eager formula.
+- a backend name (`triton` | `tilelang` | `compile` | `torch`): every op runs that
+  backend (fused kernel, compiled formula, eager formula), with no measurement; a name
+  the device cannot run is an error.
 
 The base output always comes from `MossLinear._impl`, and the base weight from the
 source each Target selects once (dense parameter, quantized / streamed storage, or an
 override). Attaching, merging or removing adapters re-binds the owning backbone's ops
 (`bind_ops()`), so a fused linear+epilogue kernel never reads a weight past an adapter.
 Changing the multiplier (`set_multiplier`) or the adapter state (`load_state_dict`)
-re-binds and builds fresh slots; factor dtypes and `requires_grad` flags are part of a
-slot's bound state, so changing them calls for `AdapterSet.bind()`.
+re-binds every layer; factor dtypes and `requires_grad` flags are part of a layer's
+bound forward, so changing them calls for `AdapterSet.bind()`.
 
 ## Steps
 
@@ -118,7 +116,7 @@ microbatch, validation included) and `end_step()` after the step's last backward
 
 - T-LoRA masks: one per token axis. Joint-block layers read a row per joint token,
   text-refiner layers a row per text token, the video embedder / final linear a row
-  per image token, modulation layers a row per sample (`adapters.tlora.AXES`, set per
+  per image token, modulation layers a row per sample (`adapters.train.tlora.AXES`, set per
   layer from its path). `end_step` clears them, so sampling and exports see the
   full-rank adapter, which is what the exported files hold.
 - Random draws: each layer's DyLoRA rank prefix and module-dropout skip come from a
@@ -138,30 +136,50 @@ factors: LoCon `lora_up`, LoHa `hada_w2_a`, LoKr `lokr_w2` / `lokr_w2_b`, GLoRA 
 
 ## Quantized and streamed bases
 
-When a layer's base lives in storage (`MossLinear.set_base`), its dense parameter is
-empty and every adapter path reads the base through the storage; the base matmul stays
-the storage's own `linear`. Such layers always bind the bypass form, since nothing can
-be merged into the storage; `merge_into` refuses them, `ALGO="full"` is rejected, and
-merged exports dequantize the storage.
+When a layer's base is not a plain 16/32-bit dense parameter (quantized or streamed
+storage via `MossLinear.set_base`, or fp8-compute copies), its dense parameter is an
+empty placeholder and the base matmul stays the storage's own `linear`. Such layers bind
+the bypass form only: the adapter's delta is added to the base output, no dense weight
+or dW is held, and `ADAPTER_MODE="merge"` is a validation error naming the base. DoRA
+reads one transient copy of the base per step for the norm of W + dW
+(docs/internals/adapter-binding.md#quantized-and-streamed-bases). `merge_into` refuses
+such layers and merged exports dequantize the storage one layer at a time.
 
 ## Multiplier
 
 The multiplier scales dW. For DoRA it moves the decomposed weight linearly toward the
-base weight, `W + m*(W' - W)`, which is how ComfyUI applies strength; for OFT/BOFT it
-interpolates each rotation toward identity, `m*R + (1 - m)*I` (LyCORIS's functional
-`diff_weight(..., scale=m)`).
+base weight, `W + m*(W' - W)` with `W' = decompose(W + dW)`, which is how ComfyUI applies
+strength; for OFT/BOFT it interpolates each rotation toward identity,
+`m*R + (1 - m)*I` (LyCORIS's functional `diff_weight(..., scale=m)`).
+
+LyCORIS's own DoRA runtime (`weight_decompose(W + dW, dora_scale, m)`, used by
+`LoConModule.forward` / `get_merged_weight` and so by the kohya and sd-webui LyCORIS
+loaders) scales the magnitude instead: `(W + dW) * (m * (s - 1) + 1)` with `s` the
+per-row (or per-column) ratio `dora_scale / ||W + dW||`. The two agree at `m = 1` and
+differ at any other strength, so a DoRA file at strength 0.7 renders differently there
+than in KohakuMoss and ComfyUI. KohakuMoss follows ComfyUI because its exports are made
+for ComfyUI (the `comfy` format) and because a linear move keeps every format's
+strength one rule (`diff`-written layers, merges and the DoRA kernels all compute
+`W + m * delta`).
 
 ## State and export
 
-- `state_dict()` / `save_state()` hold the raw parameters by LyCORIS key (exact resume;
-  the file also records the spec); `load_state_dict` requires exactly the live keys.
+- `state_dict()` / `save_state()` hold the raw parameters by LyCORIS key (exact resume);
+  `state_metadata()` is the file's metadata, written by `save_state` and by every
+  training checkpoint's `trainable.safetensors`: the raw-state tag, the adapter
+  configuration (`kohakumoss_spec`) and the weight fold the layers trained on
+  (`kohakumoss_fold`, a `fold_record`: per-block scales, via, pre-gate scales, eps; null
+  when unfolded). A full finetune's checkpoint carries its own tag and the fold.
+  `load_state_dict` requires exactly the live keys.
 - `export(path, fmt)` writes `lycoris` (LyCORIS's own state dicts; a layer with a
   per-row fold scale is written as `diff`), `comfy` (see
   `docs/guides/export-to-comfy.md`), `merged` (one bare-key transformer file) or
   `diffusers` (the transformer folder: shards, index and `config.json`). The merged
   formats go through the backbone's own export state
   (`kohakumoss.model.io.save.export_state`), which dequantizes stored bases and undoes
-  the residual fold; `row_scales` undoes the fold for `lycoris` / `comfy`.
+  the residual fold; `row_scales` undoes the fold for `lycoris` / `comfy`;
+  `fused_qkv` writes ComfyUI's fused `proj.qkv` layout for `comfy` and `merged`
+  (`docs/guides/export-to-comfy.md#fused-qkv`).
 - Every export and `merge_into` evaluates the adapters outside training (no rank
   dropout, every DyLoRA block, no T-LoRA mask) and leaves the training state as it was.
 - `merge_into(m)` bakes every linear and norm delta at `m`.
@@ -169,16 +187,28 @@ interpolates each rotation toward identity, `m*R + (1 - m)*I` (LyCORIS's functio
 ## Inference
 
 `load_adapters(model, [(file, multiplier), ...], mode)` reads LyCORIS files,
-ComfyUI-style files (`lora_unet_` or `diffusion_model.` keys) and training states (their
-spec rebuilt without dropout, on the device's own tier):
+ComfyUI-style files (`lora_unet_` or `diffusion_model.` keys; a fused `proj.qkv` LoRA or
+`diff` layer is split into q / k / v) and training states. A training state (tagged
+with its configuration in the file's metadata) is converted first
+to the unfolded LyCORIS tensors an export writes: its modules rebuilt from its
+configuration without dropout, on the device's own backend, each layer's dW rows
+divided by the fold the state trained on (its recorded fold; this model's own when it
+records none), the base a layer reads during that conversion being the effective
+weight in the state's own space. It then loads like a LyCORIS file, so a state trained
+on a folded model renders correctly on an unfolded one and the reverse:
 
-- `bypass` stacks each adapter's forward on the previous one. Low-rank paths stay
-  factorised; DoRA, dense diffs, DyLoRA, `full` and OFT at multiplier != 1 apply a dW
-  held once in the layer's compute dtype, computed against the layer's current
+- `bypass` stacks each adapter's forward on the previous one. On a dense base low-rank
+  paths stay factorised; DoRA, dense diffs, DyLoRA and OFT at multiplier != 1 apply a
+  dW held once in the layer's compute dtype, computed against the layer's current
   effective weight (the base plus every adapter stacked before it), as `merge` does;
-- `merge` adds dW into the base weights, summed in fp32 and rounded once.
+- `merge` adds dW into the base weights, summed in fp32 and rounded once;
+- on a quantized / streamed base every kind attaches as a bypass chain whatever the
+  mode (a merge request falls back with one log line): DoRA keeps only its per-row (or
+  per-column) ratio, computed once from a transient copy of the effective weight, and a
+  dense-diff file is refused.
 
-Loaded modules run on the device's preferred tier. `remove()` restores every touched
+Loaded modules run their own methods (LyCORIS picks the backend per call). `remove()`
+restores every touched
 weight and forward bit-exactly; `undoable=False` keeps no copies (a one-way merge, as
 `scripts/export/merge.py` does). `row_scales` places unfolded files onto a folded
 model.

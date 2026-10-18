@@ -1,11 +1,17 @@
 # Guides
 
+In the order a first run follows them:
+
 | page | content |
 | --- | --- |
-| [install-windows.md](install-windows.md) | Windows install, toolchain, feature matrix |
-| [first-lora.md](first-lora.md) | train a first LoRA / LyCORIS adapter |
-| [full-finetune.md](full-finetune.md) | full finetune, memory profiles for it |
-| [datasets.md](datasets.md) | preparing data, importing to the dataset format, caching |
-| [inference.md](inference.md) | sampling with base weights and adapters |
+| [install.md](install.md) | one install command per platform (Linux, Windows, Intel Arc, Google Colab), extras, the doctor |
+| [install-windows.md](install-windows.md) | Windows toolchain, feature matrix |
+| [first-lora.md](first-lora.md) | train a first LoRA / LyCORIS adapter, end to end |
+| [configs.md](configs.md) | kogine configs, preset layers, recipes, `kohakumoss-config`, host RAM per VRAM layer |
+| [datasets.md](datasets.md) | preparing data, inspecting the plan, caching, importing to the dataset format |
+| [inference.md](inference.md) | sampling with base weights and adapters, comparison grids |
 | [export-to-comfy.md](export-to-comfy.md) | exporting adapters and checkpoints for ComfyUI |
-| [multi-gpu.md](multi-gpu.md) | DDP, FSDP2, pipeline (Linux) |
+| [full-finetune.md](full-finetune.md) | full finetune, memory profiles and host RAM for it |
+| [multi-gpu.md](multi-gpu.md) | DDP, FSDP2, pipeline, threaded pipeline (Linux) |
+| [logging.md](logging.md) | log levels, colours, tables, progress bars, kernel tuning lines, VRAM numbers |
+| [scripts.md](scripts.md) | every script under `scripts/`: what it does and how to run it, the example run scripts |

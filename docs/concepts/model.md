@@ -33,13 +33,17 @@ v = cfg(img, text, sigma, seq, mask)                      # skipped where mask[b
 - `img` [N_img, 128] and `text` [N_txt, 4096] are packed (see `seqinfo.md`); `sigma` is
   fp32 [B].
 - `bind_forward` resolves the block plan once (re-bind after a fold or fp16-fix change).
-  With `segment_skip_layers`, one bool mask [B] applies to every listed block: their
-  gates are zeroed for the flagged samples, which leaves those samples' stream exactly as
-  skipping the blocks would. Packed CFG uses this for the negative-branch skip of block 22.
-- Time embedding, shared modulation and head modulation are computed per sample in fp32
-  with any enclosing autocast disabled; those modules store fp32 weights (`KEEP_FP32`).
-  On a 16-bit trunk their linears run on 16-bit inputs with fp32 accumulation and an fp32
-  output (`docs/concepts/numerics.md`, Conditioning). The timestep sinusoid is fp32.
+  With `segment_skip_layers`, one bool mask [B] applies to every listed block: each
+  listed block runs on the whole packed batch and its output is kept only on the tokens
+  of unflagged samples (`torch.where`); flagged samples keep the stream the skip gives
+  (the fold's rescale `r` only), whatever the block computed on them, so an inf or NaN
+  there cannot reach them. Packed CFG uses this for the negative-branch skip of block 22.
+  Skip indices outside `[0, depth)` are an error in `sample_latents` and the sample
+  knobs.
+- Time embedding, shared modulation and head modulation are computed per sample; those
+  modules store fp32 weights (`KEEP_FP32`). Their linears are plain PyTorch linears
+  under the caller's autocast, and their outputs are cast to fp32 for the modulation
+  (`docs/concepts/numerics.md`, Conditioning). The timestep sinusoid is fp32.
 
 ## Ops and runners
 

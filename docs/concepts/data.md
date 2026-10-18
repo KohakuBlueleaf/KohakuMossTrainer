@@ -5,34 +5,64 @@ or `torch.distributed`: rank and world are plain ints, encoders are plain callab
 and the model-side layout (`SeqInfo`) is built by the trainer from `hw` and `text_len`.
 
 ```
-Source.scan() ──▶ CatalogRow ──▶ Catalog ──▶ Planner(seed, rank, world) ──▶ BatchPlan
+Source.walk() ──▶ catalog file (cache) ──▶ Catalog (columns) ──▶ Planner(seed, rank,
+                                                                  world) ──▶ BatchPlan
                                                          │
-                     MossDataset.materialize: captions, text dropout, cache lookups,
-                     decode ──▶ HostBatch (pinned) ──▶ trainer
+                     MossDataset.materialize: rows fetched, captions, text dropout,
+                     cache lookups, decode ──▶ HostBatch (pinned) ──▶ trainer
 ```
+
+## Single-writer files
+
+Every KohakuVault file has exactly one writer process; any number of processes read
+it. The catalog files are written by the process that holds their lock (the trainer's
+rank 0; the others read after it). The online caches write one shard file per rank.
+The offline cache scripts and `cache_merge.py` / `catalog_cache.py` are one process
+each. No code path retries a write on a busy database.
+
+## Dataset entries
+
+Each `DATASETS` item is `{"source": name, **source arguments}` plus the dataset-level
+keys, which the source never sees:
+
+| key | effect |
+| --- | --- |
+| `weight` | multiplies every row weight of the entry (mixing between datasets) |
+| `caption` | the entry's caption template (default: `CAPTION`) |
+| `loss_weight` | per-sample loss weight of the entry's rows (`HostBatch.weight`) |
+| `catalog` | a prebuilt catalog file, read instead of scanning when it exists |
+| `import_to` | `catalog_build.py` only: copy the images into a `moss_shard` directory |
 
 ## Sources
 
-| source | layout | notes |
+| source | layout | arguments and fields |
 | --- | --- | --- |
-| `kohya` | `<repeats>_<name>/img.ext` + `.txt` | `repeat_prefix`: `first` (leading int, kohya), `product` (product of all leading ints), `ignore`; `artist_from_folder`: `None`, `"name"` (folder name without numeric prefixes) or a regex |
-| `folder` | any tree, sidecars `.txt` / `.caption` / `.json` | `txt_as`: `tags` or `nl`; json keys `tags`, `caption`, `artist`, `rating`, the rest stays in `row.json` |
-| `jsonl` | one record per line, image key `image` / `file` / `path` / `file_name` | `weight`, `group` columns honoured |
-| `parquet` | path column or bytes column | needs `pyarrow` |
-| `webdataset` | uncompressed `.tar`, members `<key>.<ext>` | read by byte offset, no tar parsing at load time |
-| `synthetic` | seeded random images + tag captions | smoke runs and tests |
+| `kohya` | `<repeats>_<name>/img.ext` + `.txt` | `repeat_prefix`: `first` (leading int, kohya), `product` (product of all leading ints), `ignore`; `artist_from_folder`: `None`, `"name"` (folder name without numeric prefixes) or a regex; `include_root` (default False): also the images directly in `path`, repeat 1, no artist; no image found is an error naming the layout and `include_root` |
+| `folder` | any tree, sidecars `.txt` / `.caption` / `.json` | `txt_as`: `tags` or `nl`; `recursive` (default True); json keys `tags`, `caption`, `artist`, `rating`, the rest stays in `row.json` |
+| `jsonl` | one record per line, image key `image` / `file` / `path` / `file_name` | `root` (image paths relative to it; default the file's folder); record keys `tags` (list or string), `caption` / `text` / `caption_nl`, `artist`, `rating`, `weight`, `group`, the rest in `row.json` |
+| `parquet` | path column (`image_col`, default `image`) or bytes column (`bytes_col`) | `root` as for `jsonl`; the same columns as the jsonl keys; needs `pyarrow` (extra `parquet`) |
+| `webdataset` | uncompressed `.tar` (`path` is a glob), members `<key>.<ext>` | `txt_as` for `<key>.txt`; `<key>.json` with the folder json keys; read by byte offset, no tar parsing at load time |
 | `moss_shard` | the native format | see below |
+
+`kohya`, `folder`, `jsonl` and `parquet` (path column) also take `hash_content`
+(blake2b of the image bytes instead of the absolute path, size and mtime, below); `webdataset` and a parquet
+bytes column always hash the bytes.
 
 Rows are keyed on image files; a sidecar without an image is ignored. Scanning reads
 image headers only (size, EXIF orientation, alpha); the content identity used by caches
-is a file fingerprint (size + mtime) unless `hash_content=True` or the data has been
-imported into shards (then it is a blake2b content hash).
+is a file fingerprint (absolute path + size + mtime) unless `hash_content=True` or the
+data has been imported into shards (then it is a blake2b content hash). The path makes
+two files with equal size and mtime (archives extracted with second-resolution
+timestamps, `cp -p` copies) two identities; it also ties a fingerprint-keyed cache
+entry to the file's location, so moving the dataset re-encodes it, while content hashes
+are location-free.
 
 ## The `moss_shard` format
 
 ```
 dataset/
-  catalog.db          KohakuVault ColumnVault, one column per CatalogRow field
+  catalog.db          a catalog file (layout below); each row's extra holds the
+                      blake2b content hash and the source locator (`origin`)
   shards/00000.bin    concatenated encoded images (rolled at shard_bytes, 1 GiB default)
   shards/00000.idx    32-byte records: offset u64, size u32, w u16, h u16, codec u8,
                       flags u8 (bit 0 = alpha), 6 pad, content-hash prefix u64
@@ -40,6 +70,75 @@ dataset/
 
 `scripts/data/catalog_build.py` imports any source (`import_to`) or just writes its
 catalog (`catalog`) so later runs skip the scan.
+
+## The catalog
+
+`Catalog` holds the planning columns in numpy (`w`, `h` int64, `weight` float32,
+`has_alpha` and `live` bool, `group_id` int64 into `groups`, the caption-source char
+counts `chars[...]`, `source` int64) and nothing per row. `catalog[i]` builds a
+`CatalogRow` from the columns and the row's variable fields (locator, tags,
+caption_nl, artist, rating, json, extra), fetched on demand through a per-process LRU
+(4096 rows). Planners, the latent cache pass, the statistics and `Catalog.concat` read
+only the columns; rows are fetched when a batch is materialised or a caption rendered.
+`Catalog(rows)` builds the same object from in-memory rows.
+
+### The catalog file
+
+One KohakuVault file, a ColumnVault and a KVault on the same path:
+
+| part | contents |
+| --- | --- |
+| fixed i64 columns | `w`, `h`, `has_alpha`, `live`, `group_id`, `tags_chars`, `nl_chars`, `artist_chars`, `rating_chars`, `json_chars`; the stamps `st_size`, `st_mtime`, `s1_size` ... `s3_mtime` |
+| `weight32` | 4 little-endian float32 bytes per row |
+| `item` (str) | the scan item each row came from |
+| KVault `r<id, 8-byte BE>` | msgpack of the row's variable fields |
+| KVault `meta:info`, `meta:groups` | schema, generation, row count, source kind; group names |
+
+Opening reads each planning column with one range read straight into numpy (no
+per-row objects); the stamps and items are read only by a rescan. `catalog.db` of a
+`moss_shard` dataset and `catalog_build.py` files use the same layout, the only one
+the runtime reads ([datasets.md](../guides/datasets.md#4-optional-import-into-shards)
+for a file of another layout). A `moss_shard` dataset without its `shards/` is an
+error saying so.
+
+### The catalog cache
+
+Scanning sources (`kohya`, `folder`, `jsonl`, `parquet`, `webdataset`) list walk
+items cheaply and probe them expensively. A walk item has a stable key, an 8-int stamp
+and a probe:
+
+| source | item | stamp |
+| --- | --- | --- |
+| `kohya`, `folder` | an image | (size, mtime_ns) of the image and of its `.txt`, `.caption`, `.json` (-1 when absent), from one `os.scandir` per directory |
+| `jsonl`, `parquet` (path column) | a record, key `locator#n` | the image's (size, mtime_ns) plus a 63-bit hash of the record |
+| `parquet` (bytes column) | the file | its (size, mtime_ns) |
+| `webdataset` | a tar | its index, size, mtime_ns |
+
+Each dataset entry has a catalog file `<cache>/catalog/<source>-<digest>.db` (the digest
+covers the source kind, its absolute path and its options); `<cache>` is the latent /
+text cache dir, or the dir it would be with those caches off. At startup the writer
+walks the source and compares stamps: new items are probed and appended, changed items
+are re-probed and rewritten in place (same ids), items no longer walked are
+tombstoned (`live` 0, weight 0; their ids are never reused for another item). A cold
+scan appends in walk order, so its ids equal an uncached scan's. Probing runs in
+`DATA_SCAN_WORKERS` spawn processes that return rows; only the writer touches the file,
+committing every 4096 rows. One line reports `catalog: N images (M from cache, K
+probed) in X s`.
+
+`DATA_RESCAN`: `False` (default, incremental), `True` (re-probe every item in place),
+`"never"` (open the file without walking: for a large dataset known not to change).
+`scripts/data/catalog_cache.py` shows, drops or compacts the files (`ACTION`,
+`kohakumoss_data.scan.manage`); a compaction rewrites the live rows in walk order with
+new ids, copying unchanged rows, which is exactly what a cold scan writes.
+
+Writer coordination: the writer takes `<file>.lock` (O_CREAT | O_EXCL, holding its pid
+and host; a lock whose pid is gone on this host is stale), clears `<file>.ready`,
+updates the file, writes `<file>.ready` (generation, row count) and releases the lock.
+A reader (`MossDataset(cfg, writer=False)`, or a writer that finds a live lock) waits
+up to `DATA_WAIT` seconds for no live lock and a marker, then opens the file. A lock
+file that cannot be read (its writer has not written it yet) counts as stale after
+60 s; a lock from another host is never stale. The trainer builds the dataset on rank 0
+first, then the other ranks build it as readers after a barrier.
 
 ## Captions
 
@@ -55,8 +154,9 @@ Templates (`CAPTION = {"template": ...}`):
   `field_dropout` (fields in `keep` never drop).
 
 Caption variant `k` of row `r` is rendered from a generator seeded by
-`(seed, r, k)`, so there are exactly `CAPTION_VARIANTS` captions per row: what the text
-cache stores is what training draws.
+`(seed, r, k)`, so there are exactly `max(1, CAPTION_VARIANTS)` captions per row (0
+draws variant 0): what the text cache stores is what training draws, since the cache
+pass takes the count from the planner.
 
 ## Resolution, batching, over-long samples
 
@@ -72,6 +172,8 @@ patchify 2); `hw` in a batch is the latent grid (pixels / 16).
 | `square_crop` | side sqrt(`TARGET_AREA`), centre crop |
 | `shifted_square` | same, seeded crop position |
 
+Sizes are (h, w) pixels; a crop box is (left, top, right, bottom) in source pixels with
+the target's aspect, cropped and then resized to the target.
 `ASPECT_RANGE` bounds w/h (images outside are cropped to the bound). `UPSCALE="never"`
 keeps images smaller than the target at their native size. `DataConfig.crop` is
 `center` (default) or `random`; an offline latent cache needs `center`.
@@ -84,15 +186,24 @@ keeps images smaller than the target at their native size. `DataConfig.crop` is
 | `tokens_ffd` | first-fit-decreasing per window of 256 samples into `MAX_TOKENS` bins (denser batches, order shuffled) |
 | `count` | `BATCH_SIZE` consecutive samples (trailing partial batch dropped) |
 
-`MAX_SAMPLES` additionally caps the samples per token batch (0 = no cap).
-`TOKEN_BUDGET="exact"` takes every caption length from the offline text cache, so
-`MAX_TOKENS` is a hard bound; a static pipeline micro-batch shape (`MAX_TOKENS`,
-`MAX_SAMPLES`) needs it (`kohakumoss_data.pipeline_problems` lists what is missing).
+`MAX_SAMPLES` additionally caps the samples per token batch (0 = no cap; the cap is
+then set above any batch size, so every batching function applies it unconditionally).
+`bucket` runs the batching function once per bucket; `bucket` and `tokens_ffd` batches
+are shuffled after batching.
+`TOKEN_BUDGET` decides each sample's text tokens in planning:
+
+| value | text tokens |
+| --- | --- |
+| `estimate` (default) | from the catalog's char columns: the dataset's caption template estimates each row's caption length without dropout (`estimate_chars`), then `ceil(chars / TEXT_CHARS_PER_TOKEN) + TEXT_OVERHEAD_TOKENS`, capped at `MAX_TEXT_TOKENS`; no row is read |
+| `render` | each sampled caption is rendered (rows fetched): its offline text-cache length when cached, else the same estimate of the rendered string |
+| `exact` | every caption's length from the offline text cache, so `MAX_TOKENS` is a hard bound; a static pipeline micro-batch shape (`MAX_TOKENS`, `MAX_SAMPLES`) needs it (`kohakumoss_data.pipeline_problems` lists what is missing) |
 
 Every `DataConfig` field except `latent_factor` is a train-script knob of the same
 name in upper case (`DataConfig.from_knobs`), including `CROP`, `PLANNER_KWARGS`
 (`window`, `drop_last`, ...; these override the planner arguments derived from the
-other knobs), `LATENT_ENCODER_ID`, `TEXT_ENCODER_ID`, `LATENT_DRAW` (also the VAE draw
+other knobs), `LATENT_ENCODER_ID`, `TEXT_ENCODER_ID`, `LATENT_ENCODER_SPEC` /
+`TEXT_ENCODER_SPEC` (set by the trainer and the cache passes, see
+[Cache keys](#cache-keys)), `LATENT_DRAW` (also the VAE draw
 used for online encoding), `BACKGROUND`, `RESAMPLE`, `TEXT_CHARS_PER_TOKEN`,
 `TEXT_OVERHEAD_TOKENS`, `MAX_TEXT_TOKENS`, `PREFETCH` and `PIN_MEMORY`.
 `kohakumoss_data.data_problems(cfg)` lists every value that would make
@@ -113,25 +224,63 @@ prompts plus `img_keep` / `text_limit`; the trainer encodes, then gathers / cuts
 
 Each epoch is a seeded permutation of the weighted row multiset (row i appears
 floor(w) times, plus once more with probability frac(w)); each occurrence gets a
-seeded crop / flip / caption variant / keep draw. Text tokens for planning come from
-the offline text cache when it has the caption, otherwise (and always with
-`TEXT_CACHE="online"` or `"off"`) from `ceil(chars / text_chars_per_token) +
-text_overhead_tokens`. An online cache grows during the run, so planning never reads
+seeded crop / flip / caption variant / keep draw. Text tokens for planning follow
+`TOKEN_BUDGET` (above); an online cache grows during the run, so planning never reads
 it: the plan is a pure function of the data, the seed and the knobs, and a restart or
-resume maps every index to the same samples. Global batch `g = index * world + rank`,
-so ranks never share a batch.
+resume maps every index to the same samples. Tombstoned rows have weight 0 and are
+never planned. Global batch `g = index * world + rank`, so ranks never share a batch;
+`g` is located by walking the epoch lengths, and the planner keeps its last five epochs.
+
+## HostBatch
+
+`MossDataset.materialize(index, rank, world)` returns a `HostBatch`; image tokens are
+sample-major and row-major over each sample's latent grid.
+
+| field | contents |
+| --- | --- |
+| `ids` | int64 [B] catalog row ids |
+| `hw` | int32 [B, 2] latent grid (pixels / 16) |
+| `text_len` | int32 [B] text tokens; final when `text` is set, filled by the consumer after encoding `prompts` |
+| `text_drop` | bool [B] text dropout draws |
+| `weight` | float32 [B] the entries' `loss_weight` |
+| `img_keep` | per sample, sorted kept grid indices after `drop_tokens`, or None (all kept) |
+| `latents` | cached packed latents [N_img, C], kept tokens only |
+| `text` | cached packed text embeddings, already cut to `text_limit` |
+| `pixels` | uint8 [H, W, 3] full images when latents are not cached; the consumer encodes, then gathers `img_keep` |
+| `prompts` | captions when text is not cached; the consumer keeps the first `text_limit` rows after encoding |
+| `text_limit` | per sample, > 0 caps the text tokens (`truncate_text`) |
+| `latent_keys` / `text_keys` | each sample's cache keys (empty when that cache is off), used by online write-back |
+| `index` / `rank` | the plan coordinates |
+| `layout` | the consumer's packed-sequence layout, built in the loader worker by a transform when the text lengths are final (None otherwise) |
 
 ## Loader
 
 `Loader` wraps a `DataLoader(batch_size=None)` over a `BatchStream`: worker `w` of
-`W` materialises indices `start + w, start + w + W, ...`, and the DataLoader returns
-them in order, so the stream is the same for any worker count. Resume state is
-`{seed, start}`. Workers use `spawn` on every OS, so the dataset (sources, catalog,
-templates, caches) is pickled by value; file handles reopen lazily per process.
+`W` materialises indices `start + w, start + w + W, ...`, and the DataLoader
+round-robins its workers in order, so the stream is the same for any worker count. Resume state is
+`{seed, start}`. Workers never fork the trainer process: they start from a fresh
+interpreter (`kohakumoss_data.loader.stateless.worker_context`: `forkserver` on Linux,
+`spawn` on Windows), so the dataset (sources, catalog, templates, caches) is pickled by
+value; file handles reopen lazily per process. Batches do not depend on the start
+method.
+
+The DataLoader starts its workers one after another, and each start returns only once
+the new worker has read most of its pickled arguments, which it reads after importing
+the launching process's main module and while importing the modules the arguments
+name (torch, `kohakumoss_data`, the transform's module; the trainer's
+`LayoutTransform` brings in `kohakumoss_kernels` with every backend). Under `spawn`
+every worker pays those imports in turn: with a launcher that imports the trainer at
+its top, step 1 waits 46 s for 4 workers on an RTX 5090 host (Linux), whatever the
+cache modes. Under `forkserver` the server preloads the main module, the DataLoader's
+worker loop and the modules of the dataset and the transform once, and every worker
+forks from it with them imported, so the wait is one set of imports. Windows has only
+`spawn`, where the wait grows with `NUM_WORKERS`.
 
 `Loader(transform=...)` / `build_loader(cfg, rank, world, transform=...)` (a picklable
 callable or a dotted path) runs on every batch inside the worker, before the
-DataLoader pins it. The trainer passes `kohakumoss.training.step.LayoutTransform`,
+DataLoader pins it (with `PIN_MEMORY` and an accelerator with pinned host memory: CUDA
+or XPU; `kohakumoss_common.devices.streamed_type` is the one predicate the loader, the
+SeqInfo transfer and the offload engines share). The trainer passes `kohakumoss.training.step.LayoutTransform`,
 which builds the batch's SeqInfo there (when the text lengths are final) and attaches
 it as `hb.layout`, so the layout is not built on the training thread.
 
@@ -145,12 +294,26 @@ prompt.
 (`latents.db`, `text.db`, KohakuVault). An empty `CACHE_DIR` resolves to `<path>/cache`
 of the first dataset with a `path` (its folder when the path is a file or a glob)
 (`kohakumoss_data.resolved_cache_dir`); the trainer and the cache scripts use the same
-rule. Keys:
+rule.
 
-- latent: content identity x encoder id x storage dtype x target size x crop box x
+### Cache keys
+
+- latent: content identity x encoder x storage dtype x target size x crop box x
   flip x background (alpha images only) x resample filter x VAE draw
   (`latent_draw`, `mode` or `sample`)
-- text: rendered caption x encoder id x storage dtype
+- text: rendered caption x encoder x storage dtype
+
+The encoder part is the encoder id plus its compute spec (`LATENT_ENCODER_SPEC`,
+`TEXT_ENCODER_SPEC`; `kohakumoss_data.encoder_key_id`): the VAE's compute dtype
+(`fp32` / `bf16` / `fp16`), and the text encoder's `<dtype>/<precision>` plus the
+quantization group of a weight-only int8 / fp8 base or the fp8 kernel recipe
+(`kohakumoss.encoders.specs`). A VAE in fp16 and one in bf16, or an int8 text encoder
+and a 16-bit one, give different encodings, so a cache built one way never serves a
+run that computes the other way: the run misses and the miss message names the
+differing spec. The placement (memory mode, batching, layout, kernels) is not in the
+key. The cache passes take the spec from the encoder they build (`encoder_spec`) and
+refuse a dataset whose spec differs; the trainer derives it from its own encoder knobs
+(`VAE_DTYPE`, `TEXT_ENCODE` resolved on its device; `training.build.model.data_knobs`).
 
 `offline` raises on a miss (run the cache scripts first); `online` returns pixels /
 prompts plus `latent_keys` / `text_keys` so the trainer can encode and write the
@@ -162,16 +325,57 @@ A cache hit returns the stored (rounded) value. `LatentCache.as_cached` /
 `TextCache.as_cached` round a fresh encoding exactly the same way, on its device, so
 an online run trains on identical values whether a sample hits or misses.
 
-Online write-back is `CacheWriter`, the trainer's `on_encoded` hook: it queues each
-batch's fresh encodings and a background thread writes them. Only full values are
+Online write-back is `CacheWriter`, the trainer's `on_encoded` hook: it copies each
+batch's fresh encodings into pinned host memory on a side stream (after the compute
+stream's work, one event per batch), queues the host tensors, and a background thread
+waits for the event and writes them; no device tensor waits in the queue and no copy
+runs on the compute stream. Only full values are
 written: full-grid latents (a kept-token subset is not the value of its key) and text
-that was not cut by `text_limit`. Every rank of a multi-process run writes the same
-vault; a busy vault is retried with backoff (up to `busy_timeout`, 600 s) instead of
-failing the run.
+that was not cut by `text_limit`. Each rank writes only its own shards,
+`latents.r<rank>.kv` / `text.r<rank>.kv` next to the main files, so no file has two
+writers. Every lookup (`get`, `in`, the lengths) reads the union of the main file and
+the shards present (re-listed at most every 5 s); `scripts/data/cache_merge.py`
+(`kohakumoss_data.cache.store.merge_shards`, one process, no run writing) folds the
+shards into the main file and deletes them.
+
+Precompute writes to disk: `scripts/data/cache_latents.py` / `cache_text.py` fill
+`latents.db` / `text.db` for `offline` (tests/data/cache/test_cache.py). The latent pass reads
+each chunk's image bytes on the main thread and decodes them on `NUM_WORKERS` threads,
+one chunk ahead of the encoder. An `online` run
+writes its misses back through `CacheWriter` (tests/data/cache/test_writer.py), so a later
+epoch or run hits. Online latents come from the VAE under its `VAE_ENCODE` placement,
+`ahead` host batches per VAE pass ([offload.md](../internals/offload.md#vae)).
+
+Each cache pass, and each `online` run, records the knobs that shape its keys in
+`<cache_dir>/latents.settings.json` / `text.settings.json` (one entry per distinct build;
+`kohakumoss_data.cache.settings.FIELDS`). An `offline` miss raises `CacheMiss`, which
+names the first missing sample and the key knobs that differ from the nearest recorded
+build (all of the run's key knobs when the cache recorded none). It also prints the key
+knobs as data-config lines and the cache pass with every key knob passed as `--set`
+(PowerShell quoting on Windows, POSIX elsewhere), so the rebuild matches the run
+(tests/data/cache/test_cache_miss.py). A cache whose recorded builds lack one of the
+key knobs was written under other keys, so every entry misses; the message says so and
+gives the same rebuild command. `MAX_TOKENS` is not a key knob: the caches hold full-grid latents and whole captions,
+whatever the batch budget.
 
 The text cache's lengths are read through a packed length table (`idx:lengths`, 20
 bytes per entry, binary-searched) that the text cache pass writes at its end; a vault
 without the table is scanned once at startup.
+
+### Tensor store files
+
+Each cache file is a KVault (`TensorStore`) with one writer: the main file for the
+offline passes and `cache_merge.py`, `<stem>.r<rank>.kv` shards for online writers.
+
+| key | value |
+| --- | --- |
+| `t:<key>` | magic `KMT1`, dtype code u8, ndim u8, pad u16, scale f32, shape u32 x ndim, then the raw little-endian payload |
+| `m:<key>` | the first dim (token count) as ASCII digits, written after `t:<key>` |
+| `idx:lengths` | u32 count, the sorted 16-byte keys, their i32 lengths |
+
+fp8 values are e4m3 with a per-tensor fp32 scale `absmax / 448` computed in fp32 (1 for
+an all-zero tensor). A merge takes each copied entry's length from its `t:` header, so a
+shard whose writer stopped between the two writes still merges.
 
 Sizes at MOSS shapes: a 1 MP latent is 64 x 64 x 128 bf16 = 1 MiB; a text embedding is
 L x 4096 bf16 = 8 KiB per token, so a 300-token caption is ~2.4 MiB per variant.

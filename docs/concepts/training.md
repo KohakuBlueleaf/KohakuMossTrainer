@@ -7,19 +7,24 @@ in a fixed order and hands the loop to a driver.
 
 ## Build order
 
-1. Precision policy (`PRECISION`, `KEEP_FP32`, `FP16_FIX`, `FP16_FIX_KWARGS`).
-2. Backbone: `WEIGHTS="random"` builds a random preset (tiny for smoke runs), otherwise
-   the checkpoint is loaded straight to the device.
+1. Precision (`PRECISION`, `KEEP_FP32`, `FP16_FIX`, `FP16_FIX_KWARGS`).
+2. Backbone: the `WEIGHTS` checkpoint, loaded straight to the device.
 3. `FP16_FIX` (`apply_fp16_fix`), then the memory plan (quantized base, weight
    streaming, activation offload, block runner).
 4. Trainable set: LyCORIS adapters (`kohakumoss.adapters`), or `FullTrainable` for
    `ALGO="full"` (the backbone's own parameters; the text refiner stays frozen unless
    `TRAIN_TEXT_REFINER`). Trainable parameters move to the master dtype.
-5. `bind_ops()`, encoders, parallel hooks / pipeline stages, kernel prewarm, compile,
+5. `bind_ops()`, encoders, kernel prewarm, pipeline stages, parallel hooks, compile,
    TrainStep, OptimBundle, EMA, data, logger, callbacks, checkpoints, resume, driver.
 
-Everything is resolved here; the loop has no per-step configuration branches. The
-global RNG is seeded with `SEED` for the build (identical model and adapter init on
+Everything is resolved here; the loop has no per-step configuration branches. Each run
+starts from the kernel library's process state of a fresh process
+(`kohakumoss_kernels.run_state.reset_run_state`: no in-memory backend failure or probe
+result, default backend priorities, no settled tuned choice, an empty decision log; the
+tuning tables and the on-disk failure record stay), so a second run in one process (a
+notebook, a sweep) does not inherit the first one's. After the build the log names
+where the text encoder and the VAE were placed, in the inference placement lines, or
+why the run holds none. The global RNG is seeded with `SEED` for the build (identical model and adapter init on
 every rank) and with `SEED + rank` after it. The σ and noise generators of the train
 step are seeded from `(SEED, stream rank)`: each data-parallel rank draws its own σ and
 noise; under `PARALLEL="pipeline"` every stage uses rank 0's streams (all stages see the
@@ -34,18 +39,33 @@ kernel choice is made inside a checkpointed forward. The buckets come from the d
 knobs: the longest sample is `min(MAX_TOKENS, largest planned latent grid +
 max_text_tokens)` (attention segment lengths up to it), the largest batch is
 `MAX_TOKENS` for token batching or `BATCH_SIZE` samples for count batching (block-op
-token buckets 256, 512, ... up to it). `PARALLEL="threaded"` prewarms every stage
-device; multi-process runs broadcast rank 0's tuning tables afterwards. Each step then
-decides, outside autograd, any raced-op problem first met during it. The adapter set's
-`prewarm` then races every adapter tier slot over the LyCORIS token buckets up to the
-largest batch (powers of two below LyCORIS's row bucket, multiples of it above), on
-random scratch values of the factors (restored afterwards, no gradient left) and
-without calling the layers, so streamed layers are covered too and LyCORIS's tier race
-settles before step 0. All prewarm runs before the gradient-sync hooks are installed
-and leaves no gradient behind. `TUNE="off"` binds neither prewarm and turns LyCORIS's
-tier race off (`apply` calls `lycoris.kernels.set_tuning(False)`), so adapter ops take
-the first capable tier unmeasured; CPU devices are skipped (their ops are the untuned
-eager spec).
+token buckets 256, 512, ... up to it, each run at its top or at the largest batch,
+whichever is smaller). The ops are recorded from a weightless twin of the backbone
+(the same structure, base storage, dtypes and grad flags; no weight memory), on the
+training device, before `PARALLEL="pipeline"` / `"threaded"` split the model into
+stages; the online text encoder's ops are tuned the same way right before its first
+pass, so a run whose captions are all cached tunes none
+([../internals/tuning.md](../internals/tuning.md#prewarm)); the kernel ops of the
+further threaded stage devices bind from the same
+card's tables (or are decided between steps on first use), and the adapter prewarm,
+which runs on scratch inputs, settles every threaded stage device before step 0
+(`adapter_prewarm_devices`). Multi-process runs broadcast rank 0's tuning tables
+afterwards. Each step then decides, outside autograd, any tuned-op problem first met
+during it. The adapter set's
+`prewarm` then settles every distinct adapter autotuned op (fused kernel against the
+compiled formula) over the adapter token buckets up to the largest batch (powers of two
+from 256), on scratch inputs (the factors keep their values and no gradient is left)
+and without calling the layers, so streamed layers are covered too and every adapter
+op is bound before step 0. All prewarm runs before the gradient-sync hooks are
+installed and leaves no gradient behind. `TUNE="off"` binds neither prewarm, and every
+adapter op takes its stored pick, else its fused kernel, unmeasured (LyCORIS's own tile
+tuning is off too); CPU devices are skipped (their ops are the untuned eager formula).
+
+`release_workspaces` (gc, device sync, `empty_cache` on every prewarmed device) runs
+after the kernel prewarm and again after the adapter prewarm. The first release must
+come before the adapter prewarm: the kernel prewarm's freed workspace (512 MiB measured
+on an RTX 3090) otherwise takes the adapter prewarm's small persistent allocations and
+its segment stays reserved through training.
 
 Around each micro-batch the adapter set's `begin_step(sigma, seq, step)` sets T-LoRA
 masks and draws DyLoRA ranks / module-dropout skips (seeded by step and micro-batch);
@@ -109,54 +129,94 @@ median σ at 0.78. `uniform` and `logit_normal` are continuous alternatives.
 | --- | --- |
 | `adamw` | torch AdamW (fused on CUDA) |
 | `adamw16` | AdamW for 16-bit parameters: fp32 math, 16-bit states, `sqrt(v)` stored so the second moment does not underflow in fp16; `OPTIMIZER_KWARGS={"rounding": "nearest" \| "stochastic" \| "kahan"}` (stochastic is bf16-only) |
-| `adamw8bit` | bitsandbytes 8-bit AdamW |
+| `adamw8bit` | bitsandbytes 8-bit AdamW, extra `quant` |
+| `adamw8bit_kernel` | KohakuMoss's own 8-bit AdamW: m (int8) and sqrt(v) (uint8) in blockwise states, stepped by the kernel library's `adamw8bit_step` (Triton / TileLang / eager, chosen per device); `OPTIMIZER_KWARGS={"rounding": ...}` as `adamw16` |
 | `muon` | Muon on 2-D hidden matrices (fused `qkv` split in 3, `ffn_up_gate` in 2, each chunk orthogonalised by 5 Newton–Schulz steps, update scaled by 0.2·√max(rows, cols) to match AdamW's RMS) and AdamW on the rest, in one optimiser |
-| `prodigy`, `schedule_free` | prodigyopt / schedulefree (schedule-free switches to eval weights for sampling and validation) |
-| `cpu_adamw` | host AdamW; chosen automatically for `adamw` when weight streaming keeps trainable masters on the host |
+| `prodigy`, `schedule_free` | prodigyopt / schedulefree, extra `optim` (schedule-free switches to eval weights for sampling and validation) |
+
+
+`OPTIMIZER` names the algorithm and its implementation; `OPTIM_STATE` (`gpu`, `stream`,
+`cpu`) only places `adamw`'s states and picks its placement builder (`gpu` torch AdamW,
+`stream` `host_state_adamw`, `cpu` `cpu_adamw`, also when weight streaming keeps the
+trainable masters on the host). The placement builders (`cpu_adamw`,
+`host_state_adamw`, `master_adamw`) are not `OPTIMIZER` names; validation names the
+`OPTIMIZER` / `OPTIM_STATE` pair to use instead.
 
 `WD_RULES="moss"` disables weight decay for biases, norms, 1-D tensors and the
 embedders, and applies decay-to-one (`p -= lr·wd·(p-1)`) to the last joint block's q/k
 norm weights in full finetunes. `SCHEDULE` is an AnySchedule config; `end: -1` means
-`STEPS`.
+`STEPS`. Loading a checkpoint writes the restored step's scheduled values (lr and any
+other scheduled key) into the optimiser groups the schedule drives, including the lr
+holders of the per-parameter and offload optimisers, so the first resumed step runs at
+the scheduled lr.
+
+`OPTIMIZER_KWARGS` is checked against the registered builder's own arguments
+(`adamw16`: `rounding`; `muon`: `momentum`, `ns_steps`; `schedule_free`:
+`warmup_steps`; `adamw8bit_kernel`: `rounding`; `adamw`, `adamw8bit`, `prodigy`:
+none); `LR`, `BETAS` and `EPS` have
+their own knobs, and a dotted-path `OPTIMIZER` is not checked.
 
 ## The optimiser step
 
-`OptimBundle.step()` unscales the gradients, takes their fp32 global norm, checks the norm
-and the loss for non-finite values, agrees that flag across ranks (MAX), and brings loss,
-norm and flag to the host in **one** transfer — the only host sync of a training step.
+`OptimBundle.step()` unscales the gradients, takes their fp32 global norm (per-tensor
+norms in fp32 too), checks the norm and the loss for non-finite values, agrees that flag
+across ranks (under DDP / FSDP2 the loss shares and the flags go in one SUM all-reduce),
+and brings loss, norm and flag to the host in **one** transfer — the only host sync of a
+training step (the step's token count reaches the device through pinned memory without
+one).
 A bad step is skipped (the fp16 scale backs off by 0.5, floored at 1) and counted
 (`skipped_steps` and `nonfinite_steps`); clipping multiplies the gradients by an
 on-device coefficient. With `fused_step` in the memory plan (the `low` / `minimal`
 profiles) each parameter steps inside backward on the last micro-batch of a step
-(`FusedStepBundle`): the full gradient never exists at once, so `GRAD_CLIP` clips each
-parameter by its own norm, `grad_norm` is the norm of the unclipped per-parameter
-gradients accumulated on device, and the mode is single-device and not combined with
-Muon. There a parameter whose gradient is non-finite is not updated (states untouched);
+(`FusedStepBundle`): the full gradient never exists at once, so `GRAD_CLIP` (the global
+norm in every bundle) scales each gradient by `min(1, GRAD_CLIP / the previous step's
+global norm)`, the last global norm known when a parameter steps (no clip on a run's
+first step; a non-finite step keeps the previous factor; checkpoints carry it). A
+gradient spike is therefore applied with the previous step's factor on the step it
+occurs (unclipped when the previous norm was below `GRAD_CLIP`); its own norm sets the
+next step's factor, and a non-finite spike is skipped by the non-finite guard;
+`grad_norm` is the global norm of the unclipped gradients accumulated on device, and the mode is not combined with Muon (under DDP each
+parameter steps on its gradient summed across ranks; see
+[multi-gpu.md](../guides/multi-gpu.md)). There a parameter whose gradient is non-finite is not updated (states untouched);
 the rest of the step applies. Such a step counts in `nonfinite_steps` (the scale backs
-off, an instability dump is written), not in `skipped_steps`, and EMA follows it.
-The optimiser state follows `optim_state` of the plan: `adamw` becomes `adamw8bit` for
-`8bit` and `cpu_adamw` for `cpu`.
+off, an instability dump is written), not in `skipped_steps`, and EMA follows it; its
+`grad_norm` is NaN and `nonfinite_params` counts the parameters it froze. In both modes
+`NONFINITE_PATIENCE` (default 8) stops the run, naming the parameters, after that many
+consecutive non-finite steps at the loss-scale floor or that many steps in a row with
+the same non-finite parameters. Before it stops, it writes the failing step to
+`<output>/instability/repro_step.pt` (`training/callbacks/repro.py`, a `torch.save`
+dict): the step's last prepared micro-batch as host tensors (`z` noised latents,
+`text`, `sigma`, `target`, `weight` (the weighted per-sample loss weights), `hw`,
+`text_len`, `img_keep` (per sample the kept grid indices or None), `denom` (the
+step's token count, an int), `step`) and `adapters` (every trainable tensor by name,
+its values after the step: a skipped step leaves them as its forward saw them). The
+error message names the file; `KOHAKUMOSS_REPRO_STEP=<file>` replays it in
+`tests/training/checkpoint/test_repro_step_nan.py`. The native and Lightning loops record it; the
+pipelines do not.
+The optimiser state follows `optim_state` of the plan: `adamw` becomes
+`host_state_adamw` for `stream` and `cpu_adamw` for `cpu`.
 
 ## Precision
 
-`bf16` / `fp16` compute (`auto`: bf16 when every training device has it, else fp16;
-fp32 on CPU). Every matmul takes 16-bit inputs with fp32 accumulation; fp32 holds the
-vector ops, reductions and masters only, so `PRECISION="fp32"` (fp32 matmuls) is the
-CPU / test reference mode and validation rejects it on a GPU. No part of the trainer
-computes in fp64. Trainable parameters live in fp32 masters (16-bit for
+`PRECISION` is `bf16`, `fp16` or `auto` (bf16 when every training CUDA device has it,
+else fp16; bf16 off CUDA). Every matmul takes 16-bit inputs with fp32 accumulation; fp32
+holds the vector ops, reductions and masters only. No part of the trainer computes in
+fp64. Trainable parameters live in fp32 masters (16-bit for
 `adamw16`), modules in `KEEP_FP32` stay fp32, the forward runs under autocast. `fp16`
 enables the dynamic loss scaler (init 2^16, growth ×2 after 2000 clean steps).
-`FP16_FIX` keeps the residual stream inside the fp16 range: `online` scales it at run
-time (`FP16_FIX_KWARGS={"c": 1/16}` for the base, whose stream peaks near 62k),
-`weights` bakes the same fold into the weights (adapter and merged exports undo it),
-`fp32_residual` carries the stream in fp32 (see numerics). Validation rejects
+`FP16_FIX` keeps the residual stream inside the fp16 range with an online fix only:
+`online` scales it at run time (`FP16_FIX_KWARGS={"c": 1/16}` for the base, whose
+stream peaks near 62k), `fp32_residual` carries the stream in fp32 (see numerics).
+An fp16-fix checkpoint (the fold baked into the weights) trains with `FP16_FIX="none"`
+and that file as `WEIGHTS`; `FP16_FIX="weights"` is not a training value (inference
+still loads either). Validation rejects
 `PRECISION="fp16"` on `VARIANT="base"` / `"sft"` with `FP16_FIX="none"`, and
 `PRECISION="bf16"` when any entry of `DEVICES` has no bf16.
 
 ## Memory plan in the loop
 
 The optimiser follows the plan's `optim_state` for `OPTIMIZER="adamw"`: `gpu` torch
-AdamW, `8bit` bitsandbytes, `stream` GPU AdamW with host-resident states, `cpu` host
+AdamW, `stream` GPU AdamW with host-resident states, `cpu` host
 AdamW (also forced when trainable weights stream from host masters). With
 `grad_offload` each gradient leaves the device as soon as it is accumulated and is summed
 in fp32 host memory over the `GRAD_ACC` micro-batches; the host AdamW reads those sums
@@ -170,8 +230,14 @@ group's lr ratio.
 `PARALLEL="threaded"` runs the stages on `DEVICES` inside one process;
 `PARALLEL="pipeline"` runs one process per stage (torch.distributed pipelining,
 `PIPELINE_SCHEDULE`; `threaded` runs `gpipe` or `async`). A step is `MICROBATCHES` loader batches; every pipeline rank reads
-the same batches and steps only the parameters of its own stages, and checkpoints merge
-the stages on rank 0. `pipeline` stages are built for a static micro-batch of
+the same batches and steps only the parameters of its own stages, and checkpoints and
+the final export merge the stages on rank 0. Each micro-batch's adapter step state
+(T-LoRA rank masks, DyLoRA ranks, module-dropout draws) is drawn in micro-batch order,
+as the native loop draws it, and installed again before that micro-batch's own forward
+and backward (its checkpoint recompute included); the `pipeline` engine draws it from
+the padded static layout it runs. The threaded `async` schedule runs a micro-batch's
+backward while the next one's forward runs, so those adapters with a checkpointing plan
+are rejected there (`gpipe` or `checkpoint='none'`). `pipeline` stages are built for a static micro-batch of
 `MAX_TOKENS` tokens and `MAX_SAMPLES` samples, so it needs token batching,
 `MAX_SAMPLES >= 1`, `TOKEN_BUDGET="exact"` and an offline text cache; token drop is
 supported (each sample's loss covers its kept tokens). Both are rejected on Windows,
@@ -180,7 +246,15 @@ and sampling / validation callbacks are not available in these layouts.
 ## EMA
 
 `EMA = 0.9999` (or a list of decays) keeps fp32 averages updated after each successful
-step. `EMA = {"kind": "power", "sigma_rel": [0.05, 0.10]}` keeps EDM2 power-function
+step. Each average lives on its parameter's device unless the spec names a `device`:
+under `stream='swap'` the block masters are host tensors, so their averages are host
+buffers updated on the host (no full-model device buffer, no per-step H2D), after the
+in-backward block optimiser's write-back to those masters has landed
+(`StreamedAdamW.synchronize`); the host update costs CPU time per step and parameter.
+The memory estimate counts 4 B per trainable device parameter per average. A parameter that is not fp32 on the averages' device is converted once per update,
+in chunks of at most 64 M elements, and averaged into every decay from that one copy;
+accelerator parameters averaged into host buffers are copied through two pinned
+staging chunks (one copies while the other is averaged). `EMA = {"kind": "power", "sigma_rel": [0.05, 0.10]}` keeps EDM2 power-function
 averages and writes a snapshot at every checkpoint; `python -m
 kohakumoss.training.ema.posthoc --run <dir> --sigma-rel 0.07 --out ema.safetensors`
 reconstructs an average of any width afterwards. The power-EMA exponent for a
@@ -195,22 +269,23 @@ Gram matrix is `sqrt((2g_a+1)(2g_b+1))/(g_a+g_b+1) (lo/t_a)^(g_a+1/2) (lo/t_b)^(
 ## Drivers, checkpoints, callbacks
 
 `DRIVER="native"` (default) and `"lightning"` (manual optimisation) run the same TrainStep
-and bundle, arm every micro-batch the same way (fused steps, gradient offload, the DDP
+and bundle, start every micro-batch the same way (fused steps, gradient offload, the DDP
 reducer) and reach identical parameters. Lightning drives the loop on this process's one
-device; processes and gradient sync are KohakuMoss's.
+device; processes, gradient sync and placement are KohakuMoss's. The LightningModule
+holds the backbone outside its module tree (a plain attribute), so it has no parameter
+of its own: Lightning's move of the module to the device at fit start and back to the
+CPU at teardown moves nothing, and every memory profile (host fp32 masters under
+`swap`, streamed weights, host optimiser state, the DDP shared host region) keeps its
+placement; the export after training reads the same placed model as under the native
+driver.
 
 A checkpoint directory holds the trainable state, EMA, optimiser + schedule + scaler,
 the loader position, and one `rng.<rank>.pt` per rank (global torch / numpy / python
 RNG, the CUDA state of that rank's devices, the σ and noise generators); each rank
-restores its own file, so resuming is bit-exact on every rank: always on CPU, and on
-CUDA in deterministic mode. `KOHAKUMOSS_DETERMINISTIC=1`, set before the process starts,
-selects the kernels' deterministic backward paths (no atomics), and the trainer then
-turns on torch's deterministic algorithms, a fixed cuBLAS workspace
-(`CUBLAS_WORKSPACE_CONFIG=:4096:8`) and no cuDNN autotune; kernel tuning choices come
-from the per-card tuning table, the same for both runs. Deterministic mode exists for
-reproducibility checks (the exact-resume tests) and costs speed (no atomics, no
-autotuned cuDNN, deterministic torch kernels); training and every benchmark run without
-it, and it is on only when the variable is set explicitly. A checkpoint is written into
+restores its own file, so a resumed run draws the same data, σ and noise streams as an
+uninterrupted one. On CPU the resumed parameters are bit-exact; on CUDA kernels that
+accumulate through atomics (the fused attention backward, cuBLAS split-K, cuDNN
+autotune) round in arrival order, so the resumed run matches to rounding. A checkpoint is written into
 `step_XXXXXXXX.partial/` (every rank its RNG file, rank 0 the rest) and renamed once
 complete; only renamed directories are listed or resumed, and the last step is not
 written again when the cadence already saved it. `SAVE_MINUTES` is checked every
@@ -222,3 +297,15 @@ KohakuBoard or wandb), samples through `MossPipeline` on the live model (images 
 over every rank's validation batches, all conditional: no text dropout), and
 instability dumps (`instability/step_X.json` on a non-finite step or a loss above 5×
 its running average).
+
+## Shutdown
+
+`training.shutdown.install` (the first thing `entry.run` does; also the bench matrix's run
+wrapper) makes SIGTERM raise `SystemExit(143)` in the main thread, so the run unwinds
+like an exception (finally blocks, exit handlers), and at exit kills every live
+multiprocessing child and the process's forkserver. Loader workers on Linux are forked
+by the forkserver, not by the trainer: they watch the forkserver and the forkserver
+outlives a trainer killed outright, so without this a terminated run leaves the
+forkserver and its workers behind (about 0.5 to 0.8 GB RSS each). SIGKILL cannot be
+handled; the bench matrix runner starts each run as its own process group and kills the
+group (`kohakumoss_bench/run/proc.py`).
