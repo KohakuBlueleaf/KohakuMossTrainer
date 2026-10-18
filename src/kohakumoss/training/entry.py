@@ -78,7 +78,7 @@ from kohakumoss.tuning.prewarm import prewarm_devices, release_workspaces, tunes
 from kohakumoss.types.plans import ParallelPlan
 from kohakumoss_data import DataConfig, build_loader
 from kohakumoss_kernels.run_state import reset_run_state
-from kohakumoss_kernels.tuning import decisions
+from kohakumoss_kernels.tuning import decisions, window
 from kohakumoss_kernels.tuning.tuner import set_mode as set_tune_mode
 
 _device_type = default_device_type
@@ -338,6 +338,7 @@ def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
         close_quietly(writer)
         logger.close()
         restore_lycoris_tuning(lycoris_tuning)
+        window.reopen()
     return state
 
 

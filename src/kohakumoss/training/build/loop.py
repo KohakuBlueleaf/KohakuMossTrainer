@@ -2,6 +2,7 @@
 
 import contextlib
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
 import torch.distributed as dist
@@ -62,6 +63,7 @@ from kohakumoss.training.vae import LatentAhead
 from kohakumoss_common.calls import nothing
 from kohakumoss_common.registry import build
 from kohakumoss_data import CacheWriter, DataConfig
+from kohakumoss_kernels.tuning.window import tuning_window
 
 
 def build_step(
@@ -254,15 +256,35 @@ def sample_settings(k: dict, embeds: list | None = None) -> dict:
 
 class PipelineImages:
     """`generate(**settings).images` of a MossPipeline over the live training model,
-    under the run's `autocast` (the training compute dtype)."""
+    under the run's `autocast` (the training compute dtype). The first call tunes its
+    missing kernel configs up to the end of its first sampler step
+    (`window.tuning_window`); later calls time nothing."""
 
     def __init__(self, pipe, autocast=contextlib.nullcontext):
         self.pipe = pipe
         self.autocast = autocast
+        self.run = self._first
 
     def __call__(self, **settings) -> list:
+        return self.run(**settings)
+
+    def _first(self, **settings) -> list:
+        self.run = self._later
+        with tuning_window() as close:
+            user = settings.get("step_callback")
+            settings["step_callback"] = partial(_closing, close, user)
+            return self._later(**settings)
+
+    def _later(self, **settings) -> list:
         with self.autocast():
             return self.pipe.generate(**settings).images
+
+
+def _closing(close, user, i: int, x) -> None:
+    """Sampler step `i` done: end the tuning window, then `user`."""
+    close()
+    if user is not None:
+        user(i, x)
 
 
 def metrics_every(k: dict) -> int:

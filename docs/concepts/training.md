@@ -47,11 +47,13 @@ stages; the online text encoder's ops are tuned the same way right before its fi
 pass, so a run whose captions are all cached tunes none
 ([../internals/tuning.md](../internals/tuning.md#prewarm)); the kernel ops of the
 further threaded stage devices bind from the same
-card's tables (or are decided between steps on first use), and the adapter prewarm,
+card's tables, and the adapter prewarm,
 which runs on scratch inputs, settles every threaded stage device before step 0
 (`adapter_prewarm_devices`). Multi-process runs broadcast rank 0's tuning tables
-afterwards. Each step then decides, outside autograd, any tuned-op problem first met
-during it. The adapter set's
+afterwards. Kernel configs are fixed from step 1 on; only the kernel-vs-compile
+choice of problems first met in the first `RETUNE_STEPS` steps is decided between
+those steps, and the first sample grid's first sampler step tunes its own shapes
+([../internals/tuning.md](../internals/tuning.md#tuning-windows)). The adapter set's
 `prewarm` then settles every distinct adapter autotuned op (fused kernel against the
 compiled formula) over the adapter token buckets up to the largest batch (powers of two
 from 256), on scratch inputs (the factors keep their values and no gradient is left)

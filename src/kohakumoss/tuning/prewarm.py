@@ -36,6 +36,7 @@ from kohakumoss_kernels.tuning.prewarm import attention_lengths
 from kohakumoss_kernels.tuning.replay import OpReport, replay, timed_kernels, unique
 from kohakumoss_kernels.tuning.replay import problem as replay_problem
 from kohakumoss_kernels.tuning.tuner import broadcast, set_cap
+from kohakumoss_kernels.tuning.window import freeze
 
 log = get_logger(__name__)
 PREWARM_PEAK: dict[str, tuple[int, int]] = {}
@@ -392,15 +393,20 @@ class AdapterPrewarm:
 
 
 def go_capped(budgets: dict) -> None:
-    """The end of the prewarm: every later tune of the process runs within `budgets`
-    (device -> bytes, `tuner.set_cap`), and LyCORIS binds its stored or model-ranked
-    tiles without tuning (no LyCORIS tile tune inside a step)."""
+    """The end of the prewarm: kernel configs are fixed (`window.freeze`: a key first
+    met later binds untimed), the tuning windows after it (text-encoder prewarm, first
+    sampler step, retune steps) time within `budgets` (device -> bytes,
+    `tuner.set_cap`), and LyCORIS binds its stored or model-ranked tiles without
+    tuning (no LyCORIS tile tune inside a step)."""
     for device, nbytes in budgets.items():
         set_cap(device, nbytes)
+    freeze()
     set_lycoris_tuning(False)
     caps = ", ".join(f"{d} {b / GIB:.2f} GiB" for d, b in budgets.items() if b)
     log.info(
-        f"after the prewarm: every tune within the tuning budget ({caps or 'none'}); "
+        "after the prewarm: kernel configs fixed (a key first met later binds its "
+        "first candidate, untimed); the text-encoder prewarm, the first sampler step "
+        f"and the retune steps tune within the tuning budget ({caps or 'none'}); "
         "LyCORIS tile tuning off, an untuned LyCORIS key binds its model-ranked tile, "
         "untimed and unstored"
     )

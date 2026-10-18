@@ -1,30 +1,18 @@
-"""Between-step allocator release and accounting (CUDA / XPU): STEP_RELEASE "auto"
-(default) releases on CUDA without expandable segments only once the cache holds more
-than AUTO_MARGIN above the step's allocated peak, and never elsewhere; "none" returns no
-memory to the driver between steps, "empty_cache" returns the free cached blocks after
-every optimizer step, an integer N after every N steps; the step metrics report what
-the allocator returned. See docs/internals/offload.md#between-step-release."""
+"""Between-step allocator release and accounting (CUDA / XPU): STEP_RELEASE "none"
+(default) returns no memory to the driver inside the training loop; "empty_cache"
+returns the free cached blocks after every optimizer step and an integer N after every
+N steps (explicit opt-ins: a release synchronises and blocks); the step metrics report
+what the allocator returned. See docs/internals/offload.md#between-step-release."""
 
-import sys
 import time
 
 import torch
 
-from kohakumoss_kernels.hardware.memory import (
-    device_total,
-    open_window,
-    reserved,
-    restart_window,
-    trim,
-)
+from kohakumoss_kernels.hardware.memory import reserved, trim
 
 GIB = 2**30
-AUTO = "auto"
-AUTO_SHARE = 0.10
-AUTO_FLOOR = GIB
-EXPANDABLE = "expandable_segments:True"
+DEFAULT = "none"
 RELEASE_NAMES = {"none": 0, "empty_cache": 1}
-_ALLOCATOR_SETTINGS = getattr(torch._C, "_accelerator_getAllocatorSettings", None)
 
 
 def release_every(value) -> int:
@@ -37,47 +25,29 @@ def release_every(value) -> int:
 
 def release_problems(value) -> list[str]:
     """What is wrong with a STEP_RELEASE value (empty = valid)."""
-    if isinstance(value, str) and (value in RELEASE_NAMES or value == AUTO):
+    if isinstance(value, str) and value in RELEASE_NAMES:
         return []
     if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
         return []
     return [
-        f"STEP_RELEASE={value!r} not in {(AUTO, *RELEASE_NAMES)} or an int >= 1 "
+        f"STEP_RELEASE={value!r} not in {tuple(RELEASE_NAMES)} or an int >= 1 "
         "(every N steps)"
     ]
 
 
-def expandable(device) -> bool:
-    """The CUDA caching allocator on `device` runs expandable segments (the settings
-    in force, read from torch; Linux only)."""
-    if torch.device(device).type != "cuda" or _ALLOCATOR_SETTINGS is None:
-        return False
-    return sys.platform == "linux" and EXPANDABLE in _ALLOCATOR_SETTINGS()
+class StepRelease:
+    """Every `every` steps, after the optimizer step: the device's free cached blocks
+    go back to the driver (`release(device)`, a synchronise + empty_cache); keeps what
+    its last release returned (`released` bytes, host seconds)."""
 
-
-def fragments(device) -> bool:
-    """`device`'s allocator grows its reserved bytes step over step (CUDA without
-    expandable segments)."""
-    return torch.device(device).type == "cuda" and not expandable(device)
-
-
-def auto_margin(device) -> int:
-    """Bytes the cache may hold above the step's allocated peak under "auto": the larger
-    of AUTO_SHARE of the device and AUTO_FLOOR."""
-    return max(int(AUTO_SHARE * device_total(device)), AUTO_FLOOR)
-
-
-class _Releaser:
-    """A between-step release that keeps what its last `release(device)` returned:
-    `released` bytes (reserved before minus reserved after) and its host seconds."""
-
-    def __init__(self, device, release=trim, clock=time.perf_counter):
+    def __init__(self, device, every: int, release=trim, clock=time.perf_counter):
         self.device = torch.device(device)
+        self.every = every
         self.release = release
         self.clock = clock
         self.released, self.secs = 0, 0.0
 
-    def _release(self) -> None:
+    def on_step_end(self, state, out) -> None:
         began, before = self.clock(), reserved(self.device)
         self.release(self.device)
         self.released = max(before - reserved(self.device), 0)
@@ -90,39 +60,9 @@ class _Releaser:
         return out
 
 
-class AutoRelease(_Releaser):
-    """Every step, after the optimizer step: when the allocator holds more than
-    `margin` bytes above the step's allocated peak (one allocator read, no sync), the
-    free cached blocks go back to the driver (`release(device)`)."""
-
-    every = 1
-
-    def __init__(self, device, margin: int, release=trim, clock=time.perf_counter):
-        super().__init__(device, release, clock)
-        self.margin = margin
-        self.window = open_window(self.device)
-
-    def on_step_end(self, state, out) -> None:
-        peak, _ = restart_window(self.window)
-        if reserved(self.device) - peak > self.margin:
-            self._release()
-
-
-class StepRelease(_Releaser):
-    """Every `every` steps, after the optimizer step: the device's free cached blocks
-    go back to the driver (`release(device)`, a synchronise + empty_cache)."""
-
-    def __init__(self, device, every: int, release=trim, clock=time.perf_counter):
-        super().__init__(device, release, clock)
-        self.every = every
-
-    def on_step_end(self, state, out) -> None:
-        self._release()
-
-
 class CacheReleaseStats:
     """Every step: the bytes returned to the driver at that step, reserved before minus
-    reserved after: the `source` release's (a _Releaser), else the drop of the
+    reserved after: the `source` release's (a StepRelease), else the drop of the
     allocator's reserved bytes since the previous step end; the callback frees nothing.
     Metrics: `cache_released_gib` (GiB returned at this step), and averaged over the
     steps since the last metric row (`rows` cadence) `cache_releases` (share of steps
@@ -131,7 +71,7 @@ class CacheReleaseStats:
 
     every = 1
 
-    def __init__(self, device, rows: int, source: _Releaser | None = None):
+    def __init__(self, device, rows: int, source: StepRelease | None = None):
         self.device = torch.device(device)
         self.rows = max(int(rows), 1)
         self.mark = reserved(self.device)
@@ -162,22 +102,14 @@ class CacheReleaseStats:
             self._clear()
 
 
-def _releasing(device: torch.device, release) -> list:
-    """The STEP_RELEASE callback for `release`, resolved once (empty: none)."""
-    if release == AUTO:
-        return [AutoRelease(device, auto_margin(device))] if fragments(device) else []
-    every = release_every(release)
-    return [StepRelease(device, every)] if every else []
-
-
-def release_callbacks(device, rows: int, release=AUTO) -> list:
-    """On an accelerator: the STEP_RELEASE callback (`release`, resolved once; none
-    for "none", or for "auto" where the allocator does not fragment) ahead of the
-    accounting of what it returned (metric rows every `rows` steps); nothing on the
-    host."""
+def release_callbacks(device, rows: int, release=DEFAULT) -> list:
+    """On an accelerator: the STEP_RELEASE callback (resolved once; none for "none")
+    ahead of the accounting of what the allocator returned (metric rows every `rows`
+    steps); nothing on the host."""
     device = torch.device(device)
     if device.type not in ("cuda", "xpu"):
         return []
-    releasing = _releasing(device, release)
+    every = release_every(release)
+    releasing = [StepRelease(device, every)] if every else []
     source = releasing[0] if releasing else None
     return releasing + [CacheReleaseStats(device, rows, source)]

@@ -200,7 +200,8 @@ def test_bound_independent_of_the_cache(alloc, monkeypatch, tmp_path):
 def check_live_cap(fake, monkeypatch, cap) -> None:
     """After the prewarm (`set_cap`): a live key whose timing would pass the budget
     binds its first candidate untimed and unstored; the fat config never allocates;
-    one trim follows the tune, none a later lookup."""
+    neither the tune nor a later lookup returns memory to the driver (no trim inside
+    the training loop)."""
     trims = []
     monkeypatch.setattr(tuner, "trim", trims.append)
     monkeypatch.setattr(tuner, "DEFERRED", set())
@@ -214,10 +215,9 @@ def check_live_cap(fake, monkeypatch, cap) -> None:
         assert fake.top < FAT["mib"] * MIB, fake.top / MIB
         assert (str(DEV), "test_live", key) in tuner.DEFERRED
         assert key not in fake.tables["test_live"].rows
-        tuned = len(trims)
-        assert tuned >= 1, "no trim after a live tune"
+        assert trims == [], f"a live tune trimmed {len(trims)}x"
         tuner.select("test_live", DEV, key, lambda: [LEAN, FAT, MID], _launch(fake), 3)
-        assert len(trims) == tuned, "a lookup trimmed"
+        assert trims == [], "a lookup trimmed"
     finally:
         tuner.set_cap(DEV, None)
 
@@ -225,6 +225,17 @@ def check_live_cap(fake, monkeypatch, cap) -> None:
 def test_live_tunes_stay_within_the_budget(alloc, monkeypatch):
     check_live_cap(alloc, monkeypatch, 500 * MIB)
     must_fail(lambda: check_live_cap(alloc, monkeypatch, None), "no process cap")
+
+
+def test_negative_a_live_tune_that_trims(alloc, monkeypatch):
+    real = tuner._measure
+
+    def trimming(*args, **kwargs):
+        kwargs["trims"] = True
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(tuner, "_measure", trimming)
+    must_fail(lambda: check_live_cap(alloc, monkeypatch, 500 * MIB), "a trimming tune")
 
 
 def test_fraction_restored_when_a_config_raises(alloc, monkeypatch):

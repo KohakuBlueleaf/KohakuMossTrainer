@@ -115,7 +115,10 @@ Inference (`MossPipeline`, `scripts/sample/sample.py`, `compare_grid.py`):
   0.17 ms), measured`). A provisional binding (the problem is queued for a retune, the
   own kernel runs meanwhile) is no decision and logs only `queued <kernel> <key>` at
   DEBUG. At INFO each batch of decisions is one table, logged after a prewarm, after a
-  retune that measured something, at the end of training step 1 and after a generate:
+  retune that measured something (training: the first `RETUNE_STEPS` steps; then
+  `kernel tuning closed after step N`), at the end of training step 1 and after a
+  generate. A key first met after the tuning windows binds untimed with one WARNING
+  line (`met after the tuning window`):
 
   ```
   after a retune (0.41s): 12 kernel decision(s)
@@ -194,7 +197,7 @@ export.
 
 | `TUNE` | effect |
 | --- | --- |
-| `table` (training default) | bind the card's stored decisions; a problem not in the table is tuned once and stored (training: in the prewarm before step 0, forward + backward on the planned shapes and dtype, workspaces released after, and new shapes between steps; inference: on its first call, no prewarm) |
+| `table` (training default) | bind the card's stored decisions; a problem not in the table is tuned once and stored (training: in the prewarm before step 0, forward + backward on the planned shapes and dtype, workspaces released after; then only the text-encoder prewarm, the kernel-vs-compile retune of the first `RETUNE_STEPS` steps and the first sample grid's first sampler step; inference: on its first call, no prewarm) |
 | `off` (inference default) | bind the card's stored decisions, else the default config; nothing is timed or stored |
 
 `kohakumoss-tune --device cuda:0 --dtype bf16 --sizes 1024x1024 832x1216` (or

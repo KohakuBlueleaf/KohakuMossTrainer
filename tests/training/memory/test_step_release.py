@@ -6,7 +6,6 @@ import pytest
 
 from kohakumoss.memory import release as step_release
 from kohakumoss.memory.release import (
-    AutoRelease,
     CacheReleaseStats,
     StepRelease,
     release_callbacks,
@@ -15,7 +14,7 @@ from kohakumoss.memory.release import (
 from kohakumoss.training.state import TrainState
 from kohakumoss_kernels.hardware import memory
 from tests._util.negative import must_fail
-from tests.training.memory.test_vram_accounting import FakeMem, gib
+from tests.training.memory.test_vram_accounting import FakeMem
 
 pytestmark = pytest.mark.cpu
 
@@ -151,60 +150,19 @@ def test_release_stats_on_accelerators_only(fake):
     assert stats.take == release.take, "the stats do not read the bound release"
 
 
-def _autos(callbacks: list) -> list:
-    return [cb for cb in callbacks if isinstance(cb, AutoRelease)]
+def check_default(default) -> None:
+    """The default binds no release inside the training loop, and "auto" is gone."""
+    assert default == "none"
+    assert _releases(release_callbacks("cuda", 1, default)) == []
+    assert release_problems("auto"), "'auto' still accepted"
 
 
-def check_auto(build, fake) -> None:
-    """STEP_RELEASE "auto": no release with expandable segments; without them one that
-    releases only when reserved exceeds the step's allocated peak by the margin."""
-    assert _autos(build(True)) == []
-    (auto,) = _autos(build(False))
-    assert auto.margin == int(0.10 * gib(24))
-    calls = []
-    auto.release = calls.append
-    for alloc, held in ((6.0, 8.0), (9.0, 10.0), (2.0, 10.0)):
-        fake.set(alloc, held)
-    auto.on_step_end(TrainState(), None)
-    assert calls == [], "released within the margin of the step's peak"
-    fake.set(6.0, 9.0)
-    auto.on_step_end(TrainState(), None)
-    assert len(calls) == 1, calls
+def test_default_releases_nothing(fake):
+    check_default(step_release.DEFAULT)
 
 
-def _auto_build(monkeypatch):
-    def build(expanding: bool) -> list:
-        monkeypatch.setattr(step_release, "expandable", lambda device: expanding)
-        return release_callbacks("cuda", 1, "auto")
-
-    return build
-
-
-def test_auto_releases_past_the_margin_only(fake, monkeypatch):
-    assert release_problems("auto") == []
-    check_auto(_auto_build(monkeypatch), fake)
-
-
-class _AlwaysAuto(AutoRelease):
-    """The broken variant: releases after every step."""
-
-    def on_step_end(self, state, out) -> None:
-        self.release(self.device)
-
-
-class _NeverAuto(AutoRelease):
-    """The broken variant: never releases."""
-
-    def on_step_end(self, state, out) -> None:
-        return None
-
-
-@pytest.mark.parametrize("broken", [_AlwaysAuto, _NeverAuto])
-def test_negative_auto_always_or_never(fake, monkeypatch, broken):
-    monkeypatch.setattr(step_release, "AutoRelease", broken)
-    must_fail(
-        lambda: check_auto(_auto_build(monkeypatch), fake), f"auto as {broken.__name__}"
-    )
+def test_negative_a_releasing_default(fake):
+    must_fail(lambda: check_default("empty_cache"), "a default that releases")
 
 
 def _releases(callbacks: list) -> list:

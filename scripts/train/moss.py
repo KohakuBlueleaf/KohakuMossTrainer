@@ -133,7 +133,7 @@ FP16_FIX_KWARGS = (
 # ===================== MEMORY =====================
 MEMORY_PROFILE = "balanced"  # a catalog profile (kohakumoss-config list; docs/concepts/profiles.md) | "speed" | "balanced" | "low" | "minimal" | "auto" | "manual"
 MEMORY_AUTO_FORCE = False  # "auto" with no profile that fits: False = error, True = run the last one anyway (WARNING)
-STEP_RELEASE = "auto"  # between-step release of free cached device memory: "auto" (CUDA without expandable segments, once the cache exceeds the step peak by a margin) | "none" | "empty_cache" (every step) | N (every N steps)
+STEP_RELEASE = "none"  # between-step release of free cached device memory: "none" (no release in the training loop) | "empty_cache" (every step; synchronises) | N (every N steps)
 # MEMORY_PROFILE="manual": the knobs below set the plan (None = the default in brackets); with a profile they must stay None.
 CHECKPOINT = (
     None  # "none" | "block" | "sub-block" | "selective" | "partial:<fraction>"  [block]
@@ -182,7 +182,8 @@ DIST_BIND = "lazy"  # nccl / xccl process group: "lazy" (communicators on first 
 KERNELS = (
     {}
 )  # op -> backend, e.g. {"attention_varlen": "triton", "lycoris": "torch"}; empty = arch priority
-TUNE = "table"  # "table" (stored decisions; missing ones tuned in the prewarm before step 0 and between steps, then stored) | "off" (stored decisions, else fixed defaults; nothing timed)
+TUNE = "table"  # "table" (stored decisions; missing ones tuned in the prewarm before step 0, then stored) | "off" (stored decisions, else fixed defaults; nothing timed)
+RETUNE_STEPS = 3  # TUNE="table": the kernel-vs-compile retune runs after each of the first N steps; after them nothing is tuned (a later new shape binds untimed)
 COMPILE = "off"  # "off" | "block" | "model"
 
 # ===================== RUNTIME =====================

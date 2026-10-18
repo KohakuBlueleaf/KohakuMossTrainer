@@ -1,9 +1,10 @@
 """The process-wide kernel state a run starts from: no in-memory backend failure or
-status result, default backend priorities, no settled tuned choice and an empty
-decision log (the tuning tables and the on-disk failure record stay)."""
+status result, default backend priorities, no settled tuned choice, an open tuning
+window and an empty decision log (the tuning tables and the on-disk failure record
+stay)."""
 
 from kohakumoss_kernels import registry, status
-from kohakumoss_kernels.tuning import decisions, tuner
+from kohakumoss_kernels.tuning import decisions, tuner, window
 
 
 def reset_run_state() -> None:
@@ -12,4 +13,5 @@ def reset_run_state() -> None:
     status.forget_session()
     registry.reset_priority()
     tuner.reset()
+    window.reopen()
     decisions.clear()

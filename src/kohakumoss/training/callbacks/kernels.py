@@ -1,6 +1,7 @@
-"""Kernel step callbacks: the between-step retune of uncovered problems, the step-1
-prewarm-vs-training VRAM report, the step-1 vs steps 2-10 speed report and the switch
-of the decision log to live mode. See docs/internals/tuning.md#prewarm."""
+"""Kernel step callbacks: the between-step retune of uncovered problems over the first
+steps (then the tuner is sealed), the step-1 prewarm-vs-training VRAM report, the
+step-1 vs steps 2-10 speed report and the switch of the decision log to live mode.
+See docs/internals/tuning.md#prewarm."""
 
 import statistics
 import time
@@ -13,13 +14,19 @@ from kohakumoss.parallel.launch import dist_rank, ranks_meet
 from kohakumoss.tuning.prewarm import PREWARM_PEAK, tunes
 from kohakumoss_common.calls import nothing
 from kohakumoss_common.units import GIB
-from kohakumoss_kernels.backends.compile.choice import pending_count, retune_pending
+from kohakumoss_kernels.backends.compile.choice import (
+    drop_pending,
+    pending_count,
+    retune_pending,
+)
 from kohakumoss_kernels.hardware.memory import close_window, open_window
 from kohakumoss_kernels.tuning import decisions
 from kohakumoss_kernels.tuning.tuner import agree, measured_anywhere
+from kohakumoss_kernels.tuning.window import seal
 
 log = get_logger(__name__)
 STEP_ONE: "weakref.WeakSet" = weakref.WeakSet()
+RETUNE_STEPS = 3
 
 
 def late_prewarm(device: torch.device, secs: float) -> None:
@@ -64,24 +71,41 @@ class PrewarmVram:
 
 
 class RetuneKernels:
-    """After every step, on every rank: when some rank has queued kernel-vs-compile
-    problems (`anywhere(pending())`), time them (`retune_pending`) and meet on the store
-    (`meet`); then bind the configs any rank measured on every rank (`tuner.agree`)."""
+    """After each of the process's first `steps` steps, on every rank: when some rank
+    has queued kernel-vs-compile problems (`anywhere(pending())`), time them
+    (`retune_pending`) and meet on the store (`meet`); then bind the configs any rank
+    measured on every rank (`tuner.agree`). After the last of them the tuner is sealed
+    (`window.seal`): nothing is queued or timed again, queued problems stay on the
+    kernel; a no-op on every later step."""
 
     every = 1
 
-    def __init__(self, meet=ranks_meet, anywhere=None):
+    def __init__(self, meet=ranks_meet, anywhere=None, steps: int = RETUNE_STEPS):
         self.retune = retune_pending
         self.pending = pending_count
         self.anywhere = anywhere or pending_anywhere
         self.meet = meet
         self.agree = agree
+        self.steps = steps
+        self.seen = 0
 
     def on_step_end(self, state, out) -> None:
-        if self.anywhere(self.pending()):
+        self.seen += 1
+        if self.seen <= self.steps and self.anywhere(self.pending()):
             self.retune()
             self.meet("retuned")
         self.agree()
+        if self.seen >= self.steps:
+            self.close()
+
+    def close(self) -> None:
+        left = drop_pending()
+        seal()
+        self.on_step_end = nothing
+        log.info(
+            f"kernel tuning closed after step {hl(self.seen)} of this process: "
+            f"{hl(left)} queued kernel-vs-compile problem(s) left on the kernel"
+        )
 
 
 def pending_anywhere(count: int) -> bool:
@@ -136,8 +160,10 @@ class DecisionsLive:
 
 
 def retune_callbacks(k: dict) -> list:
-    """The between-step retune, when TUNE times kernels."""
-    return [RetuneKernels()] if tunes(k) else []
+    """The between-step retune of the first RETUNE_STEPS steps, when TUNE times
+    kernels."""
+    steps = k.get("RETUNE_STEPS", RETUNE_STEPS)
+    return [RetuneKernels(steps=steps)] if tunes(k) else []
 
 
 def vram_callbacks(k: dict, device: torch.device) -> list:

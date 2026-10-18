@@ -70,10 +70,11 @@ by the allocator: for the timed call, the per-process memory fraction
 (`set_per_process_memory_fraction`, CUDA and XPU) is set to the bytes reserved at the
 start plus the bound, then restored, so the config grows the reserved memory by at
 most the bound; an allocation past it raises out-of-memory before the memory is
-taken. Every bounded config starts from an empty allocator cache
+taken. In the prewarm every bounded config starts from an empty allocator cache
 (`hardware.memory.trim` before it), so whether a config fits never depends on the
 free blocks earlier configs left cached, and two runs on one card store the same
-verdict (`tests/kernels/tuning/test_tuner_working.py`, negative: no trim). Such a config is recorded under `failures`
+verdict (`tests/kernels/tuning/test_tuner_working.py`, negative: no trim); a live tune
+inside the training loop does not trim (see below). Such a config is recorded under `failures`
 ("over the working-memory bound") and the fastest config within the bound is stored as
 usual (the same problem excludes it again in any later process). Where the bound is
 not below what the device has free, or the allocator takes no fraction, the bound is
@@ -112,7 +113,7 @@ process with `tuning.set_mode(...)`:
 
 | value | timed | table | behaviour |
 | --- | --- | --- | --- |
-| `table` (training default) | yes | read, write | a stored decision binds; a missing key is timed once, on its first eager call, and the winner stored. The trainer (and `kohakumoss-tune`) runs the prewarm below before the first real call; the trainer also measures new kernel-vs-compile shapes between steps; an owned pipeline measures them after each generate |
+| `table` (training default) | yes | read, write | a stored decision binds; a missing key is timed once, on its first eager call, and the winner stored. The trainer (and `kohakumoss-tune`) runs the prewarm below before the first real call and then tunes only inside its tuning windows (below); an owned pipeline measures queued kernel-vs-compile shapes after each generate |
 | `off` (inference default) | no | read | a stored decision binds; a missing key takes the planner's first candidate (a kernel-or-compile op: its kernel), never stored; no prewarm |
 
 Under both values the LyCORIS kernels follow TUNE through LyCORIS's process switch
@@ -401,11 +402,12 @@ metrics cover it.
 
 The end of the adapter prewarm (`prewarm.go_capped`) makes that budget the
 process's: `tuner.set_cap(device, budget)`, so every later `select` that passes no
-cap (the between-step kernel-vs-compile retune, a live adapter or attention key, the
-text-encoder prewarm in step 1) times within it; a key whose timing would pass it
+cap (inside the tuning windows below: the between-step kernel-vs-compile retune, the
+text-encoder prewarm in step 1, the first sampler step) times within it; a key whose timing would pass it
 binds its first candidate for the process, untimed and unstored (`tuner.DEFERRED`,
-one INFO line `over the tuning budget`), and every live tune is followed by one
-`trim` so its working memory does not stay reserved. It also turns LyCORIS's tile
+one INFO line `over the tuning budget`). A live tune returns no memory to the driver:
+its working memory stays in the allocator's cache for the steps to reuse (no `trim`
+inside the training loop). It also turns LyCORIS's tile
 tuning off (`set_lycoris_tuning(False)`, restored at the run's end): a LyCORIS key the
 prewarm did not tune (an inherited bucket's size) binds LyCORIS's stored or
 model-ranked tile and is never tuned inside a step. The adapter prewarm flushes its
@@ -415,6 +417,41 @@ table lists only the retune's decisions.
 (negative: no cap) and
 `tests/training/prewarm/test_adapter_prewarm.py::test_prewarm_end_caps_every_later_tune`
 (negative: LyCORIS left tuning) check it.
+
+### Tuning windows
+
+A training run tunes kernels only in these windows:
+
+| window | what is timed | memory returned to the driver |
+| --- | --- | --- |
+| the prewarm before step 1 (and `kohakumoss-tune`) | every planned problem | before and after each phase, before each bounded config |
+| the online text encoder's prewarm, right before its first pass (`TextPrewarm`) | its pack buckets | after it |
+| the first `RETUNE_STEPS` steps of the process (default 3), between steps (`RetuneKernels`) | queued kernel-vs-compile problems (`torch.compile` against the kernel) | only when a queued problem's inputs do not fit |
+| the first sample grid of the run, up to the end of its first sampler step (`PipelineImages`) | missing configs of the sampling shapes | the sampler's own releases (after encode, after sampling, after decode) |
+
+The window state lives in `kohakumoss_kernels.tuning.window`. The end of the prewarm
+(`go_capped`) calls `window.freeze()`: outside a window,
+`select` times nothing, and a key first met there binds the first candidate that builds
+and runs once, untimed, unstored, named in `tuner.DEFERRED` and logged once at WARNING
+(`met after the tuning window`): the prewarm's plan did not reach that shape, and the
+next run's prewarm covers it once the plan does. `window.tuning_window()` lifts the freeze
+inside the text-encoder prewarm and the first sampler step, and `timing_here()` lifts
+it inside the retune. After the last retune step `RetuneKernels` calls `window.seal()`:
+a kernel-or-compile op no longer queues a new problem (it binds the kernel), the
+problems still queued are dropped and stay on the kernel (one INFO line `kernel tuning
+closed after step N`), and the callback is a no-op from then on. The count is per
+process, so a resumed run retunes its own first steps; the run's end reopens the
+windows (`window.reopen()`), so a later inference or tuning call in the same process
+tunes as a fresh one. Under a process group a window after step 1 lifts the freeze, not
+the go-live deferral, so its missing keys stay untimed there. The VAE decode of the
+first sample grid runs after its first sampler step and binds untimed where a key is
+missing. No window returns memory to the
+driver on its own schedule inside the loop, and no step outside them tunes.
+`tests/kernels/tuning/test_tuning_window.py` checks that a frozen key binds untimed
+and a window times it (negative: a select that ignores the freeze), that the retune
+runs over the first N steps only and then seals (negative: a retune every step), that
+a sealed op queues nothing (negative: queued after the seal), and that only the first
+sample grid's first sampler step is open (negative: every grid open).
 
 The kernel candidate is the heavy one where the input takes a gradient. On an RTX 5090
 (LoKr full_matrix factor 16, fp16, the 3072 -> 16384 bypass with base at 20000 rows)
@@ -484,9 +521,9 @@ card and tunes its own). The text-encoder prewarm runs on each rank before that 
 first encode, without a broadcast (a rank whose captions are all cached never encodes);
 each rank's text encoder encodes only its own prompts.
 
-Problems first met after the prewarm (a bucket the plan did not reach, the adapter and
-text-encoder prewarms that run on every rank) are timed by the rank that meets them.
-After every step, on every rank, `RetuneKernels` runs `tuner.agree()`: each rank's
+Problems timed after the prewarm (inside the tuning windows; the adapter and
+text-encoder prewarms run on every rank) are timed by the rank that meets them.
+After each retune step, on every rank, `RetuneKernels` runs `tuner.agree()`: each rank's
 measurements since the last step are counted with one one-element all-reduce
 (`measured_anywhere`, on the backend's device) and gathered (`all_gather_object`) only
 when some rank measured something, so a step after warm-up costs one small
@@ -501,12 +538,13 @@ bind the first candidate of a missing key that builds and runs once, untimed (a
 config raising a build error is skipped as in timing; all failing raises
 `ConfigsFailed`), for the process, unstored, named in `tuner.DEFERRED` and logged once
 at INFO (`deferred under DDP: first candidate, untimed`) (its peers would otherwise wait in the step's collectives under the
-NCCL timeout); the between-step retune times inside `tuner.timing_here()`. One
-process times in the step as before. The retune times only kernel-vs-compile
+NCCL timeout); the between-step retune times inside `window.timing_here()`. A sample
+grid's first sampler step (rank 0 only) stays deferred under a process group: its
+window lifts the freeze, not the deferral. The retune times only kernel-vs-compile
 problems, whose call layouts it queues; a deferred generic `select` key (attention,
 quantized GEMM, adapter configs) keeps no call to replay, so under DDP it stays on its
 first candidate for the run, and the next run's prewarm covers it when its plan
-reaches that shape. Step 1, before go-live, may still time a key in the step. The test checks the deferral, the single-process
+reaches that shape. The test checks the deferral, the single-process
 path and the retune (negative: no deferral, timed in the step), the
 merge (negative: the highest rank wins), the rebinding (negative: bindings kept) and
 that the objects are gathered only after a measurement (negative: a gather every

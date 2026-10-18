@@ -212,10 +212,14 @@ stream; the offload engines copy into the fixed buffers above, so a step neither
 nor re-reserves what the previous step used, and reserved memory stays at the steady
 peak instead of being unmapped and mapped again every step. Memory goes back to the
 driver only at phase boundaries: after the build, after the kernel and adapter
-prewarm and the text-encoder prewarm, after a retune that measured something, and
-around sampling (`MossPipeline` releases after a generate). Under memory pressure the
-allocator itself frees cached blocks and retries an allocation before it reports
-out-of-memory.
+prewarm and the text-encoder prewarm, and around sampling (`MossPipeline` releases
+after a generate); the between-step retune of the first steps returns nothing (only a
+queued problem whose inputs do not fit releases before it is dropped), and no step
+after the tuning windows tunes (docs/internals/tuning.md#tuning-windows). Under memory pressure the allocator itself frees cached blocks and retries an
+allocation before it reports out-of-memory. `STEP_RELEASE` (default `"none"`) is the
+only explicit release inside the loop: `"empty_cache"` (every optimizer step) or N
+(every N steps) are opt-ins, each a device synchronise plus `empty_cache` that the next
+step pays back as fresh allocations.
 
 `kohakumoss.memory.release.CacheReleaseStats` runs after every step on CUDA /
 XPU and reports the bytes returned to the driver at that step, as reserved bytes

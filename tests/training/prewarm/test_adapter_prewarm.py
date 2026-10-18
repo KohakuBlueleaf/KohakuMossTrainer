@@ -27,7 +27,7 @@ from kohakumoss.training.optim import build_bundle
 from kohakumoss.tuning import prewarm
 from kohakumoss.tuning.prewarm import AdapterPrewarm
 from kohakumoss_kernels.hardware import memory
-from kohakumoss_kernels.tuning import tuner
+from kohakumoss_kernels.tuning import tuner, window
 from kohakumoss_kernels.tuning.buckets import pow2
 from kohakumoss_kernels.tuning.manifest import Manifest
 from kohakumoss_kernels.tuning.replay import OpReport
@@ -346,13 +346,15 @@ def test_ranks_share_the_budget(monkeypatch, tmp_path):
 
 
 def check_capped_after_prewarm(go) -> None:
-    """The end of the adapter prewarm caps every later tune and stops LyCORIS's tile
-    tuning (no LyCORIS tune inside a step)."""
+    """The end of the adapter prewarm freezes the kernel configs, caps every later tune
+    (inside the tuning windows) and stops LyCORIS's tile tuning (no LyCORIS tune inside
+    a step)."""
     device = torch.device("cuda", 0)
     previous = set_lycoris_tuning(True)
     try:
         go({device: 3 * GIB})
         assert tuner._CAPS.get(str(device)) == 3 * GIB, tuner._CAPS
+        assert window.frozen(), "kernel configs still tuned in the steps"
         assert not tuning_enabled(), "LyCORIS still tunes in the steps"
     finally:
         restore_lycoris_tuning(previous)

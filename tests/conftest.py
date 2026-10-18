@@ -38,7 +38,7 @@ from kohakumoss.adapters.lycoris.tuning import set_lycoris_tuning
 from kohakumoss_common import log as klog
 from kohakumoss_kernels.hardware.arch import arch_of
 from kohakumoss_kernels.registry import load_backends
-from kohakumoss_kernels.tuning import decisions, tuner
+from kohakumoss_kernels.tuning import decisions, tuner, window
 
 pytest_plugins = ["tests._util.synthetic_source"]
 SM_MARKERS = {"sm70": 70, "sm75": 75, "sm86": 86, "sm89": 89, "sm120": 120}
@@ -143,11 +143,14 @@ def _seed():
 
 @pytest.fixture(autouse=True)
 def _tune_off():
-    """Each test starts with TUNE="off" (no measurement) and no recorded decisions."""
+    """Each test starts with TUNE="off" (no measurement), an open tuning window and no
+    recorded decisions."""
     tuner.set_mode("off")
+    window.reopen()
     decisions.clear()
     yield
     tuner.set_mode("off")
+    window.reopen()
     decisions.clear()
 
 

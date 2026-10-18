@@ -2,7 +2,8 @@
 
 The choices of a registered op are its own backend's kernel (`kernel`) and `compile`.
 A call looks its problem up: a bound callable, else the settled per-card result of an
-earlier measurement, else the kernel (and the problem is queued). `retune_pending()`
+earlier measurement, else the kernel (and the problem is queued, until the tuner is
+sealed). `retune_pending()`
 (between steps, outside any autograd graph) measures the queued problems and stores the
 winners; the next call of each binds its winner; `decide(*args)` measures one problem
 directly. See docs/internals/tuning.md#kernel-vs-compile.
@@ -31,8 +32,8 @@ from kohakumoss_kernels.tuning.tuner import (
     select,
     settled,
     timing_allowed,
-    timing_here,
 )
+from kohakumoss_kernels.tuning.window import sealed, timing_here
 
 log = get_logger(__name__)
 KERNEL = {"impl": "kernel"}
@@ -172,7 +173,7 @@ class KernelOrCompile:
             return self.impls["kernel"]
         else:
             self._probe(args)
-            tuned = get_mode() == "table"
+            tuned = get_mode() == "table" and not sealed()
             key = self.problem(args)
             note(self.name, key)
             row = settled(self.name, _device(args), key)
@@ -293,10 +294,19 @@ def pending_count() -> int:
     return sum(len(op.pending) for op in list(_OPS))
 
 
+def drop_pending() -> int:
+    """Forget every queued problem (each stays on its provisional kernel binding);
+    returns how many there were."""
+    count = pending_count()
+    for op in list(_OPS):
+        op.pending.clear()
+    return count
+
+
 def retune_pending() -> int:
-    """Decide every queued problem of every op (call between steps), then, when it
-    measured any, return the measurement's free blocks to the driver; nothing is
-    measured where the tuner may not time an autograd launch."""
+    """Decide every queued problem of every op (call between steps), without returning
+    memory to the driver; nothing is measured where the tuner may not time an autograd
+    launch."""
     if not timing_allowed(autograd=True):
         return 0
     devices = {
@@ -309,8 +319,6 @@ def retune_pending() -> int:
     start = time.perf_counter()
     with torch.enable_grad(), rng_kept(devices), timing_here():
         measured = sum(op.retune() for op in list(_OPS))
-    for device in devices if measured else ():
-        release(device)
     if measured:
         took = time.perf_counter() - start
         log.debug(

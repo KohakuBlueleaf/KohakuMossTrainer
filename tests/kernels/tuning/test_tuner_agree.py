@@ -5,7 +5,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from kohakumoss_kernels.tuning import tuner
+from kohakumoss_kernels.tuning import tuner, window
 from tests._util.negative import must_fail
 
 pytestmark = pytest.mark.cpu
@@ -141,7 +141,8 @@ def check_in_step_miss_deferred(monkeypatch, grouped: bool, kernel: str) -> None
 
     monkeypatch.setattr(tuner, "TIMINGS", {"events": measure})
     monkeypatch.setattr(tuner, "dist", _TwoRanks(0) if grouped else dist)
-    monkeypatch.setattr(tuner, "_STATE", {"mode": "table", "defer": False})
+    monkeypatch.setattr(tuner, "_STATE", {**tuner._STATE, "mode": "table"})
+    window.reopen()
     monkeypatch.setattr(tuner, "DEFERRED", set())
     monkeypatch.setattr(tuner, "_CHOSEN", {})
     tuner.decisions.go_live()
@@ -150,7 +151,7 @@ def check_in_step_miss_deferred(monkeypatch, grouped: bool, kernel: str) -> None
     assert got == {"a": 1}
     assert bool(timed) != grouped, ("timed in a step", timed)
     assert (("cpu", kernel, "p") in tuner.DEFERRED) == grouped
-    with tuner.timing_here():
+    with window.timing_here():
         tuner.select(kernel, cpu, "q", lambda: [{"a": 1}, {"a": 2}], launch)
     assert timed, "the between-step retune did not time"
 
@@ -185,7 +186,8 @@ def check_deferred_skips_a_broken_config(monkeypatch, kernel: str) -> None:
         return run
 
     monkeypatch.setattr(tuner, "dist", _TwoRanks(0))
-    monkeypatch.setattr(tuner, "_STATE", {"mode": "table", "defer": False})
+    monkeypatch.setattr(tuner, "_STATE", {**tuner._STATE, "mode": "table"})
+    window.reopen()
     monkeypatch.setattr(tuner, "DEFERRED", set())
     monkeypatch.setattr(tuner, "_CHOSEN", {})
     monkeypatch.setattr(tuner, "_FAILED", {})

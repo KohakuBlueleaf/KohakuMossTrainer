@@ -35,6 +35,7 @@ from kohakumoss_kernels.hardware.memory import release, trim, working
 from kohakumoss_kernels.hardware.toolchain import version
 from kohakumoss_kernels.tuning import decisions
 from kohakumoss_kernels.tuning.timing import best_ms, graph_ms
+from kohakumoss_kernels.tuning.window import STATE as WINDOW
 
 MODES = ("table", "off")
 OOM_SKIPPED: tuple[type[BaseException], ...] = (torch.OutOfMemoryError,)
@@ -42,7 +43,7 @@ WORKING_FACTOR = 8.0
 WORKING_FLOOR = 256 << 20
 TIMINGS = {"graph": graph_ms, "events": lambda fn, device: best_ms(fn, device, 10)}
 TAGGED = ("kohakumoss", "triton", "triton-windows", "triton-xpu", "tilelang")
-_STATE = {"mode": "table", "defer": False}
+_STATE = {"mode": "table"}
 DEFERRED: set[tuple[str, str, str]] = (
     set()
 )  # (device, kernel, key) bound untimed in a step
@@ -222,7 +223,9 @@ def select(
     `ConfigsFailed` is raised (again on every later lookup in this process). `cap`
     bounds every config's working memory in bytes: a config past it raises `OverBound`
     and nothing is stored or settled. Where `timing_allowed` is false the first
-    candidate is returned unsettled. See docs/internals/tuning.md#select."""
+    candidate is returned unsettled; after `window.freeze` (outside a window) or under
+    a deferring process group a missing key binds untimed (`_defer`). See
+    docs/internals/tuning.md#select."""
     ident = (str(device), kernel, key)
     ranked = list(candidates()) if _WATCH else None
     if _WATCH and len(ranked) > 1:
@@ -247,7 +250,7 @@ def select(
             _CHOSEN[ident] = ranked[0]
             decisions.record(kernel, key, "default", ranked[0])
         return ranked[0]
-    if _STATE["defer"]:
+    if WINDOW["defer"] or WINDOW["frozen"]:
         return _defer(ident, device, key, ranked, launch, errors)
     measure = TIMINGS[timing]
     TIMED[kernel] = TIMED.get(kernel, 0) + 1
@@ -258,7 +261,7 @@ def select(
         with rng_kept([device]):
             return _measure(
                 ident, device, key, tab, order, launch, measure, errors, factor,
-                _CAPS[str(device)] if live else cap,
+                _CAPS[str(device)] if live else cap, trims=not live,
             )  # fmt: skip
     except OverBound:
         if not live:
@@ -266,15 +269,13 @@ def select(
         return _over_budget(ident, key, ranked)
     finally:
         TIMED_SECS[kernel] = TIMED_SECS.get(kernel, 0.0) + time.perf_counter() - began
-        if live:
-            trim(device)
 
 
 def set_cap(device: torch.device | str, nbytes: int | None) -> None:
     """From the end of the prewarm on: every `select` on `device` that passes no `cap`
-    times its configs within `nbytes` (the prewarm's tuning budget; None: no cap); a
-    key over it binds its first candidate, untimed, and every such tune is followed by
-    one `trim`."""
+    times its configs within `nbytes` (the prewarm's tuning budget; None: no cap),
+    without returning memory to the driver; a key over it binds its first candidate,
+    untimed."""
     if nbytes is None:
         _CAPS.pop(str(device), None)
     else:
@@ -296,11 +297,13 @@ def _over_budget(ident, key: str, ranked: list) -> dict:
 
 
 def _defer(ident, device, key: str, ranked: list, launch, errors) -> dict:
-    """A key met in a step under a process group (`defer_if_grouped`): the first of
-    `ranked` that builds and runs once, untimed, binds for the process (unstored, in
-    DEFERRED, one INFO line); a config raising one of `errors` is skipped; when every
-    one does, `ConfigsFailed` (the registry falls back)."""
+    """A key met after the tuning window (`window.freeze`; one WARNING line: the prewarm did
+    not cover it) or in a step under a process group (`defer_if_grouped`; one INFO
+    line): the first of `ranked` that builds and runs once, untimed, binds for the
+    process (unstored, in DEFERRED); a config raising one of `errors` is skipped; when
+    every one does, `ConfigsFailed` (the registry falls back)."""
     kernel = ident[1]
+    frozen = WINDOW["frozen"]
     failures, toolchain = {}, []
     for config in ranked:
         try:
@@ -313,9 +316,9 @@ def _defer(ident, device, key: str, ranked: list, launch, errors) -> dict:
         _CHOSEN[ident] = config
         DEFERRED.add(ident)
         decisions.queued(kernel, key)
-        log.info(
-            f"{kernel} {key}: deferred under DDP: first candidate, untimed "
-            f"({config_name(config)})"
+        why = "met after the tuning window" if frozen else "deferred under DDP"
+        (log.warning if frozen else log.info)(
+            f"{kernel} {key}: {why}: first candidate, untimed ({config_name(config)})"
         )
         return config
     err = ConfigsFailed(kernel, failures, all(toolchain), f"{kernel}:{key}")
@@ -357,10 +360,12 @@ def capped_bound(relative: int | None, cap: int | None) -> int | None:
 
 
 def _measure(
-    ident, device, key, tab, shortlist, launch, measure, errors, factor=None, cap=None
-) -> dict:
+    ident, device, key, tab, shortlist, launch, measure, errors, factor=None, cap=None,
+    trims=True,
+) -> dict:  # fmt: skip
     """Time `shortlist` under the working-memory bound, store and settle the winner
-    (see `select`)."""
+    (see `select`); `trims`: a bounded config starts from an empty allocator cache
+    (the prewarm; a live tune inside the training loop never returns memory)."""
     kernel = ident[1]
     timings, failures, best = {}, {}, None
     toolchain, short, used = [], [], {}
@@ -368,7 +373,7 @@ def _measure(
     for config in shortlist:
         relative = working_bound(lean, factor)
         bound = capped_bound(relative, cap)
-        if bound is not None:
+        if bound is not None and trims:
             # every bounded config starts from an empty allocator cache
             trim(device)
         try:
@@ -456,24 +461,12 @@ def defer_if_grouped() -> None:
     """At go-live (`decisions.go_live`): under a process group of two or more ranks a
     key first met inside a step is never timed there (its peers wait in the step's
     collectives): `select` binds its first candidate for the process, unstored, and
-    names it in DEFERRED; timing stays allowed inside `timing_here()`."""
+    names it in DEFERRED; timing stays allowed inside `window.timing_here()`."""
     grouped = dist.is_available() and dist.is_initialized()
-    _STATE["defer"] = grouped and dist.get_world_size() > 1
+    WINDOW["defer"] = grouped and dist.get_world_size() > 1
 
 
 decisions.on_live(defer_if_grouped)
-
-
-@contextmanager
-def timing_here():
-    """Inside: `select` times missing keys even after `defer_if_grouped` (the
-    between-step retune, where every rank waits on the retune gate)."""
-    was = _STATE["defer"]
-    _STATE["defer"] = False
-    try:
-        yield
-    finally:
-        _STATE["defer"] = was
 
 
 def timing_allowed(in_backward: bool = False, autograd: bool = False) -> bool:

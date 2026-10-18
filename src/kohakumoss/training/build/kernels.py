@@ -28,6 +28,7 @@ from kohakumoss_common.calls import nothing
 from kohakumoss_data import DataConfig
 from kohakumoss_kernels.hardware.memory import release
 from kohakumoss_kernels.tuning import decisions
+from kohakumoss_kernels.tuning.window import tuning_window
 
 
 def build_prewarm(k: dict, built, prec, device: torch.device, dataset=None):
@@ -63,10 +64,11 @@ def build_prewarm(k: dict, built, prec, device: torch.device, dataset=None):
 
 class TextPrewarm:
     """The online text encoder's prewarm (`prewarm_text` on its weightless twin), run
-    once right before its first pass: every pack bucket of its plan with rows up to
-    `max_text_tokens` and the length bucket of the data's longest caption estimate
-    (`data_tokens`, 0: unknown); logged as a prewarm table, its peak kept for the
-    step-1 report, its workspaces returned to the driver after it."""
+    once right before its first pass, inside a tuning window (`window.tuning_window`):
+    every pack bucket of its plan with rows up to `max_text_tokens` and the length
+    bucket of the data's longest caption estimate (`data_tokens`, 0: unknown); logged
+    as a prewarm table, its peak kept for the step-1 report, its workspaces returned to
+    the driver after it."""
 
     def __init__(self, te, max_text_tokens: int, data_tokens: int = 0):
         self.te = te
@@ -76,7 +78,8 @@ class TextPrewarm:
     def __call__(self) -> None:
         device = self.te.device
         start = time.perf_counter()
-        text = prewarm_text(self.te, self.max_text_tokens, self.data_tokens)
+        with tuning_window():
+            text = prewarm_text(self.te, self.max_text_tokens, self.data_tokens)
         reports = {f"text {n}": r for n, r in text.items()}
         took = time.perf_counter() - start
         if reports:
