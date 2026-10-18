@@ -1,6 +1,10 @@
 """Activation offload: saved tensors of a block live in host memory between forward
-and backward, prefetched per block. See docs/internals/offload.md."""
+and backward, prefetched per block; a saved dtype cast of a parameter is recast in
+backward instead, and one tensor saved twice in a block is one packet. See
+docs/internals/offload.md."""
 
+import weakref
+from collections import deque
 from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -9,25 +13,97 @@ import torch
 from torch import Tensor
 
 from kohakumoss.offload.accel import module, streamed, with_index
+from kohakumoss_common.calls import nothing
+
+CAST = "ToCopyBackward0"
+VIEWS = frozenset(
+    {
+        "TBackward0",
+        "TransposeBackward0",
+        "PermuteBackward0",
+        "ViewBackward0",
+        "UnsafeViewBackward0",
+        "AliasBackward0",
+    }
+)
 
 
 @dataclass
 class Packet:
-    """One offloaded saved tensor."""
+    """One offloaded saved tensor; `users` saved variables share it. `given`: its host
+    buffer went back to the pool (the device copy `gpu` is then the only one)."""
 
     host: Tensor
     block: int
     d2h: object = None
     gpu: Tensor | None = None
     h2d: object = None
+    flat: Tensor | None = None
+    users: int = 1
+    given: bool = False
 
 
-def _noop(block: int) -> None:
-    return None
+@dataclass
+class Recast:
+    """A saved view of a dtype cast of parameter `param` (its value at `version`):
+    cast again and viewed with the saved shape / stride / offset on unpack."""
+
+    param: Tensor
+    dtype: torch.dtype
+    version: int
+    shape: torch.Size
+    stride: tuple[int, ...]
+    offset: int
+
+
+def cast_source(t: Tensor) -> Tensor | None:
+    """The contiguous leaf parameter whose dtype cast `t` is, or a view of (autocast's
+    weight cast, `w.t()` as a linear saves it), else None."""
+    fn = t.grad_fn
+    while fn is not None and fn.name() in VIEWS:
+        fn = fn.next_functions[0][0]
+    if fn is None or fn.name() != CAST:
+        return None
+    param = getattr(fn.next_functions[0][0], "variable", None)
+    if param is None or param.device != t.device or not param.is_contiguous():
+        return None
+    if t.untyped_storage().nbytes() != param.numel() * t.element_size():
+        return None
+    return param
+
+
+def recast_of(t: Tensor, param: Tensor) -> Recast:
+    return Recast(
+        param, t.dtype, param._version, t.shape, t.stride(), t.storage_offset()
+    )
+
+
+def _recast(pk: Recast) -> Tensor:
+    """The parameter cast again; raises when the parameter changed since forward."""
+    if pk.param._version != pk.version:
+        raise RuntimeError(
+            "activation offload: a parameter whose dtype cast was saved for backward "
+            "was modified in place before that backward"
+        )
+    cast = pk.param.detach().to(pk.dtype)
+    return cast.as_strided(pk.shape, pk.stride, pk.offset)
+
+
+def _key(t: Tensor) -> tuple:
+    return (
+        t.untyped_storage().data_ptr(),
+        t.storage_offset(),
+        tuple(t.shape),
+        t.stride(),
+        t.dtype,
+        t._version,
+    )
 
 
 class ActivationOffload:
-    """saved_tensors_hooks engine; `block(i)` scopes the hooks to block i."""
+    """saved_tensors_hooks engine; `block(i)` scopes the hooks to block i. `inflight`
+    blocks of copies (each direction) may be queued on the side streams; a copy of a
+    newer block first waits on the host for the oldest block's copies."""
 
     def __init__(
         self,
@@ -35,22 +111,34 @@ class ActivationOffload:
         min_bytes: int = 1 << 20,
         pinned: bool = True,
         prefetch: bool = True,
+        inflight: int = 2,
     ):
         self.device = with_index(device)
         self.min_bytes = min_bytes
         self.cuda = streamed(self.device)
         self.dm = module(self.device)
         self.pinned = pinned and self.cuda
+        self.inflight = inflight
         self.skip: set[int] = set()
+        self.seen: dict[tuple, tuple] = {}
         self.pending: dict[int, list[Packet]] = {}
+        self.pool: dict[int, list[tuple[Tensor, object]]] = {}
+        self.queued: dict[str, deque] = {"d2h": deque(), "h2d": deque()}
         self.current = 0
-        self.stats = {"packed_bytes": 0, "kept": 0, "packed": 0}
+        self.stats = {
+            "packed_bytes": 0,
+            "kept": 0,
+            "packed": 0,
+            "paced": 0,
+            "recast": 0,
+            "shared": 0,
+        }
         if self.cuda:
             self.d2h_stream = self.dm.Stream(self.device)
             self.h2d_stream = self.dm.Stream(self.device)
             self._store = self._store_device
             self._load = self._load_device
-            self._prefetch = self._fetch if prefetch else _noop
+            self._prefetch = self._fetch if prefetch else nothing
         else:
             self._store = self._store_host
             self._load = self._load_host
@@ -61,31 +149,59 @@ class ActivationOffload:
             if t.numel():
                 self.skip.add(t.untyped_storage().data_ptr())
 
+    def rebuild(self, tensors: Iterable[Tensor]) -> None:
+        """The kept storages become exactly these tensors' (after storages were
+        replaced, e.g. parameter dtype changes, so no freed address stays kept)."""
+        self.skip = set()
+        self.exclude(tensors)
+
     @contextmanager
     def block(self, index: int):
+        """Scope the hooks to block `index`; an exception drops the step's packets (their
+        host buffers return to the pool)."""
         prev = self.current
         self.current = index
-        with torch.autograd.graph.saved_tensors_hooks(self.pack, self.unpack):
-            yield
-        self.current = prev
+        self.seen = {}
+        try:
+            with torch.autograd.graph.saved_tensors_hooks(self.pack, self.unpack):
+                yield
+        except BaseException:
+            self.reset()
+            raise
+        finally:
+            self.current = prev
+            self.seen = {}
 
     def pack(self, t: Tensor):
         if (
             t.device != self.device
-            or t.numel() * t.element_size() < self.min_bytes
+            or t.nbytes < self.min_bytes
             or t.untyped_storage().data_ptr() in self.skip
         ):
             self.stats["kept"] += 1
             return t
+        param = cast_source(t)
+        if param is not None:
+            self.stats["recast"] += 1
+            return recast_of(t, param)
+        key = _key(t)
+        hit = self.seen.get(key)
+        if hit is not None and hit[0]() is not None:
+            hit[1].users += 1
+            self.stats["shared"] += 1
+            return hit[1]
         self.stats["packed"] += 1
-        self.stats["packed_bytes"] += t.numel() * t.element_size()
+        self.stats["packed_bytes"] += t.nbytes
         pk = self._store(t)
+        self.seen[key] = (weakref.ref(t), pk)
         self.pending.setdefault(self.current, []).append(pk)
         return pk
 
     def unpack(self, pk):
         if isinstance(pk, Tensor):
             return pk
+        if isinstance(pk, Recast):
+            return _recast(pk)
         return self._load(pk)
 
     def _store_host(self, t: Tensor) -> Packet:
@@ -95,41 +211,94 @@ class ActivationOffload:
         self.pending.pop(pk.block, None)
         return pk.host
 
+    @staticmethod
+    def capacity(nbytes: int) -> int:
+        """Pool size class of a packet: the next power of two, at least 1 MiB."""
+        return 1 << max(20, (nbytes - 1).bit_length())
+
+    def _take(self, t: Tensor) -> Tensor:
+        """A pinned byte buffer for `t` from the smallest pooled size class that holds
+        it (last copy done), else a new one of its class."""
+        cap = self.capacity(t.nbytes)
+        fits = [k for k, free in self.pool.items() if k >= cap and free]
+        if not fits:
+            return torch.empty(cap, dtype=torch.uint8, pin_memory=self.pinned)
+        flat, done = self.pool[min(fits)].pop()
+        done.synchronize()
+        return flat
+
+    def _give(self, flat: Tensor, done) -> None:
+        """Return a host buffer to the pool once the copy `done` has finished."""
+        self.pool.setdefault(flat.numel(), []).append((flat, done))
+
+    def _pace(self, kind: str, block: int, ev) -> None:
+        """Record `ev` as `block`'s latest `kind` copy; while more than `inflight`
+        blocks have copies queued, wait on the host for the oldest block's last one."""
+        queued = self.queued[kind]
+        if queued and queued[-1][0] == block:
+            queued[-1][1] = ev
+            return
+        queued.append([block, ev])
+        while len(queued) > self.inflight:
+            queued.popleft()[1].synchronize()
+            self.stats["paced"] += 1
+
     def _store_device(self, t: Tensor) -> Packet:
-        host = torch.empty(t.shape, dtype=t.dtype, pin_memory=self.pinned)
+        flat = self._take(t)
+        nbytes = t.nbytes
+        host = flat[:nbytes].view(t.dtype).view(t.shape)
         self.d2h_stream.wait_stream(self.dm.current_stream(self.device))
         with self.dm.stream(self.d2h_stream):
             host.copy_(t, non_blocking=True)
         t.record_stream(self.d2h_stream)
         ev = self.dm.Event()
         ev.record(self.d2h_stream)
-        return Packet(host, self.current, d2h=ev)
+        self._pace("d2h", self.current, ev)
+        return Packet(host, self.current, d2h=ev, flat=flat)
 
     def _fetch(self, block: int) -> None:
-        for pk in self.pending.pop(block, ()):
+        packets = self.pending.pop(block, ())
+        if packets:
+            # device buffers come from the consumer (current) stream's pool
+            self.h2d_stream.wait_stream(self.dm.current_stream(self.device))
+        for pk in packets:
             if pk.gpu is not None:
                 continue
+            gpu = torch.empty(pk.host.shape, dtype=pk.host.dtype, device=self.device)
             self.h2d_stream.wait_event(pk.d2h)
             with self.dm.stream(self.h2d_stream):
-                gpu = torch.empty(
-                    pk.host.shape, dtype=pk.host.dtype, device=self.device
-                )
                 gpu.copy_(pk.host, non_blocking=True)
+            gpu.record_stream(self.h2d_stream)
             ev = self.dm.Event()
             ev.record(self.h2d_stream)
             pk.gpu, pk.h2d = gpu, ev
+            self._give(pk.flat, ev)
+            pk.given = True
+            self._pace("h2d", block, ev)
 
     def _load_device(self, pk: Packet) -> Tensor:
+        """The packet's device copy; once fetched it stays with the packet (freed with
+        it), so a saved tensor read more often than it was saved never re-reads the
+        recycled host buffer."""
         if pk.gpu is None:
+            if pk.given:
+                raise RuntimeError(
+                    "activation offload: a packet's host buffer was recycled before "
+                    "its last unpack"
+                )
             self.pending.setdefault(pk.block, []).append(pk)
             self._fetch(pk.block)
             self._prefetch(pk.block - 1)
-        cur = self.dm.current_stream(self.device)
-        cur.wait_event(pk.h2d)
-        gpu, pk.gpu = pk.gpu, None
-        gpu.record_stream(cur)
-        return gpu
+        self.dm.current_stream(self.device).wait_event(pk.h2d)
+        pk.users -= 1
+        return pk.gpu
 
     def reset(self) -> None:
-        """Drop packets of a step that never ran backward."""
+        """Drop packets of a step that never ran backward (their buffers return)."""
+        for packets in self.pending.values():
+            for pk in packets:
+                if pk.flat is not None and not pk.given:
+                    self._give(pk.flat, pk.d2h)
         self.pending.clear()
+        for queued in self.queued.values():
+            queued.clear()

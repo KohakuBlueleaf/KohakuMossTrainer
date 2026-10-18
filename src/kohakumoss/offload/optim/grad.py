@@ -1,6 +1,8 @@
 """Gradient offload: per-parameter gradients summed in fp32 host memory across the
 GRAD_ACC micro-batches, finished at `flush()` or inside the last backward
-(`arm(last, final)`). See docs/internals/offload.md."""
+(`start(last, final)`). A step's first gradient of a parameter is copied into its sum
+and later ones added, so a sum is never zeroed; `filled` marks the sums holding this
+step's gradients. See docs/internals/offload.md."""
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -9,8 +11,8 @@ from functools import partial
 import torch
 from torch import Tensor, nn
 
-from kohakumoss.offload.accel import module, streamed
-from kohakumoss.offload.host_acc import HostAccumulator
+from kohakumoss.offload.accel import DONE, module, streamed
+from kohakumoss.offload.optim.host_acc import HostAccumulator
 
 
 @dataclass
@@ -20,25 +22,28 @@ class _Lane:
     consumed: object = None
 
 
-class _Done:
-    def synchronize(self) -> None:
-        return None
-
-
 def _event_after(device: torch.device):
     """An event on `device`'s current stream (host: already complete)."""
     if not streamed(device):
-        return _Done()
+        return DONE
     dm = module(device)
     ev = dm.Event()
     ev.record(dm.current_stream(device))
     return ev
 
 
+RING_SLOTS = 3
+
+
+def ring_bytes(largest: int) -> int:
+    """Device bytes of the staging ring of a device's largest offloaded parameter."""
+    return RING_SLOTS * 4 * largest
+
+
 class _Ring:
     """Device staging for host sums coming back (H2D stream) and the update stream."""
 
-    def __init__(self, device: torch.device, largest: int, slots: int = 3):
+    def __init__(self, device: torch.device, largest: int, slots: int = RING_SLOTS):
         self.dm = module(device)
         self.h2d = self.dm.Stream(device)
         self.opt = self.dm.Stream(device)
@@ -65,12 +70,13 @@ class GradOffload:
         self.params = [p for p in params if p.requires_grad]
         self.host: dict[nn.Parameter, Tensor] = {}
         self.lanes: dict[int, _Lane] = {}
+        self.finishes: dict[int, Callable] = {}
         self.stats = {"bytes_d2h": 0, "bytes_h2d": 0}
         self._streams: dict[torch.device, object] = {}
         self.final: Callable | None = None
         self.handles = []
         self._mode = "offload"
-        self.acc = HostAccumulator(pinned)
+        self.acc = HostAccumulator(pinned, stats=self.stats)
         self.rings: dict[torch.device, _Ring] = {}
         largest: dict[torch.device, int] = {}
         for p in self.params:
@@ -92,6 +98,7 @@ class GradOffload:
                 finish = partial(self._finish, lane)
             self.host[p] = host
             self.lanes[id(p)] = lane
+            self.finishes[id(p)] = finish
             hook = partial(self._hook, {"offload": offload, "finish": finish})
             self.handles.append(p.register_post_accumulate_grad_hook(hook))
 
@@ -102,7 +109,7 @@ class GradOffload:
             self._streams[device] = stream
         return stream
 
-    def arm(self, last: bool, final: Callable | None = None) -> None:
+    def start(self, last: bool, final: Callable | None = None) -> None:
         """Offload this micro-batch's grads, or (last with `final`) finish them in place."""
         self.final = final
         self._mode = "finish" if last and final is not None else "offload"
@@ -112,16 +119,19 @@ class GradOffload:
 
     @torch.no_grad()
     def _offload_host(self, lane: _Lane, p: Tensor) -> None:
-        lane.host.add_(p.grad)
+        if lane.filled:
+            lane.host.add_(p.grad)
+        else:
+            lane.host.copy_(p.grad)
         lane.filled = True
         p.grad = None
 
     @torch.no_grad()
     def _offload_device(self, lane: _Lane, stream, key: int, p: Tensor) -> None:
         g = p.grad
-        self.acc.add(key, g, lane.host, stream)
+        self.acc.add(key, g, lane.host, stream, first=not lane.filled)
         lane.filled = True
-        self.stats["bytes_d2h"] += g.numel() * g.element_size()
+        self.stats["bytes_d2h"] += g.nbytes
         p.grad = None
 
     @torch.no_grad()
@@ -160,9 +170,22 @@ class GradOffload:
         g.record_stream(ring.opt)
         p.grad = None
 
+    @torch.no_grad()
+    def settle(self) -> None:
+        """After the last backward started with a `final`: finish every parameter whose
+        hook did not fire in it but whose sum holds earlier micro-batches' gradients
+        (their sum becomes its gradient)."""
+        if self._mode != "finish":
+            return
+        for p in self.params:
+            if self.lanes[id(p)].filled:
+                p.grad = torch.zeros_like(p)
+                self.finishes[id(p)](p)
+
     def finish(self) -> None:
-        """The compute stream waits for every in-backward update (before the next
-        forward reads the parameters)."""
+        """`settle`, then the compute stream waits for every in-backward update
+        (before the next forward reads the parameters)."""
+        self.settle()
         for device, ring in self.rings.items():
             ring.dm.current_stream(device).wait_stream(ring.opt)
 
@@ -171,19 +194,32 @@ class GradOffload:
         self.acc.drain()
 
     def zero(self) -> None:
-        """Clear the host accumulators (call after the optimiser step)."""
+        """End the step's sums (call after the optimiser step): the next gradient of
+        each parameter replaces its sum, nothing is cleared."""
         self.acc.drain()
         for lane in self.lanes.values():
             if lane.consumed is not None:
                 lane.consumed.synchronize()
                 lane.consumed = None
-            lane.host.zero_()
             lane.filled = False
 
+    def filled_sums(self) -> list[Tensor]:
+        """The host sums holding this step's gradients."""
+        return [self.host[p] for p in self.params if self.lanes[id(p)].filled]
+
+    def filled_params(self) -> list[nn.Parameter]:
+        """The parameters of `filled_sums`, in the same order."""
+        return [p for p in self.params if self.lanes[id(p)].filled]
+
     def restore(self, p: nn.Parameter) -> None:
-        """Put the summed gradient of one parameter back on its device."""
+        """Put the summed gradient of one parameter back on its device (None when it
+        received no gradient this step)."""
+        lane = self.lanes[id(p)]
+        if not lane.filled:
+            p.grad = None
+            return
         p.grad = self.host[p].to(p.device, p.dtype, non_blocking=True)
-        self.lanes[id(p)].consumed = _event_after(p.device)
+        lane.consumed = _event_after(p.device)
         self.stats["bytes_h2d"] += p.numel() * 4
 
     def to_device(self) -> None:
@@ -191,6 +227,20 @@ class GradOffload:
         for p in self.params:
             self.restore(p)
 
+    @torch.no_grad()
+    def store(self, p: nn.Parameter) -> None:
+        """Replace the host sum of `p` with `p.grad` (copied on the current stream; the
+        host waits for that stream before reading) and drop the device gradient."""
+        lane = self.lanes[id(p)]
+        lane.host.copy_(p.grad, non_blocking=streamed(p.device))
+        lane.filled = True
+        self.stats["bytes_d2h"] += p.grad.nbytes
+        p.grad = None
+
     def remove(self) -> None:
         for h in self.handles:
             h.remove()
+
+    def close(self) -> None:
+        """Stop the accumulator's worker thread."""
+        self.acc.close()

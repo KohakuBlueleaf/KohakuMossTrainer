@@ -8,6 +8,14 @@ from torch import Tensor, nn
 
 from kohakumoss.offload.accel import module, streamed
 
+RING_SLOTS = 3
+
+
+def ring_bytes(largest: int) -> int:
+    """Device bytes of HostStateAdamW's state ring: RING_SLOTS slots of 4 fp32 rows
+    (master, m, v, gradient) of the largest parameter."""
+    return RING_SLOTS * 4 * 4 * largest
+
 
 def fused_adamw(master, grad, m, v, step, group, found_inf=None) -> None:
     """One AdamW update (`torch._fused_adamw_`) of fp32 tensors; bumps `step`. A
@@ -149,9 +157,10 @@ class HostStateAdamW(_GroupsMixin):
             master = master.pin_memory() if pin else master.clone()
             zeros = [torch.zeros(master.shape, pin_memory=pin) for _ in range(2)]
             self.host[id(p)] = (master, *zeros)
-        self.n_slots = 3
+        self.n_slots = RING_SLOTS
+        # rows: master, m, v, the fp32 gradient
         self.slots = [
-            torch.empty(3, largest, dtype=torch.float32, device=self.device)
+            torch.empty(4, largest, dtype=torch.float32, device=self.device)
             for _ in range(self.n_slots)
         ]
         self.next_slot = 0
@@ -173,6 +182,7 @@ class HostStateAdamW(_GroupsMixin):
             for p in self.params:
                 self.written[id(p)] = self.dm.Event()
                 self.written[id(p)].record(cur)
+            self.no_inf = torch.zeros((), dtype=torch.float32, device=self.device)
             self._update = self._update_device
         else:
             self._update = self._update_host
@@ -217,21 +227,20 @@ class HostStateAdamW(_GroupsMixin):
             self.loaded.pop(id(p))
         bufs = self._bufs(slot, p)
         g = p.grad
+        g32 = self.slots[slot][3, : p.numel()].view(p.shape)
+        found = self.no_inf if found_inf is None else found_inf
         self.opt.wait_stream(self.dm.current_stream(self.device))
         self.opt.wait_event(self.ready[slot])
         with self.dm.stream(self.opt):
             step = self.steps[id(p)]
+            g32.copy_(g)
             fused_adamw(
-                bufs[0],
-                g.float(),
-                bufs[1],
-                bufs[2],
-                step,
-                self.group_of[id(p)],
-                found_inf,
+                bufs[0], g32, bufs[1], bufs[2], step, self.group_of[id(p)], found
             )
             p.copy_(bufs[0])
+        # mark the caller's tensors as used on the side stream
         g.record_stream(self.opt)
+        found.record_stream(self.opt)
         self.d2h.wait_stream(self.opt)
         with self.dm.stream(self.d2h):
             for dst, src in zip(self.host[id(p)], bufs):

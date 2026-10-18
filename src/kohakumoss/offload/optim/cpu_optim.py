@@ -9,7 +9,10 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from kohakumoss.offload.accel import module, streamed
+from kohakumoss.offload.accel import DONE, module, streamed
+from kohakumoss.offload.worker import HostWorker
+
+HOST_STATE = ("master", "exp_avg", "exp_avg_sq")
 
 
 def _fused_available() -> bool:
@@ -70,24 +73,42 @@ adamw_host = _fused_adamw if FUSED_CPU else _manual_adamw
 """One AdamW update of host fp32 tensors (decoupled weight decay); bumps `step`."""
 
 
-class _Done:
-    def synchronize(self) -> None:
-        return None
-
-
-DONE = _Done()
-
-
 @dataclass
 class _Lane:
-    """Per-parameter host buffers and the bound copy functions for its device."""
+    """Per-parameter host buffers and the bound copy / step functions for its device;
+    the gradient's host copy is allocated on its first D2H (`pin`: pinned)."""
 
-    grad_host: Tensor
+    grad_host: Tensor | None
     shadow: Tensor
     d2h: object
     h2d: object
     group: dict
     ready: object = None
+    step: object = None
+    found: Tensor | None = None
+    pin: bool = False
+
+
+class _Scratch:
+    """One reusable fp32 host buffer: a 16-bit host gradient converted for the host
+    AdamW without a new allocation per step."""
+
+    def __init__(self):
+        self.flat = torch.empty(0, dtype=torch.float32)
+
+    def fp32(self, t: Tensor) -> Tensor:
+        if t.dtype == torch.float32:
+            return t
+        if self.flat.numel() < t.numel():
+            self.flat = torch.empty(t.numel(), dtype=torch.float32)
+        return self.flat[: t.numel()].view(t.shape).copy_(t)
+
+
+def _grad_host(p: Tensor, lane: _Lane) -> Tensor:
+    """The lane's host gradient buffer (allocated on first use)."""
+    if lane.grad_host is None:
+        lane.grad_host = torch.empty(p.shape, dtype=p.dtype, pin_memory=lane.pin)
+    return lane.grad_host
 
 
 class CPUAdamW(Optimizer):
@@ -107,8 +128,11 @@ class CPUAdamW(Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.pinned = pinned
+        self.stats = {"bytes_h2d": 0, "bytes_d2h": 0}
         self._streams: dict[torch.device, tuple] = {}
         self._lanes: dict[int, _Lane] = {}
+        self._worker: HostWorker | None = None
+        self._scratch = {"main": _Scratch(), "worker": _Scratch()}
         for group in self.param_groups:
             for p in group["params"]:
                 self._init(p, group)
@@ -123,8 +147,8 @@ class CPUAdamW(Optimizer):
             exp_avg_sq=torch.zeros_like(master),
             step=torch.zeros((), dtype=torch.float32),
         )
-        grad_host = torch.empty(p.shape, dtype=p.dtype, pin_memory=pin)
         shadow = torch.empty(p.shape, dtype=p.dtype, pin_memory=pin)
+        lane = _Lane(None, shadow, None, None, group, pin=pin)
         if cuda:
             if p.device not in self._streams:
                 self._streams[p.device] = (
@@ -132,19 +156,23 @@ class CPUAdamW(Optimizer):
                     module(p.device).Stream(p.device),
                 )
             d2h, h2d = self._streams[p.device]
-            lane = _Lane(grad_host, shadow, None, None, group)
             lane.d2h = partial(_d2h_device, lane=lane, stream=d2h)
             lane.h2d = partial(_h2d_device, lane=lane, stream=h2d)
+            lane.found = torch.zeros((), dtype=torch.float32, pin_memory=pin)
+            lane.step = partial(self._step_async, lane=lane, d2h=d2h, h2d=h2d)
+            if self._worker is None:
+                self._worker = HostWorker("kohakumoss-cpu-adamw")
         else:
-            lane = _Lane(grad_host, shadow, None, None, group)
             lane.d2h = partial(_d2h_host, lane=lane)
             lane.h2d = partial(_h2d_host, lane=lane)
+            lane.step = partial(self._step_now, lane=lane)
         lane.ready = _has_grad
         self._lanes[id(p)] = lane
 
     def use_host_grads(self, offload) -> None:
         """Read the gradients of the offloaded parameters from a GradOffload's host fp32
-        accumulators (no D2H here); other parameters keep their own lanes."""
+        accumulators (no D2H here; stepped when their sum holds this step's
+        gradients); other parameters keep their own lanes."""
         for group in self.param_groups:
             for p in group["params"]:
                 if p not in offload.host:
@@ -152,15 +180,28 @@ class CPUAdamW(Optimizer):
                 lane = self._lanes[id(p)]
                 lane.grad_host = offload.host[p]
                 lane.d2h = _already_on_host
-                lane.ready = _always
+                lane.ready = partial(_filled, offload.lanes[id(p)])
 
     def _update(self, p: Tensor, lane: _Lane, ev) -> None:
+        self._compute(p, lane, ev, self._scratch["main"])
+        lane.h2d(p)
+        self.stats["bytes_h2d"] += p.nbytes
+
+    def _fetch(self, p: Tensor, lane: _Lane):
+        """`lane.d2h(p)`, counting the copied gradient bytes."""
+        if lane.d2h is not _already_on_host:
+            self.stats["bytes_d2h"] += p.nbytes
+        return lane.d2h(p)
+
+    def _compute(self, p: Tensor, lane: _Lane, ev, scratch: _Scratch) -> None:
+        """The host AdamW update of p (after its gradient copy `ev`) into the shadow;
+        a 16-bit gradient is converted into `scratch`."""
         st, group = self.state[p], lane.group
         ev.synchronize()
         b1, b2 = group["betas"]
         adamw_host(
             st["master"],
-            lane.grad_host.float(),
+            scratch.fp32(lane.grad_host),
             st["exp_avg"],
             st["exp_avg_sq"],
             st["step"],
@@ -174,7 +215,6 @@ class CPUAdamW(Optimizer):
             k = group["lr"] * group["decay_to_one_coef"]
             st["master"].sub_(st["master"] - 1.0, alpha=k)
         lane.shadow.copy_(st["master"])
-        lane.h2d(p)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -184,27 +224,94 @@ class CPUAdamW(Optimizer):
             for p in group["params"]:
                 lane = self._lanes[id(p)]
                 if lane.ready(p):
-                    work.append((p, lane, lane.d2h(p)))
+                    work.append((p, lane, self._fetch(p, lane)))
         for p, lane, ev in work:
             self._update(p, lane, ev)
         return loss
 
     @torch.no_grad()
     def step_param(self, p: Tensor, found_inf: Tensor | None = None) -> None:
-        """Update one parameter now (its grad must be set); skipped when `found_inf`
-        (a 0-d tensor) is nonzero."""
-        lane = self._lanes[id(p)]
-        ev = lane.d2h(p)
+        """Update one parameter (its grad must be set; it may be dropped on return);
+        skipped when `found_inf` (a 0-d tensor) is nonzero. Device parameters update on
+        a host worker: `finish()` before the parameter is read again."""
+        self._lanes[id(p)].step(p, found_inf)
+
+    def _step_now(self, p: Tensor, found_inf: Tensor | None, lane: _Lane) -> None:
+        ev = self._fetch(p, lane)
         if found_inf is not None and bool(found_inf.item()):
             return
         self._update(p, lane, ev)
 
+    def _step_async(
+        self, p: Tensor, found_inf: Tensor | None, lane: _Lane, d2h, h2d
+    ) -> None:
+        dm = module(p.device)
+        host = _grad_host(p, lane)
+        d2h.wait_stream(dm.current_stream(p.device))
+        with dm.stream(d2h):
+            host.copy_(p.grad, non_blocking=True)
+            if found_inf is None:
+                lane.found.zero_()
+            else:
+                lane.found.copy_(found_inf, non_blocking=True)
+                found_inf.record_stream(d2h)
+        p.grad.record_stream(d2h)
+        self.stats["bytes_d2h"] += p.grad.nbytes
+        ev = dm.Event()
+        ev.record(d2h)
+        self._worker.put(partial(self._update_async, p, lane, ev, h2d))
+
+    def _update_async(self, p: Tensor, lane: _Lane, ev, h2d) -> None:
+        ev.synchronize()
+        if lane.found.item():
+            return
+        self._compute(p, lane, DONE, self._scratch["worker"])
+        dm = module(p.device)
+        h2d.wait_event(ev)
+        with dm.stream(h2d):
+            p.data.copy_(lane.shadow, non_blocking=True)
+        self.stats["bytes_h2d"] += p.nbytes
+
     def finish(self) -> None:
-        return None
+        """Every queued update has run and the current stream waits for its copy back."""
+        if self._worker is None:
+            return
+        self._worker.join()
+        for device, (_, h2d) in self._streams.items():
+            module(device).current_stream(device).wait_stream(h2d)
+
+    def state_dict(self) -> dict:
+        if self._worker is not None:
+            self._worker.join()
+        return super().state_dict()
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        """torch's load with the masters and moments kept as host fp32 tensors (torch
+        casts state to each parameter's device and dtype) and every lane bound to its
+        new group dict."""
+        if self._worker is not None:
+            self._worker.join()
+        super().load_state_dict(state_dict)
+        ids = [i for g in state_dict["param_groups"] for i in g["params"]]
+        params = [p for g in self.param_groups for p in g["params"]]
+        for i, p in zip(ids, params, strict=True):
+            saved = state_dict["state"].get(i, {})
+            for key in HOST_STATE:
+                if key in saved:
+                    host = saved[key].detach().to("cpu", torch.float32)
+                    self.state[p][key] = host.clone()
+        for group in self.param_groups:
+            for p in group["params"]:
+                self._lanes[id(p)].group = group
+
+    def close(self) -> None:
+        """Stop the host worker thread (after its queued updates)."""
+        if self._worker is not None:
+            self._worker.close()
 
 
 def _d2h_host(p: Tensor, lane: _Lane):
-    lane.grad_host.copy_(p.grad)
+    _grad_host(p, lane).copy_(p.grad)
     return DONE
 
 
@@ -212,8 +319,8 @@ def _has_grad(p: Tensor) -> bool:
     return p.grad is not None
 
 
-def _always(p: Tensor) -> bool:
-    return True
+def _filled(sum_lane, p: Tensor) -> bool:
+    return sum_lane.filled
 
 
 def _already_on_host(p: Tensor):
@@ -226,9 +333,10 @@ def _h2d_host(p: Tensor, lane: _Lane) -> None:
 
 def _d2h_device(p: Tensor, lane: _Lane, stream):
     dm = module(p.device)
+    host = _grad_host(p, lane)
     stream.wait_stream(dm.current_stream(p.device))
     with dm.stream(stream):
-        lane.grad_host.copy_(p.grad, non_blocking=True)
+        host.copy_(p.grad, non_blocking=True)
     ev = dm.Event()
     ev.record(stream)
     return ev

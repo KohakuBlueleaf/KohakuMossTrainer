@@ -4,17 +4,21 @@ See docs/internals/offload.md for what each knob trades.
 """
 
 from dataclasses import fields, replace
+from itertools import product
 
 import torch
 
+from kohakumoss.quant.compute import COMPUTE as FP8_COMPUTE
+from kohakumoss.quant.compute import DGRAD as FP8_DGRAD
+from kohakumoss.quant.compute import FP8_RECIPES
 from kohakumoss.types.plans import MemoryPlan
 from kohakumoss_kernels.hardware.arch import arch_of
 
 CHECKPOINT_MODES = ("none", "block", "sub-block", "selective")
 STREAM_MODES = ("off", "ring", "swap")
-BASE_PRECISIONS = ("compute", "fp8", "int8", "quant")
+BASE_PRECISIONS = ("compute", "fp8", "int8", "quant", *FP8_COMPUTE)
 KNOB_FIELDS = {"compile": "COMPILE", "kernels": "KERNELS"}
-OPTIM_STATES = ("gpu", "stream", "8bit", "cpu")
+OPTIM_STATES = ("gpu", "stream", "cpu")
 COMPILE_MODES = ("off", "block", "model")
 
 PROFILES: dict[str, dict] = {
@@ -30,22 +34,24 @@ PROFILES: dict[str, dict] = {
         checkpoint="block",
         act_offload=False,
         base_precision="compute",
-        stream="off",
+        stream="ring",
+        stream_resident=16,
         optim_state="gpu",
         fused_step=False,
     ),
     "low": dict(
         checkpoint="block",
         act_offload=True,
-        base_precision="quant",
-        stream="off",
-        optim_state="8bit",
+        base_precision="compute",
+        stream="ring",
+        stream_resident=4,
+        optim_state="stream",
         fused_step=True,
     ),
     "minimal": dict(
         checkpoint="block",
         act_offload=True,
-        base_precision="quant",
+        base_precision="compute",
         stream="ring",
         stream_resident=2,
         optim_state="stream",
@@ -61,6 +67,15 @@ def checkpoint_mode(value: str) -> tuple[str, float]:
     if value.startswith("partial:"):
         return "block", float(value.split(":", 1)[1])
     return value, 1.0 if value != "none" else 0.0
+
+
+def _fp8_device_problems(plan: MemoryPlan, device) -> list[str]:
+    if plan.base_precision not in FP8_COMPUTE or device is None:
+        return []
+    kind = torch.device(device).type
+    if kind == "cuda":
+        return []
+    return [f"base_precision {plan.base_precision!r} needs a CUDA device, not {kind}"]
 
 
 def resolve_base_precision(value: str, device: torch.device | str) -> str:
@@ -81,12 +96,17 @@ def validate(
     problems = []
     if (
         device is not None
-        and plan.base_precision == "fp8"
+        and plan.base_precision in ("fp8", *FP8_COMPUTE)
         and not arch_of(device).has_fp8
     ):
         problems.append(
-            f"base_precision 'fp8' needs fp8 GEMMs (sm89+), not {arch_of(device).name}"
+            f"base_precision {plan.base_precision!r} needs fp8 GEMMs (sm89+), not "
+            f"{arch_of(device).name}"
         )
+    if plan.fp8_recipe not in FP8_RECIPES:
+        problems.append(f"fp8_recipe {plan.fp8_recipe!r} not in {FP8_RECIPES}")
+    if plan.fp8_dgrad not in FP8_DGRAD:
+        problems.append(f"fp8_dgrad {plan.fp8_dgrad!r} not in {FP8_DGRAD}")
     if plan.stream == "swap" and not trainable_base and not inference:
         problems.append(
             "stream='swap' streams trainable blocks; a frozen base uses 'ring'"
@@ -98,10 +118,10 @@ def validate(
         problems.append(f"checkpoint fraction {frac} outside [0, 1]")
     if plan.stream not in STREAM_MODES:
         problems.append(f"stream {plan.stream!r} not in {STREAM_MODES}")
-    if not inference and plan.stream != "off" and (mode == "none" or frac < 1.0):
-        problems.append("weight streaming needs every block checkpointed")
     if plan.stream != "off" and plan.stream_resident < 2:
         problems.append("weight streaming needs stream_resident >= 2")
+    if plan.act_offload and plan.act_offload_inflight < 1:
+        problems.append("activation offload needs act_offload_inflight >= 1")
     if plan.stream == "ring" and trainable_base:
         problems.append("stream='ring' is frozen-base only; use 'swap' for full FT")
     if plan.base_precision not in BASE_PRECISIONS:
@@ -110,6 +130,11 @@ def validate(
         )
     if plan.base_precision in ("fp8", "int8", "quant") and trainable_base:
         problems.append("a quantized base cannot be trained (full FT)")
+    if plan.base_precision in FP8_COMPUTE and trainable_base and plan.stream != "off":
+        problems.append(
+            f"base_precision {plan.base_precision!r} full FT keeps the weights resident "
+            "(fp8 copies requantized after each step): stream='off'"
+        )
     if plan.optim_state not in OPTIM_STATES:
         problems.append(f"optim_state {plan.optim_state!r} not in {OPTIM_STATES}")
     swap = plan.stream == "swap" and trainable_base and not inference
@@ -121,7 +146,7 @@ def validate(
         )
     if plan.compile not in COMPILE_MODES:
         problems.append(f"compile {plan.compile!r} not in {COMPILE_MODES}")
-    return problems
+    return problems + _fp8_device_problems(plan, device)
 
 
 def resolve(
@@ -168,3 +193,56 @@ def resolve(
     if problems:
         raise ValueError("invalid memory plan: " + "; ".join(problems))
     return plan
+
+
+CATALOG_AXES: tuple[dict[str, dict], ...] = (
+    {
+        "nockpt": dict(checkpoint="none"),
+        "ckpt": dict(checkpoint="block"),
+        "subckpt": dict(checkpoint="sub-block"),
+    },
+    {
+        "resident": dict(stream="off"),
+        "stream16": dict(stream="ring", stream_resident=16),
+        "stream8": dict(stream="ring", stream_resident=8),
+        "stream4": dict(stream="ring", stream_resident=4),
+        "stream2": dict(stream="ring", stream_resident=2),
+    },
+    {"": dict(act_offload=False), "actoff": dict(act_offload=True)},
+    {
+        "": dict(optim_state="gpu", fused_step=False),
+        "optfused": dict(optim_state="gpu", fused_step=True),
+        "optstream": dict(optim_state="stream", fused_step=True),
+        "optcpu": dict(optim_state="cpu", fused_step=False),
+    },
+    {"": dict(grad_offload=False), "gradoff": dict(grad_offload=True)},
+)
+
+
+def catalog() -> dict[str, dict]:
+    """Every combination of the placement axes (checkpoint x weights x activations x
+    optimizer x gradients) that validates for a frozen-base run, named by its parts;
+    precision is never part of a profile. See docs/concepts/profiles.md."""
+    out: dict[str, dict] = {}
+    for combo in product(*(axis.items() for axis in CATALOG_AXES)):
+        name = "-".join(part for part, _ in combo if part)
+        values = dict(base_precision="compute", pinned=True)
+        for _, knobs in combo:
+            values.update(knobs)
+        if not validate(replace(MemoryPlan(), **values)):
+            out[name] = values
+    return out
+
+
+CATALOG = catalog()
+PROFILES.update(CATALOG)
+PROFILES["manual"] = {}
+
+
+def catalog_name(profile: str) -> str | None:
+    """The catalog entry whose plan equals `profile`'s (a short name), or None."""
+    plan = replace(MemoryPlan(), **PROFILES[profile])
+    for name, values in CATALOG.items():
+        if replace(MemoryPlan(), **values) == plan:
+            return name
+    return None

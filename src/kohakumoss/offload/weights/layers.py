@@ -1,5 +1,6 @@
 """Inference-time layer streaming for large frozen encoders: each layer's parameters
-are on the device only while it runs. See docs/internals/offload.md."""
+are on the device only while it runs (forward hooks, or `enter(i)` / `leave(i)` from a
+forward that drives the layers itself). See docs/internals/offload.md."""
 
 from collections.abc import Sequence
 from functools import partial
@@ -8,9 +9,11 @@ import torch
 from torch import Tensor, nn
 
 from kohakumoss.offload.accel import module, streamed, with_index
+from kohakumoss.offload.weights.streaming.events import SlotEvents
+from kohakumoss_common.calls import nothing
 
 
-def _tensors(module: nn.Module) -> dict[str, Tensor]:
+def module_tensors(module: nn.Module) -> dict[str, Tensor]:
     """Parameters and buffers of `module` by name (both are streamed)."""
     out = dict(module.named_parameters())
     for name, buf in module.named_buffers():
@@ -19,12 +22,29 @@ def _tensors(module: nn.Module) -> dict[str, Tensor]:
     return out
 
 
+def tensor_bytes(tensors) -> int:
+    """Total storage bytes of an iterable of tensors."""
+    return sum(t.nbytes for t in tensors)
+
+
+def host_copy(t: Tensor, pinned: bool, dtype: torch.dtype | None = None) -> Tensor:
+    """A contiguous host copy of `t` in `dtype` (default its own), pinned when `pinned`;
+    a contiguous host tensor already in `dtype` is returned as is."""
+    h = t.detach().to("cpu", dtype or t.dtype).contiguous()
+    return h.pin_memory() if pinned else h
+
+
+def tensor_ids(modules: Sequence[nn.Module]) -> frozenset[int]:
+    """Ids of every parameter and buffer of `modules`."""
+    return frozenset(id(t) for m in modules for t in module_tensors(m).values())
+
+
 def move_except(
     module: nn.Module, layers: Sequence[nn.Module], device: torch.device | str
 ) -> None:
     """Move every parameter/buffer of `module` not inside `layers` to `device`."""
-    inside = {id(t) for layer in layers for t in _tensors(layer).values()}
-    for t in _tensors(module).values():
+    inside = tensor_ids(layers)
+    for t in module_tensors(module).values():
         if id(t) not in inside:
             t.data = t.data.to(device)
 
@@ -45,28 +65,36 @@ def find_layer_list(module: nn.Module) -> nn.ModuleList:
 class _Pool:
     """Ring of device slots for layers sharing one parameter signature."""
 
-    def __init__(self, template: list[Tensor], resident: int, device, cuda: bool):
-        self.slots = [
-            [torch.empty(t.shape, dtype=t.dtype, device=device) for t in template]
-            for _ in range(resident)
-        ]
+    def __init__(self, template: list[Tensor], resident: int):
+        self.template = template
+        self.resident = resident
+        self.slots: list[list[Tensor]] = []
         self.held: list[int | None] = [None] * resident
         self.next = 0
+        self.ready: list = []
+        self.free: list = []
+
+    def open(self, device, cuda: bool) -> None:
+        self.slots = [
+            [torch.empty(t.shape, dtype=t.dtype, device=device) for t in self.template]
+            for _ in range(self.resident)
+        ]
+        self.held = [None] * self.resident
+        self.next = 0
         if cuda:
-            dm = module(device)
-            cur = dm.current_stream(device)
-            self.ready = [dm.Event() for _ in range(resident)]
-            self.free = [dm.Event() for _ in range(resident)]
-            for ev in self.free:
-                ev.record(cur)
+            events = SlotEvents(module(device), device, self.resident)
+            self.ready, self.free = events.ready, events.free
 
-
-def _no_prefetch() -> None:
-    return None
+    def close(self) -> None:
+        self.slots = []
+        self.held = [None] * self.resident
 
 
 class LayerStreamer:
-    """Streams `layers` through `resident` device slots per layer signature."""
+    """Streams `layers` through `resident` device slots per layer signature.
+
+    `open()` allocates the slots (implicitly on the first entry), `close()` waits for
+    the device and frees them; `h2d_bytes` counts every host-to-device byte copied."""
 
     def __init__(
         self,
@@ -74,6 +102,7 @@ class LayerStreamer:
         device: torch.device | str,
         resident: int = 2,
         pinned: bool = True,
+        hooks: bool = True,
     ):
         self.layers = list(layers)
         self.device = with_index(device)
@@ -82,23 +111,26 @@ class LayerStreamer:
         self.host: list[list[Tensor]] = []
         self.targets: list[list[Tensor]] = []
         self.pool_of: list[_Pool] = []
+        self.layer_bytes: list[int] = []
         pools: dict[tuple, _Pool] = {}
         for layer in self.layers:
-            params = _tensors(layer)
+            params = module_tensors(layer)
             hosts = []
             for t in params.values():
-                h = t.detach().to("cpu").contiguous()
-                if pinned and self.cuda:
-                    h = h.pin_memory()
+                h = host_copy(t, pinned and self.cuda)
                 t.data = h
                 hosts.append(h)
             sig = tuple((n, tuple(t.shape), t.dtype) for n, t in zip(params, hosts))
             if sig not in pools:
-                pools[sig] = _Pool(hosts, resident, self.device, self.cuda)
+                pools[sig] = _Pool(hosts, resident)
             self.pool_of.append(pools[sig])
             self.host.append(hosts)
             self.targets.append(list(params.values()))
+            self.layer_bytes.append(tensor_bytes(hosts))
+        self.pools = list(pools.values())
         self.slot_of: dict[int, int] = {}
+        self.is_open = False
+        self.h2d_bytes = 0
         if self.cuda:
             self.stream = self.dm.Stream(self.device)
             self._copy, self._wait, self._free = (
@@ -109,17 +141,43 @@ class LayerStreamer:
         else:
             self._copy, self._wait, self._free = (
                 self._copy_host,
-                self._nothing,
-                self._nothing,
+                nothing,
+                nothing,
             )
         n = len(self.layers)
+        self.ahead = [
+            partial(self._prefetch, i + 1) if i + 1 < n else nothing for i in range(n)
+        ]
         self.handles = []
-        for i, layer in enumerate(self.layers):
-            ahead = partial(self._prefetch, i + 1) if i + 1 < n else _no_prefetch
-            pre = partial(self._pre, i, ahead)
-            post = partial(self._post, i)
-            self.handles.append(layer.register_forward_pre_hook(pre))
-            self.handles.append(layer.register_forward_hook(post))
+        if hooks:
+            for i, layer in enumerate(self.layers):
+                self.handles.append(
+                    layer.register_forward_pre_hook(partial(self._pre, i))
+                )
+                self.handles.append(layer.register_forward_hook(partial(self._post, i)))
+
+    def slot_bytes(self) -> int:
+        """Device bytes the open ring holds."""
+        return sum(p.resident * tensor_bytes(p.template) for p in self.pools)
+
+    def open(self) -> None:
+        for pool in self.pools:
+            pool.open(self.device, self.cuda)
+        self.slot_of.clear()
+        self.is_open = True
+
+    def close(self) -> None:
+        if not self.is_open:
+            return
+        if self.cuda:
+            self.dm.current_stream(self.device).wait_stream(self.stream)
+        for i, targets in enumerate(self.targets):
+            for t, h in zip(targets, self.host[i]):
+                t.data = h
+        for pool in self.pools:
+            pool.close()
+        self.slot_of.clear()
+        self.is_open = False
 
     def _load(self, i: int) -> int:
         pool = self.pool_of[i]
@@ -131,6 +189,7 @@ class LayerStreamer:
         pool.held[slot] = i
         self.slot_of[i] = slot
         self._copy(pool, slot, self.host[i])
+        self.h2d_bytes += self.layer_bytes[i]
         return slot
 
     def _copy_host(self, pool: _Pool, slot: int, src: list[Tensor]) -> None:
@@ -144,9 +203,6 @@ class LayerStreamer:
                 dst.copy_(s, non_blocking=True)
         pool.ready[slot].record(self.stream)
 
-    def _nothing(self, pool: _Pool, slot: int) -> None:
-        return None
-
     def _wait_device(self, pool: _Pool, slot: int) -> None:
         self.dm.current_stream(self.device).wait_event(pool.ready[slot])
 
@@ -157,7 +213,10 @@ class LayerStreamer:
         if i not in self.slot_of:
             self._load(i)
 
-    def _pre(self, i: int, ahead, module, args) -> None:
+    def enter(self, i: int) -> None:
+        """Layer i's tensors point at its device slot (loaded if not prefetched)."""
+        if not self.is_open:
+            self.open()
         slot = self.slot_of.get(i)
         if slot is None:
             slot = self._load(i)
@@ -165,13 +224,20 @@ class LayerStreamer:
         self._wait(pool, slot)
         for t, s in zip(self.targets[i], pool.slots[slot]):
             t.data = s
-        ahead()
+        self.ahead[i]()
 
-    def _post(self, i: int, module, args, output) -> None:
+    def leave(self, i: int) -> None:
+        """Layer i's slot is released to the ring; its tensors point at the host copy."""
         pool = self.pool_of[i]
         self._free(pool, self.slot_of[i])
         for t, h in zip(self.targets[i], self.host[i]):
             t.data = h
+
+    def _pre(self, i: int, module, args) -> None:
+        self.enter(i)
+
+    def _post(self, i: int, module, args, output) -> None:
+        self.leave(i)
 
     def remove(self) -> None:
         for h in self.handles:

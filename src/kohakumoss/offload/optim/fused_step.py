@@ -5,7 +5,8 @@ from collections.abc import Callable, Iterable
 
 import torch
 from torch import Tensor, nn
-from torch.optim import Optimizer
+
+from kohakumoss_common.calls import nothing
 
 
 class PerParamOptimizer:
@@ -59,14 +60,10 @@ class PerParamOptimizer:
             self.optims[p].load_state_dict(state[i])
 
 
-def _skip(p: Tensor) -> None:
-    return None
-
-
 class FusedStep:
     """Post-accumulate-grad hooks that transform the gradient and call `step_param(p)`.
 
-    `scaled=True` expects `arm(..., inv_scale)` every step; `clip > 0` clips per
+    `scaled=True` expects `start(..., inv_scale)` every step; `clip > 0` clips per
     parameter.
     """
 
@@ -88,14 +85,14 @@ class FusedStep:
         if clip > 0:
             transforms.append(self._clip)
         self._transforms = tuple(transforms)
-        self._active = _skip
+        self._active = nothing
         self.handles = [
             p.register_post_accumulate_grad_hook(self._hook) for p in self.params
         ]
 
-    def arm(self, last_microbatch: bool, inv_scale: Tensor | None = None) -> None:
+    def start(self, last_microbatch: bool, inv_scale: Tensor | None = None) -> None:
         """Step on this backward (the last micro-batch of the step) or only accumulate."""
-        self._active = self._step if last_microbatch else _skip
+        self._active = self._step if last_microbatch else nothing
         self.inv_scale = inv_scale
         if inv_scale is not None:
             self.found_inf = torch.zeros((), device=inv_scale.device)
@@ -111,7 +108,7 @@ class FusedStep:
         g.nan_to_num_(0.0, 0.0, 0.0)
 
     def _clip(self, g: Tensor) -> None:
-        norm = g.float().norm()
+        norm = torch.linalg.vector_norm(g, dtype=torch.float32)
         g.mul_(torch.clamp(self.clip / (norm + 1e-6), max=1.0).to(g.dtype))
 
     @torch.no_grad()
@@ -125,10 +122,3 @@ class FusedStep:
     def remove(self) -> None:
         for h in self.handles:
             h.remove()
-
-
-def wrap_optimizer_step_param(opt: Optimizer) -> Callable[[Tensor], None]:
-    """`step_param` for an optimiser that has it, else a per-parameter group step."""
-    if hasattr(opt, "step_param"):
-        return opt.step_param
-    raise TypeError("use PerParamOptimizer for fused per-parameter steps")

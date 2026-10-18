@@ -5,11 +5,11 @@ docs/internals/offload.md (MemorySession and parameter groups)."""
 import torch
 from torch import Tensor, nn
 
-from kohakumoss.offload.cpu_optim import CPUAdamW
-from kohakumoss.offload.gpu_adamw import HostStateAdamW, MasterAdamW
-from kohakumoss.training.memory.apply import MemoryEngines, apply_to_backbone
-from kohakumoss.training.memory.optimizers import build_memory_optim
-from kohakumoss.types.plans import MemoryPlan, PrecisionPolicy
+from kohakumoss.memory.apply import MemoryEngines, apply_to_backbone
+from kohakumoss.offload.optim.cpu_optim import CPUAdamW
+from kohakumoss.offload.optim.gpu_adamw import HostStateAdamW, MasterAdamW
+from kohakumoss.training.memory.optimizers import build_memory_optim, host_optimizer
+from kohakumoss.types.plans import MemoryPlan, PrecisionConfig
 
 CONSTANT = {"mode": "constant"}
 
@@ -17,7 +17,9 @@ CONSTANT = {"mode": "constant"}
 class MemorySession:
     """Engines + bundle for one run: `backward(loss, micro)` per micro-batch, `step()`
     per optimiser step. `param_groups` are torch-style groups over the model's
-    parameters as given before the session (replaced parameters followed by name)."""
+    parameters as given before the session (replaced parameters followed by name).
+    `optimizer` is the trainer's OPTIMIZER (default `adamw`, placed by
+    `plan.optim_state` exactly as in training)."""
 
     def __init__(
         self,
@@ -34,6 +36,7 @@ class MemorySession:
         quant_min_features: int = 256,
         param_groups: list[dict] | None = None,
         grad_clip: float = 0.0,
+        optimizer: str = "adamw",
     ):
         self.plan, self.grad_acc = plan, grad_acc
         self.device = torch.device(device)
@@ -57,8 +60,7 @@ class MemorySession:
         )
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         groups = resolve_groups(model, named, defaults)
-        optimizer = "master_adamw" if plan.optim_state == "gpu" else "adamw"
-        policy = PrecisionPolicy(compute=compute_dtype, scaler=False)
+        prec = PrecisionConfig(compute=compute_dtype, scaler=False)
         self.bundle, self.accumulate = build_memory_optim(
             groups,
             plan,
@@ -68,19 +70,18 @@ class MemorySession:
             dict(lr=lr, betas=tuple(betas), eps=eps),
             CONSTANT,
             1 << 30,
-            policy,
+            prec,
             grad_clip,
         )
 
     @property
     def dev_opt(self):
         """The optimiser of the device (non-streamed) parameters."""
-        shared = getattr(self.bundle, "shared", None)
-        return shared if shared is not None else getattr(self.bundle, "optimizer", None)
+        return host_optimizer(self.bundle)
 
     @property
     def block_opt(self):
-        return getattr(self.bundle, "blocks", None)
+        return self.bundle.blocks
 
     @property
     def grads(self):

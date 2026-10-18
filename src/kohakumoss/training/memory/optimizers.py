@@ -4,22 +4,27 @@ build here. See docs/internals/offload.md (optimisers)."""
 
 import contextlib
 from collections.abc import Callable
+from dataclasses import dataclass
+from functools import partial
 
 import torch
+from torch import Tensor
 
-from kohakumoss.offload.stream_optim import StreamedAdamW
-from kohakumoss.training.memory.apply import (
+from kohakumoss.memory.apply import (
     MemoryEngines,
     attach_fused_step,
     attach_grad_offload,
 )
-from kohakumoss.training.optim.build import build_bundle
-from kohakumoss.training.optim.bundle import local_grad_norm, no_agree
-from kohakumoss.types.plans import MemoryPlan, PrecisionPolicy
+from kohakumoss.offload.optim.stream_optim import StreamedAdamW
+from kohakumoss.parallel.ddp import ShardedNorm, sum_block_stats
+from kohakumoss.training.optim.bundle.base import local_grad_norm, no_agree
+from kohakumoss.training.optim.bundle.build import build_bundle
+from kohakumoss.training.optim.bundle.nonfinite import param_names
+from kohakumoss.training.optim.optimizers.factory import master_groups
+from kohakumoss.types.plans import MemoryPlan, PrecisionConfig
 
 ADAMW_BY_STATE = {
     "gpu": "adamw",
-    "8bit": "adamw8bit",
     "cpu": "cpu_adamw",
     "stream": "host_state_adamw",
 }
@@ -60,44 +65,114 @@ def _chain(*fns) -> Callable[[], None]:
     return run
 
 
-def _offload_parts(grads, host_optimizer: bool, fused: bool) -> dict:
+def _group_params(groups: list[dict]) -> list[Tensor]:
+    return [p for g in groups for p in g["params"]]
+
+
+def _host_grads(grads, masters: list[Tensor]) -> list[Tensor]:
+    return grads.filled_sums() + [p.grad for p in masters if p.grad is not None]
+
+
+def host_grad_names(grads, masters: list[Tensor], by_id: dict[int, str]) -> list[str]:
+    """The parameter name of every `_host_grads` entry, in its order."""
+    params = grads.filled_params() + [p for p in masters if p.grad is not None]
+    return [by_id.get(id(p), f"host_grad[{i}]") for i, p in enumerate(params)]
+
+
+def _offload_parts(
+    grads, host_optimizer: bool, fused: bool, masters, by_id: dict[int, str]
+) -> dict:
     """Bundle hooks for gradient offload: in-backward finish, host optimiser (reads the
-    host sums), or device optimiser (sums put back on the device before the step)."""
-    host = list(grads.host.values())
+    host sums holding this step's gradients and the streamed blocks' host gradients),
+    or device optimiser (sums put back on the device before the step). Off the fused
+    path, parameters whose last-micro-batch hook did not fire are settled first."""
     match (fused, host_optimizer):
         case (True, _):
             return {"after": grads.zero}
         case (False, True):
-            return {"before": grads.flush, "after": grads.zero, "grads": lambda: host}
+            return {
+                "settle": grads.settle,
+                "before": grads.flush,
+                "after": grads.zero,
+                "grads": partial(_host_grads, grads, list(masters)),
+                "grad_names": partial(host_grad_names, grads, list(masters), by_id),
+            }
         case _:
-            return {"before": _chain(grads.flush, grads.to_device), "after": grads.zero}
+            return {
+                "settle": grads.settle,
+                "before": _chain(grads.flush, grads.to_device),
+                "after": grads.zero,
+            }
 
 
-def _offload_arm(grads, accumulate: Callable):
-    """Offload every micro-batch's gradients and keep the gradient-sync context."""
+def _offload_start(grads, accumulate: Callable, final: Callable | None = None):
+    """Offload every micro-batch's gradients (the last one through `final` when given)
+    and keep the gradient-sync context."""
     if grads is None:
         return accumulate
 
-    def arm(last: bool):
-        grads.arm(last, None)
+    def start(last: bool):
+        grads.start(last, final)
         return accumulate(last)
 
-    return arm
+    return start
 
 
-def _host_optimizer(bundle):
-    return (
-        bundle.shared
-        if getattr(bundle, "shared", None) is not None
-        else bundle.optimizer
-    )
+class _OffloadThrough:
+    """A GradOffload whose in-backward finish calls `step` (the DDP reduction in front of
+    the bundle's per-parameter step) instead of the bundle's own callback."""
+
+    def __init__(self, grads, step: Callable):
+        self.grads = grads
+        self.step = step
+
+    def start(self, last: bool, final: Callable | None = None) -> None:
+        self.grads.start(last, self.step if final is not None else None)
+
+    def finish(self) -> None:
+        self.grads.finish()
 
 
-def _block_groups(groups: list[dict]) -> list[dict]:
-    return [
-        {k: v for k, v in g.items() if k not in ("names", "splits", "use_muon")}
-        for g in groups
-    ]
+def _ddp_kept(ddp, engines: MemoryEngines, grads, params) -> Callable | None:
+    """DDP wiring of a plan that keeps gradients until the step: host-stepped streamed
+    blocks are summed before their gradients leave for the host; offloaded gradients
+    are summed on the last micro-batch and replace their host sums (the returned
+    GradOffload callback; None without offload)."""
+    if engines.host_stepped:
+        owners = engines.stream.owners
+        reduce = ddp.block_reduce(owners, everyone=owners is None)
+        ddp.watch(engines.stream.reduce_with(reduce))
+    if grads is None:
+        return None
+    ddp.host_reads = True
+    return ddp.reduced(params, grads.store)
+
+
+def _start_both(first: Callable, second: Callable, last: bool):
+    first(last)
+    return second(last)
+
+
+def _not_mine(stream) -> set[int]:
+    """Ids of the streamed masters another rank steps (DDP block owners)."""
+    return {id(p) for key, p in stream.params.items() if not stream.mine(key[0])}
+
+
+def _owned_grads(stream) -> set[int]:
+    """Ids of this rank's streamed-block host gradients (sharded across ranks)."""
+    return {id(g) for g in stream.host_grad.values()}
+
+
+def _host_barrier(sync: Callable[[], None], arena) -> None:
+    """The owners' block write-backs have landed in the shared host region for every
+    rank."""
+    sync()
+    arena.ready()
+
+
+def host_optimizer(bundle):
+    """The bundle's optimiser of the device parameters."""
+    return bundle.shared if bundle.shared is not None else bundle.optimizer
 
 
 def build_memory_optim(
@@ -109,7 +184,7 @@ def build_memory_optim(
     hyper: dict,
     schedule: dict,
     steps: int,
-    policy: PrecisionPolicy,
+    prec: PrecisionConfig,
     grad_clip: float,
     hooks=None,
 ):
@@ -117,72 +192,173 @@ def build_memory_optim(
 
     `swap` blocks with a GPU optim_state step per block in backward (StreamedAdamW;
     resident states for `gpu`); with `cpu` they join the host AdamW after
-    `flush_grads`. `hooks`: the parallel layout's loop hooks (ParallelHooks)."""
+    `flush_grads`. `hooks`: the parallel layout's loop hooks (ParallelHooks); its
+    `ddp` AsyncReducer sums every gradient that leaves backward before the step (the
+    in-backward step, gradient offload, streamed blocks) across ranks first."""
+    w = resolve_wiring(plan, engines, optimizer, hooks)
+    by_id = {id(p): n for p, n in zip(_group_params(groups), param_names(groups))}
+    stream = engines.stream
+    grad_norm = getattr(hooks, "grad_norm", local_grad_norm)
+    if w.sharded and not w.gpu_blocks:
+        groups, _ = split_groups(groups, _not_mine(stream))
+        grad_norm = ShardedNorm(partial(_owned_grads, stream), device)
+    dev_groups, block_groups = (
+        split_groups(groups, w.streamed) if w.gpu_blocks else (groups, [])
+    )
+    if w.gpu_blocks and not dev_groups:
+        raise ValueError(
+            "swap with a GPU optimiser needs a trainable non-block parameter"
+        )
+    device_params = [
+        p for g in dev_groups for p in g["params"] if id(p) not in w.streamed
+    ]
+    grads = None
+    extra = {}
+    if plan.grad_offload:
+        grads = attach_grad_offload(engines, device_params, plan.pinned)
+        extra = _offload_parts(
+            grads, w.host_adamw, w.fused, engines.host_params(), by_id
+        )
+    if w.name in HOST_BUFFER_OPTIMIZERS:
+        hyper = {**hyper, "pinned": plan.pinned}
+    before = None if w.fused and w.ddp is not None else getattr(hooks, "before", None)
+    bundle = build_bundle(
+        dev_groups,
+        device,
+        w.name,
+        hyper,
+        schedule,
+        steps,
+        prec,
+        grad_clip,
+        fused_step=w.fused,
+        grad_norm=grad_norm,
+        agree=getattr(hooks, "agree", no_agree),
+        before=_chain(
+            extra.get("settle"), before, engines.before_step, extra.get("before")
+        ),
+        after=_chain(engines.after_step, extra.get("after")),
+        reduce_loss=getattr(hooks, "reduce_loss", no_agree),
+        grads=extra.get("grads"),
+        grad_names=extra.get("grad_names"),
+        reduce_step=getattr(hooks, "reduce_step", None),
+    )
+    wire = _wire_fused if w.fused else _wire_kept
+    return wire(bundle, w, engines, grads, device_params, block_groups, hyper, hooks)
+
+
+@dataclass(frozen=True)
+class OptimWiring:
+    """One plan's resolved optimiser wiring (`resolve_wiring`): the optimiser name,
+    the in-backward step, where streamed blocks step, and the DDP role."""
+
+    name: str
+    fused: bool
+    gpu_blocks: bool
+    resident_states: bool
+    host_adamw: bool
+    sharded: bool
+    ddp: object | None
+    streamed: frozenset[int]
+
+
+def resolve_wiring(
+    plan: MemoryPlan, engines: MemoryEngines, optimizer: str, hooks=None
+) -> OptimWiring:
+    """The wiring of OPTIMIZER under `plan` over `engines` and the layout's `hooks`;
+    raises when GPU-stepped swap blocks lack the in-backward step."""
     name = optimizer_for(optimizer, plan)
     stream = engines.stream
-    streamed = {id(p) for p in engines.host_params()}
+    streamed = frozenset(id(p) for p in engines.host_params())
     gpu_blocks = bool(streamed) and plan.optim_state != "cpu"
     fused = bool(plan.fused_step)
     if gpu_blocks and not fused:
         raise ValueError(
             "swap blocks with a GPU optimiser step in backward: fused_step"
         )
-    dev_groups, block_groups = (
-        split_groups(groups, streamed) if gpu_blocks else (groups, [])
+    ddp = getattr(hooks, "ddp", None)
+    return OptimWiring(
+        name=name,
+        fused=fused,
+        gpu_blocks=gpu_blocks,
+        resident_states=plan.optim_state == "gpu",
+        host_adamw=name == "cpu_adamw",
+        sharded=ddp is not None and stream is not None and stream.owners is not None,
+        ddp=ddp,
+        streamed=streamed,
     )
-    if gpu_blocks and not dev_groups:
-        raise ValueError(
-            "swap with a GPU optimiser needs a trainable non-block parameter"
-        )
-    device_params = [
-        p for g in dev_groups for p in g["params"] if id(p) not in streamed
-    ]
-    grads = None
-    extra = {}
-    if plan.grad_offload:
-        grads = attach_grad_offload(engines, device_params, plan.pinned)
-        extra = _offload_parts(grads, name == "cpu_adamw", fused)
-    if name in HOST_BUFFER_OPTIMIZERS:
-        hyper = {**hyper, "pinned": plan.pinned}
-    before = getattr(hooks, "before", None)
-    bundle = build_bundle(
-        dev_groups,
-        device,
-        name,
-        hyper,
-        schedule,
-        steps,
-        policy,
-        grad_clip,
-        fused_step=fused,
-        grad_norm=getattr(hooks, "grad_norm", local_grad_norm),
-        agree=getattr(hooks, "agree", no_agree),
-        before=_chain(before, engines.before_step, extra.get("before")),
-        after=_chain(engines.after_step, extra.get("after")),
-        reduce_loss=getattr(hooks, "reduce_loss", no_agree),
-        grads=extra.get("grads"),
-    )
-    accumulate = getattr(hooks, "accumulate", None)
-    if not fused:
-        if name == "cpu_adamw" and grads is not None:
-            _host_optimizer(bundle).use_host_grads(grads)
-        return bundle, _offload_arm(grads, accumulate or _null_accumulate)
+
+
+def _wire_kept(
+    bundle, w: OptimWiring, engines, grads, device_params, block_groups, hyper, hooks
+):
+    """Gradients kept until the step: the host optimiser reads offloaded sums, DDP sums
+    streamed blocks and offloaded gradients, host-stepped blocks start each
+    micro-batch."""
+    if w.host_adamw and grads is not None:
+        host_optimizer(bundle).use_host_grads(grads)
+    final = None
+    if w.ddp is not None:
+        final = _ddp_kept(w.ddp, engines, grads, device_params)
+    accumulate = getattr(hooks, "accumulate", None) or _null_accumulate
+    if engines.host_stepped:
+        accumulate = partial(_start_both, engines.stream.start, accumulate)
+    return bundle, _offload_start(grads, accumulate, final)
+
+
+def _wire_fused(
+    bundle, w: OptimWiring, engines, grads, device_params, block_groups, hyper, hooks
+):
+    """The step in backward: device parameters through gradient offload or FusedStep
+    (DDP-reduced first), GPU-stepped swap blocks through StreamedAdamW."""
+    ddp = w.ddp
+    step = bundle.step_param
+    if ddp is not None:
+        step = ddp.reduced(device_params, bundle.step_param)
     if grads is not None:
-        bundle.attach(grads, finishes=True)
-    else:
-        bundle.attach(attach_fused_step(engines, device_params, bundle.step_param))
-    if gpu_blocks:
-        blocks = StreamedAdamW(
-            stream,
-            lr=hyper["lr"],
-            betas=hyper["betas"],
-            eps=hyper["eps"],
-            weight_decay=0.0,
-            resident=plan.optim_state == "gpu",
-            groups=_block_groups(block_groups),
+        bundle.attach(
+            grads if ddp is None else _OffloadThrough(grads, step), finishes=True
         )
-        bundle.attach_blocks(blocks)
-    return bundle, bundle.arm
+    else:
+        bundle.attach(attach_fused_step(engines, device_params, step))
+    if w.gpu_blocks:
+        _attach_blocks(bundle, w, engines.stream, block_groups, hyper)
+    if ddp is None:
+        return bundle, bundle.start
+    # gradient offload settles its late parameters into the reduction before it ends
+    bundle.finishers.insert(0 if grads is None else 1, ddp.finish)
+    return bundle, partial(_start_both, ddp.start, bundle.start)
+
+
+def _attach_blocks(bundle, w: OptimWiring, stream, block_groups, hyper) -> None:
+    """StreamedAdamW over the swap blocks, its DDP reduction and the shared-region
+    barrier."""
+    blocks = StreamedAdamW(
+        stream,
+        lr=hyper["lr"],
+        betas=hyper["betas"],
+        eps=hyper["eps"],
+        weight_decay=0.0,
+        resident=w.resident_states,
+        groups=master_groups(block_groups),
+    )
+    bundle.attach_blocks(blocks)
+    if w.ddp is not None:
+        everyone = w.resident_states or not w.sharded
+        blocks.reduce = w.ddp.block_reduce(stream.owners, everyone=everyone)
+        w.ddp.watch(getattr(blocks, "opt", None))
+        if not everyone:
+            bundle.reduce_block_stats = sum_block_stats
+    if stream.arena is not None:
+        bundle.finishers.append(
+            partial(_host_barrier, blocks.synchronize, stream.arena)
+        )
+
+
+def close_memory(engines: MemoryEngines, bundle) -> None:
+    """End of a run: stop the host worker threads of the engines and the optimisers."""
+    engines.close()
+    bundle.close()
 
 
 def _null_accumulate(last: bool):

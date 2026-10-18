@@ -5,6 +5,7 @@ on configuration. Sub-block checkpointing uses `block.sub_blocks()` when the blo
 provides it (callables `(x, ctx) -> x`), else the whole block.
 """
 
+import contextlib
 from collections.abc import Callable
 from functools import partial
 
@@ -16,7 +17,9 @@ from torch.utils.checkpoint import (
     create_selective_checkpoint_contexts,
 )
 
-from kohakumoss.types.api import BlockCtx
+from kohakumoss.model.runner import PlainRunner
+from kohakumoss.types.context import BlockCtx
+from kohakumoss_kernels.saved_ops import KEPT
 
 SAVE_OPS = {
     torch.ops.aten.mm.default,
@@ -35,28 +38,57 @@ def register_saved_op(op) -> None:
 
 
 def _save_matmuls(ctx, op, *args, **kwargs) -> CheckpointPolicy:
-    if op in SAVE_OPS:
+    if op in SAVE_OPS or op in KEPT:
         return CheckpointPolicy.MUST_SAVE
     return CheckpointPolicy.PREFER_RECOMPUTE
 
 
 def selective_context():
-    """Checkpoint contexts that keep matmul/attention outputs and recompute the rest."""
+    """Checkpoint contexts that keep matmul/attention outputs (aten, and the kernel
+    attention / fused-linear forwards of `kohakumoss_kernels.saved_ops.KEPT`) and
+    recompute the rest."""
     return create_selective_checkpoint_contexts(_save_matmuls)
 
 
-class PlainRunner:
-    """`block(x, ctx)`."""
+class ForwardThreads:
+    """Recompute context: the intra-op thread count of the forward (`threads`) for the
+    recompute, the caller's restored after it, around an `inner` recompute context.
+    See docs/internals/adapter-binding.md#checkpoint-recompute."""
 
-    def bind(self, layers) -> "PlainRunner":
-        return self
+    def __init__(self, threads: int, inner=None):
+        self.threads = threads
+        self.inner = inner if inner is not None else contextlib.nullcontext()
 
-    def run(self, index: int, block: nn.Module, x: Tensor, ctx: BlockCtx) -> Tensor:
-        return block(x, ctx)
+    def __enter__(self):
+        self.prev = torch.get_num_threads()
+        if self.prev != self.threads:
+            torch.set_num_threads(self.threads)
+        return self.inner.__enter__()
+
+    def __exit__(self, *exc):
+        try:
+            return self.inner.__exit__(*exc)
+        finally:
+            if self.prev != self.threads:
+                torch.set_num_threads(self.prev)
+
+
+def forward_state(inner: Callable | None = None) -> Callable:
+    """A checkpoint `context_fn`: `inner`'s (forward, recompute) contexts (none by
+    default), the recompute run under the forward's intra-op thread count."""
+
+    def contexts():
+        forward, recompute = inner() if inner is not None else (None, None)
+        threads = torch.get_num_threads()
+        forward = forward if forward is not None else contextlib.nullcontext()
+        return forward, ForwardThreads(threads, recompute)
+
+    return contexts
 
 
 class CheckpointRunner:
-    """Non-reentrant activation checkpointing of whole blocks, sub-blocks or selectively.
+    """Non-reentrant activation checkpointing of whole blocks, sub-blocks or selectively;
+    each recompute runs under its forward's intra-op thread count (`forward_state`).
 
     `blocks` restricts checkpointing to those indices (partial checkpointing).
     `bind(layers)` resolves each block's callable once; `run` only indexes it.
@@ -67,11 +99,10 @@ class CheckpointRunner:
             raise ValueError(mode)
         self.mode = mode
         self.blocks = blocks
-        self._ckpt = partial(checkpoint, use_reentrant=False)
-        if mode == "selective":
-            self._ckpt = partial(
-                checkpoint, use_reentrant=False, context_fn=selective_context
-            )
+        inner = selective_context if mode == "selective" else None
+        self._ckpt = partial(
+            checkpoint, use_reentrant=False, context_fn=forward_state(inner)
+        )
         self._fns: tuple[Callable, ...] = ()
 
     def _resolve(self, index: int, block: nn.Module) -> Callable:
@@ -129,14 +160,15 @@ class StreamRunner:
 
 
 class StageRunner:
-    """Runner of a pipeline stage holding layers [lo, hi); maps local -> global index."""
+    """Runner of a pipeline stage holding layers [offset, offset + len(layers)); maps
+    local -> global index. The inner runner binds at the global indices."""
 
     def __init__(self, inner, offset: int):
         self.inner = inner
         self.offset = offset
 
     def bind(self, layers) -> "StageRunner":
-        self.inner.bind(layers)
+        self.inner.bind((None,) * self.offset + tuple(layers))
         return self
 
     def run(self, index: int, block: nn.Module, x: Tensor, ctx: BlockCtx) -> Tensor:
