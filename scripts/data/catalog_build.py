@@ -1,6 +1,6 @@
 """Scan every dataset in DATASETS once and write its catalog (or import it into shards).
 
-    kogine run scripts/data/catalog_build.py --config configs/data/data_kohya_style.py
+    kogine run scripts/data/catalog_build.py --config configs/data/kohya/kohya_style.py
 
 Each dataset entry may set `catalog` (path of the catalog.db to write / reuse later)
 and `import_to` (directory: copy the images into the native moss_shard format).
@@ -9,29 +9,37 @@ and `import_to` (directory: copy the images into the native moss_shard format).
 import json
 import os
 
+from kohakumoss.training.knobs import KNOWN as TRAIN_KNOBS
+from kohakumoss_common.knobs import check_script, siblings
+from kohakumoss_common.log import get_logger, setup
 from kohakumoss_data.dataset import build_source
-from kohakumoss_data.format.catalog import Catalog, write_catalog
 from kohakumoss_data.importer import import_source
+from kohakumoss_data.scan.runner import scan_catalog
 from kohakumoss_data.stats import catalog_stats
+
+log = get_logger("scripts.catalog_build")
 
 # ===================== DATA =====================
 DATASETS = []  # same entries as the train script
 
 
 def main() -> None:
-    for spec in DATASETS:
-        source = build_source(spec)
-        if spec.get("import_to"):
-            n = import_source(source, spec["import_to"])
-            print(f"imported {n} images -> {spec['import_to']}")
+    setup()
+    check_script(globals(), accept=TRAIN_KNOBS | siblings(__file__))
+    for entry in DATASETS:
+        source = build_source(entry)
+        if entry.get("import_to"):
+            n = import_source(source, entry["import_to"])
+            log.info(f"imported {n} images -> {entry['import_to']}")
             continue
-        rows = list(source.scan())
-        path = spec.get("catalog")
+        path = entry.get("catalog")
         if path:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-            write_catalog(path, rows)
-            print(f"wrote {len(rows)} rows -> {path}")
-        print(json.dumps(catalog_stats(Catalog(rows)), indent=1))
+            catalog = scan_catalog(source, path, kind="catalog")
+            log.info(f"wrote {len(catalog)} rows -> {path}")
+        else:
+            catalog = scan_catalog(source, None)
+        log.info(json.dumps(catalog_stats(catalog), indent=1))
 
 
 if __name__ == "__main__":

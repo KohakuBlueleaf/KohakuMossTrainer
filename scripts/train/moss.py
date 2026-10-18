@@ -1,22 +1,40 @@
 """Train MOSS-Image (LyCORIS adapters or full finetune). Every knob is a global below.
 
-kogine run scripts/train/moss.py --config configs/moss/smoke/smoke_tiny.py
 kogine run scripts/train/moss.py --config configs/moss/recipes/recipes_lora_24g_bf16.py --set LR=2e-4
 """
 
+from typing import Annotated
+
+from kohakuengine import FormatArg
+
 from kohakumoss.training.entry import run
+from kohakumoss_common.knobs import prompt_list
 
 # ===================== MODEL =====================
-WEIGHTS = (
-    ""  # HF dir (transformer/ + text_encoder/ + vae/) | single .safetensors | "random"
-)
-VARIANT = "base"  # "base" | "sft" | "tiny"
+WEIGHTS = ""  # HF dir (transformer/ + text_encoder/ + vae/) | single .safetensors
+VARIANT = "base"  # "base" | "sft"
 ARCH_OVERRIDES = {}  # MossArchConfig field overrides
 TEXT_ENCODER = ""  # "" = <WEIGHTS>/text_encoder; path to Qwen3.5 dir
-TEXT_DEVICE = (
-    ""  # device the text encoder runs on ("" = the training device; e.g. "cpu")
-)
+TEXT_DEVICE = ""  # GPU the text encoder runs on ("" = the training device); "cpu" only with TEXT_CACHE="offline"
+TEXT_ENCODE = {}  # TextEncoderPlan fields (docs/internals/text-encoder.md):
+#   "memory": "auto" (default: fastest that fits next to the DiT step) | "resident" | "offload" (whole TE in per pass) | "stream" (layer ring)
+#   "stream_resident": 2 (ring slots per layer kind), "pinned": True
+#   "precision": "compute" | "int8" | "fp8" (weight-only) | "fp8_compute" | "mxfp8" (fp8 GEMMs, sm89+); "quant_group": 0 (per channel) | 64 | 128
+#   "stored": "" | a pre-quantized text-encoder file of that precision (scripts/export/text_quant.py; no quantizing at load)
+#   "fp8_recipe": "row" | "tensor" | "block" (fp8_compute scaling)
+#   "dtype": "bf16" | "fp16" | "fp32"; "batch": 32 prompts / "max_tokens": 16384 tokens per kernel call
+#   "layout": "packed" (varlen) | "padded" | "single"; "forward": "kernels" | "hf" (transformers modules; single / padded)
+#   "ahead": 1 (TEXT_CACHE "online" / "off": host batches encoded per TE pass); "ahead_device": "host" | "device" (where results wait)
+#   "kernels": {} (op -> backend, e.g. {"gated_delta_rule_varlen": "triton"})
+# Sample prompts are encoded once at build; with TEXT_CACHE="offline" the TE is freed after that.
 VAE = ""  # "" = <WEIGHTS>/vae
+VAE_ENCODE = {}  # VaePlan fields (docs/internals/offload.md#vae):
+#   "memory": "resident" (default) | "offload" (VAE in per pass) | "stream" (block rings) | "auto" | "cpu" (LATENT_CACHE="offline" only)
+#   "batch": 1 (same-size images per encode call), "ahead": 1 (LATENT_CACHE "online" / "off": host batches encoded per VAE pass), "tile": False (tiled / sliced encode and decode)
+#   "compile": "auto" (channels_last + torch.compile on a resident CUDA VAE) | "on" | "off"
+VAE_DTYPE = (
+    "auto"  # "auto" (bf16 where the card has it, else fp16) | "bf16" | "fp16" | "fp32"
+)
 TRAIN_TEXT_REFINER = False  # adapters/full FT also on the 2 text-refiner blocks
 
 # ===================== DATA =====================
@@ -33,9 +51,7 @@ MAX_TOKENS = 16384  # target joint tokens (image + text) per batch per rank
 OVERLONG = "drop"  # sample longer than MAX_TOKENS: "drop" | "truncate_text" | "drop_tokens" (random image-token drop)
 BATCH_SIZE = 4  # BATCHING="count": samples per batch per rank
 MAX_SAMPLES = 0  # cap on samples per token batch; 0 = none (pipeline needs > 0)
-TOKEN_BUDGET = (
-    "estimate"  # "estimate" | "exact" (cached text lengths only; pipeline needs it)
-)
+TOKEN_BUDGET = "estimate"  # "estimate" (caption char columns) | "render" (each sampled caption) | "exact" (cached text lengths only; pipeline needs it)
 CAPTION = {"template": "tags", "keep": ["artist"], "shuffle": True, "tag_dropout": 0.0}
 TEXT_DROP = 0.1  # probability a sample uses the empty-prompt embedding
 LATENT_CACHE = "offline"  # "off" | "offline" | "online"
@@ -59,6 +75,9 @@ MAX_TEXT_TOKENS = 4096  # cap on a caption's text tokens in planning
 PREFETCH = 2  # batches prefetched per loader worker
 PIN_MEMORY = True  # pin host batches for async H2D copies
 NUM_WORKERS = 4
+DATA_RESCAN = False  # catalog cache: False (re-probe changed / new files) | True (re-probe all) | "never" (no walk)
+DATA_SCAN_WORKERS = 8  # worker processes probing image headers on a (re)scan
+DATA_WAIT = 3600.0  # seconds a non-writer rank waits for the catalog writer
 SEED = 0
 
 # ===================== ADAPTER =====================
@@ -70,11 +89,12 @@ ALGO_KWARGS = (
     {}
 )  # e.g. {"factor": 8} for lokr, {"constraint": 0.0} for oft (DIM is the OFT block size)
 DORA = False
-DORA_DETACH = False  # True detaches the DoRA norm (eager path only)
+DORA_DETACH = (
+    False  # True detaches the DoRA weight norm in training (no fused DoRA kernel then)
+)
 DROPOUT = {"input": 0.0, "rank": 0.0, "module": 0.0}
 ADAPTER_MODE = "bypass"  # "bypass" | "merge"
 LORAPLUS_RATIO = 1.0  # lr ratio of up / down factors (LoRA+); 1.0 = off
-LYCORIS_COMPILE_DYNAMIC = "tokens"  # LyCORIS compile tier: "tokens" (one graph per weight shape) | "static" | "dynamic"
 TRAIN_NORMS = False
 
 # ===================== OBJECTIVE =====================
@@ -86,18 +106,13 @@ TIMESTEP_KWARGS = {
     "cutoff": 0.95,
     "uniform_mix": 0.01,
 }
-LOSS = "mse"  # "mse" | "huber" | "masked_mse"
+LOSS = "mse"  # "mse" | "huber" | "l1" | "masked_mse" (needs a per-token loss mask)
 LOSS_KWARGS = {}
 WEIGHTING = "none"  # "none" | "x0" | "eps"
 
 # ===================== OPTIM =====================
-OPTIMIZER = (
-    "adamw"  # "adamw" | "adamw16" | "adamw8bit" | "muon" | "prodigy" | "schedule_free"
-)
+OPTIMIZER = "adamw"  # "adamw" | "adamw16" | "adamw8bit" (bitsandbytes) | "adamw8bit_kernel" (KohakuMoss 8-bit kernel) | "muon" | "prodigy" | "schedule_free"
 OPTIMIZER_KWARGS = {}
-FULL_MODE = (
-    "direct"  # ALGO="full": "direct" (train base weights) | "lycoris" (LyCORIS diff)
-)
 LR = 1e-4
 BETAS = (0.9, 0.95)
 EPS = 1e-8
@@ -108,33 +123,66 @@ GRAD_CLIP = 1.0
 EMA = 0.0  # 0 = off; e.g. 0.9999
 
 # ===================== PRECISION =====================
-PRECISION = "bf16"  # "bf16" | "fp16" | "auto" (bf16 where supported, else fp16; fp32 on CPU) | "fp32" (CPU reference only)
+PRECISION = "bf16"  # "bf16" | "fp16" | "auto" (bf16 where supported, else fp16)
 KEEP_FP32 = ("time_embedding", "shared_block_modulation", "video_head_modulation")
-FP16_FIX = "none"  # "none" | "weights" (fold baked into weights) | "online" (runtime factors) | "fp32_residual"
+FP16_FIX = "none"  # "none" (also for an fp16-fix WEIGHTS file) | "online" (runtime factors) | "fp32_residual"
 FP16_FIX_KWARGS = (
     {}
 )  # e.g. {"c": 1 / 16, "s_attn": 1.0, "s_ffn": 1.0, "eps": "stock"}; base needs c = 1/16
 
 # ===================== MEMORY =====================
-MEMORY_PROFILE = "balanced"  # "speed" | "balanced" | "low" | "minimal" | "auto"
+MEMORY_PROFILE = "balanced"  # a catalog profile (kohakumoss-config list; docs/concepts/profiles.md) | "speed" | "balanced" | "low" | "minimal" | "auto" | "manual"
+MEMORY_AUTO_FORCE = False  # "auto" with no profile that fits: False = error, True = run the last one anyway (WARNING)
+STEP_RELEASE = "auto"  # between-step release of free cached device memory: "auto" (CUDA without expandable segments, once the cache exceeds the step peak by a margin) | "none" | "empty_cache" (every step) | N (every N steps)
+# MEMORY_PROFILE="manual": the knobs below set the plan (None = the default in brackets); with a profile they must stay None.
+CHECKPOINT = (
+    None  # "none" | "block" | "sub-block" | "selective" | "partial:<fraction>"  [block]
+)
+STREAM = None  # block weights: "off" (resident) | "ring" (frozen base streamed) | "swap" (full FT, host masters)  [off]
+STREAM_RESIDENT = None  # device block slots when streaming (>= 2)  [0]
+PINNED = None  # pinned host memory for every offload (False: pageable, staged copies)  [True]
+ACT_OFFLOAD = (
+    None  # saved activations to host memory between forward and backward  [False]
+)
+OPTIM_STATE = None  # AdamW state placement: "gpu" | "stream" (host, streamed per parameter) | "cpu" (host update)  [gpu]
+GRAD_OFFLOAD = (
+    None  # gradients summed in host fp32 across GRAD_ACC micro-batches  [False]
+)
+FUSED_STEP = None  # optimiser step per parameter inside backward  [False]
+# Base precision, independent of the memory profile:
+BASE_PRECISION = None  # frozen base: "compute" | "int8" | "fp8" | "fp8_compute" | "mxfp8" | "quant" (fp8 on sm89+, else int8)  [compute]
+FP8_RECIPE = None  # fp8_compute scaling: "tensor" | "row" | "block"  [row]
+FP8_DGRAD = (
+    None  # fp8 bases: "fp8" (W^T copy, fp8 input-gradient GEMM) | "16bit"  [fp8]
+)
 MEMORY_OVERRIDES = (
     {}
 )  # any MemoryPlan field, e.g. {"checkpoint": "sub-block", "stream": "ring"}
+# frozen-base precision: BASE_PRECISION / FP8_RECIPE / FP8_DGRAD above (docs/internals/quant-kernels.md)
 
 # ===================== PARALLEL =====================
 PARALLEL = "none"  # "none" | "ddp" | "fsdp" | "pipeline" | "threaded"
-DIST_BACKEND = (
-    "auto"  # "auto" (nccl on CUDA, xccl on XPU, gloo otherwise) | "nccl" | "gloo"
-)
+DIST_BACKEND = "auto"  # "auto" (nccl on CUDA, xccl on XPU, gloo otherwise; xccl only through auto) | "nccl" | "gloo"
 DEVICES = (0,)
-PIPELINE_SCHEDULE = "1f1b"  # "gpipe" | "1f1b" | "interleaved-1f1b" | "zb"
+PIPELINE_SCHEDULE = "1f1b"  # "gpipe" | "1f1b" | "interleaved-1f1b" | "looped-bfs" | "interleaved-zb" | "zbv" | "dualpipe-v"; threaded: "gpipe" | "async"
+PIPELINE_SPLIT = "measured"  # stage split: "measured" | "flops" | "even" | layers per stage, e.g. (11, 10, 11, 10)
 MICROBATCHES = 4
+FSDP_REDUCE = "step"  # fsdp with GRAD_ACC > 1: "step" (one reduce-scatter per step; unsharded gradients held over the micro-batches) | "micro" (reduce-scatter every micro-batch; sharded gradients only)
+DDP_BACKEND = "kohakumoss"  # ddp: "kohakumoss" (the project's reducers, every memory plan) | "torch" (stock torch DDP, the A / B baseline; plans that keep gradients on the device until the step)
+DDP_REDUCE_DTYPE = (
+    "fp32"  # ddp gradient sums: "fp32" | "param" (each parameter's own dtype)
+)
+DIST_TIMEOUT = (
+    600  # seconds a collective of the step loop / the build waits for every rank
+)
+DIST_GATE_TIMEOUT = 7200  # seconds a store gate waits for rank-0-only or per-rank work (catalog scan, kernel tuning, the auto plan, the data / prewarm barriers, checkpoint saves, the sample grid)
+DIST_BIND = "lazy"  # nccl / xccl process group: "lazy" (communicators on first use) | "device" (bound to the rank's device at init; the pipeline stays lazy)
 
 # ===================== KERNELS =====================
 KERNELS = (
     {}
 )  # op -> backend, e.g. {"attention_varlen": "triton", "lycoris": "torch"}; empty = arch priority
-TUNE = "auto"  # "auto" | "off" | "prewarm"
+TUNE = "table"  # "table" (stored decisions; missing ones tuned in the prewarm before step 0 and between steps, then stored) | "off" (stored decisions, else fixed defaults; nothing timed)
 COMPILE = "off"  # "off" | "block" | "model"
 
 # ===================== RUNTIME =====================
@@ -147,10 +195,19 @@ RUN_NAME = ""
 # ===================== LOGGING =====================
 LOGGER = "console"  # "console" | "board" | "wandb"
 PROJECT = "kohakumoss"
-LOG_EVERY = 10
+LOG_EVERY = 10  # console step line every N steps (and the first / last)
+METRICS_EVERY: int | None = (
+    None  # sink rows every N steps (+ first / last); None = LOG_EVERY
+)
+PROGRESS = True  # tqdm bar over STEPS on a TTY (or FORCE_COLOR=1), at INFO
+NONFINITE_PATIENCE = 8  # stop after N non-finite steps at the loss-scale floor, or N steps with the same non-finite parameters; 0 = off
+TRACE_STEPS = ()  # (first, last): torch.profiler over steps first+1..last on every rank -> <output>/ranks/
+PROFILE_STEPS = ()  # (first, last): cudaProfilerStart / Stop around steps first+1..last (ncu --profile-from-start off, nsys --capture-range=cudaProfilerApi)
 
 # ===================== SAMPLING =====================
-SAMPLE_PROMPTS = []
+SAMPLE_PROMPTS: Annotated[list, FormatArg(prompt_list)] = (
+    []
+)  # a bare string is one prompt
 SAMPLE_NEGATIVE = ""
 SAMPLE_EVERY = 0  # steps; 0 = off
 SAMPLE_STEPS = 50
@@ -163,8 +220,10 @@ VALIDATE_EVERY = 0  # steps; 0 = off
 VALIDATION = {}  # {"datasets": [...], "sigmas": [...], "seed": 0}
 
 # ===================== CHECKPOINT / EXPORT =====================
-SAVE_EVERY = 500
-SAVE_MINUTES = 0
+SAVE_EVERY = 500  # steps; 0 = off
+SAVE_MINUTES = (
+    0  # also a checkpoint every N minutes (checked every LOG_EVERY steps); 0 = off
+)
 KEEP_LAST = 3
 RESUME = ""  # checkpoint dir | "latest"
 EXPORT_FORMATS = ("comfy",)  # "comfy" | "lycoris" | "merged" | "diffusers"

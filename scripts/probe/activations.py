@@ -5,11 +5,10 @@ block, attention logits (q.k * scale), ffn_up_gate and ffn_down outputs, o outpu
 and modulation. Writes a JSON report with the fold factor that puts the residual stream
 under FOLD_TARGET.
 
-    python scripts/probe/activations.py --weights <root>/base --embeds runs/probe/embeds.pt \
-        --out runs/probe/activations.json
+    kogine run scripts/probe/activations.py --set WEIGHTS=<root>/base \
+        --set EMBEDS=runs/probe/embeds.pt --set OUT=runs/probe/activations.json
 """
 
-import argparse
 import json
 import math
 from collections import defaultdict
@@ -17,12 +16,21 @@ from pathlib import Path
 
 import torch
 
+from kohakumoss.logging.log import get_logger, setup
 from kohakumoss.model import load_backbone
 from kohakumoss.types.seqinfo import build_seqinfo
+from kohakumoss_common.knobs import check_script
 
+log = get_logger("scripts.activations")
+
+WEIGHTS = ""  # transformer dir / root or single file
+EMBEDS = ""  # embeddings file from scripts/probe/embed.py
+OUT = ""  # output report .json
+DEVICE = "cuda"
+Z0 = ""  # optional saved clean latents {(h, w): [1, C, h, w]}; "" = random
 SIGMAS = (1.0, 0.9, 0.7, 0.5, 0.3, 0.1, 0.02)
 RESOLUTIONS = ((512, 512), (1024, 1024), (768, 1344))
-FOLD_TARGET = 2.0**12
+FOLD_TARGET = 2.0**12  # max |x| the fold factor targets
 FP16_MAX = 65504.0
 
 
@@ -83,23 +91,16 @@ def _out_hook(rec, site, layer):
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--weights", required=True)
-    ap.add_argument("--embeds", required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--device", default="cuda")
-    ap.add_argument(
-        "--z0", default="", help="optional saved clean latents {(h,w): [1,C,h,w]}"
-    )
-    args = ap.parse_args()
-    dev = torch.device(args.device)
-    data = torch.load(args.embeds)
+    setup()
+    check_script(globals())
+    if not WEIGHTS or not EMBEDS or not OUT:
+        raise SystemExit("set WEIGHTS, EMBEDS and OUT")
+    dev = torch.device(DEVICE)
+    data = torch.load(EMBEDS)
     texts = list(data["embeds"]) + [data["empty"]]
     names = list(data["prompts"]) + [""]
-    z0_bank = torch.load(args.z0) if args.z0 else {}
-    model, _ = load_backbone(
-        args.weights, device=dev, dtype=torch.float32, keep_fp32=()
-    )
+    z0_bank = torch.load(Z0) if Z0 else {}
+    model, _ = load_backbone(WEIGHTS, device=dev, dtype=torch.float32, keep_fp32=())
     model.requires_grad_(False)
     rec, seq_box = Recorder(), {}
     instrument(model, rec, seq_box)
@@ -143,7 +144,7 @@ def main() -> None:
                             ),
                         }
                     )
-                    print(rows[-1], flush=True)
+                    log.info(str(rows[-1]))
     peak = dict(rec.peak)
     stream_peak = max(v for k, v in peak.items() if k.startswith("stream."))
     text_peak = max(v for k, v in peak.items() if k.startswith("text_stream."))
@@ -160,9 +161,9 @@ def main() -> None:
         "per_layer": peak,
         "rows": rows,
     }
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out).write_text(json.dumps(report, indent=1), encoding="utf-8")
-    print(json.dumps({"fold": report["fold"], "summary_max": summary}, indent=1))
+    Path(OUT).parent.mkdir(parents=True, exist_ok=True)
+    Path(OUT).write_text(json.dumps(report, indent=1), encoding="utf-8")
+    log.info(json.dumps({"fold": report["fold"], "summary_max": summary}, indent=1))
 
 
 if __name__ == "__main__":

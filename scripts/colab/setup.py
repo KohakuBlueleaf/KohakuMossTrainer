@@ -1,7 +1,7 @@
 """Set up KohakuMoss on a Google Colab VM: a uv venv with the torch build matching the
 driver's CUDA, the package extras, an optional editable LyCORIS checkout, then the
 doctor report. Runs with the VM's system Python; nothing is installed into it but uv.
-See docs/guides/colab.md.
+See docs/guides/install.md (Google Colab).
 
     python scripts/colab/setup.py
     python scripts/colab/setup.py --venv /content/km-venv --lycoris /content/LyCORIS
@@ -12,8 +12,9 @@ import re
 import shutil
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
 TORCH_INDEX = ((13, 0, "cu130"), (12, 8, "cu128"), (12, 6, "cu126"))
@@ -33,7 +34,9 @@ def driver_cuda() -> tuple[int, int]:
     ).stdout
     found = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", out)
     if found is None:
-        raise SystemExit("nvidia-smi reports no CUDA version: is a GPU runtime attached?")
+        raise SystemExit(
+            "nvidia-smi reports no CUDA version: is a GPU runtime attached?"
+        )
     return int(found[1]), int(found[2])
 
 
@@ -42,7 +45,9 @@ def torch_index(cuda: tuple[int, int]) -> str:
     for major, minor, tag in TORCH_INDEX:
         if cuda >= (major, minor):
             return f"https://download.pytorch.org/whl/{tag}"
-    raise SystemExit(f"driver CUDA {cuda[0]}.{cuda[1]} < 12.6: no torch wheel runs on it")
+    raise SystemExit(
+        f"driver CUDA {cuda[0]}.{cuda[1]} < 12.6: no torch wheel runs on it"
+    )
 
 
 def uv_bin() -> str:
@@ -54,10 +59,22 @@ def uv_bin() -> str:
     return str(Path.home() / ".local" / "bin" / "uv")
 
 
+def project_table() -> dict:
+    """The `[project]` table of pyproject.toml."""
+    return tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))[
+        "project"
+    ]
+
+
+def torch_requirement() -> str:
+    """The torch requirement pyproject.toml pins."""
+    deps = project_table()["dependencies"]
+    return next(d for d in deps if re.match(r"torch\s*[<>=!~]", d))
+
+
 def extra_requirements(extras: list[str]) -> list[str]:
     """Requirement strings of `extras` as pyproject.toml declares them."""
-    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    table = project["project"]["optional-dependencies"]
+    table = project_table()["optional-dependencies"]
     unknown = sorted(set(extras) - set(table))
     if unknown:
         raise SystemExit(f"unknown extras {unknown}; pyproject has {sorted(table)}")
@@ -93,7 +110,9 @@ def main():
         default=f"{sys.version_info.major}.{sys.version_info.minor}",
         help="venv Python version (default: the VM's system Python)",
     )
-    ap.add_argument("--torch", default="torch>=2.13", help="torch requirement")
+    ap.add_argument(
+        "--torch", default=torch_requirement(), help="torch requirement (pyproject's)"
+    )
     ap.add_argument("--torch-index", default="", help="wheel index; '' = by driver")
     ap.add_argument("--extras", default="kernels,lightning,quant,dev,bench")
     ap.add_argument("--lycoris", default="", help="LyCORIS checkout to install -e")

@@ -1,11 +1,11 @@
 """Record one 50-step CFG sampling trajectory (official loop or ours) for later comparison.
 
-    python scripts/probe/trajectory.py --impl official --dtype fp32 --prompt 2 \
-        --weights <root>/base --embeds runs/probe/embeds.pt --out runs/probe/traj
-    python scripts/probe/trajectory.py --compare runs/probe/traj
+    kogine run scripts/probe/trajectory.py --set IMPL=official --set PRECISION=fp32 \
+        --set PROMPT=2 --set WEIGHTS=<root>/base --set EMBEDS=runs/probe/embeds.pt \
+        --set OUT=runs/probe/traj
+    kogine run scripts/probe/trajectory.py --set COMPARE=runs/probe/traj
 """
 
-import argparse
 import itertools
 import json
 from pathlib import Path
@@ -16,36 +16,58 @@ import torch
 from kohakumoss.diffusion.sampling import sample_latents, unpack
 from kohakumoss.encoders.vae import FluxVae
 from kohakumoss.inference.pipeline import to_pil
-from kohakumoss.inference.reference import official_module, rel_error
+from kohakumoss.logging.log import get_logger, setup
 from kohakumoss.model import load_backbone
 from kohakumoss.model.numerics import SaturationCounters, apply_fp16_fix
+from kohakumoss.probe.official import official_module, rel_error
+from kohakumoss_common.knobs import check_script
 
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
+log = get_logger("scripts.trajectory")
+
+IMPL = "ours"  # "official" | "ours"
+PRECISION = "fp32"  # compute dtype: "fp32" | "bf16" | "fp16"
+TRANSFORMER = ""  # DiT override (fp16-fix file); "" = WEIGHTS
+FP16_FIX = "none"  # ours: "none" | "weights" | "online" | "fp32_residual"
+FP16_FIX_KWARGS = {}  # ours: e.g. {"c": 0.0625}
+TAG = ""  # output name; "" = <IMPL>_<PRECISION>_<FP16_FIX>
+CFG_MODE = "packed"  # ours: "packed" | "two_pass"
+PROMPT = 0  # index into the embeddings file
+SEED: int | None = None  # None = 42 + PROMPT
+SIZES = [(1024, 1024)]  # (H, W) of the image; one trajectory, so the first entry
+NOISE = ""  # saved initial noise [1, 128, H, W] (.pt); "" = drawn from SEED on cuda
+STEPS = 50
+CFG = 3.0
+WEIGHTS = ""  # pipeline dir with transformer/ (and vae/ for DECODE_REF)
+EMBEDS = ""  # embeddings file from scripts/probe/embed.py
+OUT = ""  # output directory of <TAG>.pt
+COMPARE = ""  # directory of recorded runs: compare them instead of recording
+DECODE_REF = ""  # with COMPARE: decode every run, LPIPS vs this run
 
 
-def official_traj(args, dtype, text, empty, noise):
-    mod = official_module(args.weights)
+def official_traj(dtype, text, empty, noise):
+    mod = official_module(WEIGHTS)
     ref = mod.MOSSImageTransformer.from_pretrained(
-        str(Path(args.weights) / "transformer"), torch_dtype=dtype
+        str(Path(WEIGHTS) / "transformer"), torch_dtype=dtype
     )
     ref = ref.to(noise.device).eval().requires_grad_(False)
     sched = mod.MOSSImageScheduler()
-    sched.set_timesteps(args.steps, device=noise.device)
+    sched.set_timesteps(STEPS, device=noise.device)
     x, steps = noise.float(), []
     pos, neg = text[None].to(noise.device, dtype), empty[None].to(noise.device, dtype)
     for t in sched.timesteps:
         v = ref(x, t, pos, return_dict=False)[0].float()
         u = ref(x, t, neg, skip_layers=[22], return_dict=False)[0].float()
-        x = sched.step(u + args.cfg * (v - u), t, x, return_dict=False)[0]
+        x = sched.step(u + CFG * (v - u), t, x, return_dict=False)[0]
         steps.append(x.cpu())
     return steps
 
 
-def ours_traj(args, dtype, text, empty, noise):
+def ours_traj(dtype, text, empty, noise, seed):
     dev = noise.device
-    model, _ = load_backbone(args.transformer or args.weights, device=dev, dtype=dtype)
+    model, _ = load_backbone(TRANSFORMER or WEIGHTS, device=dev, dtype=dtype)
     model.requires_grad_(False)
-    apply_fp16_fix(model, args.fp16_fix, **json.loads(args.fp16_fix_kwargs))
+    apply_fp16_fix(model, FP16_FIX, **FP16_FIX_KWARGS)
     h, w = noise.shape[-2:]
     sat = SaturationCounters(model, threshold=65504.0)
     hw = torch.tensor([[h, w]])
@@ -55,23 +77,21 @@ def ours_traj(args, dtype, text, empty, noise):
         [text.to(dev, dtype)],
         [empty.to(dev, dtype)],
         (16 * h, 16 * w),
-        args.steps,
-        args.cfg,
+        STEPS,
+        CFG,
         5.0,
         None,
-        [args.seed],
+        [seed],
         dev,
-        args.cfg_mode,
+        CFG_MODE,
         lambda i, x: steps.append(unpack(x, hw)[0].cpu()),
+        noise[0].flatten(1).T,
     )
     stats = sat.read()
-    print(
-        "stream maxabs",
-        max(v["maxabs"] for v in stats.values()),
-        "values >= fp16 max",
-        sum(v["over"] for v in stats.values()),
-        "final finite",
-        bool(torch.isfinite(steps[-1]).all()),
+    log.info(
+        f"stream maxabs {max(v['maxabs'] for v in stats.values())} "
+        f"values >= fp16 max {sum(v['over'] for v in stats.values())} "
+        f"final finite {bool(torch.isfinite(steps[-1]).all())}"
     )
     return steps
 
@@ -87,7 +107,7 @@ def compare(folder: Path) -> None:
             "at": {i: curve[i] for i in (0, 9, 19, 29, 39, 49) if i < len(curve)},
         }
     (folder / "compare.json").write_text(json.dumps(out, indent=1), encoding="utf-8")
-    print(json.dumps(out, indent=1))
+    log.info(json.dumps(out, indent=1))
 
 
 def decode_compare(folder: Path, ref: str, weights: str) -> None:
@@ -114,52 +134,39 @@ def decode_compare(folder: Path, ref: str, weights: str) -> None:
     (folder / f"images_vs_{ref}.json").write_text(
         json.dumps(out, indent=1), encoding="utf-8"
     )
-    print(json.dumps(out, indent=1))
+    log.info(json.dumps(out, indent=1))
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--impl", choices=("official", "ours"))
-    ap.add_argument("--dtype", default="fp32", choices=tuple(DTYPES))
-    ap.add_argument("--transformer", default="", help="DiT override (fp16-fix file)")
-    ap.add_argument("--fp16-fix", default="none")
-    ap.add_argument("--fp16-fix-kwargs", default="{}")
-    ap.add_argument("--tag", default="")
-    ap.add_argument("--cfg-mode", default="packed")
-    ap.add_argument("--prompt", type=int, default=0)
-    ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--size", type=int, default=1024)
-    ap.add_argument("--steps", type=int, default=50)
-    ap.add_argument("--cfg", type=float, default=3.0)
-    ap.add_argument("--weights")
-    ap.add_argument("--embeds")
-    ap.add_argument("--out")
-    ap.add_argument("--compare", default="")
-    ap.add_argument(
-        "--decode-ref", default="", help="with --compare: LPIPS vs this run"
-    )
-    args = ap.parse_args()
-    if args.compare:
-        compare(Path(args.compare))
-        if args.decode_ref:
-            decode_compare(Path(args.compare), args.decode_ref, args.weights)
+    setup()
+    check_script(globals())
+    if COMPARE:
+        compare(Path(COMPARE))
+        if DECODE_REF:
+            decode_compare(Path(COMPARE), DECODE_REF, WEIGHTS)
         return
-    data = torch.load(args.embeds)
-    args.seed = 42 + args.prompt if args.seed is None else args.seed
+    if IMPL not in ("official", "ours"):
+        raise SystemExit(f"IMPL={IMPL!r} not in ('official', 'ours')")
+    data = torch.load(EMBEDS)
+    seed = 42 + PROMPT if SEED is None else SEED
     dev = torch.device("cuda")
-    h = args.size // 16
-    g = torch.Generator(dev).manual_seed(args.seed)
-    noise = torch.randn((1, 128, h, h), generator=g, device=dev)
-    fn = official_traj if args.impl == "official" else ours_traj
+    h, w = SIZES[0][0] // 16, SIZES[0][1] // 16
+    if NOISE:
+        noise = torch.load(NOISE).to(dev)
+    else:
+        g = torch.Generator(dev).manual_seed(seed)
+        noise = torch.randn((1, 128, h, w), generator=g, device=dev)
+    text, empty = data["embeds"][PROMPT], data["empty"]
     with torch.inference_mode():
-        steps = fn(
-            args, DTYPES[args.dtype], data["embeds"][args.prompt], data["empty"], noise
-        )
-    out = Path(args.out)
+        if IMPL == "official":
+            steps = official_traj(DTYPES[PRECISION], text, empty, noise)
+        else:
+            steps = ours_traj(DTYPES[PRECISION], text, empty, noise, seed)
+    out = Path(OUT)
     out.mkdir(parents=True, exist_ok=True)
-    tag = args.tag or f"{args.impl}_{args.dtype}_{args.fp16_fix}"
+    tag = TAG or f"{IMPL}_{PRECISION}_{FP16_FIX}"
     torch.save(steps, out / f"{tag}.pt")
-    print("saved", tag, len(steps))
+    log.info(f"saved {tag} {len(steps)}")
 
 
 if __name__ == "__main__":

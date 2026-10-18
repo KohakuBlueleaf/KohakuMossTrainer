@@ -4,22 +4,22 @@ kogine run scripts/export/export.py --set WEIGHTS=<model dir> --set ADAPTER=<run
 kogine run scripts/export/export.py --set FORMAT=merged --set OUT=merged.safetensors ...
 """
 
-from kohakumoss.adapters.cli import export_main
+from kohakumoss.adapters.export.cli import RENAMED, export_main
+from kohakumoss_common.knobs import check_script
 
-WEIGHTS = ""  # base transformer the adapter was trained on (HF dir or single file)
-ADAPTER = ""  # raw training state written by the trainer / LycoAdapterSet.save_state
+WEIGHTS = ""  # base transformer of the model (HF dir or single file; any fold: the state's recorded fold is applied)
+ADAPTER = ""  # a training state: a run checkpoint's trainable.safetensors or a LycoAdapterSet.save_state file
 OUT = ""  # output file (or directory for FORMAT="diffusers")
-FORMAT = "comfy"  # "comfy" | "lycoris" | "merged" | "diffusers"
+FORMAT = "comfy"  # "comfy" | "lycoris" | "merged" | "diffusers" (a full-finetune checkpoint: merged / diffusers)
 STYLE = "lora_unet"  # comfy/lycoris keys: "lora_unet" | "diffusion_model"
-DTYPE = "bf16"  # "bf16" | "fp16" | "fp32"
+SAVE_DTYPE = "bf16"  # dtype of the written tensors: "bf16" | "fp16" | "fp32"
 MULTIPLIER = 1.0  # strength baked into merged outputs
-FUSED_QKV = False  # merged: write joint q/k/v as one proj.qkv
-FP16_FIX = "none"  # the run's FP16_FIX ("weights" folds the trained weights)
-FP16_FIX_KWARGS = {}  # the run's FP16_FIX_KWARGS (c, s_attn, s_ffn, eps)
+FUSED_QKV = False  # comfy / merged: joint q/k/v as one proj.qkv (the Comfy-Org repack)
 DEVICE = "cpu"
 
 
 def main():
+    check_script(globals(), RENAMED)
     return export_main(globals())
 
 

@@ -3,16 +3,17 @@
 Stages (all write into one JSON report):
   blocks : per-block / output error vs the official fp32 forward, ours fp32 / bf16 /
            fp16 (+fold) and official bf16, at several resolutions and sigmas
-  pack   : packed multi-sample forward == per-sample forwards
+  pack   : packed multi-sample forward == per-sample forwards == padded (one extra
+           padding sample) forward
   fold   : fold exactness on the real weights (gate and per-layer proj modes)
   images : 1024^2, 50 steps, CFG 3, official loop vs MossPipeline (per-step latent
            error, decoded-image error, LPIPS)
 
-    python scripts/probe/parity.py --weights <root>/base --embeds runs/probe/embeds.pt \
-        --out runs/probe/parity --ref-device cuda:0 --our-device cuda:1
+    kogine run scripts/probe/parity.py --set WEIGHTS=<root>/base \
+        --set EMBEDS=runs/probe/embeds.pt --set OUT=runs/probe/parity \
+        --set REF_DEVICE=cuda:0 --set OUR_DEVICE=cuda:1
 """
 
-import argparse
 import gc
 import json
 from pathlib import Path
@@ -23,11 +24,22 @@ import torch
 from kohakumoss.diffusion.sampling import sample_latents, unpack
 from kohakumoss.encoders.vae import FluxVae
 from kohakumoss.inference.pipeline import to_pil
-from kohakumoss.inference.reference import official_module, rel_error
+from kohakumoss.logging.log import get_logger, setup
 from kohakumoss.model import load_backbone
 from kohakumoss.model.numerics import fold, unfold
+from kohakumoss.probe.official import official_module, rel_error
 from kohakumoss.types.seqinfo import build_seqinfo
+from kohakumoss_common.knobs import check_script
 
+log = get_logger("scripts.parity")
+
+WEIGHTS = ""  # pipeline dir with transformer/ (and the official pipeline code)
+EMBEDS = ""  # embeddings file from scripts/probe/embed.py
+OUT = ""  # output directory (parity.json, PNGs, z0_bank.pt)
+REF_DEVICE = "cuda:0"  # official model device
+OUR_DEVICE = "cuda:1"  # KohakuMoss model device
+FOLD = 2.0**-4  # fold factor of the ours_fp16_fold row
+STAGES = ("blocks", "pack", "images")  # stages to run
 RESOLUTIONS = ((512, 512), (1024, 1024))
 SIGMAS = (0.9, 0.5, 0.1)
 
@@ -71,8 +83,8 @@ def our_forward(model, latent, sigma, text, skip=frozenset()):
     return out.T.reshape(1, c, h, w)
 
 
-def stage_blocks(args, mod, data, report):
-    ref_dev, our_dev = torch.device(args.ref_device), torch.device(args.our_device)
+def stage_blocks(mod, data, report):
+    ref_dev, our_dev = torch.device(REF_DEVICE), torch.device(OUR_DEVICE)
     cases = []
     for height, width in RESOLUTIONS:
         for p, text in enumerate(data["embeds"]):
@@ -80,7 +92,7 @@ def stage_blocks(args, mod, data, report):
                 g = torch.Generator().manual_seed(100 + p)
                 lat = torch.randn((1, 128, height // 16, width // 16), generator=g)
                 cases.append((height, width, p, sigma, lat, text))
-    ref = official_transformer(mod, args.weights, torch.float32, ref_dev)
+    ref = official_transformer(mod, WEIGHTS, torch.float32, ref_dev)
     ref_blocks, ref_out = {}, []
     ref_store = {}
     handles = block_hooks(ref.layers, ref_store)
@@ -100,9 +112,9 @@ def stage_blocks(args, mod, data, report):
         ("ours_fp32", torch.float32, None),
         ("ours_bf16", torch.bfloat16, None),
         ("ours_fp16", torch.float16, None),
-        ("ours_fp16_fold", torch.float16, args.fold),
+        ("ours_fp16_fold", torch.float16, FOLD),
     ):
-        model, _ = load_backbone(args.weights, device=our_dev, dtype=dtype)
+        model, _ = load_backbone(WEIGHTS, device=our_dev, dtype=dtype)
         model.requires_grad_(False)
         if fold_c:
             fold(model, fold_c)
@@ -130,14 +142,15 @@ def stage_blocks(args, mod, data, report):
                         "block_rel": per_block,
                     }
                 )
-                print(name, {k: v for k, v in out_rows[-1].items() if k != "block_rel"})
+                brief = {k: v for k, v in out_rows[-1].items() if k != "block_rel"}
+                log.info(f"{name} {brief}")
         for h in handles:
             h.remove()
         rows[name] = out_rows
         del model
         free()
     with torch.inference_mode():
-        ref16 = official_transformer(mod, args.weights, torch.bfloat16, our_dev)
+        ref16 = official_transformer(mod, WEIGHTS, torch.bfloat16, our_dev)
         rows["official_bf16"] = [
             {
                 "res": [c[0], c[1]],
@@ -163,9 +176,9 @@ def stage_blocks(args, mod, data, report):
     }
 
 
-def stage_pack_fold(args, data, report):
-    dev = torch.device(args.our_device)
-    model, _ = load_backbone(args.weights, device=dev, dtype=torch.float32)
+def stage_pack_fold(data, report):
+    dev = torch.device(OUR_DEVICE)
+    model, _ = load_backbone(WEIGHTS, device=dev, dtype=torch.float32)
     model.requires_grad_(False)
     hws = [(32, 32), (48, 40), (24, 64)]
     texts = [t.to(dev) for t in data["embeds"]]
@@ -184,7 +197,20 @@ def stage_pack_fold(args, data, report):
                 for i, z in enumerate(lats)
             ]
         )
-        report["pack"] = {"packed_vs_loop_rel": rel_error(packed, loop)}
+        pad = 256
+        seq_pad = build_seqinfo(
+            torch.tensor(hws + [(1, pad)]),
+            torch.tensor([t.shape[0] for t in texts] + [0]),
+        )
+        img_pad = torch.cat((img, img.new_zeros(pad, img.shape[1])))
+        sigma_pad = torch.cat((sigma, sigma[:1])).to(dev)
+        padded = model(img_pad, torch.cat(texts), sigma_pad, seq_pad.to(dev)).float()
+        padded = padded[: img.shape[0]].cpu()
+        report["pack"] = {
+            "packed_vs_loop_rel": rel_error(packed, loop),
+            "padded_vs_packed_rel": rel_error(padded, packed),
+            "padded_vs_packed_max_abs": (padded - packed).abs().max().item(),
+        }
         base = our_forward(model, lats[0], sigma[:1], texts[0]).cpu()
         fold_rows = {}
         for label, c, via in (
@@ -200,7 +226,7 @@ def stage_pack_fold(args, data, report):
             unfold(model)
             fold_rows[label] = rel_error(folded, base)
         report["fold"] = fold_rows
-    print(report["pack"], report["fold"])
+    log.info(f"{report['pack']} {report['fold']}")
     del model
     free()
 
@@ -232,15 +258,15 @@ def official_decode(vae, z):
     return vae.decode(z, return_dict=False)[0].clamp(-1, 1).float()
 
 
-def stage_images(args, mod, data, report):
-    ref_dev, our_dev = torch.device(args.ref_device), torch.device(args.our_device)
+def stage_images(mod, data, report):
+    ref_dev, our_dev = torch.device(REF_DEVICE), torch.device(OUR_DEVICE)
     dtype = torch.bfloat16
-    ref = official_transformer(mod, args.weights, dtype, ref_dev)
-    ours, _ = load_backbone(args.weights, device=our_dev, dtype=dtype)
+    ref = official_transformer(mod, WEIGHTS, dtype, ref_dev)
+    ours, _ = load_backbone(WEIGHTS, device=our_dev, dtype=dtype)
     ours.requires_grad_(False)
-    vae = FluxVae.from_pretrained(args.weights, our_dev, torch.float32)
+    vae = FluxVae.from_pretrained(WEIGHTS, our_dev, torch.float32)
     metric = lpips.LPIPS(net="alex").to(our_dev)
-    out_dir = Path(args.out)
+    out_dir = Path(OUT)
     rows, z0_bank = [], {}
     for p, text in enumerate(data["embeds"]):
         seed = 42 + p
@@ -297,10 +323,7 @@ def stage_images(args, mod, data, report):
                 "vae_decode_vs_official_rel": vae_rel,
             }
         )
-        print(
-            {k: v for k, v in rows[-1].items() if k != "latent_rel_per_step"},
-            flush=True,
-        )
+        log.info(str({k: v for k, v in rows[-1].items() if k != "latent_rel_per_step"}))
     report["images"] = rows
     torch.save(z0_bank, out_dir / "z0_bank.pt")
     del ref, ours, vae
@@ -308,30 +331,24 @@ def stage_images(args, mod, data, report):
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--weights", required=True)
-    ap.add_argument("--embeds", required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--ref-device", default="cuda:0")
-    ap.add_argument("--our-device", default="cuda:1")
-    ap.add_argument("--fold", type=float, default=2.0**-4)
-    ap.add_argument("--stages", default="blocks,pack,images")
-    args = ap.parse_args()
-    out = Path(args.out)
+    setup()
+    check_script(globals())
+    if not WEIGHTS or not EMBEDS or not OUT:
+        raise SystemExit("set WEIGHTS, EMBEDS and OUT")
+    out = Path(OUT)
     out.mkdir(parents=True, exist_ok=True)
-    data = torch.load(args.embeds)
-    mod = official_module(args.weights)
-    report = {"fold": args.fold}
-    stages = args.stages.split(",")
-    if "pack" in stages:
-        stage_pack_fold(args, data, report)
-    if "blocks" in stages:
-        stage_blocks(args, mod, data, report)
-    if "images" in stages:
-        stage_images(args, mod, data, report)
+    data = torch.load(EMBEDS)
+    mod = official_module(WEIGHTS)
+    report = {"fold": FOLD}
+    if "pack" in STAGES:
+        stage_pack_fold(data, report)
+    if "blocks" in STAGES:
+        stage_blocks(mod, data, report)
+    if "images" in STAGES:
+        stage_images(mod, data, report)
     (out / "parity.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
     summary = {k: v for k, v in report.items() if k not in ("blocks",)}
-    print(json.dumps(summary, indent=1, default=str))
+    log.info(json.dumps(summary, indent=1, default=str))
 
 
 if __name__ == "__main__":
