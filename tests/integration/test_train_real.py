@@ -26,7 +26,7 @@ import torch
 from kohakumoss.training.entry import run
 from kohakumoss_kernels.hardware.arch import arch_of
 from tests._util.negative import must_fail
-from tests.integration.conftest import fp16_fix_knobs, real_knobs
+from tests.integration.conftest import fp16_fix_knobs, needs_precision, real_knobs
 
 pytestmark = [pytest.mark.real_weights, pytest.mark.cuda, pytest.mark.slow]
 
@@ -55,6 +55,7 @@ DIVERGED = 1e-2  # a relative step-1 loss gap that is a real divergence
 def _precision(name: str, weights_root: Path, fix_file) -> dict:
     match name:
         case "bf16":
+            needs_precision("bf16")
             return {"PRECISION": "bf16"}
         case "fp16":
             if fix_file is None:

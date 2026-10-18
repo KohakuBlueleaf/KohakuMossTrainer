@@ -1,14 +1,18 @@
-"""Real export / merge scripts on a 2-step bf16 LoRA run of the real weights: the export
-script on the run's checkpoint writes the same tensors as the run's own export (comfy
-and LyCORIS), and so does every checkpoint the session's earlier real runs left (their
-algos / precisions / fp16 fixes recorded); a checkpoint stripped of its spec / fold
-metadata is refused and nothing is written; a FUSED_QKV comfy file merges into the same
-transformer as the unfused one; a merge into the fp16-fix file adds the unfolded
-merge's delta W times the fold's row scales; the run directory holds its log.txt."""
+"""Real export / merge scripts on a 2-step LoRA run of the real weights (the card's
+16-bit precision: bf16 where the card has it, else fp16): the export script on the run's checkpoint writes
+the same tensors as the run's own export (comfy and LyCORIS), and so does every
+checkpoint the session's earlier real runs left (their algos / precisions / fp16 fixes
+recorded, at the dtype of their export's weight tensors); a checkpoint stripped of its
+spec / fold metadata is refused and nothing is written; a FUSED_QKV comfy file merges
+into the same transformer as the unfused one; a merge into an fp16-fix file (one this
+test folds with pre-gate scales, and the shipped one) adds the plain merge's delta W
+times the fold's row scales, within each base dtype's rounding of delta W; the run
+directory holds its log.txt."""
 
 import json
 import re
 import shutil
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -18,7 +22,9 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 from kohakumoss.model import load_backbone
-from kohakumoss.model.numerics import output_row_scales
+from kohakumoss.model.io.source import checkpoint_files
+from kohakumoss.model.numerics import output_row_scales, unfold
+from kohakumoss.model.numerics.fold import fold_rows
 from kohakumoss.training.entry import run
 from tests._util.negative import must_fail
 from tests.integration.conftest import real_knobs
@@ -35,12 +41,15 @@ pytestmark = [pytest.mark.real_weights, pytest.mark.cuda, pytest.mark.slow]
 ROOT = Path(__file__).resolve().parents[2]
 EXPORT = ROOT / "scripts" / "export" / "export.py"
 MERGE = ROOT / "scripts" / "export" / "merge.py"
+FIX_SCRIPT = ROOT / "scripts" / "export" / "fp16_fix.py"
+BUILT_FIX = {"C": 0.0625, "S_ATTN": 0.5, "S_FFN": 0.5}
+STORED = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32}
 
 
 @pytest.fixture(scope="module")
 def trained(weights_root, dataset_slice, tmp_path_factory) -> Path:
-    """<out>/run of a 2-step LoRA run with its step-2 checkpoint and comfy + LyCORIS
-    exports."""
+    """<out>/run of a 2-step LoRA run (the card's precision, `real_knobs`) with its
+    step-2 checkpoint and comfy + LyCORIS exports."""
     out = tmp_path_factory.mktemp("export_run")
     k = real_knobs(
         weights_root,
@@ -53,7 +62,6 @@ def trained(weights_root, dataset_slice, tmp_path_factory) -> Path:
         DIM=8,
         ALPHA=8.0,
         LR=1e-2,
-        PRECISION="bf16",
         EXPORT_FORMATS=("lycoris", "comfy"),
     )
     run(k)
@@ -84,15 +92,16 @@ def check_close(a: dict, b: dict, rel: float) -> None:
 @pytest.mark.parametrize("fmt", ["comfy", "lycoris"])
 def test_export_script_matches_the_run_export(fmt, trained, weights_root, tmp_path):
     out = tmp_path / f"{fmt}.safetensors"
+    own = load_file(str(next((trained / "export").glob(f"*-{fmt}.safetensors"))))
     sets = {
         "WEIGHTS": str(weights_root / "base"),
         "ADAPTER": str(_state(trained)),
         "OUT": str(out),
         "FORMAT": fmt,
+        "SAVE_DTYPE": weight_dtype(own),
         "DEVICE": "cuda",
     }
     run_script(str(EXPORT), set_overrides=sets)
-    own = load_file(str(next((trained / "export").glob(f"*-{fmt}.safetensors"))))
     got = load_file(str(out))
     check_same(got, own)
     key = next(iter(own))
@@ -178,17 +187,26 @@ def test_export_of_a_checkpoint_without_metadata(trained, weights_root, tmp_path
     with safe_open(str(_state(old)), "pt") as f:
         assert not set(META_KEYS) & set(f.metadata() or {})
     assert (old / "config.json").is_file()
-    check_refused(weights_root / "base", _state(old), tmp_path / "old.safetensors")
+    own = load_file(str(next((trained / "export").glob("*-comfy.safetensors"))))
+    dtype = weight_dtype(own)
+    old_out = tmp_path / "old.safetensors"
+    check_refused(weights_root / "base", _state(old), old_out, dtype)
     out = tmp_path / "intact.safetensors"
     must_fail(
-        lambda: check_refused(weights_root / "base", _state(trained), out),
+        lambda: check_refused(weights_root / "base", _state(trained), out, dtype),
         "a checkpoint with its metadata intact",
     )
-    own = load_file(str(next((trained / "export").glob("*-comfy.safetensors"))))
     check_same(load_file(str(out)), own)
 
 
 DTYPE_NAMES = {torch.bfloat16: "bf16", torch.float16: "fp16", torch.float32: "fp32"}
+
+
+def weight_dtype(state: dict) -> str:
+    """SAVE_DTYPE name of an export: its weight tensors' dtype (alphas are always fp32)."""
+    return DTYPE_NAMES[
+        next(t.dtype for k, t in state.items() if not k.endswith(".alpha"))
+    ]
 
 
 def session_runs(root: Path) -> list[Path]:
@@ -214,11 +232,19 @@ def test_every_session_checkpoint_exports_like_its_run(
             | {"run": run_dir.name, "path": str(run_dir)}
         )
         own = load_file(str(next((run_dir / "export").glob("*-comfy.safetensors"))))
-        dtype = DTYPE_NAMES[next(iter(own.values())).dtype]
+        dtype = weight_dtype(own)
         weights = Path(knobs["WEIGHTS"])
         out = tmp_path / f"r{i}.safetensors"
         _export(weights, _state(run_dir), out, dtype=dtype)
         check_same(load_file(str(out)), own)
+        if i == 0:
+            other = "fp32" if dtype != "fp32" else "bf16"
+            wrong = tmp_path / f"r{i}_{other}.safetensors"
+            _export(weights, _state(run_dir), wrong, dtype=other)
+            must_fail(
+                lambda: check_same(load_file(str(wrong)), own),
+                f"a re-export at {other} instead of the export's {dtype}",
+            )
         old = _stripped_run(run_dir, tmp_path / f"r{i}")
         check_refused(weights, _state(old), tmp_path / f"r{i}_old.safetensors", dtype)
     record_property("session_checkpoints", json.dumps(kinds))
@@ -237,54 +263,115 @@ def _merge(weights: Path, adapter: Path, out: Path) -> None:
     run_script(str(MERGE), set_overrides=sets)
 
 
-def unfolded(path) -> dict:
-    """The backbone weights of `path` (fp32, CPU) with any recorded fold divided out of
-    each output row."""
-    model, _ = load_backbone(str(path), device="cpu", dtype=torch.float32)
-    scales = output_row_scales(model)
-    out = {}
-    for key, w in model.state_dict().items():
-        w = w.detach().float()
-        s = scales.get(key[: -len(".weight")]) if key.endswith(".weight") else None
-        out[key] = w if s is None else w / s.view(-1, *([1] * (w.dim() - 1))).float()
+def _lycoris(trained: Path) -> Path:
+    return next((trained / "export").glob("*-lycoris.safetensors"))
+
+
+def stored_dtype(path: Path) -> torch.dtype:
+    """The dtype most of a checkpoint's floating tensors are stored in."""
+    counts = Counter()
+    for f in checkpoint_files(path):
+        with safe_open(str(f), "pt") as h:
+            names = (h.get_slice(k).get_dtype() for k in h.keys())
+            counts.update(STORED[n] for n in names if n in STORED)
+    return counts.most_common(1)[0][0]
+
+
+@pytest.fixture(scope="module")
+def plain_merge(trained, weights_root, tmp_path_factory) -> Path:
+    """The run's LyCORIS export merged into the base weights (fp32)."""
+    out = tmp_path_factory.mktemp("plain_merge") / "merged.safetensors"
+    _merge(weights_root / "base", _lycoris(trained), out)
     return out
+
+
+@pytest.fixture(scope="module")
+def built_fix(weights_root, tmp_path_factory) -> Path:
+    """An fp16-fix file of the base weights with pre-gate scales (the o / ffn_down rows
+    folded too), written at the base's own dtype."""
+    out = tmp_path_factory.mktemp("built_fix") / "fix.safetensors"
+    base = weights_root / "base"
+    sets = {
+        "WEIGHTS": str(base),
+        **BUILT_FIX,
+        "SAVE_DTYPE": DTYPE_NAMES[stored_dtype(base)],
+        "OUT": str(out),
+    }
+    run_script(str(FIX_SCRIPT), set_overrides=sets)
+    return out
+
+
+def unfolded(path) -> dict:
+    """The backbone weights of `path` (fp32, CPU) with the recorded fold undone by the
+    model's own inverse (every parameter it scales: weight rows, biases, modulation)."""
+    model, _ = load_backbone(str(path), device="cpu", dtype=torch.float32)
+    unfold(model)
+    return {k: v.detach().float() for k, v in model.state_dict().items()}
 
 
 def check_same_delta(d_fix: dict, d_plain: dict, slack: dict) -> None:
     """Per tensor: the fix-file merge's delta W (unfolded) equals the plain merge's,
-    within 1e-5 x its max plus the fp32 rounding of the merged weights (`slack`)."""
+    within 1e-5 x its max plus the per-element `slack` (the fp32 rounding of the merged
+    weights and each base dtype's rounding of delta W)."""
     assert d_fix.keys() == d_plain.keys()
     for key, d_a in d_plain.items():
         bound = 1e-5 * float(d_a.abs().max()) + slack[key]
         assert bool(((d_fix[key] - d_a).abs() <= bound).all()), key
 
 
-def test_merge_into_the_fp16_fix_file(trained, weights_root, fix_file, tmp_path):
-    if fix_file is None:
+def delta_rounding(*paths: Path) -> tuple[float, float]:
+    """(relative, absolute) rounding of a delta W computed in the coarser of the
+    checkpoints' stored dtypes: half an eps, and half an eps of its smallest normal."""
+    infos = [torch.finfo(stored_dtype(p)) for p in paths]
+    return max(i.eps for i in infos) / 2, max(i.eps * i.tiny for i in infos) / 2
+
+
+@pytest.mark.parametrize("which", ["built", "shipped"])
+def test_merge_into_an_fp16_fix_file(
+    which, request, trained, weights_root, fix_file, plain_merge, tmp_path
+):
+    if which == "shipped" and fix_file is None:
         pytest.skip("no fp16-fix file")
-    adapter = next((trained / "export").glob("*-lycoris.safetensors"))
-    _merge(weights_root / "base", adapter, tmp_path / "a.safetensors")
-    _merge(fix_file, adapter, tmp_path / "b.safetensors")
-    fix_model, _ = load_backbone(str(fix_file), device="cpu", dtype=torch.float32)
+    fix_path = request.getfixturevalue("built_fix") if which == "built" else fix_file
+    out = tmp_path / "merged_fix.safetensors"
+    _merge(fix_path, _lycoris(trained), out)
+    fix_model, _ = load_backbone(str(fix_path), device="cpu", dtype=torch.float32)
     scales = {k: v.float() for k, v in output_row_scales(fix_model).items()}
+    params = fold_rows(fix_model)
     del fix_model
     assert any(
         bool((s != 1).any()) for s in scales.values()
     ), "the fix file folds nothing"
-    base, fix = unfolded(weights_root / "base"), unfolded(fix_file)
-    merged, merged_fix = unfolded(tmp_path / "a.safetensors"), unfolded(
-        tmp_path / "b.safetensors"
-    )
+    rel, tiny = delta_rounding(weights_root / "base", fix_path)
+    base, fix = unfolded(weights_root / "base"), unfolded(fix_path)
+    merged, merged_fix = unfolded(plain_merge), unfolded(out)
+    out.unlink()
     d_plain = {k: merged[k] - base[k] for k in base}
     d_fix = {k: merged_fix[k] - fix[k] for k in fix}
-    slack = {k: 2 * FP32_EPS * (merged[k].abs() + merged_fix[k].abs()) for k in d_plain}
+    slack = {
+        k: 2 * FP32_EPS * (merged[k].abs() + merged_fix[k].abs())
+        + rel * (d_plain[k].abs() + d_fix[k].abs())
+        + tiny
+        for k in d_plain
+    }
     check_same_delta(d_fix, d_plain, slack)
+    bias = next(
+        k
+        for k, s in params.items()
+        if k.endswith(".bias") and isinstance(s, float) and s != 1
+    )
+    left = {bias: merged_fix[bias] - fix[bias] * float(params[bias])}
+    must_fail(
+        lambda: check_same_delta(left, {bias: d_plain[bias]}, {bias: slack[bias]}),
+        f"the fix file's {bias} left folded",
+    )
     folded = {}
     for key, d in d_fix.items():
         s = scales.get(key[: -len(".weight")]) if key.endswith(".weight") else None
         if s is not None and bool((s != 1).any()) and bool(d_plain[key].any()):
             folded[key] = d / s.view(-1, *([1] * (d.dim() - 1)))
-    assert folded, "the trained adapter touches no row the fold scales"
+    if which == "built":
+        assert folded, "the trained adapter touches no row the fold scales"
     for key, dropped in folded.items():
         must_fail(
             lambda: check_same_delta(

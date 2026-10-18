@@ -10,6 +10,7 @@ from kohakuengine import run
 from kohakumoss.encoders.text.encoder import QwenTextEncoder
 from kohakumoss.quant.convert import QuantLinear
 from kohakumoss.quant.stored_text import read_text_record, text_of
+from kohakumoss_kernels.hardware.arch import arch_of
 
 pytestmark = [pytest.mark.real_weights, pytest.mark.cuda, pytest.mark.slow]
 
@@ -27,8 +28,10 @@ def test_stored_file_encodes_like_load_time_quantization(
     weights_root, tmp_path, precision
 ):
     weights = str(weights_root / "base")
-    if precision == "fp8_compute" and torch.cuda.get_device_capability() < (8, 9):
-        pytest.skip("fp8 compute needs sm89+")
+    if precision == "fp8_compute" and not arch_of("cuda").has_fp8:
+        pytest.skip(
+            f"fp8 compute needs a card with fp8; {arch_of('cuda').name} has none"
+        )
     out = tmp_path / "te.safetensors"
     run(
         str(ROOT / "scripts/export/text_quant.py"),
@@ -36,7 +39,7 @@ def test_stored_file_encodes_like_load_time_quantization(
     )
     record = read_text_record(out)
     assert record["precision"] == precision and record["layers"]
-    base = {"precision": precision, "memory": "resident", "dtype": "bf16"}
+    base = {"precision": precision, "memory": "resident", "dtype": "auto"}
     want = _encode(weights, base)
     te = QwenTextEncoder.from_pretrained(weights, "cuda", {**base, "stored": str(out)})
     stored = [m for m in text_of(te.model).modules() if isinstance(m, QuantLinear)]
