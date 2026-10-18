@@ -203,8 +203,8 @@ def phase_peaks(record: dict) -> dict:
     """GiB of a training run's prewarm phase against its step phase: the nvidia-smi
     peak (the process, else the card above idle), torch max allocated / reserved (the
     prewarm's; the steps': step 1's own peak and every later step's), and `over`: True
-    when a prewarm peak exceeds the step one, None without a comparable pair (the rule:
-    tuning never uses more VRAM than training); torch reserved at the first and the last
+    when a prewarm peak exceeds the step one, None without a comparable pair; torch
+    reserved at the first and the last
     step after step 1 (the growth trend), and `past_budget`: for a run under a VRAM cap,
     whether the step phase's smi peak or reserved peak went past it.
     See docs/performance/bench-matrix.md#release."""

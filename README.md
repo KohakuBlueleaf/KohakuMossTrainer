@@ -250,9 +250,12 @@ process's, sampled every 500 ms, split at the first step into startup + kernel p
 and the step loop. The 8 GB / 6 GB rows run with the allocator capped at the target.
 Caches-off rows were measured with the text encoder streamed; this release keeps it
 resident where it fits, which is faster on 32 GB+ cards. First-run kernel tuning runs
-before step 0 and is not in samples/s. The runs used release tree 7356056ba5 (content
-7209a988 and 6f967733, the same runtime code); the `vram_8g` no-cache and latent-cache
-rows ran on that runtime with the extra bench rows added.
+before step 0 and is not in samples/s; the tuning prewarm is bounded by the kernel
+prewarm's planned-maximum replay and on these rows peaks at or within 0.8 GiB of the
+step peak (footnote 4). The runs used the v0.1.0 release code (the runtime of commits
+db622de..3f1f50d; the benches ran on pre-commit snapshots with identical runtime
+code); the `vram_8g` no-cache and latent-cache rows ran on the same runtime with the
+extra bench rows added.
 
 (1) The run shared the card with another process, so it is not reported.
 (2) Windows (WDDM): nvidia-smi reports the card's use above its idle baseline, not the

@@ -229,10 +229,11 @@ to the first step) against the step phase (`report/results.py` `phase_peaks`, Gi
   peak, parsed from its `VRAM peak: prewarm ...; step 1 ...` log line, and every later
   step's metric-row peak: `vram_step_peak`, `vram_peak_alloc`, `vram_peak_reserved`;
   step 1's row is left out, its window can hold the prewarm);
-- "prewarm > step": yes when any prewarm peak exceeds the step phase's. Tuning never
-  uses more VRAM than training, and these rows check it on the released code. Peaks
-  are compared with peaks: a median of the step peaks understates a run whose packs
-  vary in length.
+- "prewarm > step": yes when any prewarm peak exceeds the step phase's. The tuning
+  prewarm is bounded by the kernel prewarm's planned-maximum replay; on the release
+  rows it peaks at or within 0.8 GiB of the step peak (the minimal LoRA rows: 3.1 vs
+  2.8 GiB on the RTX 5090). Peaks are compared with peaks: a median of the step peaks
+  understates a run whose packs vary in length.
 
 The offline caches are built once per encoder dtype the host's cards resolve to
 (`knobs.encoder_dtype`: bf16 where the card has it, else fp16; the VAE dtype and the
