@@ -58,6 +58,10 @@ kohakumoss-tune = "kohakumoss.cli.tune:main"
 where = ["src"]
 include = ["kohakumoss*", "kohakumoss_common*", "kohakumoss_kernels*", "kohakumoss_data*"]
 
+[tool.setuptools.package-data]
+# the packaged Qwen3.5-9B config and tokenizer (Apache-2.0, see its NOTICE)
+"kohakumoss.encoders.text" = ["assets/*/*"]
+
 [tool.black]
 line-length = 88
 target-version = ["py310"]

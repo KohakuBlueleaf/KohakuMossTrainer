@@ -1,0 +1,16 @@
+Qwen3.5-9B text-encoder configuration and tokenizer, as shipped with MOSS-Image.
+
+Files in this folder:
+  config.json            text_encoder/config.json of OpenMOSS-Team/MOSS-Image-Base
+  tokenizer.json.gz      gzip of tokenizer/tokenizer.json of OpenMOSS-Team/MOSS-Image-Base
+  tokenizer_config.json  tokenizer/tokenizer_config.json of OpenMOSS-Team/MOSS-Image-Base
+  chat_template.jinja    tokenizer/chat_template.jinja of OpenMOSS-Team/MOSS-Image-Base
+
+Sources (each licensed under the Apache License, Version 2.0):
+  https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base
+  https://huggingface.co/Qwen/Qwen3.5-9B
+  https://huggingface.co/Comfy-Org/MOSS-Image
+
+The tokenizer and configuration are the work of the Qwen team (Alibaba Cloud); MOSS-Image
+is the work of the OpenMOSS team. The files are redistributed unmodified (the tokenizer
+gzip-compressed) under the Apache License, Version 2.0, a copy of which is in LICENSE.
