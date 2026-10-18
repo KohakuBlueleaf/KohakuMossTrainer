@@ -1,9 +1,19 @@
-"""Step bench of the real MOSS architecture (random weights) per memory profile, run
-through the trainer (`entry.run`: build, forward, backward and the optimiser step,
-synthetic data): step time, tokens/s, peak memory and the memory model's estimate.
-Writes runs/bench/step/<gpu>_<variant>.json. See docs/internals/offload.md.
+"""Step bench of MOSS per memory profile, run through the trainer (`entry.run`: build,
+forward, backward and the optimiser step) on `--weights` and `--datasets`: step time,
+tokens/s, peak memory and the memory model's estimate. Writes
+runs/bench/step/<gpu>_<variant>.json. See docs/internals/offload.md.
 
-    python scripts/bench/step/step.py --device cuda:0 --profiles balanced,low,minimal
+    python scripts/bench/step/step.py --weights <root>/base \
+        --datasets '[{"source": "kohya", "path": "<dataset>"}]' \
+        --device cuda:0 --profiles balanced,low,minimal
+    python scripts/bench/step/step.py --weights <root>/base --datasets '[...]' \
+        --profiles low --text-weights <root>/base --text-plan '{"memory": "stream"}'
+
+With --text-weights the trainer encodes every batch's captions online with the real
+text encoder under --text-plan (TEXT_CACHE off): the row then carries the text-encoder
+share of the step (`te_ms`, `te_share`, `te_h2d_GB`), the VRAM timeline of the pass
+(`vram_te_peak`, `vram_te_after`) and of the DiT step (`vram_step_peak`), and the
+estimate with the text encoder.
 """
 
 import argparse
@@ -16,15 +26,20 @@ import tempfile
 from pathlib import Path
 
 import torch
+from transformers import AutoConfig, AutoModel
 
+from kohakumoss.encoders.text import text_plan
+from kohakumoss.memory.estimate import estimate
+from kohakumoss.memory.planner import with_text
+from kohakumoss.memory.profiles import resolve
 from kohakumoss.offload.accel import default_type
 from kohakumoss.offload.accel import module as accel
+from kohakumoss.offload.encoders.text_memory import text_sizes
 from kohakumoss.training.build.model import workload
 from kohakumoss.training.entry import run
-from kohakumoss.training.memory.estimate import estimate
-from kohakumoss.training.memory.profiles import resolve
 
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "train" / "moss.py"
+DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
 
 def script_defaults() -> dict:
@@ -44,7 +59,7 @@ def knobs(args, profile: str, out_dir: str) -> dict:
     """The train script's defaults with the bench's run on top."""
     k = script_defaults()
     k.update(
-        WEIGHTS="random",
+        WEIGHTS=args.weights,
         VARIANT=args.variant,
         ALGO=args.algo,
         DIM=16,
@@ -52,7 +67,7 @@ def knobs(args, profile: str, out_dir: str) -> dict:
         PRECISION=args.precision,
         FP16_FIX="online" if args.precision == "fp16" else "none",
         FP16_FIX_KWARGS={"c": 1 / 16} if args.precision == "fp16" else {},
-        DATASETS=[{"source": "synthetic", "count": 64}],
+        DATASETS=json.loads(args.datasets),
         LATENT_CACHE="off",
         TEXT_CACHE="off",
         RESOLUTION_MODE="bucket",
@@ -74,7 +89,39 @@ def knobs(args, profile: str, out_dir: str) -> dict:
         OUTPUT_DIR=out_dir,
         RUN_NAME="step",
     )
+    if args.text_weights:
+        k.update(TEXT_ENCODER=args.text_weights, TEXT_ENCODE=json.loads(args.text_plan))
+    k.update(json.loads(args.knobs) if args.knobs else {})
     return k
+
+
+def text_estimate(args, k: dict, est, device) -> dict:
+    """The memory estimate with the text encoder (sizes from its config on the meta
+    device, in the plan's compute dtype)."""
+    root = Path(args.text_weights)
+    root = root / "text_encoder" if (root / "text_encoder").is_dir() else root
+    plan = text_plan(k["TEXT_ENCODE"])
+    dtype = DTYPES.get(plan.dtype, torch.bfloat16)
+    with torch.device("meta"):
+        model = AutoModel.from_config(
+            AutoConfig.from_pretrained(str(root)), dtype=dtype
+        )
+    sizes = text_sizes(getattr(model, "language_model", model), plan.stream_resident)
+    tokens = (k["BATCH_SIZE"] * plan.ahead * 300, plan.max_tokens or 16384)
+    budget = accel(device).get_device_properties(device).total_memory
+    total, memory = with_text(est, sizes, budget, tokens, plan.memory)
+    return {"estimate_with_text_GiB": total / 1024**3, "text_memory": memory}
+
+
+def _mean(rows: list[dict], key: str) -> float:
+    """Mean over the logged steps (encode-ahead passes land on some steps only)."""
+    vals = [r[key] for r in rows if key in r]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def _median(rows: list[dict], key: str) -> float | None:
+    vals = sorted(r[key] for r in rows if key in r)
+    return vals[len(vals) // 2] if vals else None
 
 
 def run_profile(args, profile: str) -> dict:
@@ -89,7 +136,7 @@ def run_profile(args, profile: str) -> dict:
     plan = resolve(profile, k["MEMORY_OVERRIDES"], device, trainable_base=full)
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(args.precision)
     est = estimate(workload(k, dtype or torch.float32), plan)
-    return {
+    row = {
         "profile": profile,
         "measures": "trainer step: forward + backward + optimiser step",
         "plan": {key: v for key, v in plan.__dict__.items() if key != "kernels"},
@@ -101,19 +148,41 @@ def run_profile(args, profile: str) -> dict:
         ),
         "estimate_GiB": est.gib(),
     }
+    for key in ("vram_te_peak", "vram_te_after", "vram_step_peak", "vram_step_after"):
+        vals = [r[key] for r in rows if key in r]
+        if vals:
+            row[key + "_GiB"] = max(vals)
+    if args.text_weights:
+        te = _median(rows, "te_time")
+        row["text"] = {
+            "plan": k["TEXT_ENCODE"],
+            "te_ms": None if te is None else te * 1e3,
+            "te_ms_mean": _mean(rows, "te_time") * 1e3,
+            "te_share": _median(rows, "te_share"),
+            "te_tokens_per_s": _median(rows, "te_tokens_per_s"),
+            "te_h2d_GB": _median(rows, "te_h2d_gb"),
+            **text_estimate(args, k, est, device),
+        }
+    return row
 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--weights", required=True)
+    ap.add_argument("--datasets", required=True, help="DATASETS (JSON list)")
     ap.add_argument("--device", default=f"{default_type()}:0")
     ap.add_argument("--variant", default="base")
     ap.add_argument("--algo", default="lora")
     ap.add_argument("--precision", default="bf16")
     ap.add_argument("--profiles", default="balanced,low,minimal")
     ap.add_argument("--overrides", default="")
+    ap.add_argument("--knobs", default="", help="JSON of extra train knobs")
     ap.add_argument("--area", type=int, default=1024 * 1024)
     ap.add_argument("--iters", type=int, default=3)
     ap.add_argument("--only", default="")
+    ap.add_argument("--tag", default="")
+    ap.add_argument("--text-weights", default="", help="real text encoder root / dir")
+    ap.add_argument("--text-plan", default="{}", help="TextEncoderPlan fields (JSON)")
     ap.add_argument("--out", default="runs/bench/step")
     args, _ = ap.parse_known_args()
     if args.only:
@@ -139,8 +208,10 @@ def main():
         "rows": rows,
     }
     os.makedirs(args.out, exist_ok=True)
+    tag = f"_{args.tag}" if args.tag else ""
     path = os.path.join(
-        args.out, f"{report['gpu'].replace(' ', '_')}_{args.variant}_{args.algo}.json"
+        args.out,
+        f"{report['gpu'].replace(' ', '_')}_{args.variant}_{args.algo}{tag}.json",
     )
     with open(path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=1)

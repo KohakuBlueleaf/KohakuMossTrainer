@@ -1,21 +1,25 @@
 """Loader throughput: batches/s, images/s, joint tokens/s across worker counts.
 
-    kogine run scripts/bench/data/loader.py --config configs/data/data_kohya_style.py
+    kogine run scripts/bench/data/loader.py --config configs/data/kohya/kohya_style.py
 
-Without a config it runs on the synthetic source. Results go to
-`OUT_DIR/loader_<mode>.json`, one record per worker count, written after each.
+DATASETS comes from the data config. Results go to `OUT_DIR/loader_<mode>.json`, one
+record per worker count, written after each.
 """
 
 import json
 import os
 import time
 
+from kohakumoss.training.knobs import KNOWN as TRAIN_KNOBS
+from kohakumoss_common.knobs import check_script, siblings
 from kohakumoss_data.dataset import MossDataset
 from kohakumoss_data.loader.stateless import Loader
 from kohakumoss_data.scripting import data_config
 
+DATA_SCRIPTS = os.path.join(os.path.dirname(__file__), "..", "..", "data")
+
 # ===================== DATA =====================
-DATASETS = [{"source": "synthetic", "count": 256}]
+DATASETS = []  # [{"source": ..., "path": ...}] (the data config's)
 RESOLUTION_MODE = "resize"
 TARGET_AREA = 1024 * 1024
 BATCHING = "tokens"
@@ -57,6 +61,7 @@ def run(dataset, workers: int) -> dict:
 
 
 def main() -> None:
+    check_script(globals(), accept=TRAIN_KNOBS | siblings(DATA_SCRIPTS))
     cfg = data_config(globals(), num_workers=0)
     dataset = MossDataset(cfg)
     os.makedirs(OUT_DIR, exist_ok=True)

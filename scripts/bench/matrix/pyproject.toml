@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# The bench matrix tooling: a dev package, never part of the kohakumoss wheel.
+#   uv pip install -e scripts/bench/matrix
+[project]
+name = "kohakumoss-bench"
+version = "0.1.0"
+description = "KohakuMoss real-GPU bench matrix: multi-host runs, sampling, reports."
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Kohaku-Blueleaf" }]
+dependencies = ["kohakumoss", "huggingface_hub"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["kohakumoss_bench*"]

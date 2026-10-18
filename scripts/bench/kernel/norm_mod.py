@@ -6,13 +6,14 @@ python scripts/bench/kernel/norm_mod.py --backend triton
 import torch
 
 from kohakumoss_kernels.backends.eager import norm as eager
-from kohakumoss_kernels.bench.blockops import contenders, dtypes, measure, parse, report
-
-
-def seg_of(lens, device):
-    return torch.cat(
-        [torch.full((n,), i, dtype=torch.int32) for i, n in enumerate(lens)]
-    ).to(device)
+from kohakumoss_kernels.bench.blockops import (
+    contenders,
+    dtypes,
+    measure,
+    parse,
+    report,
+    segment_ids,
+)
 
 
 def main():
@@ -27,7 +28,7 @@ def main():
             w = torch.ones(d, device=device)
             shift = 0.1 * torch.randn(len(lens), d, device=device)
             scale = 0.1 * torch.randn(len(lens), d, device=device)
-            seg = seg_of(lens, device)
+            seg = segment_ids(lens, device)
             fns = contenders(
                 "rms_norm_mod",
                 args.backend,

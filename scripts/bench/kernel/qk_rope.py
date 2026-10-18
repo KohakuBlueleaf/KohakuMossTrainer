@@ -19,8 +19,8 @@ def main():
         cases = cases[:1]
     bands = (1 / (10000.0 ** (torch.arange(16) / 16))).to(device)
     for dtype in dtypes(args):
-        for hw, tl_ in cases:
-            seq = build_seqinfo(torch.tensor(hw), torch.tensor(tl_))
+        for hw, text_lens in cases:
+            seq = build_seqinfo(torch.tensor(hw), torch.tensor(text_lens))
             n = seq.n_joint
             q = torch.randn(n, 24, 128, device=device).to(dtype)
             k = torch.randn(n, 24, 128, device=device).to(dtype)

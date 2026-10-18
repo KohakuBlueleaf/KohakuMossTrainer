@@ -1,14 +1,9 @@
-"""Varlen attention: every backend vs PyTorch at MOSS-Image shapes, speed and accuracy.
+"""Varlen attention at MOSS-Image shapes: every backend vs the PyTorch paths, speed,
+memory and error against an fp64 eager reference.
 
     python scripts/bench/kernel/attention.py --device cuda --dtype fp16 --out runs/bench/attention
 
-Rows: case x implementation, forward and forward+backward device ms (best of N, device
-events; fwd+bwd is the median over `--rounds` rounds that alternate the
-implementations), the step's memory above what was allocated before it, and relative
-error vs the fp64 eager reference for o, dq, dk, dv.
-`--device` takes any CUDA or XPU device (`cuda:1`, `xpu:0`).
-PyTorch baselines: per-segment SDPA loop (eager and torch.compile), padded SDPA with a
-key mask, torch varlen_attn and flex_attention with a document mask where available.
+See docs/performance/attention.md.
 """
 
 import argparse
@@ -21,7 +16,10 @@ import torch.nn.functional as F
 
 import kohakumoss_kernels as kk
 from kohakumoss_kernels.backends.eager.attention import attention_varlen as sdpa_loop
-from kohakumoss_kernels.hardware.device import probe
+from kohakumoss_kernels.backends.varlen_choice import VarlenChoice
+from kohakumoss_kernels.error_stats import stats
+from kohakumoss_kernels.hardware.device import measure_rates
+from kohakumoss_kernels.hardware.memory import device_used, window
 from kohakumoss_kernels.tuning.timing import best_ms
 
 try:
@@ -29,9 +27,15 @@ try:
 except ImportError:
     varlen_attn = None
 try:
-    from kohakumoss_kernels.backends.triton import attention as triton_kernels
+    from kohakumoss_kernels.backends.triton.attention import varlen as triton_kernels
 except ImportError:
     triton_kernels = None
+try:
+    from kohakumoss_kernels.backends.tilelang.attention import (
+        varlen as tilelang_kernels,
+    )
+except ImportError:
+    tilelang_kernels = None
 try:
     from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 except ImportError:
@@ -46,6 +50,7 @@ CASES = {
 }
 HEADS, HEAD_DIM = 24, 128
 REF_HEADS = slice(0, 2)
+KERNELS = (("tilelang", tilelang_kernels), ("triton", triton_kernels))
 
 
 def padded_sdpa(q, k, v, cu, max_len, scale):
@@ -82,6 +87,7 @@ def torch_varlen(q, k, v, cu, max_len, scale):
 
 
 def make_flex(cu, n):
+    """flex_attention (compiled) with a document mask over the segments of `cu`."""
     seg = torch.repeat_interleave(
         torch.arange(cu.numel() - 1, device=cu.device), (cu[1:] - cu[:-1]).long()
     )
@@ -108,6 +114,8 @@ def _sm80(device: torch.device) -> bool:
 
 
 def implementations(device, dtype, cu, n):
+    """{name: fn}: the PyTorch paths, each backend's registry entry (`_chosen`, its
+    per-shape choice) and its kernels alone (`_kernels`)."""
     impls = {
         "sdpa_loop": sdpa_loop,
         "sdpa_loop_compiled": torch.compile(sdpa_loop, dynamic=True),
@@ -117,20 +125,31 @@ def implementations(device, dtype, cu, n):
         impls["torch_varlen_attn"] = torch_varlen
     if flex_attention is not None and (_sm80(device) or device.type == "xpu"):
         impls["flex_doc_mask"] = make_flex(cu, n)
-    for backend in ("tilelang", "triton"):
+    for backend, kernels in KERNELS:
         try:
-            impls[f"kohakumoss_{backend}"] = kk.resolve(
+            impls[f"kohakumoss_{backend}_chosen"] = kk.resolve(
                 "attention_varlen", device, dtype, backend=backend
             )
         except kk.registry.NoImplementationError:
             continue
-    if "kohakumoss_triton" in impls:
-        impls["kohakumoss_triton_raced"] = impls.pop("kohakumoss_triton")
-        impls["kohakumoss_triton_kernels"] = triton_kernels.attention_varlen
+        if kernels is not None:
+            impls[f"kohakumoss_{backend}_kernels"] = kernels.attention_varlen
     return impls
 
 
+def bound_impl(fn, q, segments: int, max_len: int) -> str | None:
+    """Name of the implementation a per-shape choice bound for this problem (None for
+    a plain implementation, "undecided" before the choice settled)."""
+    choice = getattr(fn, "fn", fn)
+    if not isinstance(choice, VarlenChoice):
+        return None
+    bound = choice.bound.get((q.device, choice.key(q, segments, max_len)))
+    names = {id(f): name for name, f in choice.impls(q.device).items()}
+    return "undecided" if bound is None else names.get(id(bound), "?")
+
+
 def rel(a, r):
+    """Relative Frobenius error of `a` against the fp64 reference `r`."""
     return (
         (a.to(r.device, torch.float64) - r).norm() / r.norm().clamp_min(1e-30)
     ).item()
@@ -180,11 +199,13 @@ def run_case(name, lens, device, mem, dtype, iters, only, rounds=1):
                 }
             )
             continue
-        errs = {"o": rel(out[:, REF_HEADS], ref)} | {
-            f"d{c}": rel(t.grad[:, REF_HEADS], r.grad)
-            for c, t, r in zip("qkv", leaves, ref_in)
+        got = {"o": out[:, REF_HEADS]} | {
+            f"d{c}": t.grad[:, REF_HEADS] for c, t in zip("qkv", leaves)
         }
-        del out
+        refs = {"o": ref} | {f"d{c}": r.grad for c, r in zip("qkv", ref_in)}
+        errs = {key: rel(got[key], refs[key]) for key in got}
+        error_stats = {key: stats(got[key].to(ref_dev), refs[key]) for key in got}
+        del out, got
         fwd_in = [t.detach() for t in (q, k, v)]
         with torch.no_grad():
             fwd = best_ms(lambda: fn(*fwd_in, cu, max_len, scale), device, iters)
@@ -195,12 +216,22 @@ def run_case(name, lens, device, mem, dtype, iters, only, rounds=1):
             fn(*leaves, cu, max_len, scale).backward(do)
 
         base = mem.memory_allocated(device)
-        mem.reset_peak_memory_stats(device)
-        step()
-        peak = (mem.max_memory_allocated(device) - base) / 2**20
+        with window(device) as w:
+            step()
+        peak = (w.alloc - base) / 2**20
         steps[impl] = step
         rows.append(
-            {"case": name, "impl": impl, "fwd_ms": fwd, "peak_mib": peak, **errs}
+            {
+                "case": name,
+                "impl": impl,
+                "bound": bound_impl(fn, q, len(lens), max_len),
+                "fwd_ms": fwd,
+                "peak_mib": peak,
+                "peak_reserved_mib": w.reserved / 2**20,
+                "device_used_mib": device_used(device) / 2**20,
+                **errs,
+                "stats": error_stats,
+            }
         )
     times = interleaved(steps, device, iters, rounds)
     for row in rows:
@@ -226,7 +257,7 @@ def main():
     if device.index is None:
         device = torch.device(device.type, mem.current_device())
     mem.set_device(device)
-    dev = probe(device)
+    dev = measure_rates(device)
     rows = []
     for name in args.cases:
         rows += run_case(
@@ -245,15 +276,17 @@ def main():
     tag = "-".join(args.impls) or "all"
     out = Path(args.out) / f"{dev.key}-{args.dtype}-{tag}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(report, indent=1))
+    out.write_text(json.dumps(report, indent=1), encoding="utf-8")
     print(f"{dev.key} {args.dtype}")
     for r in rows:
         if "error" in r:
-            print(f"{r['case']:18s} {r['impl']:22s} ERROR {r['error']}")
+            print(f"{r['case']:18s} {r['impl']:26s} ERROR {r['error']}")
             continue
+        bound = f" -> {r['bound']}" if r["bound"] else ""
         print(
-            f"{r['case']:18s} {r['impl']:22s} fwd {r['fwd_ms']:8.3f}  fwd+bwd {r['fwd_bwd_ms']:8.3f}  "
+            f"{r['case']:18s} {r['impl']:26s} fwd {r['fwd_ms']:8.3f}  fwd+bwd {r['fwd_bwd_ms']:8.3f}  "
             f"peak {r['peak_mib']:7.0f}MiB  err o {r['o']:.2e} dq {r['dq']:.2e} dk {r['dk']:.2e} dv {r['dv']:.2e}"
+            f"{bound}"
         )
 
 

@@ -1,5 +1,5 @@
-"""Bench the fused linear + epilogue ops at MOSS shapes against cuBLAS + eager epilogue
-and torch.compile of that composition.
+"""Bench the fused linear + epilogue ops at MOSS shapes against F.linear + the eager
+epilogue and torch.compile of that composition.
 
     python scripts/bench/kernel/fused_linear.py --backend triton
 """
@@ -31,12 +31,12 @@ def main():
     device = torch.device(args.device)
     rows = []
     hw = [[64, 64]] * (1 if args.quick else 4)
-    tl_ = [300, 120, 77, 500][: len(hw)]
-    seq = build_seqinfo(torch.tensor(hw), torch.tensor(tl_))
+    text_lens = [300, 120, 77, 500][: len(hw)]
+    seq = build_seqinfo(torch.tensor(hw), torch.tensor(text_lens))
     n = seq.n_joint
     seg = seq.seg_joint.to(device)
     bands = (1 / (10000.0 ** (torch.arange(16) / 16))).to(device)
-    lora = None
+    bias = None
     for dtype in dtypes(args):
         y = torch.randn(n, 3072, device=device).to(dtype)
         w_ug = (torch.randn(16384, 3072, device=device) / 55).to(dtype)
@@ -48,7 +48,7 @@ def main():
                 f"situ N={n}",
                 fns,
                 eager_situ,
-                (y, w_ug, lora),
+                (y, w_ug, bias),
                 (True, False, False),
                 dtype,
                 args.iters,

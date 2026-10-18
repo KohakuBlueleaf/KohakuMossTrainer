@@ -6,13 +6,14 @@ python scripts/bench/kernel/residual.py --backend triton
 import torch
 
 from kohakumoss_kernels.backends.eager import loss, norm
-from kohakumoss_kernels.bench.blockops import contenders, dtypes, measure, parse, report
-
-
-def seg_of(lens, device):
-    return torch.cat(
-        [torch.full((n,), i, dtype=torch.int32) for i, n in enumerate(lens)]
-    ).to(device)
+from kohakumoss_kernels.bench.blockops import (
+    contenders,
+    dtypes,
+    measure,
+    parse,
+    report,
+    segment_ids,
+)
 
 
 def main():
@@ -23,7 +24,7 @@ def main():
     for dtype in dtypes(args):
         for lens in cases:
             n, d = sum(lens), 3072
-            seg = seg_of(lens, device)
+            seg = segment_ids(lens, device)
             x = torch.randn(n, d, device=device).to(dtype)
             o = torch.randn(n, d, device=device).to(dtype)
             gate = torch.randn(len(lens), d, device=device)
@@ -77,7 +78,7 @@ def main():
                     f"N={sum(img)}",
                     fns,
                     loss.token_mse,
-                    (p, t, seg_of(img, device), w, None),
+                    (p, t, segment_ids(img, device), w, None),
                     (True, False, False, False, False),
                     dtype,
                     args.iters,
