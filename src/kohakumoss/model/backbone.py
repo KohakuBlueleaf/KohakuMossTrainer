@@ -7,15 +7,19 @@ import torch
 from torch import Tensor, nn
 
 from kohakumoss.model.block import JointBlock
-from kohakumoss.model.components.embed import RopeBands, Sinusoid, TimeEmbedding
+from kohakumoss.model.components.embed import (
+    RopeBands,
+    TimeEmbedding,
+    timestep_embedding,
+)
 from kohakumoss.model.components.norm import RMSNorm
 from kohakumoss.model.linear import MossLinear
 from kohakumoss.model.opset import OpSet
 from kohakumoss.model.runner import PlainRunner
-from kohakumoss.model.stream import StreamPolicy, caster, scaler
+from kohakumoss.model.stream import StreamConfig, caster, scaler
 from kohakumoss.model.text_block import TextEmbedder
-from kohakumoss.types.api import BlockCtx
 from kohakumoss.types.arch import MossArchConfig
+from kohakumoss.types.context import HEAD_SCALE, HEAD_SHIFT, BlockCtx
 from kohakumoss.types.protocols import BlockRunner
 from kohakumoss.types.seqinfo import SeqInfo
 
@@ -42,14 +46,12 @@ class MossBackbone(nn.Module):
         self.residual_scale: tuple[float, ...] = (1.0,) * cfg.depth
         self.fold_scales: tuple[float, ...] | None = None
         self.runner: BlockRunner = PlainRunner()
-        self.stream = StreamPolicy()
+        self.stream = StreamConfig()
         self.fp16_fix = "none"
-        self.cond_dtype: torch.dtype | None = None
-        self._sinusoid = Sinusoid(cfg.freq_dim, cfg.time_scale)
         self._default = self.bind_forward()
 
     def init_weights(self, std: float = 0.02) -> None:
-        """Random init for from-scratch / tiny models (normal weights, zero biases)."""
+        """Random init (normal weights, zero biases)."""
         for module in self.modules():
             match module:
                 case MossLinear():
@@ -59,48 +61,51 @@ class MossBackbone(nn.Module):
 
     def bind_ops(self, ops: OpSet | None = None) -> None:
         """Bind (or re-bind after a structural change) the resolved ops and the stream
-        policy to every block."""
+        config to every block."""
         self.ops = ops if ops is not None else self.ops
-        policy = self.stream
-        compute = self.layers[0].proj["q"].weight.dtype
-        device = self.time_embedding[0].weight.device
-        self._fp32_region = partial(torch.autocast, device.type, enabled=False)
-        wide = self.cond_dtype or compute
-        wide = wide if wide in (torch.float16, torch.bfloat16) else None
-        for module in self.conditioning_linears():
-            module.set_input_dtype(wide)
-        self._cond_in = tuple(
-            wide or m.weight.dtype for m in self.conditioning_linears()
-        )
-        self._stream_dtype = policy.stream_dtype or compute
-        self._video_in = scaler(policy.embed_scale, policy.stream_dtype)
-        self._head_cast = caster(compute if policy.stream_dtype is not None else None)
-        self.text_embedder.bind(self.ops, policy)
+        stream = self.stream
+        compute = self.layers[0].proj["q"].weight_like.dtype
+        self._cond_in = tuple(m.weight.dtype for m in self.conditioning_linears())
+        self._stream_dtype = stream.stream_dtype or compute
+        self._video_in = scaler(stream.embed_scale, stream.stream_dtype)
+        self._head_cast = caster(compute if stream.stream_dtype is not None else None)
+        self.text_embedder.bind(self.ops, stream)
         for i, block in enumerate(self.layers):
-            block.bind(self.ops, policy.block(i))
+            block.bind(self.ops, stream.block(i))
 
-    def set_stream_policy(self, policy: StreamPolicy) -> None:
-        """Install a stream policy (fp16 fix) and re-bind."""
-        self.stream = policy
+    def set_stream_config(self, stream: StreamConfig) -> None:
+        """Install a stream config (fp16 fix) and re-bind."""
+        self.stream = stream
         self.bind_ops()
 
     def set_runner(self, runner: BlockRunner) -> None:
         self.runner = runner
 
-    def _plan(self, skip_layers: frozenset) -> tuple[Callable, ...]:
-        """One step per block, resolved once: run it, or (skipped) apply only the fold's
-        stream rescale r (dropped when r == 1)."""
+    def _plan(
+        self, skip_layers: frozenset, segment_skip: frozenset = frozenset()
+    ) -> tuple[Callable, ...]:
+        """One step `(x, ctx, run) -> x` per block, resolved once: run it; (skipped)
+        apply only the fold's stream rescale r (dropped when r == 1); (segment-skipped)
+        run it and keep its output only on the tokens `run` marks."""
         steps = []
         for i in range(len(self.layers)):
             r = self.residual_scale[i]
-            if i not in skip_layers:
+            if i in skip_layers:
+                if r != 1.0:
+                    steps.append(partial(_rescale, r))
+            elif i in segment_skip:
+                kept = _same if r == 1.0 else partial(_rescale, r)
+                steps.append(partial(self._run_selected, i, kept))
+            else:
                 steps.append(partial(self._run_block, i))
-            elif r != 1.0:
-                steps.append(partial(_rescale, r))
         return tuple(steps)
 
-    def _run_block(self, index: int, x: Tensor, ctxs: tuple[BlockCtx, ...]) -> Tensor:
-        return self.runner.run(index, self.layers[index], x, ctxs[index])
+    def _run_block(self, index: int, x: Tensor, ctx: BlockCtx, run) -> Tensor:
+        return self.runner.run(index, self.layers[index], x, ctx)
+
+    def _run_selected(self, index: int, kept, x: Tensor, ctx: BlockCtx, run) -> Tensor:
+        out = self.runner.run(index, self.layers[index], x, ctx)
+        return torch.where(run, out, kept(x, ctx, run))
 
     def bind_forward(
         self, skip_layers=(), segment_skip_layers=()
@@ -109,11 +114,13 @@ class MossBackbone(nn.Module):
 
         `skip_layers` skip blocks for every sample: `(img, text, sigma, seq) -> v`.
         `segment_skip_layers` skip blocks only for the samples flagged by a bool [B]
-        mask: `(img, text, sigma, seq, mask) -> v` (packed CFG)."""
-        plan = self._plan(frozenset(skip_layers))
+        mask: `(img, text, sigma, seq, mask) -> v` (packed CFG); a flagged sample's
+        stream takes the skip's value, whatever the block computed on it."""
+        skip = frozenset(skip_layers)
         if segment_skip_layers:
-            return partial(self._forward_masked, plan, tuple(segment_skip_layers))
-        return partial(self._forward_plan, plan)
+            segment = frozenset(segment_skip_layers) - skip
+            return partial(self._forward_masked, self._plan(skip, segment))
+        return partial(self._forward_plan, self._plan(skip))
 
     def set_residual_scale(self, scales: tuple[float, ...]) -> None:
         self.residual_scale = tuple(scales)
@@ -125,18 +132,16 @@ class MossBackbone(nn.Module):
         return (te[0], te[2], self.shared_block_modulation, self.video_head_modulation)
 
     def conditioning(self, sigma: Tensor) -> tuple[Tensor, Tensor]:
-        """Per-sample fp32 modulation [B, 6, D] and head modulation [B, 2, D], with any
-        enclosing autocast disabled. With a 16-bit trunk (or `cond_dtype`) the linears
-        take 16-bit inputs and accumulate and return fp32; otherwise they run in their
-        own dtype."""
+        """Per-sample fp32 modulation [B, 6, D] and head modulation [B, 2, D]. Each
+        linear takes its input in its weight dtype and runs under the caller's autocast,
+        like any PyTorch module."""
         d0, d2, dm, dh = self._cond_in
         te = self.time_embedding
-        with self._fp32_region():
-            emb = self._sinusoid(sigma.float() * self.cfg.time_scale)
-            hidden = te[1](te[0](emb.to(d0)))
-            time = te[2](hidden.to(d2)).float()
-            mod = self.shared_block_modulation(time.to(dm)).float()
-            head = self.video_head_modulation(time.to(dh)).float()
+        emb = timestep_embedding(sigma.float() * self.cfg.time_scale, self.cfg.freq_dim)
+        hidden = te[1](te[0](emb.to(d0)))
+        time = te[2](hidden.to(d2)).float()
+        mod = self.shared_block_modulation(time.to(dm)).float()
+        head = self.video_head_modulation(time.to(dh)).float()
         return mod.unflatten(-1, (6, -1)), head.unflatten(-1, (2, -1))
 
     def embed(self, img: Tensor, text: Tensor, seq: SeqInfo) -> Tensor:
@@ -154,31 +159,32 @@ class MossBackbone(nn.Module):
         xi = x.index_select(0, seq.img_in_joint)
         norm = self.final_norm_video
         y = self.ops.rms_norm_mod(
-            xi, norm.weight, head[:, 0], head[:, 1], seq.seg_img, norm.eps
+            xi,
+            norm.weight,
+            head[:, HEAD_SHIFT],
+            head[:, HEAD_SCALE],
+            seq.seg_img,
+            norm.eps,
         )
         return self.final_linear_video(self._head_cast(y))
 
-    def _trunk(self, plan, x: Tensor, ctxs: tuple[BlockCtx, ...]) -> Tensor:
+    def _trunk(self, plan, x: Tensor, ctx: BlockCtx, run) -> Tensor:
         for step in plan:
-            x = step(x, ctxs)
+            x = step(x, ctx, run)
         return x
 
     def _forward_plan(self, plan, img, text, sigma, seq) -> Tensor:
         mod, head = self.conditioning(sigma)
         x = self.embed(img, text, seq)
         ctx = BlockCtx(seq, mod, self.rope.bands, self.residual_scale)
-        x = self._trunk(plan, x, (ctx,) * len(self.layers))
+        x = self._trunk(plan, x, ctx, None)
         return self.head(x, head, seq)
 
-    def _forward_masked(self, plan, layers, img, text, sigma, seq, mask) -> Tensor:
+    def _forward_masked(self, plan, img, text, sigma, seq, mask) -> Tensor:
         mod, head = self.conditioning(sigma)
         x = self.embed(img, text, seq)
         ctx = BlockCtx(seq, mod, self.rope.bands, self.residual_scale)
-        ctxs = [ctx] * len(self.layers)
-        masked = _gates_zeroed(ctx, mask)
-        for i in layers:
-            ctxs[i] = masked
-        x = self._trunk(plan, x, tuple(ctxs))
+        x = self._trunk(plan, x, ctx, runs_on(mask, seq))
         return self.head(x, head, seq)
 
     def forward(self, img: Tensor, text: Tensor, sigma: Tensor, seq: SeqInfo) -> Tensor:
@@ -188,18 +194,18 @@ class MossBackbone(nn.Module):
         return self._default(img, text, sigma, seq)
 
 
-def _rescale(r: float, x: Tensor, ctxs) -> Tensor:
+def _rescale(r: float, x: Tensor, ctx, run) -> Tensor:
     return x * r
 
 
-def _gates_zeroed(ctx: BlockCtx, mask: Tensor) -> BlockCtx:
-    """Context whose gates are zero for masked samples: a block then leaves their stream
-    untouched, exactly as skipping it would."""
-    keep = (~mask).to(ctx.mod.dtype)[:, None]
-    mod = ctx.mod.clone()
-    mod[:, 2] = mod[:, 2] * keep
-    mod[:, 5] = mod[:, 5] * keep
-    return BlockCtx(ctx.seq, mod, ctx.bands, ctx.residual_scale)
+def _same(x: Tensor, ctx, run) -> Tensor:
+    return x
+
+
+def runs_on(mask: Tensor, seq: SeqInfo) -> Tensor:
+    """Per joint token [N_joint, 1] bool: True where the sample is not flagged by the
+    per-sample `mask` [B] (a segment-skipped block's output is kept there)."""
+    return (~mask).index_select(0, seq.seg_joint.long()).unsqueeze(-1)
 
 
 def all_linears(model: nn.Module) -> dict[str, MossLinear]:
@@ -209,4 +215,4 @@ def all_linears(model: nn.Module) -> dict[str, MossLinear]:
 
 def compute_dtype(model: MossBackbone) -> torch.dtype:
     """Dtype of the joint-block weights (the activation dtype of the trunk)."""
-    return model.layers[0].proj["q"].weight.dtype
+    return model.layers[0].proj["q"].weight_like.dtype

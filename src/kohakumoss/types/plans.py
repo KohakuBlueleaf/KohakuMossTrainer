@@ -1,4 +1,5 @@
-"""Resolved plans: precision policy, memory plan, parallel plan (built once at startup)."""
+"""Resolved run settings: precision config, memory plan, parallel plan (built once at
+startup)."""
 
 from dataclasses import dataclass, field
 
@@ -6,7 +7,7 @@ import torch
 
 
 @dataclass(frozen=True)
-class PrecisionPolicy:
+class PrecisionConfig:
     """Compute dtype, modules kept in fp32, loss scaling and the residual fold."""
 
     compute: torch.dtype = torch.bfloat16
@@ -25,13 +26,21 @@ class PrecisionPolicy:
 
 @dataclass(frozen=True)
 class MemoryPlan:
-    """Concrete memory/speed knobs a profile resolves to; every field is overridable."""
+    """Concrete memory/speed knobs a profile resolves to; every field is overridable.
+    `base_precision` fp8_compute / mxfp8 run the frozen base's GEMMs in fp8
+    (`fp8_recipe` tensor | row | block for fp8_compute); `fp8_dgrad` fp8 stores a W^T
+    copy for an fp8 input-gradient GEMM, 16bit dequantizes the forward copy.
+    `act_offload_inflight`: blocks whose activation-offload copies may be queued before
+    the host waits for the oldest block's."""
 
     profile: str = "balanced"
     kernels: dict = field(default_factory=dict)
     checkpoint: str = "block"
     act_offload: bool = False
+    act_offload_inflight: int = 2
     base_precision: str = "compute"
+    fp8_recipe: str = "row"
+    fp8_dgrad: str = "fp8"
     stream: str = "off"
     stream_resident: int = 0
     pinned: bool = True
@@ -42,8 +51,48 @@ class MemoryPlan:
 
 
 @dataclass(frozen=True)
+class TextEncoderPlan:
+    """Text-encoder placement, precision and batching (training and inference).
+
+    memory: resident | offload (whole model to the device per pass) | stream (layer
+    ring of `stream_resident` slots, prefetching) | cpu (runs on the host) | auto
+    (resolved by the memory planner); `free_after_use` drops the model after its first
+    pass. precision: compute | int8 | fp8 (weight-only, per output channel or per
+    `quant_group` input columns) | fp8_compute (fp8 GEMMs, `fp8_recipe` tensor | row |
+    block scaling, sm89+) | mxfp8 (MX block-scaled GEMMs, sm89+); fp8 compute weights
+    are quantized once, activations per call. `dtype` bf16 | fp16 | auto (bf16, or
+    fp16 where the device has no bf16). `batch` prompts / `max_tokens` tokens per
+    kernel call, `layout`
+    single | padded | packed, `forward` kernels (kohakumoss_kernels ops) | hf (the
+    transformers modules' own forward; single / padded only). `ahead` host batches
+    encoded per pass by the online text cache, held on `ahead_device` host | device.
+    `kernels` maps a text op to a backend. `stored` is a pre-quantized text-encoder
+    file (scripts/export/text_quant.py) of the same precision: its quantized linears
+    are attached instead of quantizing at load. See docs/internals/text-encoder.md."""
+
+    memory: str = "resident"
+    free_after_use: bool = False
+    precision: str = "compute"
+    quant_group: int = 0
+    fp8_recipe: str = "row"
+    stored: str = ""
+    dtype: str = "auto"
+    stream_resident: int = 2
+    pinned: bool = True
+    batch: int = 32
+    max_tokens: int = 16384
+    layout: str = "packed"
+    forward: str = "kernels"
+    ahead: int = 1
+    ahead_device: str = "host"
+    kernels: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ParallelPlan:
-    """Multi-device layout and process launch."""
+    """Multi-device layout and process launch: `timeout_s` is every collective's and
+    the store's wait (DIST_TIMEOUT), `bind` the process group's device binding
+    (DIST_BIND: "lazy" | "device")."""
 
     kind: str = "none"
     backend: str = "auto"
@@ -53,3 +102,5 @@ class ParallelPlan:
     schedule: str = "1f1b"
     microbatches: int = 1
     token_budgets: tuple[int, ...] = ()
+    timeout_s: float = 600.0
+    bind: str = "lazy"

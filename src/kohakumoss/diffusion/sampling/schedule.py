@@ -3,10 +3,7 @@
 import torch
 from torch import Tensor
 
-
-def shift_sigma(values: Tensor, shift: float) -> Tensor:
-    """shift * v / (1 + (shift - 1) * v)."""
-    return shift * values / (1 + (shift - 1) * values)
+from kohakumoss.diffusion.timestep.shift import shift_sigma
 
 
 def _grid(count: int, shift: float, total: int) -> Tensor:

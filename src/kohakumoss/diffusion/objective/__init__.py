@@ -12,7 +12,7 @@ from kohakumoss.diffusion.objective.weighting import (
     no_weighting,
     x0_weighting,
 )
-from kohakumoss.registry import Registry
+from kohakumoss_common.registry import Registry
 
 LOSSES = Registry("loss")
 LOSSES.add("mse", MSELoss)

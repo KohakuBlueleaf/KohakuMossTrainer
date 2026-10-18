@@ -2,7 +2,7 @@
 
 Primitive ops are resolved per (device, dtype, backend choice). Fused linear+epilogue
 callables are bound per layer by the `bind_*` methods: the fused kernel when one is
-registered and the layer is dense, else the composition of primitives (the spec). The
+registered and the layer is dense, else the composition of primitives. The
 backbone re-binds after any structural change (adapter attach, base storage swap), never
 per call.
 """
@@ -77,27 +77,23 @@ class OpSet:
     ) -> Callable:
         """(y, q_weight, k_weight, pos, bands, eps) -> (q, k) [N, H, Dh] for this layer."""
         fused = self.fused.get("linear_qk_rope")
-        if fused is not None and _dense(lin_q) and _dense(lin_k):
+        if fused is not None and lin_q.is_plain and lin_k.is_plain:
             return partial(_fused_qk_rope, fused, lin_q, lin_k, heads)
         return partial(_composed_qk_rope, self.qk_norm_rope, lin_q, lin_k, heads)
 
     def bind_situ(self, lin: MossLinear) -> Callable:
         """y -> situ_glu(lin(y)) for this layer."""
         fused = self.fused.get("linear_situ")
-        if fused is not None and _dense(lin):
+        if fused is not None and lin.is_plain:
             return partial(_fused_situ, fused, lin)
         return partial(_composed_situ, self.situ_glu, lin)
 
     def bind_gated_residual(self, lin: MossLinear) -> Callable:
         """(a, x, gate, seg, r) -> x * r + lin(a) * gate[seg] for this layer."""
         fused = self.fused.get("linear_gated_residual")
-        if fused is not None and _dense(lin):
+        if fused is not None and lin.is_plain:
             return partial(_fused_gated_residual, fused, lin)
         return partial(_composed_gated_residual, self.gated_residual, lin)
-
-
-def _dense(lin: MossLinear) -> bool:
-    return lin.is_plain
 
 
 def _fused_qk_rope(fused, lin_q, lin_k, heads, y, q_weight, k_weight, pos, bands, eps):

@@ -1,0 +1,25 @@
+"""Binding quantized linears to their compute device and dtype after a placement."""
+
+import torch
+from torch import nn
+
+from kohakumoss.quant.compute import ComputeWeight
+from kohakumoss.quant.weights import QuantWeight
+
+BOUND = (QuantWeight, ComputeWeight)
+
+
+def rebind_quant(module: nn.Module, device, dtype, autograd: bool = True) -> None:
+    """Bind every quantized base to (device, dtype); `autograd=False` binds the
+    fp8-compute bases of a model that never runs backward to the gradient-free op."""
+    for m in module.modules():
+        if isinstance(m, ComputeWeight):
+            m.bind(dtype, device, autograd=autograd)
+        elif isinstance(m, BOUND):
+            m.bind(dtype, device)
+
+
+def work_device(device) -> torch.device:
+    """Where weights are quantized: the compute device when it is an accelerator."""
+    device = torch.device(device)
+    return device if device.type in ("cuda", "xpu") else torch.device("cpu")

@@ -1,4 +1,5 @@
-"""Quantize the frozen MossLinear bases of a model in place."""
+"""Quantize the frozen MossLinear bases of a model in place: weight-only (int8 / fp8,
+`QuantWeight`) or fp8 compute (fp8_compute / mxfp8, `ComputeWeight`)."""
 
 from collections.abc import Callable
 
@@ -6,7 +7,29 @@ import torch
 from torch import nn
 
 from kohakumoss.model.linear import MossLinear
+from kohakumoss.quant.compute import (
+    COMPUTE,
+    ComputeCache,
+    ComputeWeight,
+    eligible,
+    recipe_of,
+)
 from kohakumoss.quant.weights import QuantWeight
+
+
+def make_base(
+    w: torch.Tensor, fmt: str, recipe: str = "row", dgrad: bool = False
+) -> QuantWeight | ComputeWeight:
+    """The quantized base of weight `w` under precision `fmt` (`recipe` and `dgrad`
+    apply to fp8_compute / mxfp8)."""
+    if fmt in COMPUTE:
+        return ComputeWeight.from_weight(w, recipe_of(fmt, recipe), dgrad)
+    return QuantWeight.from_weight(w, fmt)
+
+
+def accepts(fmt: str, out_features: int, in_features: int) -> bool:
+    """Whether a [N, K] weight can take `fmt` (fp8 compute needs aligned shapes)."""
+    return fmt not in COMPUTE or eligible(out_features, in_features) is None
 
 
 def default_filter(
@@ -25,18 +48,47 @@ def default_filter(
 class QuantLinear(nn.Module):
     """Inference replacement of a plain nn.Linear by a quantized weight (+ bias)."""
 
-    def __init__(self, linear: nn.Linear, fmt: str, compute_dtype: torch.dtype):
+    def __init__(
+        self,
+        linear: nn.Linear,
+        fmt: str,
+        compute_dtype: torch.dtype,
+        recipe: str = "row",
+        work_device: torch.device | str | None = None,
+    ):
         super().__init__()
         self.in_features, self.out_features = linear.in_features, linear.out_features
-        self.qweight = QuantWeight.from_weight(linear.weight, fmt).to(
-            linear.weight.device
-        )
+        dev = linear.weight.device
+        w = linear.weight.detach().to(work_device or dev)
+        self.qweight = make_base(w, fmt, recipe).to(dev)
         self.qweight.bind(compute_dtype)
         self.bias = None
         self._impl = self._no_bias
         if linear.bias is not None:
             self.bias = nn.Parameter(linear.bias.detach(), requires_grad=False)
             self._impl = self._with_bias
+
+    @classmethod
+    def from_base(
+        cls,
+        in_features: int,
+        out_features: int,
+        base: QuantWeight | ComputeWeight,
+        bias: torch.Tensor | None,
+        compute_dtype: torch.dtype,
+    ) -> "QuantLinear":
+        """A QuantLinear over an already-quantized base (a pre-quantized file)."""
+        self = cls.__new__(cls)
+        nn.Module.__init__(self)
+        self.in_features, self.out_features = in_features, out_features
+        self.qweight = base
+        self.qweight.bind(compute_dtype)
+        self.bias = None
+        self._impl = self._no_bias
+        if bias is not None:
+            self.bias = nn.Parameter(bias, requires_grad=False)
+            self._impl = self._with_bias
+        return self
 
     def _no_bias(self, x):
         return self.qweight.linear(x, None)
@@ -58,6 +110,8 @@ def quantize_torch_linears(
         if type(child) is nn.Linear and min(child.in_features, child.out_features) >= (
             min_features
         ):
+            if not accepts(fmt, child.out_features, child.in_features):
+                continue
             setattr(module, name, QuantLinear(child, fmt, compute_dtype))
             count += 1
         else:
@@ -66,24 +120,59 @@ def quantize_torch_linears(
 
 
 @torch.no_grad()
+def attach_compute(
+    model: nn.Module,
+    fmt: str,
+    accept: Callable[[str, MossLinear], bool],
+    compute_dtype: torch.dtype,
+    recipe: str = "row",
+    dgrad: bool = True,
+) -> list[MossLinear]:
+    """Trainable fp8 compute (fp8_compute / mxfp8): a ComputeCache, quantized from the
+    current weight, on every accepted dense MossLinear of an fp8-compute shape; returns
+    those linears (their caches need `refresh` after every optimizer step)."""
+    out = []
+    for name, lin in list(model.named_modules()):
+        if not isinstance(lin, MossLinear) or lin.base is not None:
+            continue
+        if not accept(name, lin) or not accepts(fmt, lin.out_features, lin.in_features):
+            continue
+        cache = ComputeCache(recipe_of(fmt, recipe), dgrad)
+        cache.refresh(lin.weight)
+        cache.bind(compute_dtype, lin.weight.device)
+        lin.set_compute(cache)
+        out.append(lin)
+    return out
+
+
+@torch.no_grad()
 def quantize_model(
     model: nn.Module,
     fmt: str,
     accept: Callable[[str, MossLinear], bool] | None = None,
     compute_dtype: torch.dtype | None = None,
+    recipe: str = "row",
+    dgrad: bool = False,
+    work_device: torch.device | str | None = None,
 ) -> dict[str, int]:
-    """Replace accepted MossLinear bases with QuantWeight; returns counts and bytes."""
+    """Replace accepted MossLinear bases with QuantWeight (int8 / fp8) or ComputeWeight
+    (fp8_compute / mxfp8; `recipe`, `dgrad` copy), quantizing on `work_device`
+    (default: where the weight is); returns counts and bytes (`skipped`: accepted
+    layers whose shape fp8 compute cannot take)."""
     accept = accept or default_filter(())
-    report = {"layers": 0, "dense_bytes": 0, "quant_bytes": 0}
+    report = {"layers": 0, "dense_bytes": 0, "quant_bytes": 0, "skipped": 0}
     for name, lin in list(model.named_modules()):
         if not isinstance(lin, MossLinear) or lin.base is not None:
             continue
         if not accept(name, lin):
             continue
+        if not accepts(fmt, lin.out_features, lin.in_features):
+            report["skipped"] += 1
+            continue
         w = lin.weight.detach()
-        qw = QuantWeight.from_weight(w, fmt).to(w.device)
+        qw = make_base(w.to(work_device or w.device), fmt, recipe, dgrad).to(w.device)
         report["layers"] += 1
-        report["dense_bytes"] += w.numel() * w.element_size()
+        report["dense_bytes"] += w.nbytes
         report["quant_bytes"] += qw.nbytes()
         lin.weight = nn.Parameter(
             torch.empty(0, dtype=w.dtype, device=w.device), requires_grad=False

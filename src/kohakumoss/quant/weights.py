@@ -3,16 +3,17 @@
 int8: q = round(w / s) clamped to [-127, 127], s = max|w_row| / 127.
 fp8 (e4m3fn): q = fp8(w / s), s = max|w_row| / 448.
 `linear` uses a registered `quant_linear` kernel when one serves the device, else
-dequantizes (eager); the choice is made once per weight, not per call.
+the eager quant op (dequantize + matmul, saving only `q` / `scale` for backward); the
+choice is made once per weight, not per call.
 """
 
 from functools import partial
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
 
 from kohakumoss_kernels import registry
+from kohakumoss_kernels.quant import quant_linear_eager
 
 FP8_MAX = 448.0
 INT8_MAX = 127.0
@@ -49,7 +50,6 @@ class QuantWeight(nn.Module):
         self.register_buffer("q", q)
         self.register_buffer("scale", scale.float())
         self.shape = q.shape
-        self._resolved_for = None
         self.linear = self._dequant_linear
 
     @classmethod
@@ -69,7 +69,6 @@ class QuantWeight(nn.Module):
         """Bind `linear` for (device, dtype) once: the `quant_linear` kernel when one
         serves, else eager dequantization."""
         device = self.q.device if device is None else torch.device(device)
-        self._resolved_for = (device, dtype)
         try:
             kernel = registry.resolve("quant_linear", device, dtype, fmt=self.fmt)
         except (registry.NoImplementationError, KeyError):
@@ -78,10 +77,10 @@ class QuantWeight(nn.Module):
         self.linear = partial(_kernel_linear, kernel, self)
 
     def _dequant_linear(self, x: Tensor, bias: Tensor | None) -> Tensor:
-        return F.linear(x, self.weight(x.dtype), bias)
+        return quant_linear_eager(x, self.q, self.scale, bias, self.fmt)
 
     def nbytes(self) -> int:
-        return self.q.numel() * self.q.element_size() + self.scale.numel() * 4
+        return self.q.nbytes + self.scale.numel() * 4
 
 
 def _kernel_linear(kernel, qw: QuantWeight, x: Tensor, bias: Tensor | None) -> Tensor:

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 import torch
 from torch import Tensor
 
+from kohakumoss_common.devices import streamed_type
 from kohakumoss_kernels.backends.eager.attention import remember_bounds
 
 
@@ -75,10 +76,11 @@ class SeqInfo:
 def move_tensors(
     tensors: list[Tensor], device: torch.device, non_blocking: bool = True
 ) -> list[Tensor]:
-    """Move host tensors in one copy per dtype (pinned when the target is CUDA)."""
+    """Move host tensors in one copy per dtype (pinned and asynchronous when the target
+    is an accelerator with pinned host memory: CUDA, XPU)."""
     if device.type == "cpu" or any(t.device.type != "cpu" for t in tensors):
         return [t.to(device, non_blocking=non_blocking) for t in tensors]
-    pin = device.type == "cuda"
+    pin = streamed_type(device.type)
     out: list[Tensor | None] = [None] * len(tensors)
     groups: dict[torch.dtype, list[int]] = {}
     for i, t in enumerate(tensors):

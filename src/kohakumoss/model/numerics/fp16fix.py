@@ -1,8 +1,10 @@
-"""fp16 overflow fixes, one knob: FP16_FIX = none | weights | online | fp32_residual.
+"""fp16 overflow fixes. The FP16_FIX knob of the train and sample scripts is none |
+online | fp32_residual; `weights` is the mode a model carries after `fold` (an fp16-fix
+weights file records it), never a knob value.
 
 - weights: the uniform gate fold (+ pre-gate scale) written into the weights (`fold`).
 - online: the original weights; the same factors, per block if wanted, applied at run
-  time through the StreamPolicy the blocks bind (gate multipliers, writer input scales,
+  time through the StreamConfig the blocks bind (gate multipliers, writer input scales,
   per-block residual rescale, exact eps).
 - fp32_residual: residual streams kept in fp32; norm outputs cast to the compute dtype.
 Any mode can add `clamp` (saturating clamp of the joint stream with on-device counters).
@@ -16,12 +18,14 @@ import torch
 from kohakumoss.model.backbone import MossBackbone
 from kohakumoss.model.numerics.fold import (
     fold,
+    fold_record,
     norm_eps_scales,
     residual_ratios,
+    same_fold,
     set_norm_eps,
     unfold,
 )
-from kohakumoss.model.stream import ClampCounter, StreamPolicy
+from kohakumoss.model.stream import ClampCounter, StreamConfig
 
 FP16_MAX = 65504.0
 MODES = ("none", "weights", "online", "fp32_residual")
@@ -36,17 +40,17 @@ def _per_block(v: float | Sequence[float], depth: int) -> tuple[float, ...]:
     return v
 
 
-def online_policy(
+def online_stream(
     model: MossBackbone,
     c: float | Sequence[float],
     s_attn: float | Sequence[float] = 1.0,
     s_ffn: float | Sequence[float] = 1.0,
     clamp: float | None = None,
-) -> StreamPolicy:
+) -> StreamConfig:
     """Stream scale c_l per block, pre-gate output scale s per block (o, ffn_down)."""
     depth = model.cfg.depth
     cs, sa, sf = (_per_block(v, depth) for v in (c, s_attn, s_ffn))
-    return StreamPolicy(
+    return StreamConfig(
         text_scale=cs[0],
         embed_scale=cs[0],
         gate_attn=tuple(cl / s for cl, s in zip(cs, sa)),
@@ -108,7 +112,7 @@ def apply_fp16_fix(model: MossBackbone, mode: str = "none", **kw) -> None:
                 f"model carries FP16_FIX={current} with {current_factors(model)}; "
                 f"requested {_factors(mode, model, kw)}; clear_fp16_fix first"
             )
-        model.set_stream_policy(replace(model.stream, clamp=clamp))
+        model.set_stream_config(replace(model.stream, clamp=clamp))
         return
     if current != "none":
         raise ValueError(
@@ -119,25 +123,25 @@ def apply_fp16_fix(model: MossBackbone, mode: str = "none", **kw) -> None:
             f = _factors(mode, model, kw)
             pregate = (f["s_attn"], f["s_ffn"])
             fold(model, f["c"], "gate", pregate, kw.get("eps", "exact"))
-            policy = StreamPolicy(clamp=clamp)
+            stream = StreamConfig(clamp=clamp)
         case "online":
             f = _factors(mode, model, kw)
-            policy = online_policy(model, f["c"], f["s_attn"], f["s_ffn"], clamp)
+            stream = online_stream(model, f["c"], f["s_attn"], f["s_ffn"], clamp)
             model._online_eps = set_norm_eps(
                 model, norm_eps_scales(model, f["c"], per_block=True)
             )
             model._online_factors = f
             model.set_residual_scale(residual_ratios(f["c"]))
         case "fp32_residual":
-            policy = StreamPolicy(stream_dtype=torch.float32, clamp=clamp)
+            stream = StreamConfig(stream_dtype=torch.float32, clamp=clamp)
     model.fp16_fix = mode
-    model.set_stream_policy(policy)
+    model.set_stream_config(stream)
 
 
 @torch.no_grad()
 def clear_fp16_fix(model: MossBackbone) -> None:
     """Undo whatever fix the model carries: unfold weights, restore online eps and
-    stream scales, drop the policy."""
+    stream scales, reset the stream config."""
     match model.fp16_fix:
         case "weights":
             unfold(model)
@@ -147,7 +151,43 @@ def clear_fp16_fix(model: MossBackbone) -> None:
             model._online_factors = {}
             model.set_residual_scale((1.0,) * model.cfg.depth)
     model.fp16_fix = "none"
-    model.set_stream_policy(StreamPolicy())
+    model.set_stream_config(StreamConfig())
+
+
+@torch.no_grad()
+def carry_fold(model: MossBackbone, record: dict | None) -> None:
+    """Make `model` carry exactly the weight fold of `record` (a `fold_record`; None:
+    unfolded); when the folds differ, whatever fix the model carries is cleared first.
+    Exact for power-of-two factors."""
+    if same_fold(fold_record(model), record):
+        return
+    clear_fp16_fix(model)
+    unfold(model)
+    if record is None:
+        return
+    pregate = tuple(float(s) for s in record["pregate"])
+    fold(model, record["scales"], record["via"], pregate, record.get("eps", "exact"))
+    model.fp16_fix = "weights"
+
+
+def fix_problems(
+    fix: str, kwargs: dict, fp16: bool, carried: bool, subject: str, file_knob: str
+) -> list[str]:
+    """The FP16_FIX knob problems every script shares: 'online' needs `c`; fp16 compute
+    (`subject`, the knob text naming it) needs a fix unless the weights file
+    (`file_knob`) carries one (`carried`)."""
+    p = []
+    if fix == "online" and "c" not in kwargs:
+        p.append(
+            "FP16_FIX='online' needs FP16_FIX_KWARGS['c'] (e.g. 1/16 for the base)"
+        )
+    if fp16 and fix == "none" and not carried:
+        p.append(
+            f"{subject} needs FP16_FIX ('online' with FP16_FIX_KWARGS={{'c': 1/16}} or "
+            f"'fp32_residual') or an fp16-fix {file_knob} file: the residual stream "
+            "exceeds the fp16 range"
+        )
+    return p
 
 
 def clamp_counts(model: MossBackbone) -> dict[int, int]:

@@ -1,4 +1,4 @@
-"""Residual-stream policy and the per-layer callables it binds (scaling, cast, clamp)."""
+"""Residual-stream config and the per-layer callables it binds (scaling, cast, clamp)."""
 
 from dataclasses import dataclass
 from functools import partial
@@ -8,7 +8,7 @@ from torch import Tensor
 
 
 @dataclass(frozen=True)
-class BlockPolicy:
+class BlockConfig:
     """One joint block: gate multipliers, writer-input scales, stream dtype, clamp."""
 
     gate_attn: float = 1.0
@@ -20,7 +20,7 @@ class BlockPolicy:
 
 
 @dataclass(frozen=True)
-class StreamPolicy:
+class StreamConfig:
     """Run-time stream handling the model binds once. Identity by default."""
 
     text_scale: float = 1.0
@@ -32,8 +32,8 @@ class StreamPolicy:
     stream_dtype: torch.dtype | None = None
     clamp: float | None = None
 
-    def block(self, i: int) -> BlockPolicy:
-        return BlockPolicy(
+    def block(self, i: int) -> BlockConfig:
+        return BlockConfig(
             _at(self.gate_attn, i),
             _at(self.gate_ffn, i),
             _at(self.in_attn, i),

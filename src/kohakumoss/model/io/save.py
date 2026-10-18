@@ -11,7 +11,7 @@ from kohakumoss.model.backbone import MossBackbone
 from kohakumoss.model.io.keymap import FP16_FIX_KEY, fuse_qkv
 from kohakumoss.model.io.load import INDEX, base_keys
 from kohakumoss.model.linear import MossLinear
-from kohakumoss.model.numerics.fold import unfold_state
+from kohakumoss.model.numerics.fold import fold_rows, unscaled
 from kohakumoss.types.arch import MossArchConfig
 
 
@@ -38,26 +38,37 @@ def export_state(
     keep_fold: bool = False,
     weights: dict[str, Tensor] | None = None,
 ) -> dict[str, Tensor]:
-    """Base weights only, cast (rope.bands stays fp32), contiguous on CPU. Stored
-    (quantized / streamed) bases are materialised dense; `weights` (state keys ->
-    tensors in the model's own folded space, e.g. merged W + delta W) replace the
-    model's entries; then the fold is undone unless `keep_fold` (the fp16-fix
-    checkpoint, which holds a uniform gate fold only: a per-block fold raises)."""
+    """Base weights only, cast (rope.bands stays fp32), contiguous on CPU, read one
+    tensor at a time from the live parameters and buffers (full under
+    `parallel.fsdp.unsharded`). Stored (quantized / streamed) bases are materialised
+    dense one layer at a time; `weights` (state keys -> tensors in the model's own
+    folded space, e.g. merged W + delta W) replace the model's entries; the fold is
+    undone unless `keep_fold` (the fp16-fix checkpoint, which holds a uniform gate fold
+    only: a per-block fold raises)."""
     if keep_fold and model.fold_scales is not None and model.fold_via != "gate":
         raise ValueError(
             f"keep_fold writes a uniform gate fold; this model is folded via "
             f"{model.fold_via!r} (per-block factors exist only as an online fix)"
         )
-    sd = dict(model.state_dict())
-    for path, module in model.named_modules():
-        if isinstance(module, MossLinear) and module.base is not None:
-            sd[f"{path}.weight"] = module.base.materialize()
-    sd.update(weights or {})
-    sd = sd if keep_fold else unfold_state(model, sd)
-    keys = base_keys(model.cfg)
+    live = {**dict(model.named_buffers()), **dict(model.named_parameters())}
+    stored = {
+        f"{path}.weight": module.base
+        for path, module in model.named_modules()
+        if isinstance(module, MossLinear) and module.base is not None
+    }
+    weights = weights or {}
+    rows = {} if keep_fold else fold_rows(model)
     out = {}
-    for k in keys:
-        t = sd[k].detach()
+    for k in base_keys(model.cfg):
+        if k in weights:
+            t = weights[k]
+        elif k in stored:
+            t = stored[k].materialize()
+        else:
+            t = live[k]
+        t = t.detach()
+        if k in rows:
+            t = unscaled(t, rows[k])
         if dtype is not None and k != "rope.bands" and t.is_floating_point():
             t = t.to(dtype)
         out[k] = t.contiguous().cpu()
@@ -106,7 +117,7 @@ def write_diffusers(
     shards: list[dict[str, Tensor]] = [{}]
     size = 0
     for k, t in state.items():
-        nbytes = t.numel() * t.element_size()
+        nbytes = t.nbytes
         if shards[-1] and size + nbytes > shard_bytes:
             shards.append({})
             size = 0
@@ -118,7 +129,7 @@ def write_diffusers(
         name = f"diffusion_pytorch_model-{i:05d}-of-{n:05d}.safetensors"
         save_file(shard, str(out_dir / name))
         weight_map.update({k: name for k in shard})
-    total = sum(t.numel() * t.element_size() for t in state.values())
+    total = sum(t.nbytes for t in state.values())
     index = {"metadata": {"total_size": total}, "weight_map": weight_map}
     (out_dir / INDEX).write_text(json.dumps(index, indent=2), encoding="utf-8")
     config = {

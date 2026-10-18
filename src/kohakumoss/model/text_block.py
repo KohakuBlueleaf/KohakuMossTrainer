@@ -8,7 +8,7 @@ from kohakumoss.model.components.ffn import situ_pair
 from kohakumoss.model.components.norm import RMSNorm
 from kohakumoss.model.linear import MossLinear
 from kohakumoss.model.opset import OpSet
-from kohakumoss.model.stream import StreamPolicy, caster, identity, scaler
+from kohakumoss.model.stream import StreamConfig, caster, identity, scaler
 from kohakumoss.types.arch import MossArchConfig
 from kohakumoss.types.seqinfo import SeqInfo
 
@@ -31,14 +31,15 @@ class TextBlock(nn.Module):
         self.ffn_up = MossLinear(dim, ffn, **kw)
         self.ffn_down = MossLinear(ffn, dim, **kw)
 
-    def bind(self, ops: OpSet, policy: StreamPolicy = StreamPolicy()) -> None:
-        """Writers scaled by the policy's text scale; norm outputs cast for an fp32 stream."""
+    def bind(self, ops: OpSet, stream: StreamConfig = StreamConfig()) -> None:
+        """Writers scaled by the stream's text scale; norm outputs cast for an fp32
+        stream."""
         self.ops = ops
-        c = policy.text_scale
+        c = stream.text_scale
         self._attn_out = _text_writer(ops, self.proj, c)
         self._ffn_out = _text_writer(ops, self.ffn_down, c)
-        compute = self.qkv.weight.dtype
-        self._cast = caster(compute if policy.stream_dtype is not None else None)
+        compute = self.qkv.weight_like.dtype
+        self._cast = caster(compute if stream.stream_dtype is not None else None)
 
     def forward(self, x: Tensor, seq: SeqInfo, bands: Tensor) -> Tensor:
         ops = self.ops
@@ -81,13 +82,13 @@ class TextEmbedder(nn.Module):
         )
         self._in = identity
 
-    def bind(self, ops: OpSet, policy: StreamPolicy = StreamPolicy()) -> None:
-        self._in = scaler(policy.text_scale, policy.stream_dtype)
+    def bind(self, ops: OpSet, stream: StreamConfig = StreamConfig()) -> None:
+        self._in = scaler(stream.text_scale, stream.stream_dtype)
         for block in self.blocks:
-            block.bind(ops, policy)
+            block.bind(ops, stream)
 
     def forward(self, text: Tensor, seq: SeqInfo, bands: Tensor) -> Tensor:
-        x = self._in(self.proj(text.to(self.proj.weight.dtype)))
+        x = self._in(self.proj(text.to(self.proj.weight_like.dtype)))
         for block in self.blocks:
             x = block(x, seq, bands)
         return x

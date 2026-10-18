@@ -5,8 +5,14 @@ import torch
 from kohakumoss.model.backbone import MossBackbone
 
 
+def _recomputing() -> bool:
+    """True inside a backward pass (a checkpoint's forward recompute)."""
+    return torch._C._current_graph_task_id() != -1
+
+
 class SaturationCounters:
-    """Forward hooks on every joint and text block; `read()` syncs once and returns stats."""
+    """Forward hooks on every joint and text block, counting the original forward only
+    (not a checkpoint's recompute); `read()` syncs once and returns stats."""
 
     def __init__(self, model: MossBackbone, threshold: float = 2.0**15):
         device = next(model.parameters()).device
@@ -24,6 +30,8 @@ class SaturationCounters:
 
     def _hook(self, idx: int):
         def hook(module, args, output):
+            if _recomputing():
+                return
             a = output.detach().abs()
             self.maxabs[idx] = torch.maximum(self.maxabs[idx], a.max().float())
             self.over[idx] += (a > self.threshold).sum()

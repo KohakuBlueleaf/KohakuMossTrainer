@@ -47,15 +47,4 @@ class MossArchConfig:
 PRESETS: dict[str, MossArchConfig] = {
     "base": MossArchConfig(),
     "sft": MossArchConfig(),
-    "tiny": MossArchConfig(
-        dim=128,
-        depth=4,
-        heads=4,
-        ffn_dim=256,
-        text_dim=64,
-        text_blocks=2,
-        latent_channels=16,
-        freq_dim=32,
-        negative_skip_layers=(2,),
-    ),
 }

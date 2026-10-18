@@ -11,10 +11,14 @@ from kohakumoss.model.backbone import MossBackbone
 
 
 def _scales(model: MossBackbone, c: float | Sequence[float]) -> tuple[float, ...]:
+    """Per-block scales of `c`: one factor (a number or a one-item sequence) for every
+    block, or one per block."""
     depth = model.cfg.depth
     if isinstance(c, (int, float)):
         return (float(c),) * depth
     cs = tuple(float(v) for v in c)
+    if len(cs) == 1:
+        return cs * depth
     if len(cs) != depth:
         raise ValueError(f"per-layer fold needs {depth} scales, got {len(cs)}")
     return cs
@@ -112,6 +116,18 @@ def _multiply(t: Tensor, s: Tensor | float, inverse: bool) -> Tensor:
     return (t.to(dt) * m).to(t.dtype)
 
 
+def fold_rows(model: MossBackbone) -> dict[str, Tensor | float]:
+    """Parameter name -> multiplier of the fold the model carries ({} when unfolded)."""
+    if model.fold_scales is None:
+        return {}
+    return _row_scales(model, model.fold_scales, model.fold_via, model.fold_pregate)
+
+
+def unscaled(t: Tensor, s: Tensor | float) -> Tensor:
+    """`t` with the fold multiplier `s` undone (fp32 math, one rounding)."""
+    return _multiply(t, s, inverse=True)
+
+
 def _record(model, cs, via, pregate, eps_mode, base_eps) -> None:
     model.fold_scales = cs
     model.fold_via = via
@@ -167,10 +183,9 @@ def unfold(model: MossBackbone) -> None:
     """Undo `fold` / `adopt_fold` in place (eps restored exactly)."""
     if model.fold_scales is None:
         return
-    rows = _row_scales(model, model.fold_scales, model.fold_via, model.fold_pregate)
     params = dict(model.named_parameters())
-    for name, s in rows.items():
-        params[name].copy_(_multiply(params[name], s, inverse=True))
+    for name, s in fold_rows(model).items():
+        params[name].copy_(unscaled(params[name], s))
     modules = dict(model.named_modules())
     for name, eps in model._fold_eps.items():
         modules[name].eps = eps
@@ -186,22 +201,16 @@ def unfolded_state_dict(model: MossBackbone) -> dict[str, Tensor]:
 def unfold_state(model: MossBackbone, sd: dict[str, Tensor]) -> dict[str, Tensor]:
     """`sd` (keys and space of this model's folded weights) with the fold undone;
     affected tensors are copies."""
-    if model.fold_scales is None:
-        return sd
     out = dict(sd)
-    rows = _row_scales(model, model.fold_scales, model.fold_via, model.fold_pregate)
-    for name, s in rows.items():
-        out[name] = _multiply(out[name], s, inverse=True)
+    for name, s in fold_rows(model).items():
+        out[name] = unscaled(out[name], s)
     return out
 
 
-def output_row_scales(model: MossBackbone) -> dict[str, Tensor]:
-    """Module path -> fp32 per-output-row scale the fold applied to that linear's output;
-    exporters divide an adapter's delta W rows by it."""
-    if model.fold_scales is None:
-        return {}
+def _output_scales(
+    model: MossBackbone, rows: dict[str, Tensor | float]
+) -> dict[str, Tensor]:
     out = {}
-    rows = _row_scales(model, model.fold_scales, model.fold_via, model.fold_pregate)
     for name, s in rows.items():
         if not name.endswith(".weight"):
             continue
@@ -209,3 +218,49 @@ def output_row_scales(model: MossBackbone) -> dict[str, Tensor]:
         n = model.get_submodule(module).weight.shape[0]
         out[module] = s.float() if isinstance(s, Tensor) else torch.full((n,), float(s))
     return out
+
+
+def output_row_scales(model: MossBackbone) -> dict[str, Tensor]:
+    """Module path -> fp32 per-output-row scale the fold applied to that linear's output;
+    exporters divide an adapter's delta W rows by it."""
+    return _output_scales(model, fold_rows(model))
+
+
+def fold_record(model: MossBackbone) -> dict | None:
+    """The weight fold `model` carries as a JSON record (None when unfolded): per-block
+    `scales`, `via`, the `pregate` (s_attn, s_ffn) and the norm `eps` mode."""
+    if model.fold_scales is None:
+        return None
+    return {
+        "scales": [float(c) for c in model.fold_scales],
+        "via": model.fold_via,
+        "pregate": [float(s) for s in model.fold_pregate],
+        "eps": model.fold_eps_mode,
+    }
+
+
+def _floats(values) -> list[float]:
+    """`values` as floats; a uniform sequence as its one factor."""
+    out = [float(v) for v in values]
+    return out[:1] if len(set(out)) == 1 else out
+
+
+def same_fold(a: dict | None, b: dict | None) -> bool:
+    """Two fold records scale the same weight rows by the same factors (eps aside)."""
+    if a is None or b is None:
+        return a is b
+    return (
+        a["via"] == b["via"]
+        and _floats(a["scales"]) == _floats(b["scales"])
+        and [float(s) for s in a["pregate"]] == [float(s) for s in b["pregate"]]
+    )
+
+
+def record_row_scales(model: MossBackbone, record: dict | None) -> dict[str, Tensor]:
+    """`output_row_scales` of the fold `record` describes, on `model`'s architecture
+    ({} for None), whatever fold `model` itself carries."""
+    if record is None:
+        return {}
+    cs = _scales(model, record["scales"])
+    pregate = tuple(float(s) for s in record["pregate"])
+    return _output_scales(model, _row_scales(model, cs, record["via"], pregate))

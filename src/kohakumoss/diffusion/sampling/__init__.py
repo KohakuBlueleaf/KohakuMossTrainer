@@ -8,7 +8,7 @@ from kohakumoss.diffusion.sampling.sample import (
     sample_latents,
     unpack,
 )
-from kohakumoss.diffusion.sampling.schedule import moss_sigmas, shift_sigma
+from kohakumoss.diffusion.sampling.schedule import moss_sigmas
 
 __all__ = [
     "CFG_MODES",
@@ -17,6 +17,5 @@ __all__ = [
     "latent_grid",
     "moss_sigmas",
     "sample_latents",
-    "shift_sigma",
     "unpack",
 ]

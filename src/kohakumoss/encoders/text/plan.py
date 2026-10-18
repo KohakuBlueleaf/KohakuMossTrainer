@@ -1,0 +1,129 @@
+"""TextEncoderPlan from a knob dict, and every problem with one (training and inference
+share the rules; training adds the TE-on-CPU rule)."""
+
+from dataclasses import fields, replace
+from pathlib import Path
+
+import torch
+
+from kohakumoss.quant.compute import COMPUTE, FP8_RECIPES
+from kohakumoss.types.plans import TextEncoderPlan
+from kohakumoss_kernels import ops as kernel_ops
+from kohakumoss_kernels.dtypes import BY_NAME
+from kohakumoss_kernels.hardware.arch import arch_of
+
+MEMORY = ("resident", "offload", "stream", "cpu", "auto")
+PRECISION = ("compute", "int8", "fp8", *COMPUTE)
+LAYOUT = ("single", "padded", "packed")
+FORWARD = ("kernels", "hf")
+DTYPES = {name: BY_NAME[name] for name in ("bf16", "fp16")}
+AHEAD_DEVICE = ("host", "device")
+
+
+def text_plan(
+    spec: dict | TextEncoderPlan | None = None, **overrides
+) -> TextEncoderPlan:
+    """A TextEncoderPlan from a plan, a dict of its fields, or defaults, plus overrides;
+    raises listing every unknown field."""
+    if isinstance(spec, TextEncoderPlan):
+        base, values = spec, {}
+    else:
+        base, values = TextEncoderPlan(), dict(spec or {})
+    values.update(overrides)
+    known = {f.name for f in fields(TextEncoderPlan)}
+    unknown = sorted(set(values) - known)
+    if unknown:
+        raise ValueError(
+            f"unknown text-encoder plan fields {unknown}; valid {sorted(known)}"
+        )
+    return replace(base, **values)
+
+
+def resolve_dtype(plan: TextEncoderPlan, device: torch.device | str) -> TextEncoderPlan:
+    """`dtype="auto"`: bf16 where the device has it (the host included), else fp16."""
+    if plan.dtype != "auto":
+        return plan
+    device = torch.device(device)
+    has_bf16 = device.type != "cuda" or arch_of(device).has_bf16
+    return replace(plan, dtype="bf16" if has_bf16 else "fp16")
+
+
+def plan_problems(
+    plan: TextEncoderPlan,
+    device: torch.device | str | None = None,
+    training: bool = False,
+    text_cache: str = "offline",
+    arch=arch_of,
+) -> list[str]:
+    """Every problem with `plan` (empty = valid). In training, the encoder may run on
+    the host only for the offline cache pass: online / uncached text encodes on the
+    GPU (offload / stream). `arch(device)` gives the CUDA arch (default arch_of)."""
+    p = []
+    for name, value, opts in (
+        ("memory", plan.memory, MEMORY),
+        ("precision", plan.precision, PRECISION),
+        ("fp8_recipe", plan.fp8_recipe, FP8_RECIPES),
+        ("layout", plan.layout, LAYOUT),
+        ("forward", plan.forward, FORWARD),
+        ("dtype", plan.dtype, (*DTYPES, "auto")),
+        ("ahead_device", plan.ahead_device, AHEAD_DEVICE),
+    ):
+        if value not in opts:
+            p.append(f"text-encoder {name}={value!r} not in {opts}")
+    if plan.forward == "hf" and plan.layout == "packed":
+        p.append(
+            "text-encoder forward='hf' runs layout 'single' or 'padded'; 'packed' needs "
+            "forward='kernels'"
+        )
+    if plan.batch < 1 or plan.ahead < 1 or plan.max_tokens < 0:
+        p.append("text-encoder batch >= 1, ahead >= 1 and max_tokens >= 0")
+    if plan.memory == "stream" and plan.stream_resident < 2:
+        p.append("text-encoder stream needs stream_resident >= 2")
+    if plan.quant_group and plan.precision not in ("int8", "fp8"):
+        p.append(
+            "text-encoder quant_group is a weight-only layout: precision int8 / fp8 "
+            "(fp8_compute / mxfp8 scale by fp8_recipe)"
+        )
+    if plan.quant_group < 0 or (plan.quant_group and plan.quant_group % 16):
+        p.append("text-encoder quant_group is 0 (per channel) or a multiple of 16")
+    if plan.stored and (plan.precision == "compute" or plan.quant_group):
+        p.append(
+            "text-encoder stored (a pre-quantized file) needs precision int8 / fp8 / "
+            "fp8_compute / mxfp8 (the file's) and quant_group 0"
+        )
+    if plan.stored and not Path(plan.stored).is_file():
+        p.append(f"text-encoder stored file {plan.stored} does not exist")
+    bad_ops = sorted(set(plan.kernels) - set(kernel_ops.TEXT) - {"rms_norm"})
+    if bad_ops:
+        p.append(f"text-encoder kernels has unknown ops {bad_ops}")
+    if plan.memory == "cpu" and plan.precision != "compute":
+        p.append("text-encoder memory='cpu' runs precision 'compute'")
+    if plan.precision in COMPUTE and plan.memory != "cpu" and device is not None:
+        kind = torch.device(device).type
+        if kind != "cuda":
+            p.append(f"text-encoder {plan.precision} needs a CUDA device, not {kind}")
+    if device is not None and torch.device(device).type == "cuda":
+        info = arch(device)
+        if plan.precision in COMPUTE and not info.has_fp8:
+            p.append(
+                f"text-encoder {plan.precision} needs fp8 GEMMs (sm89+), not "
+                f"{info.name}"
+            )
+        if plan.dtype == "bf16" and not info.has_bf16 and plan.memory != "cpu":
+            p.append(
+                f"text-encoder dtype 'bf16' on {info.name} (no bf16): use fp16 or auto"
+            )
+    if training and plan.memory == "cpu" and text_cache != "offline":
+        p.append(
+            "the text encoder runs on the CPU only for the offline cache pass; with "
+            f"TEXT_CACHE={text_cache!r} it encodes during training on the GPU: set "
+            "TEXT_ENCODE memory to 'offload' / 'stream' / 'resident' (or 'auto')"
+        )
+    return p
+
+
+def check_plan(plan: TextEncoderPlan, **kw) -> TextEncoderPlan:
+    problems = plan_problems(plan, **kw)
+    if problems:
+        raise ValueError("invalid text-encoder plan: " + "; ".join(problems))
+    return plan

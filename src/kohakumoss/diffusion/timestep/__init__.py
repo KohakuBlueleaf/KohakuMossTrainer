@@ -7,7 +7,7 @@ from kohakumoss.diffusion.timestep.moss import (
 )
 from kohakumoss.diffusion.timestep.shift import shift_sigma
 from kohakumoss.diffusion.timestep.simple import LogitNormalTimestep, UniformTimestep
-from kohakumoss.registry import Registry
+from kohakumoss_common.registry import Registry
 
 TIMESTEPS = Registry("timestep sampler")
 TIMESTEPS.add("moss", MossTimestep)

@@ -9,7 +9,6 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from kohakumoss.model.components.wide import wide_linear
 from kohakumoss.types.protocols import BaseWeight
 
 
@@ -26,7 +25,7 @@ class MossLinear(nn.Linear):
     ):
         super().__init__(in_features, out_features, bias, device=device, dtype=dtype)
         self.base: BaseWeight | None = None
-        self.input_dtype: torch.dtype | None = None
+        self.compute = None
         self._impl = self._dense if bias else self._dense_nobias
 
     def reset_parameters(self) -> None:
@@ -56,38 +55,27 @@ class MossLinear(nn.Linear):
         self.__dict__["base"] = None
         self.rebind()
 
-    def set_input_dtype(self, dtype: torch.dtype | None) -> None:
-        """`dtype` (fp16 / bf16): run as a `dtype`-input matmul with fp32 accumulation and
-        an fp32 output plus fp32 bias. None: the plain forward in x's dtype."""
-        self.input_dtype = dtype
+    def set_compute(self, cache) -> None:
+        """Run the dense (trainable) weight through fp8 copies held by `cache`
+        (`kohakumoss.quant.compute.ComputeCache`), or None for the 16-bit forward."""
+        self.compute = cache
         self.rebind()
 
     def rebind(self) -> None:
-        """Re-select the forward after a structural change (bias, base, input dtype)."""
-        match (
-            self.input_dtype is not None,
-            self.base is not None,
-            self.bias is not None,
-        ):
+        """Re-select the forward after a structural change (bias, base, fp8 compute)."""
+        match (self.base is not None, self.compute is not None, self.bias is not None):
             case (True, _, True):
-                self._impl = self._wide
-            case (True, _, False):
-                self._impl = self._wide_nobias
-            case (False, True, True):
                 self._impl = self._stored
-            case (False, True, False):
+            case (True, _, False):
                 self._impl = self._stored_nobias
+            case (False, True, True):
+                self._impl = self._fp8
+            case (False, True, False):
+                self._impl = self._fp8_nobias
             case (False, False, True):
                 self._impl = self._dense
             case (False, False, False):
                 self._impl = self._dense_nobias
-
-    def _wide_nobias(self, x: Tensor) -> Tensor:
-        w = self.weight if self.base is None else self.base.weight(self.input_dtype)
-        return wide_linear(x, w, self.input_dtype)
-
-    def _wide(self, x: Tensor) -> Tensor:
-        return self._wide_nobias(x) + self.bias.float()
 
     def _dense(self, x: Tensor) -> Tensor:
         return F.linear(x, self.weight.to(x.dtype), self.bias.to(x.dtype))
@@ -101,10 +89,37 @@ class MossLinear(nn.Linear):
     def _stored_nobias(self, x: Tensor) -> Tensor:
         return self.base.linear(x, None)
 
+    def _fp8(self, x: Tensor) -> Tensor:
+        return self.compute.linear(x, self.weight, self.bias)
+
+    def _fp8_nobias(self, x: Tensor) -> Tensor:
+        return self.compute.linear(x, self.weight, None)
+
     def forward(self, x: Tensor) -> Tensor:
         return self._impl(x)
 
+    def __delattr__(self, name: str) -> None:
+        if name == "weight" and "weight" in self._parameters:
+            w = self._parameters["weight"]
+            self.__dict__["_held"] = torch.empty(0, dtype=w.dtype, device=w.device)
+        super().__delattr__(name)
+
+    def _apply(self, fn, recurse: bool = True):
+        held = self.__dict__.get("_held")
+        if held is not None:
+            self.__dict__["_held"] = fn(held)
+        return super()._apply(fn, recurse)
+
+    @property
+    def weight_like(self) -> Tensor:
+        """The weight, or an empty tensor of its dtype / device after the weight
+        parameter was deleted from this module."""
+        weight = self._parameters.get("weight")
+        return weight if weight is not None else self.__dict__["_held"]
+
     @property
     def is_plain(self) -> bool:
-        """Dense storage and no LyCORIS (or other) forward override attached."""
-        return self.base is None and "forward" not in vars(self)
+        """Dense storage, 16-bit compute and no adapter (or other) forward override."""
+        return (
+            self.base is None and self.compute is None and "forward" not in vars(self)
+        )

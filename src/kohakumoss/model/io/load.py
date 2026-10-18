@@ -1,14 +1,15 @@
 """Load MOSS-Image transformer weights from HF shards, a ComfyUI file or our own saves."""
 
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
-from safetensors import safe_open
 from safetensors.torch import load_file
 from torch import Tensor, nn
 
+from kohakumoss.logging.log import get_logger, hl
 from kohakumoss.model.backbone import MossBackbone
 from kohakumoss.model.build import DEFAULT_KEEP_FP32, build_backbone
 from kohakumoss.model.io.keymap import DERIVED, FP16_FIX_KEY
@@ -22,7 +23,13 @@ from kohakumoss.model.io.source import (
 )
 from kohakumoss.model.numerics.fold import adopt_fold
 from kohakumoss.model.opset import OpSet
+from kohakumoss.quant.stored import attach_stored, read_record, stored_keys
 from kohakumoss.types.arch import MossArchConfig
+from kohakumoss_common.io import read_safetensors_metadata
+from kohakumoss_common.units import gib
+from kohakumoss_kernels.dtypes import short
+
+log = get_logger(__name__)
 
 __all__ = [
     "INDEX",
@@ -73,8 +80,7 @@ def read_fp16_fix(path: str | Path) -> dict | None:
     path = Path(path)
     if not path.is_file():
         return None
-    with safe_open(str(path), framework="pt") as f:
-        meta = f.metadata() or {}
+    meta = read_safetensors_metadata(path)
     return json.loads(meta[FP16_FIX_KEY]) if FP16_FIX_KEY in meta else None
 
 
@@ -136,10 +142,13 @@ def load_state_into(
     source: str = "",
     strict: bool = True,
     device: torch.device | str | None = None,
+    stored: frozenset[str] = frozenset(),
+    extra: frozenset[str] = frozenset(),
 ) -> LoadReport:
     """Assign a state dict or tensor source into `model` (meta or materialised), one
     tensor at a time, each cast to its param's dtype and moved to `device` (default:
-    where the source tensor is)."""
+    where the source tensor is). `stored` keys (quantized weights) and `extra` keys
+    (their scales) are accounted for and left to the caller."""
     view = _view(state)
     names = view.keys()
     expected = base_keys(model.cfg)
@@ -148,7 +157,7 @@ def load_state_into(
     have = set(names)
     report.missing = [k for k in expected if k not in have and k not in DERIVED]
     report.derived = [k for k in DERIVED if k not in have]
-    report.unexpected = [k for k in names if k not in current]
+    report.unexpected = [k for k in names if k not in current and k not in extra]
     if strict and not report.ok:
         raise KeyError(
             f"checkpoint {source}: missing {report.missing[:8]} "
@@ -156,7 +165,7 @@ def load_state_into(
             f"({len(report.unexpected)})"
         )
     for k in names:
-        if k not in current or k in DERIVED:
+        if k not in current or k in DERIVED or k in stored:
             continue
         t = view.get(k)
         dst = device if device is not None else t.device
@@ -177,15 +186,37 @@ def load_backbone(
     """Build on meta, then read, cast and move one tensor at a time (host and device
     peaks are one tensor plus the model), bind ops. An fp16-fix file is recorded as
     folded (savers and adapter exports undo it); `fp16_fix_eps="exact"` uses eps * c^2.
+    A pre-quantized fp8 file attaches its stored bases (no 16-bit copy is built).
     """
+    start = time.perf_counter()
+    log.info("loading transformer", path=path, dtype=short(dtype), device=device)
     view = ModelKeyView(CheckpointSource(path))
     cfg = cfg or infer_config(view, read_config(path))
     model = build_backbone(cfg, device="meta", dtype=dtype, keep_fp32=keep_fp32)
-    report = load_state_into(model, view, str(path), strict, device=device)
+    record = read_record(path)
+    stored, extra = stored_keys(record) if record else (set(), set())
+    report = load_state_into(
+        model, view, str(path), strict, device, frozenset(stored), frozenset(extra)
+    )
+    if record:
+        attach_stored(model, view, record, device, dtype)
+        log.info(
+            f"{hl(len(stored))} fp8 bases ({hl(record['recipe'])}) from "
+            f"{hl(path, 'path')}"
+        )
     model.rope.to(device)
     fix = read_fp16_fix(path)
     if fix is not None:
         adopt_fold(model, fix["c"], (fix["s_attn"], fix["s_ffn"]), fp16_fix_eps)
         model.fp16_fix = "weights"
     model.bind_ops(OpSet.resolve(device, dtype, kernels))
+    size = gib(sum(p.nbytes for p in model.parameters()))
+    fold = {"fp16_fold_c": fix["c"]} if fix is not None else {}
+    log.info(
+        f"transformer loaded from {hl(path, 'path')}",
+        tensors=report.n_source,
+        gib=round(size, 2),
+        secs=round(time.perf_counter() - start, 2),
+        **fold,
+    )
     return model, report
