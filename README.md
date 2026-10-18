@@ -5,13 +5,21 @@ A finetuning framework for [MOSS-Image](https://huggingface.co/OpenMOSS-Team/MOS
 native resolutions, plus inference, on Windows and Linux, from 6 GB cards to multi-GPU
 nodes.
 
+![A style LoRA after 100 steps: MOSS-Image-Base (top row) against the LoRA (bottom row), same prompts and seeds](docs/assets/teaser-style-lora.webp)
+
+A style LoRA (rank 8, fp16, fp8 base GEMMs) after 100 steps at batch ~4 (20k tokens per
+step) on one RTX 4090, with the aggressive `ckpt-stream4-actoff` offload profile and the text
+encoder and VAE encoding online in every step: 12-13 GB on the card, about 0.85 images / s.
+Top row MOSS-Image-Base, bottom row the LoRA; 32 sampler steps, CFG 3, the same seed per
+column.
+
 - **Adapters and full finetune.** LoRA / LoCon, LoHa, LoKr, DoRA, OFT, BOFT, GLoRA, IA3,
   DyLoRA, T-LoRA through [LyCORIS](https://github.com/KohakuBlueleaf/LyCORIS) (its
   algorithms, save format and fused kernels), with dropouts, LoRA+, bypass or merged
   forwards and targeting presets; full finetune with Muon + AdamW and EMA after the MOSS
   tech report.
 - **Own MOSS-Image implementation** on packed variable-length batches (one flat token
-  axis, attention never crosses a sample), checked against the official code: fp32
+  axis, attention stays within each sample), checked against the official code: fp32
   forward relative error 4.7e-6, 50-step sampling LPIPS 2.3e-6.
 - **Kernels per GPU arch.** TileLang for sm70 / sm75, Triton for sm80+ and Intel Arc;
   varlen attention, the block ops and fused linears. Each op is bound per arch, dtype and
@@ -19,8 +27,7 @@ nodes.
   stored in a tuning table.
 - **Precision.** bf16, and fp16 for cards without bf16 (with an fp16 residual fix);
   fp8 and MXFP8 compute (sm89+) for the DiT and the text encoder in training and
-  inference; int8 / fp8 weight-only frozen bases. Matmuls take 16-bit inputs with fp32
-  accumulation; no fp64 anywhere.
+  inference; int8 / fp8 weight-only frozen bases.
 - **Memory profiles** from `speed` to `minimal`, a 240-entry catalog, or manual knobs:
   checkpointing, weight streaming, activation offload, gradient offload, host optimizer
   states. Adapter training fits 8 GB and 6 GB cards; full finetune fits one 24 GB card
@@ -149,11 +156,11 @@ By compute capability; the kernel column is the arch's first backend
 the sm70 kernel suite); the final release tree's test suite was not re-run on sm70 (test
 host offline at release time).
 
-Windows targets are sm75, sm86, sm89, sm120 and Intel Arc: every single-GPU feature runs
-on Windows; multi-GPU training is Linux-only. Each op of a
-card runs its kernel or `torch.compile`, whichever is measured faster there; the eager
-path is the reference both are checked against
-([docs/performance/](docs/performance/README.md)).
+- **Windows:** sm75, sm86, sm89, sm120 and Intel Arc run every single-GPU feature;
+  multi-GPU training is Linux-only.
+- **Per-card choice:** each op runs its kernel or `torch.compile`, whichever is measured
+  faster on that card; the eager path is the reference both are checked against
+  ([docs/performance/](docs/performance/README.md)).
 
 ## Memory profiles and VRAM
 
@@ -169,13 +176,16 @@ path is the reference both are checked against
 | `vram_auto` | above 24 GB | `auto`: the fastest profile whose estimate fits | | `auto` |
 | `vram_24g_full` | full finetune, 24 GB | swapped blocks with host fp32 masters and states | 8192 | text encoder streamed |
 
-The small layers keep the DiT in host memory. For `8g` plan about 19 GiB of host RAM
-during the steps and about 32 GiB at build, when the 15.63 GiB text encoder loads to
-encode the sample prompts (the base samples every 500 steps); with `--set
-SAMPLE_EVERY=0` and both caches offline the text encoder never loads, so the build
-peak is the step figure. The single-GPU full finetune needs about 70 GiB during the
-steps and 88 GiB at build ([configs.md#host-ram](docs/guides/configs.md#host-ram)). The four named profiles and
-the whole catalog, with their estimated peaks:
+The small layers keep the DiT in host memory, so plan host RAM too
+([configs.md#host-ram](docs/guides/configs.md#host-ram)):
+
+| setup | host RAM during the steps | host RAM at build |
+| --- | --- | --- |
+| `vram_8g` | about 19 GiB | about 32 GiB (the 15.63 GiB text encoder loads to encode the sample prompts; the base samples every 500 steps) |
+| `vram_8g`, `--set SAMPLE_EVERY=0`, both caches offline | about 19 GiB | the step figure (only the caches are read; the text encoder stays on disk) |
+| single-GPU full finetune | about 70 GiB | about 88 GiB |
+
+The four named profiles and the whole catalog, with their estimated peaks:
 [docs/concepts/profiles.md](docs/concepts/profiles.md).
 
 <!-- release-tables:speed-vram:begin -->
@@ -241,23 +251,27 @@ measured):
 | `ckpt-resident` | 16384 | 12059 | 1.27 | 5071 | 18.06 |
 | `ckpt-resident` | 32768 | 29494 | 1.34 | 4977 | 24.64 |
 
-How measured: each run is 40 steps of the train script on the real weights and a
-kohya-style dataset at a 1 MP target area, packed to 8192 tokens per step (the
-`vram_8g` / `vram_6g` rows: 4096, the layers' budget at measuring time; they now ship
-4352, not re-measured); samples/s and tok/s are medians over the steps after step 10.
-"step peak" is torch's per-step peak of allocated memory; the nvidia-smi peaks are the training
-process's, sampled every 500 ms, split at the first step into startup + kernel prewarm
-and the step loop. The 8 GB / 6 GB rows run with the allocator capped at the target.
-The cells that run the text encoder every step (no cache, latent cache) were measured
-with it streamed, except the RTX 5090 no-cache cells; this release keeps it resident
-where it fits, which is faster on 32 GB+ cards (the RTX 5090 no-cache cells, footnote
-5). First-run kernel tuning runs
-before step 0 and is not in samples/s; the tuning prewarm is bounded by the kernel
-prewarm's planned-maximum replay and on these rows peaks at or within 0.8 GiB of the
-step peak (footnote 4). The runs used the v0.1.0 release code (the runtime of commits
-db622de..3f1f50d; the benches ran on pre-commit snapshots with identical runtime
-code); the `vram_8g` no-cache and latent-cache rows ran on the same runtime with the
-extra bench rows added.
+How measured:
+
+- **Run:** 40 steps of the train script on the real weights and a kohya-style dataset
+  at a 1 MP target area, packed to 8192 tokens per step. The `vram_8g` / `vram_6g` rows
+  ran at 4096 tokens; the layers ship 4352, not re-measured.
+- **Speed:** samples/s and tok/s are medians over the steps after step 10. First-run
+  kernel tuning runs before step 0 and is not in samples/s.
+- **Memory:** "step peak" is torch's per-step peak of allocated memory. The nvidia-smi
+  peaks are the training process's, sampled every 500 ms, split at the first step into
+  startup + kernel prewarm and the step loop. The tuning prewarm is bounded by the kernel
+  prewarm's planned-maximum replay and on these rows peaks at or within 0.8 GiB of the
+  step peak (footnote 4). The 8 GB / 6 GB rows run with the allocator capped at the
+  target.
+- **Text encoder:** the cells that run it every step (no cache, latent cache) were
+  measured with it streamed, except the RTX 5090 no-cache cells. The release keeps it
+  resident where it fits, which is faster on 32 GB+ cards (the RTX 5090 no-cache cells,
+  footnote 5).
+- **Code:** the v0.1.0 release code (the runtime of commits db622de..3f1f50d; the
+  benches ran on pre-commit snapshots with identical runtime code). The `vram_8g`
+  no-cache and latent-cache rows ran on the same runtime with the extra bench rows
+  added.
 
 (1) The run shared the card with another process, so it is not reported.
 (2) Windows (WDDM): nvidia-smi reports the card's use above its idle baseline, not the
@@ -335,8 +349,7 @@ flowchart LR
     opt -.->|"next step"| dit
 ```
 
-The memory plan resolves once at build time and installs its engines; nothing branches
-on it per step:
+The memory plan resolves once at build time and installs its engines:
 
 ```mermaid
 flowchart LR
@@ -366,8 +379,8 @@ flowchart LR
 
 Kernel selection is a build-time choice per op, arch and dtype, then per problem shape
 from the card's tuning table. The arch's backend priority is TileLang first on sm70 /
-sm75, Triton first on sm80+ and XPU, then `torch.compile`, then eager (the reference,
-never timed):
+sm75, Triton first on sm80+ and XPU, then `torch.compile`, then eager, the
+reference:
 
 ```mermaid
 flowchart LR
@@ -381,7 +394,9 @@ flowchart LR
     subgraph call["per problem shape"]
         direction LR
         key{"problem key"} -->|"stored"| run["kernel or compile"]
-        key -->|"missing, TUNE=table"| timing["time candidates"]
+        key -->|"missing, TUNE=table, prewarm / tuning window"| timing["time candidates"]
+        key -->|"missing, after the windows"| first["first candidate, untimed"]
+        first --> run
         timing --> table[("tuning table")]
         table --> run
     end
