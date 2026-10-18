@@ -50,7 +50,6 @@ def text_cache(weights_root, dataset_slice, tmp_path_factory) -> Path:
     """The offline text cache of the slice (every caption variant, the real encoder)."""
     cache = tmp_path_factory.mktemp("text_cache")
     k = real_knobs(weights_root, dataset_slice, cache, CACHE_DIR=str(cache), **SHORT)
-    cfg = data_config(k, latent_cache="off", text_cache="offline")
     encode = build_encoder(
         "kohakumoss.encoders.text_encoder",
         {
@@ -58,6 +57,12 @@ def text_cache(weights_root, dataset_slice, tmp_path_factory) -> Path:
             "device": "cuda",
             "plan": {"memory": "stream"},
         },
+    )
+    cfg = data_config(
+        k,
+        latent_cache="off",
+        text_cache="offline",
+        text_encoder_spec=encode.encoder_spec,
     )
     build_text(MossDataset(cfg), encode, 64)
     del encode

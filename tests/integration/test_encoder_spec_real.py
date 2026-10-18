@@ -97,12 +97,7 @@ def built_cache(weights_root, dataset_slice, tmp_path_factory) -> dict:
     }
     for kind, (script, *_) in KINDS.items():
         sets = {**data, **encoders[kind]}
-        run_script(
-            str(SCRIPTS / script),
-            set_overrides={
-                k: v if isinstance(v, str) else repr(v) for k, v in sets.items()
-            },
-        )
+        run_script(str(SCRIPTS / script), set_overrides=sets)
     torch.cuda.empty_cache()
     return data
 

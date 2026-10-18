@@ -1,5 +1,7 @@
 """The real VAE's latent statistics: FluxVae keeps the file's BatchNorm mean and
-sqrt(var + eps) bit for bit in fp32, whatever dtype the VAE runs in (bf16, fp16)."""
+sqrt(var + eps) bit for bit in fp32, whatever dtype the VAE runs in (bf16, fp16). The
+file's fp32 statistics are bf16-exact values, so the negative drops the eps instead of
+rounding them."""
 
 import json
 
@@ -37,5 +39,4 @@ def test_vae_keeps_the_file_statistics(dtype, weights_root, file_stats):
     vae = FluxVae.from_pretrained(weights_root / "base", "cpu", dtype)
     assert vae.dtype == dtype
     check_stats(vae, mean, var, eps)
-    rounded = (mean.to(dtype).float(), var.to(dtype).float())
-    must_fail(lambda: check_stats(vae, *rounded, eps), f"statistics rounded to {dtype}")
+    must_fail(lambda: check_stats(vae, mean, var, 0.0), "std without batch_norm_eps")

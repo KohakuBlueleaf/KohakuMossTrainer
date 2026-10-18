@@ -28,7 +28,7 @@ def test_grid_script(weights_root, adapter, tmp_path):
         "WEIGHTS": str(weights_root / "base"),
         "OUT": str(out),
         "CHECKPOINTS": adapter,
-        "PROMPTS": "a lighthouse, rocky coast, sunset, clouds",
+        "PROMPTS": ["a lighthouse on a rocky coast at sunset"],
         "SEEDS": "3",
         "SIZES": "512x512",
         "STEPS": "8",
