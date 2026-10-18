@@ -134,6 +134,26 @@ matrix. Multi-GPU training is Linux-only.
   equal).
 - The `xpu` extra uses `kernels-xpu` (empty: Intel's Triton comes with torch).
 
+## Where caches go
+
+The first runs on a machine build kernels and tune them; the results stay on disk, so
+later runs start without that work. Each cache has its own location, and each location
+can be moved with an environment variable (for a small home or system drive, or a
+shared drive):
+
+| cache | default | moved by |
+| --- | --- | --- |
+| KohakuMoss kernel cache: tuning tables (`tuning/`), device probes (`devices/`), recorded backend failures (`failures/`), the Windows toolchain (`toolchain/`) | `~/.cache/kohakumoss_kernels` | `KOHAKUMOSS_KERNEL_CACHE` |
+| LyCORIS fused-kernel tuning | `~/.cache/lycoris_kernels` | `LYCORIS_KERNEL_CACHE_DIR` |
+| Triton compiled kernels | `~/.triton/cache` | `TRITON_CACHE_DIR` (or `TRITON_HOME`) |
+| `torch.compile` (TorchInductor) graphs and its Triton kernels | `<system temp>/torchinductor_<user>` | `TORCHINDUCTOR_CACHE_DIR` (its Triton kernels follow `TRITON_CACHE_DIR` when set) |
+| TileLang compiled kernels (sm70 / sm75) | `~/.tilelang/cache` | `TILELANG_CACHE_DIR` |
+| dataset caches: latents, text embeddings, catalog files | `<first dataset path>/cache` | the `CACHE_DIR` knob ([data.md](../concepts/data.md)) |
+
+- Deleting a kernel cache is safe: the next run builds and tunes again.
+- A tuning table is kept per card, CUDA and torch version, so one cache directory can be
+  shared by several GPUs and installs.
+
 ## Extras
 
 | extra | packages | needed for |
