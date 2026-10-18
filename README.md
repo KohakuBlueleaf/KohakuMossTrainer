@@ -179,13 +179,101 @@ the whole catalog, with their estimated peaks:
 [docs/concepts/profiles.md](docs/concepts/profiles.md).
 
 <!-- release-tables:speed-vram:begin -->
-**Measured speed and VRAM per GPU and layer.** This table is filled from the release
-bench matrix: GPU, VRAM layer, precision, s/step, samples/s, nvidia-smi peak and steady VRAM.
+### Measured training speed and VRAM
+
+LoRA r32 / LoKr factor 16 on MOSS-Image-Base at 1 MP, one run per cell on the release
+code; bf16, fp16 on the 2080 Ti and T10. Each cell is samples/s / step peak GiB (torch
+allocated) / nvidia-smi peak GiB during prewarm - during the steps, for the three cache
+modes: none (VAE and text encoder every step), latent cache, latent + text cache.
+
+| setup | GPU | no cache | latent cache | latent + text cache |
+| --- | --- | --- | --- | --- |
+| LoRA r32, `balanced` | RTX 5090 | 0.70 / 6.63 / 5.27 - 9.46 | 0.73 / 6.63 / 6.03 - 9.32 | 1.14 / 6.63 / 7.06 - 9.54 |
+| | RTX 4090 (2) | 0.49 / 6.57 / 5.84 - 9.42 | 0.52 / 6.57 / 5.94 - 10.14 | 0.73 / 6.57 / 7.40 - 9.91 |
+| | RTX 3090 | 0.31 / 6.58 / 5.66 - 9.03 | 0.33 / 6.58 / 5.66 - 8.91 | 0.39 / 6.58 / 6.40 - 9.01 |
+| | RTX 2080 Ti | 0.14 / 6.58 / 4.78 - 8.80 | 0.15 / 6.58 / 5.54 - 8.86 | 0.22 / 6.58 / 5.55 - 8.90 |
+| | Tesla T10 | not measured (1) | 0.14 / 6.58 / 4.75 - 8.83 | 0.19 / 6.58 / 5.81 - 8.82 |
+| LoKr 16, `balanced` | RTX 5090 | 0.67 / 6.09 / 5.83 - 8.79 | 0.70 / 6.09 / 5.83 - 8.78 | 1.06 / 6.09 / 5.82 - 9.21 |
+| | RTX 4090 (2) | 0.43 / 6.23 / 7.15 - 10.34 | 0.45 / 6.23 / 5.48 - 9.65 | 0.60 / 6.23 / 5.76 - 9.64 |
+| | RTX 3090 | 0.29 / 6.05 / 5.46 - 8.42 | 0.30 / 6.05 / 5.46 - 8.34 | 0.36 / 6.05 / 5.46 - 8.83 |
+| | RTX 2080 Ti | 0.14 / 6.03 / 5.34 - 8.26 | 0.14 / 6.03 / 5.34 - 8.26 | 0.20 / 6.03 / 5.34 - 8.38 |
+| | Tesla T10 | 0.12 / 6.03 / 4.52 - 8.23 | not measured | 0.17 / 6.03 / 4.52 - 8.23 |
+| LoRA r32, `vram_8g` (8 GB cap) | RTX 5090 | not measured | not measured | 0.98 / 2.18 / 2.63 - 3.20 |
+| | RTX 4090 (2) | 0.64 / 2.14 / 2.45 - 5.33 | 0.62 / 2.13 / 2.05 - 4.63 | 0.60 / 2.13 / 2.61 - 2.99 |
+| | RTX 3090 | 0.37 / 2.14 / 2.27 - 3.78 | 0.37 / 2.13 / 2.27 - 3.75 | 0.37 / 2.13 / 2.27 - 2.83 |
+| | RTX 2080 Ti | not measured | not measured | 0.18 / 2.14 / 1.91 - 2.75 |
+| | Tesla T10 | not measured | not measured | 0.16 / 2.13 / 2.12 - 2.67 |
+| LoRA r32, `vram_6g` (6 GB cap) | RTX 5090 | n/a (3) | n/a (3) | 0.96 / 2.16 / 2.63 - 3.18 |
+| | RTX 4090 (2) | n/a (3) | n/a (3) | 0.58 / 2.11 / 0.24 - 1.29 |
+| | RTX 3090 | n/a (3) | n/a (3) | 0.36 / 2.11 / 1.93 - 2.81 |
+| | RTX 2080 Ti | n/a (3) | n/a (3) | 0.18 / 2.11 / 2.15 - 2.73 |
+| | Tesla T10 | n/a (3) | n/a (3) | 0.17 / 2.11 / 1.96 - 2.69 |
+
+Every capped `vram_8g` / `vram_6g` row stayed within its 8 / 6 GB cap. A separate
+final-tree run of the 8 GB and 6 GB layers on the RTX 5090 with both caches measured
+3.3 GB in nvidia-smi.
+
+The other release setups, latent + text cache:
+
+| setup | GPU | samples/s | tok/s | step peak GiB | nvidia-smi peak GiB (prewarm / steps) | prewarm above steps (4) |
+| --- | --- | --- | --- | --- | --- | --- |
+| LoRA r32, `minimal` | RTX 5090 | 0.98 | 3950 | 2.20 | 3.08 / 4.06 | yes |
+| | RTX 4090 (2) | 0.63 | 2513 | 2.15 | 3.02 / 4.43 | yes |
+| | RTX 3090 | 0.37 | 1472 | 2.15 | 2.01 / 3.62 | yes |
+| | RTX 2080 Ti | 0.17 | 706 | 2.15 | 1.81 / 3.50 | no |
+| | Tesla T10 | 0.16 | 639 | 2.15 | 1.79 / 3.45 | no |
+| LoKr 16, int8 base, fp16, `ckpt-stream2-actoff-optstream-gradoff` | RTX 5090 | 0.88 | 3555 | 1.81 | 2.73 / 4.58 | no |
+| | RTX 4090 (2) | 0.54 | 2166 | 1.67 | 3.67 / 8.19 | no |
+| | RTX 3090 | 0.31 | 1247 | 1.68 | 2.09 / 3.72 | no |
+| | RTX 2080 Ti | 0.17 | 686 | 1.68 | 2.06 / 2.90 | no |
+| | Tesla T10 | 0.15 | 602 | 1.67 | 2.04 / 4.29 | no |
+| LoRA r32, fp8_compute base, `balanced` | RTX 5090 | 1.38 | 5572 | 6.61 | 5.73 / 9.68 | no |
+| | RTX 4090 (2) | 0.85 | 3404 | 6.54 | 6.77 / 10.34 | no |
+
+Larger batches, RTX 5090, LoRA r32, latent + text cache (the 8x budget was not
+measured):
+
+| profile | token budget | tokens / step | samples/s | tok/s | nvidia-smi peak GiB |
+| --- | --- | --- | --- | --- | --- |
+| `balanced` | 8192 (the rows above) | not measured | 1.14 | 4596 | 9.54 |
+| `balanced` | 16384 | 12082 | 1.26 | 5050 | 12.85 |
+| `balanced` | 32768 | 29676 | 1.34 | 4975 | 19.53 |
+| `ckpt-resident` | 16384 | 12059 | 1.27 | 5071 | 18.06 |
+| `ckpt-resident` | 32768 | 29494 | 1.34 | 4977 | 24.64 |
+
+How measured: each run is 40 steps of the train script on the real weights and a
+kohya-style dataset at a 1 MP target area, packed to 8192 tokens per step (the
+`vram_8g` / `vram_6g` rows: the layer's 4352); samples/s and tok/s are medians over the
+steps after step 10. "step peak"
+is torch's per-step peak of allocated memory; the nvidia-smi peaks are the training
+process's, sampled every 500 ms, split at the first step into startup + kernel prewarm
+and the step loop. The 8 GB / 6 GB rows run with the allocator capped at the target.
+Caches-off rows were measured with the text encoder streamed; this release keeps it
+resident where it fits, which is faster on 32 GB+ cards. First-run kernel tuning runs
+before step 0 and is not in samples/s. The runs used release tree 7356056ba5 (content
+7209a988 and 6f967733, the same runtime code); the `vram_8g` no-cache and latent-cache
+rows ran on that runtime with the extra bench rows added.
+
+(1) The run shared the card with another process, so it is not reported.
+(2) Windows (WDDM): nvidia-smi reports the card's use above its idle baseline, not the
+process's own.
+(3) The 6 GB layer requires both offline caches.
+(4) "yes": a startup + kernel-prewarm peak (torch or nvidia-smi) was above the steps'.
 <!-- release-tables:speed-vram:end -->
 
 <!-- release-tables:inference:begin -->
-**Measured sampling speed and VRAM per GPU.** This table is filled from the release
-bench matrix: GPU, memory profile, base precision, s/step at 1024^2, nvidia-smi peak.
+### Measured sampling VRAM
+
+`scripts/sample/sample.py`, 1 MP (1024x1024), CFG, on the final release tree:
+
+| GPU | DiT memory profile | text encoder / VAE | s/step | nvidia-smi peak GB |
+| --- | --- | --- | --- | --- |
+| RTX 5090 | `minimal` | `auto` | not measured | 3.4 |
+| RTX 5090 | `low` | `auto` | not measured | 3.8 |
+
+Sampling speed was not measured on the release tree. Development-tree measurements (RTX
+5090 fp8 / MXFP8 compute, RTX 3090 weight streaming) are in
+[docs/guides/inference.md](docs/guides/inference.md).
 <!-- release-tables:inference:end -->
 
 ## Architecture
