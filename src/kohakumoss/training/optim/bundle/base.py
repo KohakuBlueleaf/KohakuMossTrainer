@@ -5,21 +5,27 @@ the agreed non-finite flag come back in one `.tolist()`.
 """
 
 from collections.abc import Callable
+from functools import partial
 
 import torch
 from torch import Tensor
 from torch.optim import Optimizer
+
+from kohakumoss.training.optim.bundle.nonfinite import (
+    grad_report,
+    nonfinite_count,
+    param_names,
+)
+from kohakumoss_common.calls import nothing
 
 
 def local_grad_norm(grads: list[Tensor]) -> Tensor:
     """fp32 L2 norm of all grads (replicated grads: identical on every rank)."""
     if not grads:
         return torch.zeros((), dtype=torch.float32)
-    norms = torch._foreach_norm(grads, 2.0)
+    norms = torch._foreach_norm(grads, 2.0, dtype=torch.float32)
     dev = grads[0].device
-    return torch.linalg.vector_norm(
-        torch.stack([n.float().to(dev) for n in norms]), 2.0
-    )
+    return torch.linalg.vector_norm(torch.stack([n.to(dev) for n in norms]), 2.0)
 
 
 def all_reduce_norm(grads: list[Tensor]) -> Tensor:
@@ -38,8 +44,17 @@ def all_reduce_max(flag: Tensor) -> Tensor:
     return flag
 
 
-def _clip_off(grads: list[Tensor], norm: Tensor) -> None:
-    return None
+def separate_reduce(
+    reduce_loss: Callable, agree: Callable, loss: Tensor, bad: Tensor
+) -> tuple[Tensor, Tensor]:
+    """(reduced loss, agreed int32 flag) through the two hooks, one call each."""
+    return reduce_loss(loss), agree(bad)
+
+
+def step_reducer(reduce_loss: Callable, agree: Callable, reduce_step=None) -> Callable:
+    """`(loss, bad) -> (loss, bad)` of a step: `reduce_step` when the parallel layout
+    folds both into one collective, else `reduce_loss` and `agree`."""
+    return reduce_step or partial(separate_reduce, reduce_loss, agree)
 
 
 def _by_device(grads: list[Tensor]) -> dict:
@@ -56,7 +71,7 @@ def make_clipper(
     `multi_device`: grads span devices (threaded pipeline), one coefficient copy each.
     """
     if max_norm <= 0:
-        return _clip_off
+        return nothing
 
     def clip(grads: list[Tensor], norm: Tensor) -> None:
         coef = (max_norm / (norm + 1e-6)).clamp(max=1.0)
@@ -79,7 +94,7 @@ def decay_to_one(groups: list[dict], optimizer: Optimizer) -> Callable[[], None]
         if g.get("decay_to_one")
     ]
     if not targets:
-        return _noop
+        return nothing
 
     @torch.no_grad()
     def apply() -> None:
@@ -91,8 +106,12 @@ def decay_to_one(groups: list[dict], optimizer: Optimizer) -> Callable[[], None]
     return apply
 
 
-def _noop() -> None:
-    return None
+def close_optimizers(*opts) -> None:
+    """Stop the host worker threads of the optimisers among `opts` that run them."""
+    for opt in opts:
+        close = getattr(opt, "close", None)
+        if close is not None:
+            close()
 
 
 class Bundle:
@@ -107,29 +126,36 @@ class Bundle:
         grad_clip: float,
         grad_norm: Callable[[list[Tensor]], Tensor] = local_grad_norm,
         agree: Callable[[Tensor], Tensor] = no_agree,
-        train_mode: Callable[[], None] = _noop,
-        eval_mode: Callable[[], None] = _noop,
-        before: Callable[[], None] = _noop,
-        after: Callable[[], None] = _noop,
+        train_mode: Callable[[], None] = nothing,
+        eval_mode: Callable[[], None] = nothing,
+        before: Callable[[], None] = nothing,
+        after: Callable[[], None] = nothing,
         reduce_loss: Callable[[Tensor], Tensor] = no_agree,
         grads: Callable[[], list[Tensor]] | None = None,
         device: torch.device | None = None,
+        reduce_step: Callable | None = None,
+        grad_names: Callable[[], list[str]] | None = None,
     ):
         self.optimizer = optimizer
+        self.shared = None
+        self.blocks = None
         self.schedule = schedule
         self.scaler = scaler
         self.params = [p for g in groups for p in g["params"]]
+        self.names = param_names(groups)
+        self.nonfinite_grads: list[dict] = []
+        self._report = self._device_report if grads is None else self._host_report
         self._grads = grads or self._device_grads
+        self._grad_names = grad_names
         self.clip = make_clipper(
             grad_clip, len({p.device for p in self.params}) > 1 or grads is not None
         )
         self.grad_norm = grad_norm
-        self.agree = agree
+        self.reduce = step_reducer(reduce_loss, agree, reduce_step)
         self.before = before
         self.after = after
-        self.reduce_loss = reduce_loss
         self.post_step = (
-            _noop
+            nothing
             if getattr(optimizer, "handles_decay_to_one", False)
             else decay_to_one(groups, optimizer)
         )
@@ -140,6 +166,7 @@ class Bundle:
         self.last_loss = float("nan")
         self.last_norm = float("nan")
         self.last_ok = True
+        self.last_nonfinite_params = 0
         self.skipped = 0
         self.nonfinite = 0
 
@@ -155,18 +182,29 @@ class Bundle:
     def _device_grads(self) -> list[Tensor]:
         return [p.grad for p in self.params if p.grad is not None]
 
+    def _device_report(self, grads: list[Tensor]) -> list[dict]:
+        return grad_report([(n, p.grad) for n, p in zip(self.names, self.params)])
+
+    def _host_report(self, grads: list[Tensor]) -> list[dict]:
+        """Host gradients reported by their parameter names (`grad_names`)."""
+        names = self._grad_names() if self._grad_names is not None else []
+        names += [f"host_grad[{i}]" for i in range(len(names), len(grads))]
+        return grad_report(list(zip(names, grads)))
+
     def step(self) -> bool:
         self.before()
         grads = self._grads()
         self.scaler.unscale_(grads)
         norm = self.grad_norm(grads).to(self.device)
-        loss = self.reduce_loss(self._loss.reshape(1).clone())
-        bad = (~torch.isfinite(norm) | ~torch.isfinite(loss)).to(torch.int32).reshape(1)
-        bad = self.agree(bad)
+        local = (~torch.isfinite(norm)).to(torch.int32).reshape(1)
+        loss, bad = self.reduce(self._loss.reshape(1).clone(), local)
+        bad = (bad > 0) | ~torch.isfinite(loss.reshape(1))
         loss_v, norm_v, bad_v = torch.cat(
             [loss.reshape(1).float(), norm.reshape(1).float(), bad.float()]
         ).tolist()
         ok = bad_v == 0
+        self.nonfinite_grads = []
+        self.last_nonfinite_params = 0
         if ok:
             self.clip(grads, norm)
             self.optimizer.step()
@@ -174,6 +212,8 @@ class Bundle:
         else:
             self.skipped += 1
             self.nonfinite += 1
+            self.nonfinite_grads = self._report(grads)
+            self.last_nonfinite_params = nonfinite_count(grads)
         self.after()
         self.schedule.step()
         self.scaler.update(not ok)
@@ -187,6 +227,9 @@ class Bundle:
 
     def zero_grad(self) -> None:
         self.optimizer.zero_grad(set_to_none=True)
+
+    def close(self) -> None:
+        close_optimizers(self.optimizer)
 
     @property
     def lr(self) -> float:

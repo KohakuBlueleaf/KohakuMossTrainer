@@ -1,17 +1,19 @@
-"""Direct full finetune: the backbone's own parameters are trainable (AdapterSet API)."""
+"""Full finetune: the backbone's own parameters train, behind the AdapterSet API."""
 
 import re
 
 import torch
 from torch import Tensor, nn
 
+from kohakumoss.adapters.train.adapter_set import FULL_TAG, fold_metadata
 from kohakumoss.model import save_diffusers
 from kohakumoss.model.io.save import save_single
 from kohakumoss.training.optim.groups import build_param_groups
 
 
 class FullTrainable:
-    """Trains every backbone parameter except those matching `frozen` patterns."""
+    """Trains every backbone parameter except those matching `frozen` patterns; the
+    trainable parameters are looked up by name on the live model (FSDP2 included)."""
 
     def __init__(
         self,
@@ -21,13 +23,18 @@ class FullTrainable:
     ):
         self.model = model
         patterns = [re.compile(p) for p in frozen]
-        self.named = []
+        self.names = set()
         for name, p in model.named_parameters():
             train = not any(pat.match(name) for pat in patterns)
             p.requires_grad_(train)
             if train:
-                self.named.append((name, p))
+                self.names.add(name)
         self.decay_to_one = decay_to_one
+        self.prewarm_stats: dict[str, int] = {}
+
+    @property
+    def named(self) -> list[tuple[str, nn.Parameter]]:
+        return [(n, p) for n, p in self.model.named_parameters() if n in self.names]
 
     def trainable_params(self):
         return [p for _, p in self.named]
@@ -47,6 +54,11 @@ class FullTrainable:
 
     def state_dict(self) -> dict[str, Tensor]:
         return {name: p.detach() for name, p in self.named}
+
+    def state_metadata(self) -> dict[str, str]:
+        """The metadata of a `state_dict()` file: FULL_TAG and the weight fold the
+        weights are stored in (FOLD_KEY)."""
+        return {FULL_TAG: "1", **fold_metadata(self.model)}
 
     @torch.no_grad()
     def load_state_dict(self, state: dict[str, Tensor]) -> None:
@@ -70,7 +82,15 @@ class FullTrainable:
     def end_step(self) -> None:
         return None
 
-    def prewarm(self, rows: list[int], dtype: torch.dtype, devices: list) -> int:
+    def step_state(self):
+        return None
+
+    def set_step_state(self, state) -> None:
+        return None
+
+    def prewarm(
+        self, rows: list[int], dtype: torch.dtype, devices: list, budgets=None
+    ) -> int:
         return 0
 
     @property

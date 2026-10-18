@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 
+import torch
 from anyschedule import AnySchedule
 from torch.optim import Optimizer
 
@@ -21,5 +22,31 @@ def schedule_config(schedule: dict, steps: int) -> dict:
     return cfg
 
 
-def build_schedule(optimizer: Optimizer, schedule: dict, steps: int) -> AnySchedule:
-    return AnySchedule(optimizer, config=schedule_config(schedule, steps))
+class Schedule(AnySchedule):
+    """AnySchedule whose `load_state_dict` also writes the restored step's values (lr
+    and every other scheduled key) into the optimiser's groups."""
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        super().load_state_dict(state_dict)
+        apply_current(self)
+
+
+def apply_current(schedule: AnySchedule) -> None:
+    """The schedule's values at its current step written into its optimiser's groups."""
+    groups = schedule.optimizer.param_groups
+    for group, lr in zip(groups, schedule.get_last_lr()):
+        group["lr"] = lr
+    for key, factor in schedule.get_factors().items():
+        if key == "lr":
+            continue
+        for group, base in zip(groups, schedule.base_param_groups[key]):
+            if key not in group:
+                continue
+            if isinstance(group[key], torch.Tensor):
+                group[key].fill_(factor * base)
+            else:
+                group[key] = factor * base
+
+
+def build_schedule(optimizer: Optimizer, schedule: dict, steps: int) -> Schedule:
+    return Schedule(optimizer, config=schedule_config(schedule, steps))

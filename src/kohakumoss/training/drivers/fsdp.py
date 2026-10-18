@@ -6,7 +6,6 @@ from kohakumoss.parallel.fsdp import (
     load_optimizer_state,
     optimizer_state,
     shard_like,
-    unsharded,
 )
 from kohakumoss.training.drivers.common import Parts
 from kohakumoss.training.state import TrainState
@@ -20,12 +19,10 @@ class FsdpParts(Parts):
         self.model = model
 
     def full_trainable(self) -> dict:
-        """The trainable state as full host tensors (every rank)."""
-        with unsharded(self.model):
-            return {
-                k: v.detach().to("cpu", copy=True)
-                for k, v in self.trainable.state_dict().items()
-            }
+        """The trainable state as full host tensors in the shards' (master) dtype,
+        gathered from the sharded parameters (every rank)."""
+        state = full_tensors(self.trainable.state_dict())
+        return {k: v.detach().to("cpu", copy=True) for k, v in state.items()}
 
     def __call__(self, state: TrainState) -> dict:
         parts = super().__call__(state)

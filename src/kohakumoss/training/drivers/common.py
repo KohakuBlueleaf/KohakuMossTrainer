@@ -5,6 +5,7 @@ from collections.abc import Callable, Iterable, Iterator
 
 from kohakumoss.training.state import TrainState
 from kohakumoss.training.step import image_token_count, image_tokens_per_sample
+from kohakumoss_common.calls import nothing
 
 
 def no_accumulate(last: bool):
@@ -13,14 +14,19 @@ def no_accumulate(last: bool):
 
 
 def grouped(loader: Iterable, n: int) -> Iterator[list]:
-    """Endless lists of `n` host batches (re-iterates the loader when it ends)."""
+    """Endless lists of `n` host batches; a group continues across loader passes, and a
+    pass that yields no batch raises."""
+    group = []
     while True:
-        group = []
+        seen = False
         for hb in loader:
+            seen = True
             group.append(hb)
             if len(group) == n:
                 yield group
                 group = []
+        if not seen:
+            raise RuntimeError("the training loader yielded no batch in a full pass")
 
 
 def last_flags(n: int) -> tuple[bool, ...]:
@@ -48,7 +54,35 @@ def account(state: TrainState, group: list) -> None:
     state.batch_ids = ids
 
 
+def micro_steps(
+    step, batcher, accumulate, lasts, bundle, group, denom, index: int, ema=None
+):
+    """Forward + backward of one optimiser step's micro-batches; the last StepOut.
+    `ema.join` (an EMA updating in the background) runs before each backward."""
+    join = getattr(ema, "join", nothing)
+    out = None
+    for hb, last in zip(group, lasts):
+        batch = batcher(hb)
+        with accumulate(last):
+            out = step(batch, denom, index)
+            join()
+            bundle.backward(out.loss)
+    return out
+
+
+def finish_step(state: TrainState, group: list, bundle, ema, runner, out) -> None:
+    """After a group's backward: count it, apply the optimiser step (EMA on success),
+    advance `state.step`, record the step and run the callbacks."""
+    account(state, group)
+    if bundle.step():
+        ema.update(state.step)
+    state.step += 1
+    record(state, bundle)
+    runner.run(state, out)
+
+
 def record(state: TrainState, bundle) -> None:
+    """Copy the bundle's host-side step results into `state`."""
     state.loss = bundle.last_loss
     state.grad_norm = bundle.last_norm
     state.ok = bundle.last_ok
@@ -56,6 +90,8 @@ def record(state: TrainState, bundle) -> None:
     state.scale = bundle.scaler.scale
     state.skipped = bundle.skipped
     state.nonfinite = bundle.nonfinite
+    state.nonfinite_params = bundle.last_nonfinite_params
+    state.nonfinite_names = [g["param"] for g in bundle.nonfinite_grads]
 
 
 class Parts:
@@ -74,6 +110,7 @@ class Parts:
     def __call__(self, state: TrainState) -> dict:
         return {
             "trainable": self.trainable.state_dict(),
+            "trainable_meta": self.trainable.state_metadata(),
             "ema": self.ema.state_dict(),
             "ema_gammas": dict(
                 zip(getattr(self.ema, "tags", ()), getattr(self.ema, "gammas", ()))
@@ -100,3 +137,22 @@ class Parts:
         state.step = int(st["step"])
         for key in ("tokens", "samples", "joint_sq", "text_tokens"):
             setattr(state, key, int(st.get(key, 0)))
+
+    def before_export(self) -> None:
+        """Make the live trainable set the run's full trained state (every rank calls
+        it; one process holds it already)."""
+        return None
+
+
+class ShardedOptimParts(Parts):
+    """Parts whose optimiser state is sharded across ranks (DDP block owners of the
+    streamed masters): every rank writes and reads its own `optim.<rank>.pt`."""
+
+    def __call__(self, state: TrainState) -> dict:
+        parts = super().__call__(state)
+        parts["optim_rank"] = parts["optim"]
+        parts["optim"] = {}
+        return parts
+
+    def restore(self, ckpt: dict, state: TrainState) -> None:
+        super().restore({**ckpt, "optim": ckpt["optim_rank"]}, state)

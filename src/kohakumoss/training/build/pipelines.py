@@ -6,47 +6,67 @@ from functools import partial
 import torch
 
 from kohakumoss.model.opset import OpSet
-from kohakumoss.parallel.parts import BackboneParts
-from kohakumoss.parallel.pipeline import PipelineEngine, PipeShape
-from kohakumoss.parallel.threaded import ThreadedPipeline, even_bounds
+from kohakumoss.parallel.pipeline.distributed import (
+    PipelineEngine,
+    PipeShape,
+    TokenLoss,
+    stages_per_rank,
+)
+from kohakumoss.parallel.pipeline.parts import BackboneParts
+from kohakumoss.parallel.pipeline.split import stage_bounds
+from kohakumoss.parallel.pipeline.threaded import ThreadedPipeline
+from kohakumoss.precision import autocast_factory
 from kohakumoss.training.build.objective import build_loss
-from kohakumoss.training.drivers.pipeline import PipelineObjective
 
 
-def _opset_for(policy, kernels: dict, device):
-    return OpSet.resolve(device, policy.compute, kernels)
+def _opset_for(prec, kernels: dict, device):
+    return OpSet.resolve(device, prec.compute, kernels)
 
 
-def build_threaded(k: dict, built, policy):
-    """ThreadedPipeline over DEVICES, each stage bound to its device's kernels."""
+def build_threaded(k: dict, built, prec, device: torch.device):
+    """ThreadedPipeline over DEVICES (of the training device's type), each stage bound
+    to its device's kernels."""
     parts = BackboneParts(built.backbone)
-    devices = [torch.device("cuda", i) for i in k["DEVICES"]]
+    devices = [torch.device(device.type, i) for i in k["DEVICES"]]
     schedule = k["PIPELINE_SCHEDULE"]
     return ThreadedPipeline(
         parts,
         devices,
         epilogue_modules=parts.epilogue_modules(),
         runner=built.backbone.runner,
-        opset_for=partial(_opset_for, policy, k["KERNELS"]),
+        opset_for=partial(_opset_for, prec, k["KERNELS"]),
         schedule=schedule,
     )
 
 
-def pipeline_objective(k: dict, built) -> PipelineObjective:
+def pipeline_objective(k: dict, built) -> TokenLoss:
     """The last stage's loss: LOSS / LOSS_KWARGS, as TrainStep builds it (the scaler
     is set once the optimiser bundle exists)."""
-    return PipelineObjective(build_loss(k, built), scaler=None)
+    return TokenLoss(build_loss(k, built))
 
 
-def build_engine(k: dict, built, policy, rank: int, world: int, device):
-    """(PipelineEngine for this rank, its objective) with static micro-batch shapes:
-    MAX_TOKENS joint tokens and MAX_SAMPLES samples per micro-batch (both hard bounds of
-    the planner under TOKEN_BUDGET='exact')."""
+def build_engine(k: dict, built, prec, rank: int, world: int, device):
+    """(PipelineEngine for this rank, its objective) with static micro-batch shapes
+    (MAX_TOKENS joint tokens and MAX_SAMPLES samples per micro-batch, hard bounds of
+    the planner under TOKEN_BUDGET='exact') and the PIPELINE_SPLIT stage ranges."""
     parts = BackboneParts(built.backbone)
     cfg = built.backbone.cfg
     shape = PipeShape.from_knobs(k, dim=cfg.dim, rope_axes=cfg.rope_axes)
-    per_rank = 1 if k["PIPELINE_SCHEDULE"] in ("gpipe", "1f1b") else 2
-    bounds = even_bounds(cfg.depth, world * per_rank)
+    schedule = k["PIPELINE_SCHEDULE"]
+    per_rank = stages_per_rank(schedule)
+    runner = built.backbone.runner
+    bounds = stage_bounds(
+        k["PIPELINE_SPLIT"],
+        parts,
+        shape,
+        schedule,
+        rank,
+        world,
+        device,
+        autocast_factory(prec, device),
+        runner,
+        per_rank,
+    )
     objective = pipeline_objective(k, built)
     engine = PipelineEngine(
         parts,
@@ -55,10 +75,10 @@ def build_engine(k: dict, built, policy, rank: int, world: int, device):
         device,
         shape,
         bounds,
-        k["PIPELINE_SCHEDULE"],
+        schedule,
         objective,
-        policy.compute,
-        runner=built.backbone.runner,
+        prec.compute,
+        runner=runner,
         per_rank=per_rank,
     )
     return engine, objective

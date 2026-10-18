@@ -11,43 +11,29 @@ import re
 import shutil
 from pathlib import Path
 
-import torch.distributed as dist
-from safetensors.torch import save_file
-
+from kohakumoss.parallel.launch import ranks_meet
 from kohakumoss.training.checkpoint.io import (
     capture_rng,
     is_complete,
     load_checkpoint,
+    load_optim_rank,
     load_rng,
     restore_rng,
     save_checkpoint,
+    save_optim_rank,
     save_rng,
 )
+from kohakumoss.training.checkpoint.stream import save_stream
+from kohakumoss_common.calls import nothing
 
 STEP_DIR = "step_{:08d}"
 STEP_NAME = re.compile(r"step_\d{8}")
 PARTIAL = ".partial"
 
 
-def _no_snapshot(step: int, ema: dict, gammas: dict) -> None:
-    return None
-
-
-def _no_write(step: int, parts: dict) -> None:
-    return None
-
-
-def _nothing() -> None:
-    return None
-
-
-def _no_clear(partial: Path) -> None:
-    return None
-
-
 def _barrier() -> None:
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
+    """Every rank meets on the store (`ranks_meet`: DIST_GATE_TIMEOUT)."""
+    ranks_meet("checkpoint")
 
 
 class CheckpointManager:
@@ -61,32 +47,35 @@ class CheckpointManager:
         keep_last: int,
         snapshot_ema: bool = False,
         is_main: bool = True,
-        before_save=_nothing,
+        before_save=nothing,
         rank: int = 0,
         devices=(),
     ):
         self.root = Path(output_dir) / "checkpoints"
         self.snap_root = Path(output_dir) / "ema_snapshots"
         self.keep_last = keep_last
-        self.snapshot = self._snapshot if snapshot_ema else _no_snapshot
+        self.snapshot = self._snapshot if snapshot_ema else nothing
         self.before_save = before_save
         self.rank = rank
         self.devices = tuple(devices)
         self.last_saved = -1
-        self._save = self._write if is_main else _no_write
-        self._clear = self._clear_partial if is_main else _no_clear
+        self._save = self._write if is_main else nothing
+        self._clear = self._clear_partial if is_main else nothing
 
     def saved(self, step: int) -> bool:
         """Whether this manager already wrote the checkpoint of `step`."""
         return step == self.last_saved
 
     def save(self, step: int, parts: dict) -> Path | None:
-        """Every rank: its RNG file; rank 0: the shared parts, then the rename."""
+        """Every rank: its RNG file (and its optimiser shard, `parts["optim_rank"]`);
+        rank 0: the shared parts, then the rename."""
         self.before_save()
         partial = self.root / (STEP_DIR.format(step) + PARTIAL)
         self._clear(partial)
         _barrier()
         save_rng(partial, self.rank, capture_rng(parts["step_rng"], self.devices))
+        if "optim_rank" in parts:
+            save_optim_rank(partial, self.rank, parts["optim_rank"])
         _barrier()
         path = self._save(step, parts)
         _barrier()
@@ -94,7 +83,8 @@ class CheckpointManager:
         return path
 
     def _write(self, step: int, parts: dict) -> Path:
-        """`parts`: trainable, ema, optim, step_rng, state (dicts)."""
+        """`parts`: trainable, ema, optim, step_rng, state (dicts) and the trainable
+        file's metadata (trainable_meta)."""
         final = self.root / STEP_DIR.format(step)
         partial = save_checkpoint(
             self.root / (STEP_DIR.format(step) + PARTIAL),
@@ -102,6 +92,7 @@ class CheckpointManager:
             parts["ema"],
             parts["optim"],
             {**parts["state"], "step": step},
+            parts.get("trainable_meta"),
         )
         if final.exists():
             shutil.rmtree(final)
@@ -124,14 +115,11 @@ class CheckpointManager:
     def _snapshot(self, step: int, ema: dict, gammas: dict) -> None:
         self.snap_root.mkdir(parents=True, exist_ok=True)
         name = f"{STEP_DIR.format(step)}.safetensors"
-        save_file(
-            {k: v.detach().cpu().contiguous() for k, v in ema.items()},
-            str(self.snap_root / name),
-        )
+        save_stream(ema, self.snap_root / name)
         index_file = self.snap_root / "index.json"
         index = json.loads(index_file.read_text()) if index_file.exists() else []
         index.append({"step": step, "file": name, "gammas": gammas})
-        index_file.write_text(json.dumps(index, indent=2))
+        index_file.write_text(json.dumps(index, indent=2), encoding="utf-8")
 
     def prune(self) -> None:
         """Keep the newest `keep_last` complete checkpoints (all when keep_last <= 0)."""
@@ -159,4 +147,5 @@ class CheckpointManager:
         states returned as `step_rng`."""
         ckpt = load_checkpoint(path)
         ckpt["step_rng"] = restore_rng(load_rng(path, self.rank), self.devices)
+        ckpt["optim_rank"] = load_optim_rank(path, self.rank)
         return ckpt

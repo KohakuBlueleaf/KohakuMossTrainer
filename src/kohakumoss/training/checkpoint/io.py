@@ -1,8 +1,10 @@
 """Checkpoint directory I/O.
 
-<dir>/trainable.safetensors   AdapterSet.state_dict()
+<dir>/trainable.safetensors   AdapterSet.state_dict(), metadata AdapterSet.state_metadata()
 <dir>/ema.safetensors         EMA buffers (when enabled)
 <dir>/optim.pt                OptimBundle.state_dict()
+<dir>/optim.<rank>.pt         one per rank when the optimiser state is sharded (DDP
+                              block owners): that rank's OptimBundle.state_dict()
 <dir>/rng.<rank>.pt           one per rank: global torch / CUDA (this rank's devices) /
                               numpy / python RNG and the step generators
 <dir>/state.json              step, loader state, token / sample counters, world
@@ -14,11 +16,25 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
+
+from kohakumoss.training.checkpoint.stream import save_stream
+
+_MULTIARRAY = np._core.multiarray if hasattr(np, "_core") else np.core.multiarray
+NUMPY_RNG_GLOBALS = (
+    np.ndarray,
+    np.dtype,
+    type(np.dtype(np.uint32)),
+    _MULTIARRAY._reconstruct,
+)
 
 
-def _cpu(sd: dict) -> dict:
-    return {k: v.detach().to("cpu").contiguous() for k, v in sd.items()}
+def load_pt(file: Path):
+    """torch.load of a checkpoint `.pt` file with `weights_only=True`: tensors, Python
+    containers and scalars, plus the numpy types of a numpy RNG state (the only
+    non-tensor objects the writer stores); any other global is refused."""
+    with torch.serialization.safe_globals(list(NUMPY_RNG_GLOBALS)):
+        return torch.load(file, map_location="cpu", weights_only=True)
 
 
 def _cuda_indices(devices) -> list[int]:
@@ -66,7 +82,25 @@ def load_rng(path: str | Path, rank: int) -> dict:
         raise FileNotFoundError(
             f"{file} missing: the checkpoint was written by fewer ranks than this run"
         )
-    return torch.load(file, map_location="cpu", weights_only=False)
+    return load_pt(file)
+
+
+def optim_rank_file(path: str | Path, rank: int) -> Path:
+    return Path(path) / f"optim.{rank}.pt"
+
+
+def save_optim_rank(path: str | Path, rank: int, optim: dict) -> None:
+    """Write one rank's optimiser shard (state sharded across ranks) into `path`."""
+    Path(path).mkdir(parents=True, exist_ok=True)
+    torch.save(optim, optim_rank_file(path, rank))
+
+
+def load_optim_rank(path: str | Path, rank: int) -> dict | None:
+    """This rank's optimiser shard, or None when the checkpoint has none."""
+    file = optim_rank_file(path, rank)
+    if not file.exists():
+        return None
+    return load_pt(file)
 
 
 def save_checkpoint(
@@ -75,16 +109,21 @@ def save_checkpoint(
     ema: dict,
     optim: dict,
     state: dict,
+    trainable_meta: dict[str, str] | None = None,
 ) -> Path:
     """Write the shared parts to `path` (created); state.json last, so it marks
-    completeness. The rank RNG files are written before (`save_rng`)."""
+    completeness. The rank RNG files are written before (`save_rng`).
+    `trainable_meta` (the trainable set's `state_metadata()`) is the trainable file's
+    safetensors metadata, which export and inference read."""
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
-    save_file(_cpu(trainable), str(path / "trainable.safetensors"))
+    save_stream(trainable, path / "trainable.safetensors", trainable_meta)
     if ema:
-        save_file(_cpu(ema), str(path / "ema.safetensors"))
+        save_stream(ema, path / "ema.safetensors")
     torch.save(optim, path / "optim.pt")
-    (path / "state.json").write_text(json.dumps(state, indent=2, default=str))
+    (path / "state.json").write_text(
+        json.dumps(state, indent=2, default=str), encoding="utf-8"
+    )
     return path
 
 
@@ -95,7 +134,7 @@ def load_checkpoint(path: str | Path) -> dict:
     return {
         "trainable": load_file(str(path / "trainable.safetensors")),
         "ema": load_file(str(ema_file)) if ema_file.exists() else {},
-        "optim": torch.load(path / "optim.pt", map_location="cpu", weights_only=False),
+        "optim": load_pt(path / "optim.pt"),
         "state": json.loads((path / "state.json").read_text()),
     }
 

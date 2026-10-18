@@ -1,56 +1,93 @@
-"""Train-script knobs: collection from globals and validation into one SystemExit."""
-
-import difflib
-import os
-import sys
-from pathlib import Path
+"""Train-script knobs: collection from globals and validation into one SystemExit. The
+area checks live in `training.checks`; this module holds the knob set, the choices,
+the precision and memory-plan checks and `check`."""
 
 import torch
 
+from kohakumoss.adapters.build.config import config_from_knobs
 from kohakumoss.diffusion.objective import LOSSES, WEIGHTINGS
 from kohakumoss.diffusion.timestep import TIMESTEPS
+from kohakumoss.encoders.knob_names import ENCODER_FIELDS, RENAMED_SAMPLE, SAMPLE_NAMES
 from kohakumoss.logging import LOGGERS
+from kohakumoss.memory.knob_map import mixing_problems, plan_fields
+from kohakumoss.memory.profiles import KNOB_FIELDS, ORDER, PROFILES, resolve
+from kohakumoss.memory.release import release_problems
 from kohakumoss.offload.accel import default_type
-from kohakumoss.parallel.launch import default_backend
-from kohakumoss.training.memory.profiles import KNOB_FIELDS, ORDER, resolve
-from kohakumoss.training.optim import factory as optim_factory
-from kohakumoss.training.optim.factory import OPTIMIZERS
-from kohakumoss.training.precision import DTYPES
+from kohakumoss.precision import COMPUTE
+from kohakumoss.training.checks.encoders import text_problems, vae_problems
+from kohakumoss.training.checks.objective import (
+    REAL_VARIANTS,
+    carries_fp16_fix,
+    objective_problems,
+    schedule_problems,
+)
+from kohakumoss.training.checks.outputs import EXPORTS, io_problems
+from kohakumoss.training.checks.parallel import (
+    THREADED_SCHEDULES,
+    dist_backend,
+    parallel_problems,
+)
+from kohakumoss.training.layouts import LAYOUTS
+from kohakumoss.training.optim.optimizers.factory import OPTIMIZERS
+from kohakumoss.training.optim.optimizers.kwargs import optimizer_problems
 from kohakumoss.types.arch import PRESETS
 from kohakumoss.types.plans import MemoryPlan
-from kohakumoss_data import DataConfig, data_problems, pipeline_problems
+from kohakumoss_common.knobs import choice_problems, unknown_problems
+from kohakumoss_data import DataConfig, data_problems
 from kohakumoss_kernels import ops as kernel_ops
 from kohakumoss_kernels.hardware.arch import arch_of
+from kohakumoss_kernels.tuning.tuner import MODES as TUNE_MODES
+
+__all__ = [
+    "CHOICES",
+    "EXPORTS",
+    "KNOWN",
+    "REAL_VARIANTS",
+    "THREADED_SCHEDULES",
+    "carries_fp16_fix",
+    "check",
+    "dist_backend",
+    "plan_problems",
+    "validate",
+]
 
 KNOWN = frozenset(
-    """WEIGHTS VARIANT ARCH_OVERRIDES TEXT_ENCODER TEXT_DEVICE VAE TRAIN_TEXT_REFINER DATASETS
+    """WEIGHTS VARIANT ARCH_OVERRIDES TEXT_ENCODER TEXT_DEVICE TEXT_ENCODE VAE
+    VAE_ENCODE VAE_DTYPE TRAIN_TEXT_REFINER DATASETS
     RESOLUTION_MODE TARGET_AREA SIZE_STEP ASPECT_RANGE UPSCALE MAX_TOKENS BATCH_SIZE
     CAPTION TEXT_DROP LATENT_CACHE TEXT_CACHE CACHE_DTYPE CACHE_DIR CAPTION_VARIANTS FLIP
     NUM_WORKERS SEED ALGO PRESET DIM ALPHA ALGO_KWARGS DORA DORA_DETACH DROPOUT
     ADAPTER_MODE TRAIN_NORMS TIMESTEP TIMESTEP_KWARGS LOSS LOSS_KWARGS OPTIMIZER LR
     BETAS EPS WEIGHT_DECAY WD_RULES SCHEDULE GRAD_CLIP EMA PRECISION KEEP_FP32 FP16_FIX
     FP16_FIX_KWARGS
-    MEMORY_PROFILE MEMORY_OVERRIDES PARALLEL DIST_BACKEND DEVICES PIPELINE_SCHEDULE
+    MEMORY_PROFILE MEMORY_AUTO_FORCE MEMORY_OVERRIDES STEP_RELEASE PARALLEL DIST_BACKEND DEVICES
+    PIPELINE_SCHEDULE PIPELINE_SPLIT TRACE_STEPS PROFILE_STEPS FSDP_REDUCE
+    DDP_BACKEND DDP_REDUCE_DTYPE DIST_TIMEOUT DIST_GATE_TIMEOUT DIST_BIND
+    CHECKPOINT STREAM STREAM_RESIDENT PINNED ACT_OFFLOAD OPTIM_STATE GRAD_OFFLOAD
+    FUSED_STEP BASE_PRECISION FP8_RECIPE FP8_DGRAD
     MICROBATCHES KERNELS TUNE COMPILE DRIVER STEPS GRAD_ACC OUTPUT_DIR RUN_NAME LOGGER
-    LOG_EVERY SAMPLE_PROMPTS SAMPLE_EVERY SAMPLE_STEPS SAMPLE_CFG SAMPLE_SHIFT
+    LOG_EVERY METRICS_EVERY PROGRESS SAMPLE_PROMPTS SAMPLE_EVERY SAMPLE_STEPS SAMPLE_CFG SAMPLE_SHIFT
     SAMPLE_SKIP_LAYERS SAMPLE_SIZE SAMPLE_SEEDS VALIDATE_EVERY VALIDATION SAVE_EVERY
-    SAVE_MINUTES KEEP_LAST RESUME EXPORT_FORMATS WEIGHTING OPTIMIZER_KWARGS FULL_MODE
+    SAVE_MINUTES KEEP_LAST RESUME EXPORT_FORMATS WEIGHTING OPTIMIZER_KWARGS
     SAMPLE_NEGATIVE PROJECT LORAPLUS_RATIO BATCHING OVERLONG MAX_SAMPLES TOKEN_BUDGET
-    LYCORIS_COMPILE_DYNAMIC CROP PLANNER_KWARGS LATENT_ENCODER_ID LATENT_DRAW
+    CROP PLANNER_KWARGS LATENT_ENCODER_ID LATENT_DRAW
     TEXT_ENCODER_ID BACKGROUND RESAMPLE TEXT_CHARS_PER_TOKEN TEXT_OVERHEAD_TOKENS
-    MAX_TEXT_TOKENS PREFETCH PIN_MEMORY""".split()
+    MAX_TEXT_TOKENS PREFETCH PIN_MEMORY NONFINITE_PATIENCE DATA_RESCAN
+    DATA_SCAN_WORKERS DATA_WAIT""".split()
 )
-OPTIONAL = frozenset()
 CHOICES = {
     "ADAPTER_MODE": ("bypass", "merge"),
     "WD_RULES": ("moss", "none", "all"),
-    "MEMORY_PROFILE": ("speed", "balanced", "low", "minimal", "auto"),
-    "PARALLEL": ("none", "ddp", "fsdp", "pipeline", "threaded"),
+    "MEMORY_PROFILE": (*PROFILES, "auto"),
     "DIST_BACKEND": ("auto", "nccl", "gloo"),
-    "TUNE": ("auto", "off", "prewarm"),
+    "TUNE": TUNE_MODES,
     "COMPILE": ("off", "block", "model"),
     "DRIVER": ("native", "lightning"),
-    "FP16_FIX": ("none", "weights", "online", "fp32_residual"),
+    "FP16_FIX": ("none", "online", "fp32_residual"),
+    "FSDP_REDUCE": ("step", "micro"),
+    "DDP_BACKEND": ("kohakumoss", "torch"),
+    "DDP_REDUCE_DTYPE": ("fp32", "param"),
+    "DIST_BIND": ("lazy", "device"),
 }
 ALGOS = (
     "lora",
@@ -65,13 +102,26 @@ ALGOS = (
     "tlora",
     "full",
 )
-EXPORTS = ("comfy", "lycoris", "merged", "diffusers")
-THREADED_SCHEDULES = ("gpipe", "async")
+RENAMED = {
+    **RENAMED_SAMPLE,
+    "DIST_STARTUP_TIMEOUT": "renamed to DIST_GATE_TIMEOUT",
+    "TEXT_TOKENS_PER_SAMPLE": "removed: MEMORY_PROFILE='auto' reads the dataset's "
+    "longest caption",
+    **{name: f"the train script's name is SAMPLE_{name}" for name in SAMPLE_NAMES},
+    "SIZES": "the train script's name is SAMPLE_SIZE",
+    "SIZE": "the train script's name is SAMPLE_SIZE",
+}
+default_device_type = default_type
 
 
 def run_name(k: dict) -> str:
     """RUN_NAME, or "run" when empty (output folder, logger run, export file names)."""
     return k["RUN_NAME"] or "run"
+
+
+def is_full(k: dict) -> bool:
+    """Full finetune: the backbone's own weights train (no LyCORIS module)."""
+    return k["ALGO"] == "full"
 
 
 def collect(g: dict) -> dict:
@@ -84,20 +134,11 @@ def _registry_ok(name, registry) -> bool:
 
 
 def _unknown(k: dict) -> list[str]:
-    out = []
-    for name in sorted(set(k) - KNOWN - OPTIONAL):
-        close = difflib.get_close_matches(name, KNOWN | OPTIONAL, n=1)
-        hint = f" (did you mean {close[0]}?)" if close else ""
-        out.append(f"unknown knob {name}{hint}")
-    return out
+    return unknown_problems(k, KNOWN, RENAMED, ENCODER_FIELDS)
 
 
 def _choices(k: dict) -> list[str]:
-    return [
-        f"{name}={k[name]!r} not in {opts}"
-        for name, opts in CHOICES.items()
-        if name in k and k[name] not in opts
-    ]
+    return choice_problems(k, CHOICES)
 
 
 def _cuda_devices(k: dict) -> list[int]:
@@ -107,16 +148,13 @@ def _cuda_devices(k: dict) -> list[int]:
 
 
 def resolve_precision(k: dict) -> str:
-    """PRECISION with "auto" resolved: "fp32" on CPU (the reference mode), else "bf16"
-    when every training device has it, else "fp16"."""
+    """PRECISION with "auto" resolved: "bf16" when every training CUDA device has it,
+    else "fp16"; "bf16" off CUDA."""
     if k["PRECISION"] != "auto":
         return k["PRECISION"]
-    match default_device_type():
-        case "cpu":
-            return "fp32"
-        case "cuda":
-            bf16 = all(arch_of(f"cuda:{i}").has_bf16 for i in _cuda_devices(k))
-            return "bf16" if bf16 else "fp16"
+    if default_device_type() == "cuda":
+        bf16 = all(arch_of(f"cuda:{i}").has_bf16 for i in _cuda_devices(k))
+        return "bf16" if bf16 else "fp16"
     return "bf16"
 
 
@@ -125,16 +163,11 @@ def with_precision(k: dict) -> dict:
     return {**k, "PRECISION": resolve_precision(k)}
 
 
-def _device_rules(k: dict) -> list[str]:
+def _device_problems(k: dict) -> list[str]:
     """Per-device checks over every entry of DEVICES that exists on this host."""
-    out = []
-    if k.get("PRECISION") == "fp32" and default_device_type() != "cpu":
-        out.append(
-            "PRECISION='fp32' trains with fp32 matmuls, which GPU training does not "
-            "use: set 'bf16', 'fp16' or 'auto' (fp32 is the CPU / test reference mode)"
-        )
     if k.get("PRECISION") != "bf16":
-        return out
+        return []
+    out = []
     for index in _cuda_devices(k):
         arch = arch_of(f"cuda:{index}")
         if not arch.has_bf16:
@@ -145,47 +178,23 @@ def _device_rules(k: dict) -> list[str]:
     return out
 
 
-REAL_VARIANTS = ("base", "sft")
-
-
-def _objective_rules(k: dict) -> list[str]:
+def _value_problems(k: dict) -> list[str]:
+    """Names, registries and plain value ranges."""
     p = []
-    if k["LOSS"] == "masked_mse":
-        p.append(
-            "LOSS='masked_mse' needs a per-token loss mask, and no dataset source "
-            "produces one: use LOSS='mse' | 'huber' | 'l1'"
-        )
-    if (
-        k["PRECISION"] == "fp16"
-        and k["VARIANT"] in REAL_VARIANTS
-        and k["FP16_FIX"] == "none"
-    ):
-        p.append(
-            f"PRECISION='fp16' on VARIANT={k['VARIANT']!r} needs FP16_FIX ('online' "
-            "with FP16_FIX_KWARGS={'c': 1/16}, 'weights' or 'fp32_residual'): the "
-            "residual stream exceeds the fp16 range"
-        )
-    return p
-
-
-def validate(k: dict) -> list[str]:
-    """Every problem with the knob set (empty list = valid); PRECISION="auto" is
-    resolved first."""
-    k = with_precision(k)
-    p = _unknown(k) + _choices(k) + _device_rules(k)
     if k["VARIANT"] not in PRESETS:
         p.append(f"VARIANT={k['VARIANT']!r} not in {sorted(PRESETS)}")
     if not k["WEIGHTS"]:
-        p.append("WEIGHTS is empty (a weights path, or 'random' for smoke runs)")
+        p.append("WEIGHTS is empty (a weights root, pipeline dir or single file)")
     if k["ALGO"] not in ALGOS:
         p.append(f"ALGO={k['ALGO']!r} not in {ALGOS}")
-    if k["PRECISION"] not in DTYPES:
-        p.append(f"PRECISION={k['PRECISION']!r} not in {tuple(DTYPES)}")
+    if k["PRECISION"] not in COMPUTE:
+        p.append(f"PRECISION={k['PRECISION']!r} not in {(*COMPUTE, 'auto')}")
     for name, reg in (
         ("TIMESTEP", TIMESTEPS),
         ("LOSS", LOSSES),
         ("OPTIMIZER", OPTIMIZERS),
         ("LOGGER", LOGGERS),
+        ("PARALLEL", LAYOUTS),
     ):
         if not _registry_ok(k[name], reg):
             p.append(f"{name}={k[name]!r} not in {reg.names()}")
@@ -198,50 +207,49 @@ def validate(k: dict) -> list[str]:
         p.append("STEPS must be > 0 and GRAD_ACC >= 1")
     if k["LOG_EVERY"] <= 0:
         p.append("LOG_EVERY must be > 0")
+    rows = k.get("METRICS_EVERY")
+    bad = isinstance(rows, bool) or not isinstance(rows, int) or rows <= 0
+    if rows is not None and bad:
+        p.append(
+            f"METRICS_EVERY must be None (= LOG_EVERY) or an int > 0, got {rows!r}"
+        )
+    patience = k["NONFINITE_PATIENCE"]
+    if isinstance(patience, bool) or not isinstance(patience, int) or patience < 0:
+        p.append(f"NONFINITE_PATIENCE must be an int >= 0 (0 = off), got {patience!r}")
     if not isinstance(k["MAX_SAMPLES"], int) or k["MAX_SAMPLES"] < 0:
         p.append(
             f"MAX_SAMPLES must be an int >= 0 (0 = no cap), got {k['MAX_SAMPLES']!r}"
         )
     if k["GRAD_CLIP"] < 0:
         p.append("GRAD_CLIP must be >= 0 (0 disables clipping)")
-    p += data_problems(DataConfig.from_knobs(k))
-    p += _schedule_rules(k)
-    p += _objective_rules(k)
-    p += _memory_rules(k)
-    p += _parallel_rules(k)
-    p += _optimizer_rules(k)
-    p += _io_rules(k)
-    return list(dict.fromkeys(p))
-
-
-def _schedule_rules(k: dict) -> list[str]:
-    sched = k["SCHEDULE"]
-    subs = [sched] if "mode" in sched else list(sched.values())
-    p = []
-    for sub in subs:
-        end = sub.get("end", -1)
-        end = k["STEPS"] if end == -1 else end
-        if isinstance(end, int) and sub.get("warmup", 0) >= end:
-            p.append(
-                f"SCHEDULE warmup {sub.get('warmup')} >= end {end} (STEPS={k['STEPS']})"
-            )
+    p += release_problems(k.get("STEP_RELEASE", "auto"))
     return p
 
 
-default_device_type = default_type
-
-
-def dist_backend(k: dict) -> str:
-    """DIST_BACKEND with 'auto' resolved the way the launcher resolves it."""
-    if k["DIST_BACKEND"] != "auto":
-        return k["DIST_BACKEND"]
-    return default_backend(default_device_type())
+def validate(k: dict) -> list[str]:
+    """Every problem with the knob set (empty list = valid); PRECISION="auto" is
+    resolved first."""
+    k = with_precision(k)
+    p = _unknown(k) + _choices(k) + _device_problems(k) + _value_problems(k)
+    p += data_problems(DataConfig.from_knobs(k))
+    p += schedule_problems(k)
+    p += objective_problems(k)
+    p += _memory_problems(k)
+    p += text_problems(k, arch_of)
+    p += vae_problems(k)
+    layout = _layout(k)
+    p += parallel_problems(k, layout.problems if layout is not None else None)
+    p += optimizer_problems(k)
+    p += io_problems(k)
+    return list(dict.fromkeys(p))
 
 
 def memory_overrides(k: dict) -> dict:
-    """MEMORY_OVERRIDES plus the plan fields other knobs own (COMPILE, KERNELS)."""
+    """MEMORY_OVERRIDES, the top-level memory knobs (manual mode) and precision knobs,
+    plus the plan fields other knobs own (COMPILE, KERNELS)."""
     return {
         **k["MEMORY_OVERRIDES"],
+        **plan_fields(k, k["MEMORY_PROFILE"]),
         "compile": k["COMPILE"],
         "kernels": dict(k["KERNELS"]),
     }
@@ -251,42 +259,47 @@ def plan_problems(k: dict, plan: MemoryPlan) -> list[str]:
     """What keeps a resolved MemoryPlan from running with the other knobs (PARALLEL,
     OPTIMIZER, COMPILE). See docs/guides/multi-gpu.md for the supported matrix."""
     p = []
-    kind, opt = k["PARALLEL"], k["OPTIMIZER"]
+    opt = k["OPTIMIZER"]
     if opt != "adamw" and plan.optim_state != "gpu":
         p.append(
             f"optim_state={plan.optim_state!r} places AdamW states; OPTIMIZER={opt!r} "
             "keeps its own on the GPU: use optim_state='gpu'"
         )
-    if opt == "adamw" and plan.optim_state == "8bit" and optim_factory.bnb is None:
-        p.append(
-            "optim_state='8bit' needs the bitsandbytes package: install it or set "
-            "optim_state 'gpu' / 'stream' / 'cpu'"
-        )
     if opt != "adamw" and plan.stream == "swap":
-        p.append(f"stream='swap' trains blocks with AdamW, not OPTIMIZER={opt!r}")
+        p.append(
+            f"stream='swap' trains blocks with AdamW, not OPTIMIZER={opt!r}: use a "
+            "resident profile (e.g. MEMORY_PROFILE='ckpt-resident') or STREAM='off' "
+            "with MEMORY_PROFILE='manual'"
+        )
     if plan.fused_step and opt == "muon":
-        p.append("OPTIMIZER='muon' needs fused_step=False (per-parameter steps)")
-    if kind != "none" and plan.fused_step:
-        p.append("fused_step is single-device: set fused_step=False")
-    if kind != "none" and plan.grad_offload:
-        p.append("grad_offload is single-device: set grad_offload=False")
-    if kind == "ddp" and plan.stream == "swap":
-        p.append("PARALLEL='ddp' does not reduce streamed (swap) block gradients")
-    if kind in ("fsdp", "pipeline", "threaded"):
-        for field, value, ok in (
-            ("stream", plan.stream, "off"),
-            ("optim_state", plan.optim_state, "gpu"),
-            ("base_precision", plan.base_precision, "compute"),
-            ("act_offload", plan.act_offload, False),
-        ):
-            if value != ok:
-                p.append(f"PARALLEL={kind!r} needs {field}={ok!r}, not {value!r}")
-    if plan.checkpoint == "sub-block" and (kind == "fsdp" or plan.compile == "block"):
+        p.append(
+            "OPTIMIZER='muon' needs fused_step=False (per-parameter steps): use a "
+            "profile without 'optfused' / stream for full FT (e.g. 'ckpt-resident') or "
+            "FUSED_STEP=False with MEMORY_PROFILE='manual'"
+        )
+    if plan.checkpoint == "sub-block" and plan.compile == "block":
         p.append(
             "checkpoint='sub-block' calls block parts directly: not with "
-            "PARALLEL='fsdp' or COMPILE='block'"
+            "COMPILE='block'"
         )
-    return p
+    layout = _layout(k)
+    return p + (layout.plan_problems(k, plan) if layout is not None else [])
+
+
+def _layout(k: dict):
+    """The Layout PARALLEL selects, or None when it names none (a knob problem)."""
+    name = k["PARALLEL"]
+    if not isinstance(name, str) or not _registry_ok(name, LAYOUTS):
+        return None
+    try:
+        return LAYOUTS.get(name)
+    except (KeyError, ImportError, AttributeError, ValueError):
+        return None
+
+
+def step_state(k: dict) -> bool:
+    """The run's adapters carry per-micro-batch step state (full FT carries none)."""
+    return not is_full(k) and config_from_knobs(k).step_state
 
 
 def _plans(k: dict) -> tuple[list, list[str]]:
@@ -296,16 +309,14 @@ def _plans(k: dict) -> tuple[list, list[str]]:
     plans, errors = [], []
     for name in names:
         try:
-            plans.append(
-                resolve(name, overrides, default_device_type(), k["ALGO"] == "full")
-            )
+            plans.append(resolve(name, overrides, default_device_type(), is_full(k)))
         except ValueError as err:
             errors.append(f"MEMORY_PROFILE {name!r}: {err}")
     return plans, errors
 
 
-def _memory_rules(k: dict) -> list[str]:
-    p = []
+def _memory_problems(k: dict) -> list[str]:
+    p = mixing_problems(k, k["MEMORY_PROFILE"], "MEMORY_PROFILE")
     known = {f for f in MemoryPlan.__dataclass_fields__}
     bad = sorted(set(k["MEMORY_OVERRIDES"]) - known)
     if bad:
@@ -330,111 +341,6 @@ def _memory_rules(k: dict) -> list[str]:
         p.append(
             "FP16_FIX='online' needs FP16_FIX_KWARGS['c'] (e.g. 1/16 for the base)"
         )
-    return p
-
-
-def _parallel_rules(k: dict) -> list[str]:
-    p = []
-    if k["DIST_BACKEND"] == "nccl" and sys.platform == "win32":
-        p.append("DIST_BACKEND='nccl' is unavailable on Windows: use 'gloo' or 'auto'")
-    if k["DRIVER"] == "lightning" and k["PARALLEL"] not in ("none", "ddp"):
-        p.append(
-            "DRIVER='lightning' supports PARALLEL 'none' | 'ddp'; use DRIVER='native'"
-        )
-    if not k["DEVICES"]:
-        p.append("DEVICES is empty")
-    multi = k["PARALLEL"] != "none" or len(k["DEVICES"]) > 1
-    if multi and sys.platform == "win32":
-        p.append(
-            f"PARALLEL={k['PARALLEL']!r} with DEVICES={tuple(k['DEVICES'])}: multi-GPU "
-            "training is Linux-only by design; on Windows use PARALLEL='none' and one "
-            "entry in DEVICES"
-        )
-    elif k["PARALLEL"] == "none" and len(k["DEVICES"]) > 1:
-        p.append(
-            "several DEVICES with PARALLEL='none': choose ddp / fsdp / pipeline / threaded"
-        )
-    if k["PARALLEL"] == "pipeline" and k["MICROBATCHES"] < len(k["DEVICES"]):
-        p.append("PARALLEL='pipeline' needs MICROBATCHES >= number of stages")
-    if k["PARALLEL"] == "pipeline":
-        p += pipeline_problems(DataConfig.from_knobs(k))
-    if k["PARALLEL"] == "threaded" and k["PIPELINE_SCHEDULE"] not in THREADED_SCHEDULES:
-        p.append(
-            f"PARALLEL='threaded' runs PIPELINE_SCHEDULE in {THREADED_SCHEDULES}, "
-            f"got {k['PIPELINE_SCHEDULE']!r}"
-        )
-    if k["PARALLEL"] == "fsdp" and k["OPTIMIZER"] == "muon":
-        p.append(
-            "OPTIMIZER='muon' orthogonalises whole matrices; under PARALLEL='fsdp' it "
-            "would see DTensor shards: use PARALLEL='ddp' or another optimizer"
-        )
-    if k["PARALLEL"] == "fsdp" and dist_backend(k) == "gloo":
-        p.append(
-            "PARALLEL='fsdp' needs DIST_BACKEND='nccl': gloo has no PREMUL_SUM "
-            "reduce-scatter (see docs/guides/multi-gpu.md)"
-        )
-    if k["PARALLEL"] == "fsdp" and k["SAMPLE_EVERY"] > 0:
-        p.append(
-            "PARALLEL='fsdp': sampling runs on rank 0 only and cannot all-gather the "
-            "sharded blocks; set SAMPLE_EVERY=0"
-        )
-    if k["PARALLEL"] in ("pipeline", "threaded") and k["DRIVER"] != "native":
-        p.append(f"PARALLEL={k['PARALLEL']!r} runs on DRIVER='native'")
-    if k["PARALLEL"] in ("pipeline", "threaded") and (
-        k["SAMPLE_EVERY"] > 0 or k["VALIDATE_EVERY"] > 0
-    ):
-        p.append(
-            f"PARALLEL={k['PARALLEL']!r}: sampling / validation during training are not "
-            "routed through the pipeline; set SAMPLE_EVERY=0 and VALIDATE_EVERY=0"
-        )
-    return p
-
-
-def _optimizer_rules(k: dict) -> list[str]:
-    p = []
-    opt = k["OPTIMIZER"]
-    if opt == "adamw16" and k["PRECISION"] == "fp32":
-        p.append(
-            "OPTIMIZER='adamw16' keeps 16-bit params: PRECISION must be fp16 or bf16"
-        )
-    rounding = k.get("OPTIMIZER_KWARGS", {}).get("rounding", "nearest")
-    if rounding == "stochastic" and k["PRECISION"] != "bf16":
-        p.append("stochastic rounding is bf16-only: use rounding='kahan' for fp16")
-    ema = k["EMA"]
-    if not (ema in (None, 0, 0.0) or isinstance(ema, (int, float, list, tuple, dict))):
-        p.append(
-            f"EMA={ema!r}: 0 | decay | [decays] | {{'kind': 'power', 'sigma_rel': [...]}}"
-        )
-    if isinstance(ema, (int, float)) and ema and not 0 < ema < 1:
-        p.append(f"EMA decay must be in (0, 1), got {ema}")
-    return p
-
-
-def _io_rules(k: dict) -> list[str]:
-    p = []
-    bad = [f for f in k["EXPORT_FORMATS"] if f not in EXPORTS]
-    if bad:
-        p.append(f"EXPORT_FORMATS has unknown formats {bad}; valid {EXPORTS}")
-    if (
-        k["ALGO"] == "full"
-        and set(k["EXPORT_FORMATS"]) & {"comfy", "lycoris"}
-        and k.get("FULL_MODE", "direct") == "direct"
-    ):
-        p.append(
-            "direct full finetune exports 'merged' / 'diffusers', not adapter formats"
-        )
-    if k["SAMPLE_EVERY"] > 0 and not k["SAMPLE_PROMPTS"]:
-        p.append("SAMPLE_EVERY > 0 needs SAMPLE_PROMPTS")
-    if k["VALIDATE_EVERY"] > 0 and not k["VALIDATION"].get("datasets"):
-        p.append("VALIDATE_EVERY > 0 needs VALIDATION['datasets']")
-    if k["SAVE_EVERY"] < 0 or k["KEEP_LAST"] < 0:
-        p.append("SAVE_EVERY and KEEP_LAST must be >= 0")
-    resume = k["RESUME"]
-    if resume not in ("", "latest") and not Path(resume).exists():
-        p.append(f"RESUME={resume!r} does not exist")
-    weights = k["WEIGHTS"]
-    if weights not in ("", "random") and not os.path.exists(weights):
-        p.append(f"WEIGHTS={weights!r} does not exist")
     return p
 
 

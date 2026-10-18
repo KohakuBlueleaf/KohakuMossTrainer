@@ -19,5 +19,7 @@ class TrainState:
     scale: float = 1.0
     skipped: int = 0  # steps not applied
     nonfinite: int = 0  # steps with a non-finite gradient or loss
+    nonfinite_params: int = 0  # parameters with a non-finite gradient this step
+    nonfinite_names: list = field(default_factory=list)  # their first names this step
     batch_ids: list = field(default_factory=list)
     metrics: dict = field(default_factory=dict)

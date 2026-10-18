@@ -9,8 +9,8 @@ from dataclasses import fields, replace
 import torch
 from torch import Tensor, nn
 
-from kohakumoss.training.memory.runners import PlainRunner
-from kohakumoss.types.api import BlockCtx
+from kohakumoss.memory.runners import PlainRunner
+from kohakumoss.types.context import BlockCtx
 from kohakumoss.types.seqinfo import SeqInfo
 
 
@@ -29,6 +29,10 @@ def ctx_to(ctx: BlockCtx, device: torch.device) -> BlockCtx:
     return replace(ctx, **moved)
 
 
+def _no_install(state) -> None:
+    return None
+
+
 def even_bounds(n: int, k: int) -> list[tuple[int, int]]:
     edges = [round(i * n / k) for i in range(k + 1)]
     return list(zip(edges[:-1], edges[1:]))
@@ -38,7 +42,9 @@ class ThreadedPipeline:
     """Runs `model.prologue -> layers -> model.epilogue` across `devices`.
 
     `opset_for(device)` binds each stage's blocks to that device's kernels;
-    `schedule` is `gpipe` (all forwards, one backward) or `async`.
+    `schedule` is `gpipe` (all forwards, then each micro-batch's backward in reverse
+    order) or `async`. `install(state)` puts a micro-batch's adapter step state back
+    before its forward and its gpipe backward.
     """
 
     def __init__(
@@ -52,6 +58,7 @@ class ThreadedPipeline:
         schedule: str = "gpipe",
     ):
         self.model = model
+        self.install: Callable = _no_install
         self.devices = [torch.device(d) for d in devices]
         self.bounds = bounds or even_bounds(len(model.layers), len(self.devices))
         if len(self.bounds) != len(self.devices):
@@ -100,19 +107,26 @@ class ThreadedPipeline:
         self,
         microbatches: Sequence[tuple[tuple, object]],
         loss_fn: Callable[[Tensor, object], Tensor],
+        states: Sequence | None = None,
     ) -> Tensor:
         """Forward + backward over `(inputs, extra)` micro-batches; returns the summed
-        loss (detached). `loss_fn(pred, extra)` already normalises by the step's tokens.
+        loss (detached). `loss_fn(pred, extra)` already normalises by the step's tokens;
+        `states[k]` is micro-batch k's adapter step state (None: nothing to install).
         """
-        return self._step(microbatches, loss_fn)
+        states = list(states) if states is not None else [None] * len(microbatches)
+        return self._step(microbatches, loss_fn, states)
 
-    def _gpipe(self, microbatches, loss_fn) -> Tensor:
-        losses = [loss_fn(self.forward(*inp), ex) for inp, ex in microbatches]
-        total = torch.stack([loss.float() for loss in losses]).sum()
-        total.backward()
-        return total.detach()
+    def _gpipe(self, microbatches, loss_fn, states) -> Tensor:
+        losses = []
+        for (inp, ex), state in zip(microbatches, states):
+            self.install(state)
+            losses.append(loss_fn(self.forward(*inp), ex))
+        for loss, state in zip(reversed(losses), reversed(states)):
+            self.install(state)
+            loss.float().backward()
+        return torch.stack([loss.detach().float() for loss in losses]).sum()
 
-    def _async(self, microbatches, loss_fn) -> Tensor:
+    def _async(self, microbatches, loss_fn, states) -> Tensor:
         jobs: queue.Queue = queue.Queue(maxsize=2)
         errors: list[BaseException] = []
 
@@ -130,7 +144,8 @@ class ThreadedPipeline:
         thread.start()
         losses = []
         try:
-            for inp, ex in microbatches:
+            for (inp, ex), state in zip(microbatches, states):
+                self.install(state)
                 loss = loss_fn(self.forward(*inp), ex)
                 losses.append(loss.detach().float())
                 jobs.put(loss)

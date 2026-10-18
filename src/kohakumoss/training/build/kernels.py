@@ -1,115 +1,109 @@
-"""Kernel prewarm before step 0 and the between-step retune of uncovered problems.
-
-Prewarm runs the backbone's resolved attention and block ops forward + backward on
-scratch inputs over every length bucket the planned batches reach, outside any
-checkpoint / no_grad / inference mode, so live calls only look tuned choices up. Both
-actions are bound at build time; TUNE="off" binds neither (nothing is timed).
+"""The run's kernel prewarm actions, bound at build time under TUNE="table" ("off"
+binds none, nothing is timed): the backbone prewarm before step 0 (`ModelPrewarm` over
+the run's weightless twin), the adapter autotuned-op prewarm, and the online text
+encoder's prewarm right before its first pass (`TextPrewarm`). The step callbacks live
+in `training.callbacks.kernels`. See docs/internals/tuning.md#prewarm.
 """
 
-import math
+import time
 
 import torch
-import torch.distributed as dist
-from lycoris.kernels.plans.tune import ROW_BUCKET
 
+from kohakumoss.adapters.bind.autotuned import token_buckets
+from kohakumoss.encoders.text.prewarm import prewarm_text
+from kohakumoss.precision import autocast_factory
+from kohakumoss.training.build.objective import build_loss, is_masked
+from kohakumoss.training.build.shapes import run_shapes
+from kohakumoss.training.callbacks.kernels import late_prewarm
+from kohakumoss.tuning.lengths import planned_lengths, planned_segments
+from kohakumoss.tuning.prewarm import (
+    AdapterPrewarm,
+    ModelPrewarm,
+    log_prewarm,
+    note_peak,
+    reset_peaks,
+    tunes,
+)
+from kohakumoss_common.calls import nothing
 from kohakumoss_data import DataConfig
-from kohakumoss_kernels.backends.compile.prewarm import prewarm_block_ops
-from kohakumoss_kernels.backends.compile.race import retune_pending
-from kohakumoss_kernels.tuning import prewarm_attention
-from kohakumoss_kernels.tuning.tuner import broadcast
-
-BLOCK_OPS = ("rms_norm_mod", "rms_norm", "gated_residual", "situ_glu", "qk_norm_rope")
-BLOCK_FLOOR = 256  # smallest token bucket of the block-op problem keys
+from kohakumoss_kernels.hardware.memory import release
+from kohakumoss_kernels.tuning import decisions
 
 
-def _ceil_to(x: float, step: int) -> int:
-    return int(math.ceil(x / step)) * step
-
-
-def image_tokens_max(cfg) -> int:
-    """Largest latent grid (tokens) the resolution planner yields for `cfg`: the area
-    target at the aspect extremes and 1, each side rounded up to the size step."""
-    best = 0
-    for aspect in (*cfg.aspect_range, 1.0):
-        w = _ceil_to(math.sqrt(cfg.target_area * aspect), cfg.size_step)
-        h = _ceil_to(math.sqrt(cfg.target_area / aspect), cfg.size_step)
-        best = max(best, (w // cfg.latent_factor) * (h // cfg.latent_factor))
-    return best
-
-
-def planned_lengths(cfg) -> tuple[int, int]:
-    """(longest joint sample, largest joint batch) in tokens for data config `cfg`."""
-    sample = min(cfg.max_tokens, image_tokens_max(cfg) + cfg.max_text_tokens)
-    batch = (
-        cfg.max_tokens if cfg.batching.startswith("tokens") else cfg.batch_size * sample
-    )
-    return sample, batch
-
-
-def block_lengths(batch_max: int) -> list[list[int]]:
-    """One single-sample batch per power-of-two token bucket up to `batch_max`."""
-    out, n = [], BLOCK_FLOOR
-    while True:
-        out.append([n])
-        if n >= batch_max:
-            return out
-        n *= 2
-
-
-def _noop(*args) -> None:
-    return None
-
-
-class Prewarm:
-    """Tune attention + block ops of `ops` on each device for the planned lengths."""
-
-    def __init__(self, ops, arch, dtype: torch.dtype, sample_max: int, batch_max: int):
-        self.ops = ops
-        self.arch = arch
-        self.dtype = dtype
-        self.sample_max = sample_max
-        self.lengths = block_lengths(batch_max)
-        self.attention = prewarm_attention
-        self.blocks = prewarm_block_ops
-        self.broadcast = broadcast
-
-    def __call__(self, devices: list[torch.device]) -> int:
-        """Rank 0 measures; every rank then binds from rank 0's broadcast tables."""
-        a = self.arch
-        block_ops = {name: getattr(self.ops, name) for name in BLOCK_OPS}
-        measured = 0
-        distributed = dist.is_available() and dist.is_initialized()
-        if distributed and dist.get_rank() != 0:
-            devices = []
-        for device in devices:
-            self.attention(
-                self.ops.attention_varlen,
-                device,
-                self.dtype,
-                a.heads,
-                a.head_dim,
-                self.sample_max,
-            )
-            measured += self.blocks(
-                block_ops, device, self.dtype, self.lengths, a.dim, a.heads, a.ffn_dim
-            )
-        if dist.is_available() and dist.is_initialized():
-            self.broadcast(0)
-        return measured
-
-
-def build_prewarm(k: dict, backbone, dtype: torch.dtype):
-    """The prewarm action of the run (a no-op under TUNE='off')."""
-    if k["TUNE"] == "off":
-        return _noop
+def build_prewarm(k: dict, built, prec, device: torch.device, dataset=None):
+    """The prewarm action of the run (a no-op unless TUNE times kernels): recorded
+    from the weightless twin of `built.backbone` on `device`, the attention segment
+    counts from `dataset`'s smallest planned grid and its shortest and longest caption
+    estimates (None: the area target's grid, the caption-free template and
+    MAX_TEXT_TOKENS); the step-1 report starts from this run's prewarm peaks only."""
+    if not tunes(k):
+        return nothing
+    reset_peaks()
     cfg = DataConfig.from_knobs(k)
     sample, batch = planned_lengths(cfg)
-    return Prewarm(backbone.ops, backbone.cfg, dtype, sample, batch)
+    text_min = 0 if dataset is None else dataset.text_tokens_min()
+    text_max = cfg.max_text_tokens if dataset is None else dataset.text_tokens_max()
+    image_min = 0 if dataset is None else dataset.image_tokens_min()
+    shortest, segments = planned_segments(cfg, text_min, image_min)
+    warm = ModelPrewarm(
+        run_shapes(k, prec, built.plan, device, built.backbone),
+        build_loss(k, built),
+        autocast_factory(prec, device),
+        prec.compute,
+        sample,
+        batch,
+        segments=segments,
+        shortest=shortest,
+        text_max=max(text_max, cfg.text_overhead_tokens),
+        text_shortest=max(text_min, cfg.text_overhead_tokens),
+        masked=is_masked(k),
+    )
+    return warm
 
 
-def prewarm_devices(k: dict, device: torch.device) -> list[torch.device]:
-    """Devices whose kernels this process runs (every stage device when threaded);
-    none on CPU, where every op is the untuned eager spec."""
+class TextPrewarm:
+    """The online text encoder's prewarm (`prewarm_text` on its weightless twin), run
+    once right before its first pass: every pack bucket of its plan with rows up to
+    `max_text_tokens` and the length bucket of the data's longest caption estimate
+    (`data_tokens`, 0: unknown); logged as a prewarm table, its peak kept for the
+    step-1 report, its workspaces returned to the driver after it."""
+
+    def __init__(self, te, max_text_tokens: int, data_tokens: int = 0):
+        self.te = te
+        self.max_text_tokens = max_text_tokens
+        self.data_tokens = data_tokens
+
+    def __call__(self) -> None:
+        device = self.te.device
+        start = time.perf_counter()
+        text = prewarm_text(self.te, self.max_text_tokens, self.data_tokens)
+        reports = {f"text {n}": r for n, r in text.items()}
+        took = time.perf_counter() - start
+        if reports:
+            log_prewarm(reports, took, device)
+            note_peak(device, reports)
+            decisions.flush("after the text-encoder prewarm")
+        release(device)
+        late_prewarm(device, time.perf_counter() - start)
+
+
+def attach_text_prewarm(k: dict, built, dataset=None) -> None:
+    """Under TUNE="table", the online text encoder (TEXT_CACHE "online" / "off") on an
+    accelerator tunes its ops right before its first pass, so a run whose captions all
+    hit the text cache tunes nothing; `dataset` gives the longest caption estimate."""
+    te = built.text_encoder
+    if not tunes(k) or te is None or k["TEXT_CACHE"] == "offline":
+        return
+    if te.device.type == "cpu":
+        return
+    longest = 0 if dataset is None else dataset.text_tokens_max()
+    te.before_first(TextPrewarm(te, k["MAX_TEXT_TOKENS"], longest))
+
+
+def adapter_prewarm_devices(k: dict, device: torch.device) -> list[torch.device]:
+    """Devices the adapter prewarm settles: every stage device when threaded (it runs
+    on scratch inputs, not on the placed layers), else the training device; none on
+    CPU."""
     if device.type == "cpu":
         return []
     if k["PARALLEL"] == "threaded":
@@ -117,52 +111,9 @@ def prewarm_devices(k: dict, device: torch.device) -> list[torch.device]:
     return [device]
 
 
-def adapter_buckets(batch_max: int, row_bucket: int) -> list[int]:
-    """One row count per LyCORIS token bucket up to `batch_max`'s: powers of two below
-    `row_bucket`, then multiples of `row_bucket`."""
-    if batch_max < row_bucket:
-        top = 1 << max(batch_max - 1, 0).bit_length()
-    else:
-        top = -(-batch_max // row_bucket) * row_bucket
-    out, n = [], 1
-    while n < row_bucket and n <= top:
-        out.append(n)
-        n *= 2
-    return out + [m * row_bucket for m in range(1, top // row_bucket + 1)]
-
-
-class AdapterPrewarm:
-    """The trainable set's tier-race prewarm (`prewarm(rows, dtype, devices)`) over
-    the LyCORIS token buckets of the planned batches."""
-
-    def __init__(self, trainable, dtype: torch.dtype, buckets: list[int]):
-        self.trainable = trainable
-        self.dtype = dtype
-        self.buckets = buckets
-
-    def __call__(self, devices: list[torch.device]) -> int:
-        return self.trainable.prewarm(self.buckets, self.dtype, devices)
-
-
 def build_adapter_prewarm(k: dict, built, dtype: torch.dtype):
-    """The adapter tier-race prewarm (a no-op under TUNE='off')."""
-    if k["TUNE"] == "off":
-        return _noop
+    """The adapter autotuned-op prewarm (a no-op unless TUNE times kernels)."""
+    if not tunes(k):
+        return nothing
     _, batch = planned_lengths(DataConfig.from_knobs(k))
-    return AdapterPrewarm(built.trainable, dtype, adapter_buckets(batch, ROW_BUCKET))
-
-
-class RetuneKernels:
-    """Every step: decide raced-op problems first met in this step (outside autograd)."""
-
-    every = 1
-
-    def __init__(self):
-        self.retune = retune_pending
-
-    def on_step_end(self, state, out) -> None:
-        self.retune()
-
-
-def retune_callbacks(k: dict) -> list:
-    return [] if k["TUNE"] == "off" else [RetuneKernels()]
+    return AdapterPrewarm(built.trainable, dtype, token_buckets(batch))

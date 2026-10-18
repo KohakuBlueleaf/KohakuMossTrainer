@@ -1,10 +1,14 @@
 """Process launch and process-group init without torchrun: `spawn(fn, plan, *args)`
 runs `fn(env, *args)` in one process per device. See
-docs/internals/distributed-windows.md."""
+docs/internals/distributed-launch.md."""
 
+import itertools
+import multiprocessing
 import os
 import sys
 import tempfile
+import traceback
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -15,6 +19,12 @@ import torch.multiprocessing as mp
 from kohakumoss.types.plans import ParallelPlan
 
 IS_WINDOWS = sys.platform == "win32"
+TIMEOUT_S = 600.0  # default DIST_TIMEOUT: seconds a collective / the store waits
+RANK0_WAIT_S = 7200.0  # default DIST_GATE_TIMEOUT: seconds a store gate waits
+DEVICE_BACKENDS = ("nccl", "xccl")
+BINDS = ("lazy", "device")
+_GATES = itertools.count()
+_STARTUP = {"timeout_s": RANK0_WAIT_S}
 
 
 @dataclass(frozen=True)
@@ -62,22 +72,132 @@ def init(
     port: int,
     file_path: str,
     device: torch.device,
-    timeout_s: float = 1800.0,
+    timeout_s: float = TIMEOUT_S,
+    kind: str = "ddp",
+    bind: str = "lazy",
 ) -> None:
-    """init_process_group via an explicit store (tcp) or a shared file."""
+    """init_process_group via an explicit store (tcp) or a shared file; every
+    collective and the store wait `timeout_s`; `bind` as in `bound_device`."""
     timeout = timedelta(seconds=timeout_s)
+    bound = bound_device(backend, device, kind, bind)
     if init_method == "file":
         url = "file:///" + file_path.replace("\\", "/").lstrip("/")
         dist.init_process_group(
-            backend, init_method=url, rank=rank, world_size=world, timeout=timeout
+            backend,
+            init_method=url,
+            rank=rank,
+            world_size=world,
+            timeout=timeout,
+            **bound,
         )
         return
     store = dist.TCPStore(
         addr, port, world, is_master=False, timeout=timeout, use_libuv=not IS_WINDOWS
     )
     dist.init_process_group(
-        backend, store=store, rank=rank, world_size=world, timeout=timeout
+        backend, store=store, rank=rank, world_size=world, timeout=timeout, **bound
     )
+
+
+def bound_device(
+    backend: str, device: torch.device, kind: str = "ddp", bind: str = "lazy"
+) -> dict:
+    """`{"device_id": device}` with DIST_BIND='device' for a device backend (nccl /
+    xccl) on its accelerator outside the pipeline; else nothing (lazy init). See
+    docs/internals/distributed-launch.md."""
+    if bind not in BINDS:
+        raise ValueError(f"DIST_BIND={bind!r} not in {BINDS}")
+    device_backend = backend in DEVICE_BACKENDS and device.type != "cpu"
+    if bind == "device" and device_backend and kind != "pipeline":
+        return {"device_id": device}
+    return {}
+
+
+def _store(store=None):
+    return store if store is not None else dist.distributed_c10d._get_default_store()
+
+
+def release_ranks(name: str, store=None, payload: str = "done") -> None:
+    """Rank 0: its one-time work `name` is done (`wait_for_rank0` returns `payload`)."""
+    _store(store).set(f"kohakumoss/{name}", payload)
+
+
+def set_gate_timeout(seconds: float) -> None:
+    """DIST_GATE_TIMEOUT: seconds the store gates (`wait_for_rank0`, `rank0_value`,
+    `startup_barrier` / `ranks_meet`: startup, checkpoint saves, the sample grid) wait,
+    for this process."""
+    if not seconds > 0:
+        raise ValueError(f"gate timeout must be > 0 seconds, got {seconds!r}")
+    _STARTUP["timeout_s"] = float(seconds)
+
+
+def gate_timeout() -> float:
+    """Seconds a store gate waits (DIST_GATE_TIMEOUT, default RANK0_WAIT_S)."""
+    return _STARTUP["timeout_s"]
+
+
+def _wait(store, key: str, timeout_s: float | None) -> None:
+    seconds = gate_timeout() if timeout_s is None else timeout_s
+    store.wait([key], timedelta(seconds=seconds))
+
+
+def wait_for_rank0(name: str, store=None, timeout_s: float | None = None) -> str:
+    """The other ranks: wait on the store, not in a collective, until rank 0 calls
+    `release_ranks(name)`, for up to `timeout_s` (None: the gate timeout); the
+    payload rank 0 released with."""
+    s, key = _store(store), f"kohakumoss/{name}"
+    _wait(s, key, timeout_s)
+    return s.get(key).decode()
+
+
+def rank0_value(
+    name: str,
+    choose: Callable[[], str],
+    rank: int,
+    world: int,
+    store=None,
+    timeout_s: float | None = None,
+) -> str:
+    """`choose()` run on rank 0 only; every rank returns its result (rank 0 releases
+    gate `name` with it, the others wait up to `timeout_s`; one rank: `choose()`)."""
+    if world == 1:
+        return choose()
+    if rank == 0:
+        value = choose()
+        release_ranks(name, store, value)
+        return value
+    return wait_for_rank0(name, store, timeout_s)
+
+
+def dist_rank() -> tuple[int, int]:
+    """(rank, world) of the default process group; (0, 1) without one."""
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
+
+
+def startup_barrier(
+    name: str, world: int, store=None, timeout_s: float | None = None
+) -> None:
+    """Every rank: wait on the store, not in a collective, until all `world` ranks
+    reached `name`, for up to `timeout_s` (None: the gate timeout)."""
+    s = _store(store)
+    key = f"kohakumoss/{name}"
+    if s.add(f"{key}/arrived", 1) == world:
+        s.set(key, "done")
+    _wait(s, key, timeout_s)
+
+
+def ranks_meet(what: str) -> None:
+    """`startup_barrier` over the default process group (nothing without one or with
+    one rank); a distinct gate per call."""
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        startup_barrier(gate_name(what), dist.get_world_size())
+
+
+def gate_name(what: str) -> str:
+    """A name for one rank-0-first gate, distinct per call in the run."""
+    return f"{what}-{next(_GATES)}"
 
 
 def _entry(local_rank, fn, cfg, args):
@@ -101,13 +221,22 @@ def _entry(local_rank, fn, cfg, args):
         cfg["port"],
         cfg["file"],
         device,
+        timeout_s=cfg["timeout_s"],
+        kind=cfg["kind"],
+        bind=cfg["bind"],
     )
     env = DistEnv(local_rank, world, local_rank, device, cfg["backend"])
     try:
         fn(env, *args)
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
+    except BaseException:
+        # report, kill the workers, exit; see docs/internals/distributed-launch.md
+        traceback.print_exc()
+        sys.stderr.flush()
+        for child in multiprocessing.active_children():
+            child.kill()
+        os._exit(1)
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def spawn(fn, plan: ParallelPlan, *args, device_type: str = "cuda") -> None:
@@ -121,7 +250,7 @@ def spawn(fn, plan: ParallelPlan, *args, device_type: str = "cuda") -> None:
         0,
         world,
         is_master=True,
-        timeout=timedelta(seconds=1800),
+        timeout=timedelta(seconds=plan.timeout_s),
         wait_for_workers=False,
         use_libuv=not IS_WINDOWS,
     )
@@ -130,6 +259,9 @@ def spawn(fn, plan: ParallelPlan, *args, device_type: str = "cuda") -> None:
         device_type=device_type,
         backend=backend,
         init=plan.init,
+        kind=plan.kind,
+        timeout_s=plan.timeout_s,
+        bind=plan.bind,
         addr=addr,
         port=store.port,
         file=os.path.join(tempfile.mkdtemp(prefix="kohakumoss_dist_"), "init"),

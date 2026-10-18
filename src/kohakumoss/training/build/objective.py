@@ -2,7 +2,7 @@
 the pipeline engine's last stage)."""
 
 from kohakumoss.diffusion.objective import LOSSES
-from kohakumoss.registry import build
+from kohakumoss_common.registry import build
 
 
 def is_masked(k: dict) -> bool:

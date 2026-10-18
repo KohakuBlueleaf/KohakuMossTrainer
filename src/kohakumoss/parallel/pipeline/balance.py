@@ -6,10 +6,18 @@ import time
 import torch
 import torch.distributed as dist
 
+from kohakumoss_kernels.hardware.current import rng_kept
+
 
 def measure_speed(device: torch.device | str, n: int = 2048, iters: int = 10) -> float:
-    """Dense matmul TFLOP/s of `device` in its fastest half dtype (fp32 on CPU)."""
+    """Dense matmul TFLOP/s of `device` in its fastest half dtype (fp32 on CPU); the
+    caller's CPU and `device` random generators are left where they were."""
     device = torch.device(device)
+    with rng_kept([device]):
+        return _matmul_tflops(device, n, iters)
+
+
+def _matmul_tflops(device: torch.device, n: int, iters: int) -> float:
     if device.type == "cuda":
         major, _ = torch.cuda.get_device_capability(device)
         dtype = torch.bfloat16 if major >= 8 else torch.float16

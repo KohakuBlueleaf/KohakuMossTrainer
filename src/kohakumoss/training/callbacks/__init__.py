@@ -1,12 +1,16 @@
 """Driver callbacks: `on_step_end(state, out)` plus an `every` cadence the
-CallbackRunner schedules; callbacks never check cadence themselves."""
+CallbackRunner schedules."""
 
 from kohakumoss.training.callbacks.evaluate import FixedSigma, SampleGrid, Validation
 from kohakumoss.training.callbacks.monitor import (
     InstabilityDump,
     LogMetrics,
+    StepLine,
+    TextEncodeStats,
     Throughput,
+    VaeEncodeStats,
     Vram,
+    VramAtStepOne,
 )
 from kohakumoss.training.callbacks.runner import (
     CallbackRunner,
@@ -21,8 +25,12 @@ __all__ = [
     "LogMetrics",
     "SampleGrid",
     "SaveCheckpoint",
+    "StepLine",
+    "TextEncodeStats",
     "Throughput",
     "TimedCheckpoint",
     "Validation",
+    "VaeEncodeStats",
     "Vram",
+    "VramAtStepOne",
 ]

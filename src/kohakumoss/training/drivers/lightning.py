@@ -1,7 +1,9 @@
 """Lightning driver: the same TrainStep / OptimBundle under a LightningModule with
 manual optimisation on this process's one device. Multi-process runs are launched and
-gradient-synced by KohakuMoss (`accumulate` arms each micro-batch, as in the native
-driver); Lightning only drives the loop."""
+gradient-synced by KohakuMoss (`accumulate` starts each micro-batch, as in the native
+driver); Lightning only drives the loop. The backbone is held outside the module's
+tree, so Lightning's device moves (fit start, teardown) never touch the memory plan's
+placement (host masters, streamed weights, offloaded state)."""
 
 from collections.abc import Callable
 
@@ -10,15 +12,16 @@ import torch
 from kohakumoss.training.callbacks.runner import CallbackRunner
 from kohakumoss.training.drivers.common import (
     Parts,
-    account,
+    finish_step,
     grouped,
     last_flags,
     loss_count,
+    micro_steps,
     no_accumulate,
-    record,
 )
 from kohakumoss.training.state import TrainState
 from kohakumoss.training.step import image_token_count
+from kohakumoss_common.calls import nothing
 
 try:
     import lightning as L
@@ -28,12 +31,10 @@ except ImportError:
 _Base = L.LightningModule if L is not None else torch.nn.Module
 
 
-def _nothing() -> None:
-    return None
-
-
 class MossModule(_Base):
-    """Wraps the backbone; `training_step` takes one group of GRAD_ACC host batches."""
+    """Drives the step; `training_step` takes one group of GRAD_ACC host batches. The
+    backbone (`self.held[0]`) and the step are plain attributes, not submodules: the
+    module has no parameter or buffer of its own."""
 
     def __init__(
         self,
@@ -49,11 +50,13 @@ class MossModule(_Base):
         accumulate,
         lasts,
         end_step,
+        device=None,
     ):
         super().__init__()
         self.end_step = end_step
         self.automatic_optimization = False
-        self.backbone = backbone
+        self.held = [backbone]
+        self.run_device = device
         self.step_fn = step
         self.bundle = bundle
         self.ema = ema
@@ -74,20 +77,20 @@ class MossModule(_Base):
     def training_step(self, group, batch_idx):
         state = self.state
         count = loss_count(group, self.count_fn)
-        denom = self.normalizer.denominator(count, self.device)
-        out = None
-        for hb, last in zip(group, self.lasts):
-            batch = self.batcher(hb)
-            with self.accumulate(last):
-                out = self.step_fn(batch, denom, state.step)
-                self.bundle.backward(out.loss)
+        denom = self.normalizer.denominator(count, self.run_device)
+        out = micro_steps(
+            self.step_fn,
+            self.batcher,
+            self.accumulate,
+            self.lasts,
+            self.bundle,
+            group,
+            denom,
+            state.step,
+            self.ema,
+        )
         self.end_step()
-        account(state, group)
-        if self.bundle.step():
-            self.ema.update(state.step)
-        state.step += 1
-        record(state, self.bundle)
-        self.runner.run(state, out)
+        finish_step(state, group, self.bundle, self.ema, self.runner, out)
         return None
 
 
@@ -106,7 +109,7 @@ class LightningDriver:
         parts: Parts,
         accumulate: Callable = no_accumulate,
         count_fn: Callable = image_token_count,
-        end_step: Callable[[], None] = _nothing,
+        end_step: Callable[[], None] = nothing,
     ):
         self.end_step = end_step
         if L is None:
@@ -140,6 +143,7 @@ class LightningDriver:
             self.accumulate,
             self.lasts,
             self.end_step,
+            self.device,
         )
         trainer = L.Trainer(
             max_epochs=1,

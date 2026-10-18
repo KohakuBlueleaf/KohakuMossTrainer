@@ -2,13 +2,19 @@
 
 `ConstantEMA` keeps one average per decay; `PowerEMA` keeps EDM2 power-function
 averages (beta_t = (1 - 1/t)^(gamma + 1)) per sigma_rel, whose snapshots allow post-hoc
-reconstruction (`posthoc.py`).
+reconstruction (`posthoc.py`). Each buffer lives on its parameter's device unless the
+spec names one (host masters of streamed blocks: host buffers).
 """
 
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 import torch
 from torch import Tensor, nn
+
+from kohakumoss.offload.accel import module, streamed
+from kohakumoss_common.calls import nothing
 
 
 def gamma_from_sigma_rel(sigma_rel: float, iters: int = 60) -> float:
@@ -58,10 +64,42 @@ def _chunks(indices: list[int], sizes: list[int], limit: int) -> list[list[int]]
     return out + ([cur] if cur else [])
 
 
+class _HostStage:
+    """Two pinned fp32 host buffers of `numel` elements: an accelerator chunk is copied
+    into one (non-blocking, one event) while the other chunk is averaged."""
+
+    def __init__(self, numel: int, device: torch.device):
+        self.dm = module(device)
+        self.device = device
+        self.flats = [
+            torch.empty(numel, dtype=torch.float32, pin_memory=True) for _ in range(2)
+        ]
+        self.events = [None, None]
+
+    def start(self, which: int, params: list[Tensor]) -> list[Tensor]:
+        """Queue the D2H of `params` into buffer `which`; its fp32 views."""
+        views, offset = [], 0
+        for p in params:
+            n = p.numel()
+            view = self.flats[which][offset : offset + n].view(p.shape)
+            view.copy_(p.detach(), non_blocking=True)
+            views.append(view)
+            offset += n
+        ev = self.dm.Event()
+        ev.record(self.dm.current_stream(self.device))
+        self.events[which] = ev
+        return views
+
+    def wait(self, which: int) -> None:
+        self.events[which].synchronize()
+
+
 class _BufferEMA:
     """fp32 average buffers. Parameters already fp32 on the buffer's device are lerped
     in place in one foreach call; the others are converted in chunks of at most
-    `chunk_numel` elements, so one chunk of fp32 copies is alive at a time."""
+    `chunk_numel` elements, so one chunk of fp32 copies is alive at a time; each chunk
+    is converted once per update and averaged into every tag. Accelerator parameters
+    averaged in host buffers go through two pinned staging chunks (`_HostStage`)."""
 
     def __init__(
         self,
@@ -73,6 +111,7 @@ class _BufferEMA:
         self.names = [n for n, _ in named]
         self.params = [p for _, p in named]
         self.tags = tuple(tags)
+        self.wait: Callable[[], None] = nothing
         self.buffers = {
             tag: [
                 p.detach().to(device=device or p.device, dtype=torch.float32, copy=True)
@@ -91,20 +130,61 @@ class _BufferEMA:
         self.converted = _chunks(
             rest, [p.numel() for p in self.params], max(int(chunk_numel), 1)
         )
-
-    def _lerp(self, tag: str, weight: float) -> None:
-        bufs = self.buffers[tag]
-        if self.direct:
-            torch._foreach_lerp_(
-                [bufs[i] for i in self.direct],
-                [self.params[i].detach() for i in self.direct],
-                weight,
+        staged = [
+            i
+            for i in rest
+            if streamed(self.params[i].device) and ref[i].device.type == "cpu"
+        ]
+        self.staged = set(staged)
+        self.stage = None
+        if staged:
+            largest = max(
+                sum(self.params[i].numel() for i in c) for c in self.converted
             )
-        for chunk in self.converted:
-            src = [
-                self.params[i].detach().to(bufs[i].device, torch.float32) for i in chunk
-            ]
-            torch._foreach_lerp_([bufs[i] for i in chunk], src, weight)
+            self.stage = _HostStage(largest, self.params[staged[0]].device)
+
+    def _convert(self, chunk: list[int]) -> list[Tensor]:
+        """fp32 copies on the buffers' devices (asynchronous only onto an accelerator,
+        where the averaging that reads them follows on the same stream)."""
+        ref = self.buffers[self.tags[0]]
+        return [
+            self.params[i]
+            .detach()
+            .to(ref[i].device, torch.float32, non_blocking=streamed(ref[i].device))
+            for i in chunk
+        ]
+
+    def _lerp_all(self, weights: list[float]) -> None:
+        """Average every parameter into every tag's buffers (`weights` per tag), once
+        `wait()` returned (the masters' write-back has landed)."""
+        self.wait()
+        if self.direct:
+            src = [self.params[i].detach() for i in self.direct]
+            for tag, w in zip(self.tags, weights):
+                bufs = self.buffers[tag]
+                torch._foreach_lerp_([bufs[i] for i in self.direct], src, w)
+        chunks = self.converted
+        staged = [all(i in self.staged for i in c) for c in chunks]
+        ahead = None
+        for n, chunk in enumerate(chunks):
+            if staged[n]:
+                which = n % 2
+                src = ahead if ahead is not None else self._start(chunk, which)
+                nxt = n + 1
+                ahead = (
+                    self._start(chunks[nxt], nxt % 2)
+                    if nxt < len(chunks) and staged[nxt]
+                    else None
+                )
+                self.stage.wait(which)
+            else:
+                src = self._convert(chunk)
+            for tag, w in zip(self.tags, weights):
+                bufs = self.buffers[tag]
+                torch._foreach_lerp_([bufs[i] for i in chunk], src, w)
+
+    def _start(self, chunk: list[int], which: int) -> list[Tensor]:
+        return self.stage.start(which, [self.params[i] for i in chunk])
 
     def state_dict(self) -> dict[str, Tensor]:
         return {
@@ -120,6 +200,79 @@ class _BufferEMA:
 
     def averaged(self, tag: str) -> dict[str, Tensor]:
         return dict(zip(self.names, self.buffers[tag]))
+
+
+class BackgroundEMA:
+    """`inner`'s updates on one worker thread, each overlapping the next step's
+    forward: `join()` waits for the running update (the driver calls it before each
+    backward); the next update, a state read and a load each join first."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.pool = ThreadPoolExecutor(1, thread_name_prefix="ema")
+        self.pending = None
+        accel = [p.device for p in getattr(inner, "params", []) if streamed(p.device)]
+        self.device = accel[0] if accel else None
+
+    def _update(self, step: int) -> None:
+        if self.device is None:
+            self.inner.update(step)
+            return
+        with module(self.device).device(self.device):
+            self.inner.update(step)
+
+    @property
+    def tags(self) -> tuple[str, ...]:
+        return self.inner.tags
+
+    @property
+    def gammas(self) -> tuple[float, ...]:
+        return getattr(self.inner, "gammas", ())
+
+    @property
+    def params(self) -> list[Tensor]:
+        return self.inner.params
+
+    @property
+    def buffers(self) -> dict[str, list[Tensor]]:
+        """The average buffers, once the running update has landed."""
+        self.join()
+        return self.inner.buffers
+
+    @property
+    def wait(self) -> Callable[[], None]:
+        return self.inner.wait
+
+    @wait.setter
+    def wait(self, fn: Callable[[], None]) -> None:
+        self.inner.wait = fn
+
+    def join(self) -> None:
+        if self.pending is not None:
+            pending, self.pending = self.pending, None
+            pending.result()
+
+    def update(self, step: int) -> None:
+        self.join()
+        self.pending = self.pool.submit(self._update, step)
+
+    def state_dict(self) -> dict[str, Tensor]:
+        self.join()
+        return self.inner.state_dict()
+
+    def load_state_dict(self, state: dict[str, Tensor]) -> None:
+        self.join()
+        self.inner.load_state_dict(state)
+
+    def averaged(self, tag: str) -> dict[str, Tensor]:
+        self.join()
+        return self.inner.averaged(tag)
+
+
+def host_averaged(ema) -> bool:
+    """Whether any of `ema`'s buffers is a host buffer (a CPU pass every update)."""
+    buffers = getattr(ema, "buffers", {})
+    return any(b.device.type == "cpu" for bufs in buffers.values() for b in bufs)
 
 
 def _warm_decay(decay: float, t: int) -> float:
@@ -149,8 +302,7 @@ class ConstantEMA(_BufferEMA):
     @torch.no_grad()
     def update(self, step: int) -> None:
         t = step + 1
-        for tag, rule in zip(self.tags, self.rules):
-            self._lerp(tag, 1.0 - rule(t))
+        self._lerp_all([1.0 - rule(t) for rule in self.rules])
 
 
 class PowerEMA(_BufferEMA):
@@ -172,8 +324,7 @@ class PowerEMA(_BufferEMA):
     @torch.no_grad()
     def update(self, step: int) -> None:
         t = step + 1
-        for tag, gamma in zip(self.tags, self.gammas):
-            self._lerp(tag, 1.0 - (1.0 - 1.0 / t) ** (gamma + 1.0))
+        self._lerp_all([1.0 - (1.0 - 1.0 / t) ** (g + 1.0) for g in self.gammas])
 
 
 def build_ema(named, spec, device=None):
@@ -205,4 +356,21 @@ def build_ema(named, spec, device=None):
 
 
 def ema_is_power(ema) -> bool:
-    return isinstance(ema, PowerEMA)
+    return isinstance(getattr(ema, "inner", ema), PowerEMA)
+
+
+def decay_count(spec) -> int:
+    """How many averages the EMA knob keeps (0: off)."""
+    match spec:
+        case None | 0 | 0.0:
+            return 0
+        case float() | int():
+            return 1
+        case list() | tuple():
+            return len(spec)
+        case {"kind": "power", **rest}:
+            return len(tuple(rest["sigma_rel"]))
+        case {"kind": "constant", **rest}:
+            decay = rest["decay"]
+            return len(decay) if isinstance(decay, (list, tuple)) else 1
+    raise ValueError(f"invalid EMA spec {spec!r}")

@@ -1,68 +1,106 @@
 """`run(globals())`: validate every knob, build in the fixed order, train, export."""
 
-import contextlib
 import json
-import os
-import sys
+from functools import partial
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
 
+from kohakumoss.adapters.lycoris.tuning import (
+    restore_lycoris_tuning,
+    set_lycoris_tuning,
+)
 from kohakumoss.diffusion.objective import TokenNormalizer
-from kohakumoss.logging import build_logger
-from kohakumoss.parallel.fsdp import unsharded
-from kohakumoss.parallel.launch import spawn
+from kohakumoss.logging import build_logger, fresh_run
+from kohakumoss.logging.log import (
+    add_log_file,
+    bars,
+    get_logger,
+    hl,
+    log_object,
+    setup,
+    timed,
+)
+from kohakumoss.memory.device_use import build_device_use
+from kohakumoss.memory.timeline import build_timeline
+from kohakumoss.model import resolve_config
+from kohakumoss.offload.accel import configure_allocator, release_cache
+from kohakumoss.parallel.launch import (
+    gate_name,
+    ranks_meet,
+    release_ranks,
+    set_gate_timeout,
+    spawn,
+    wait_for_rank0,
+)
+from kohakumoss.parallel.telemetry.report import build_rank_callbacks, rank_layout
+from kohakumoss.precision import autocast_factory, build_precision
+from kohakumoss.training import shutdown
 from kohakumoss.training.build.kernels import (
+    adapter_prewarm_devices,
+    attach_text_prewarm,
     build_adapter_prewarm,
     build_prewarm,
-    prewarm_devices,
 )
 from kohakumoss.training.build.loop import (
+    build_ahead,
     build_batcher,
     build_callbacks,
     build_checkpoints,
     build_driver,
     build_ema_for,
+    build_latent_ahead,
     build_optim,
+    build_recorder,
     build_step,
     build_writer,
     fixed_batches,
+    resumed_from,
     validation_data_config,
 )
-from kohakumoss.training.build.model import build_model, export
-from kohakumoss.training.build.parallel import build_hooks
-from kohakumoss.training.build.pipelines import (
-    build_engine,
-    build_threaded,
-    local_names,
-    release_nonlocal,
+from kohakumoss.training.build.model import (
+    build_model,
+    data_knobs,
+    export,
+    placement_lines,
 )
+from kohakumoss.training.build.pipelines import release_nonlocal
 from kohakumoss.training.callbacks.evaluate import FixedSigma
+from kohakumoss.training.context import RunContext
 from kohakumoss.training.drivers import Parts
-from kohakumoss.training.drivers.fsdp import FsdpParts
-from kohakumoss.training.drivers.pipeline import PipelineParts
-from kohakumoss.training.knobs import check, default_device_type, run_name
-from kohakumoss.training.precision import autocast_factory, build_policy
+from kohakumoss.training.knobs import check, default_device_type, is_full, run_name
+from kohakumoss.training.layouts import Layout, layout_of
+from kohakumoss.training.memory.optimizers import close_memory
 from kohakumoss.training.state import TrainState
 from kohakumoss.training.step import LayoutTransform
+from kohakumoss.tuning.prewarm import prewarm_devices, release_workspaces, tunes
 from kohakumoss.types.plans import ParallelPlan
 from kohakumoss_data import DataConfig, build_loader
+from kohakumoss_kernels.run_state import reset_run_state
+from kohakumoss_kernels.tuning import decisions
 from kohakumoss_kernels.tuning.tuner import set_mode as set_tune_mode
 
 _device_type = default_device_type
+log = get_logger(__name__)
 
 
 def run(g: dict):
-    """Entry point of scripts/train/moss.py; multi-device kinds spawn one process each."""
+    """Entry point of scripts/train/moss.py: the run's TrainState in process (PARALLEL
+    'none' / 'threaded'); the process-group kinds spawn one process each and return
+    None."""
+    shutdown.install()
+    setup()
     k = check(g)
-    if k["PARALLEL"] not in ("none", "threaded") and not dist.is_initialized():
+    if layout_of(k).spawns and not dist.is_initialized():
         plan = ParallelPlan(
             kind=k["PARALLEL"],
             backend=k["DIST_BACKEND"],
             devices=tuple(k["DEVICES"]),
             schedule=k["PIPELINE_SCHEDULE"],
             microbatches=k["MICROBATCHES"],
+            timeout_s=float(k["DIST_TIMEOUT"]),
+            bind=k["DIST_BIND"],
         )
         return spawn(worker_env, plan, k, device_type=_device_type())
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -72,7 +110,23 @@ def run(g: dict):
 
 def worker_env(env, k: dict) -> TrainState:
     """Spawned-process entry: `env` is kohakumoss.parallel.launch.DistEnv."""
+    setup(rank=env.rank, world=env.world)
     return worker(k, env.rank, env.world, env.device)
+
+
+def writer_first(rank: int, world: int, build):
+    """`build(writer=...)` with one catalog writer: rank 0 builds (scans, writes the
+    catalog files) before the other ranks build as readers; they wait on the store,
+    not in a collective, so a long scan does not hit DIST_TIMEOUT."""
+    if world == 1:
+        return build(writer=True)
+    name = gate_name("catalog")
+    if rank == 0:
+        out = build(writer=True)
+        release_ranks(name)
+        return out
+    wait_for_rank0(name)
+    return build(writer=False)
 
 
 def _device(k: dict, rank: int) -> torch.device:
@@ -96,93 +150,138 @@ def _compile(backbone, mode: str) -> None:
             backbone.compile(dynamic=True)
 
 
-def _stages(k: dict, built, policy, rank: int, world: int, device):
-    """(engine, objective, local trainable names, local param ids) for the pipelined
-    PARALLEL kinds; (None, None, None, None) otherwise (everything is local)."""
-    match k["PARALLEL"]:
-        case "threaded":
-            return build_threaded(k, built, policy), None, None, None
-        case "pipeline":
-            engine, objective = build_engine(k, built, policy, rank, world, device)
-            keep = {id(p) for p in engine.parameters()}
-            return engine, objective, local_names(built.trainable, engine), keep
-    return None, None, None, None
-
-
-def stream_rank(kind: str, rank: int) -> int:
-    """The rank whose data, sigma and noise streams this rank draws: its own under data
-    parallelism, rank 0's under `pipeline` (every stage sees the same micro-batches)."""
-    return 0 if kind == "pipeline" else rank
-
-
 def _snapshot(k: dict) -> dict:
     return json.loads(json.dumps(k, default=str))
 
 
-def deterministic_mode() -> None:
-    """KOHAKUMOSS_DETERMINISTIC=1 (set before the process imports the kernels):
-    torch's deterministic algorithms, a fixed cuBLAS workspace, no cuDNN autotune;
-    the kernels read the same variable. See docs/concepts/training.md."""
-    if os.environ.get("KOHAKUMOSS_DETERMINISTIC") != "1":
-        return
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.benchmark = False
+def _start(k: dict, layout: Layout, rank: int, device: torch.device):
+    """(output dir, precision, the LyCORIS tuning switch to restore): the run directory
+    and its files on rank 0, the per-run process state, the run line."""
+    allocator = configure_allocator(device)
+    torch.manual_seed(k["SEED"])  # identical model + adapter init on every rank
+    output_dir = str(Path(k["OUTPUT_DIR"]) / run_name(k))
+    if rank == 0:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        if resumed_from(k, output_dir) is None:
+            fresh_run(output_dir)
+        (Path(output_dir) / "config.json").write_text(
+            json.dumps(_snapshot(k), indent=2), encoding="utf-8"
+        )
+        add_log_file(Path(output_dir) / "log.txt")
+    reset_run_state()
+    set_gate_timeout(k["DIST_GATE_TIMEOUT"])
+    set_tune_mode(k["TUNE"])
+    lycoris_tuning = set_lycoris_tuning(tunes(k))
+    layout.begin(k)
+    if device.type == "cuda":  # cuSOLVER linear algebra, see docs/concepts/training.md
+        torch.backends.cuda.preferred_linalg_library("cusolver")
+    prec = build_precision(
+        k["PRECISION"], k["KEEP_FP32"], k["FP16_FIX"], k["FP16_FIX_KWARGS"]
+    )
+    log.info(
+        f"run {hl(run_name(k))}: {hl(k['ALGO'])} {hl(k['PRECISION'])} on {device}, "
+        f"{hl(k['STEPS'])} steps, output {hl(output_dir, 'path')}, allocator "
+        f"{hl(allocator)}"
+    )
+    return output_dir, prec, lycoris_tuning
+
+
+def _data(k: dict, layout: Layout, rank: int, world: int, device):
+    """(data knobs, token-layout transform, training loader): the catalog scan and
+    batch plan over `layout`'s data ranks (rank 0 writes the catalog first)."""
+    data_rank = layout.stream_rank(rank)
+    data_world = layout.data_world(world)
+    kd = data_knobs(k, device)
+    data_cfg = DataConfig.from_knobs(kd)
+    arch = resolve_config(k["VARIANT"], k["ARCH_OVERRIDES"] or None)
+    tokens = LayoutTransform(arch.rope_axes)
+    with timed(log, "building the data loader (catalog scan, batch plan)"):
+        loader = writer_first(
+            rank,
+            world,
+            partial(build_loader, data_cfg, data_rank, data_world, tokens),
+        )
+    return kd, tokens, loader
+
+
+def _prewarm(k: dict, built, prec, device, dataset, device_use) -> list:
+    """The kernel prewarm (weightless twin, segment counts from the dataset) and the
+    adapter prewarm, before the stage split and the gradient-sync hooks; the
+    prewarmed devices."""
+    warm = prewarm_devices(device)
+    if not (warm and tunes(k)):
+        log.info(f"no kernel prewarm (TUNE={k['TUNE']!r}, devices {warm or 'cpu'})")
+        return warm
+    with timed(log, f"kernel prewarm on {warm} (fwd + bwd, {prec.compute})"):
+        build_prewarm(k, built, prec, device, dataset)(warm)
+    decisions.flush("after the kernel prewarm")
+    release_workspaces(warm)
+    adapters = adapter_prewarm_devices(k, device)
+    with timed(log, f"adapter prewarm on {adapters}"):
+        build_adapter_prewarm(k, built, prec.compute)(adapters)
+    release_workspaces(adapters)
+    device_use.log(log, "after prewarm")
+    return warm
 
 
 def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
     """One rank of a run."""
     is_main = rank == 0
-    deterministic_mode()
+    layout = layout_of(k)
     device = device or _device(k, rank)
-    torch.manual_seed(k["SEED"])  # identical model + adapter init on every rank
-    output_dir = str(Path(k["OUTPUT_DIR"]) / run_name(k))
-    if is_main:
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-        (Path(output_dir) / "config.json").write_text(
-            json.dumps(_snapshot(k), indent=2)
-        )
-    set_tune_mode(k["TUNE"])
-    if device.type == "cuda":  # cuSOLVER linear algebra, see docs/concepts/training.md
-        torch.backends.cuda.preferred_linalg_library("cusolver")
-    policy = build_policy(
-        k["PRECISION"], k["KEEP_FP32"], k["FP16_FIX"], k["FP16_FIX_KWARGS"]
+    output_dir, prec, lycoris_tuning = _start(k, layout, rank, device)
+    device_use = build_device_use(device)
+    data_rank = layout.stream_rank(rank)
+    data_world = layout.data_world(world)
+    kd, tokens, loader = _data(k, layout, rank, world, device)
+    ranks_meet("data")
+    torch.manual_seed(k["SEED"])  # the build's init does not depend on the scan
+    with timed(log, "building model, adapters and encoders"):
+        built = build_model(k, device, prec, world, loader.dataset.text_tokens_max())
+    log_object(log, "training memory plan", built.plan)
+    for message, fields in placement_lines(k, built, device):
+        log.info(message, **fields)
+    release_cache(device)
+    device_use.log(log, "after build")
+    warm = _prewarm(k, built, prec, device, loader.dataset, device_use)
+    ranks_meet("prewarmed")
+    ctx = RunContext(
+        k, built, layout, device, rank, world, data_world, is_main, output_dir
     )
-    built = build_model(k, device, policy, world)
-    engine, objective, names, keep = _stages(k, built, policy, rank, world, device)
+    engine, objective, names, keep = layout.stages(ctx, prec)
     if keep is not None:
         release_nonlocal(built.backbone, keep)
-    # kernel and adapter prewarm, before the gradient-sync hooks are installed
-    warm = prewarm_devices(k, device)
-    build_prewarm(k, built.backbone, policy.compute)(warm)
-    build_adapter_prewarm(k, built, policy.compute)(warm)
     torch.manual_seed(k["SEED"] + rank)  # per-rank stream for everything after build
-    hooks = build_hooks(k["PARALLEL"], built, policy.compute, world)
+    hooks = layout.hooks(ctx)
     _compile(built.backbone, built.plan.compile)
     normalizer = TokenNormalizer(hooks.reduce, hooks.world_factor)
-    autocast = autocast_factory(policy, device)
-    data_rank = stream_rank(k["PARALLEL"], rank)
-    data_world = 1 if k["PARALLEL"] == "pipeline" else world
-    step = build_step(k, built, normalizer, autocast, device, stream_rank=data_rank)
-    bundle, accumulate = build_optim(k, built, device, policy, hooks, keep)
+    autocast = autocast_factory(prec, device)
+    stage_devices = [torch.device(device.type, i) for i in k["DEVICES"]]
+    share, traced, sources = rank_layout(
+        layout.name, engine, built.backbone.cfg.depth, stage_devices
+    )
+    recorder = build_recorder(k, built)
+    step = build_step(
+        k,
+        built,
+        normalizer,
+        autocast,
+        device,
+        stream_rank=data_rank,
+        forward=hooks.forward,
+        recorder=recorder,
+    )
+    bundle, accumulate = build_optim(k, built, device, prec, hooks, keep)
     if objective is not None:
         objective.scaler = bundle.scaler
-    ema = build_ema_for(k, built, device, names)
-    data_cfg = DataConfig.from_knobs(k)
-    layout = LayoutTransform(built.backbone.cfg.rope_axes)
-    loader = build_loader(data_cfg, rank=data_rank, world=data_world, transform=layout)
-    writer = build_writer(k, loader, writes=data_rank == rank)
-    batcher = build_batcher(k, built, device, writer, loader.dataset)
-    val_batches = []
-    if k["VALIDATE_EVERY"] > 0:
-        val_loader = build_loader(
-            validation_data_config(k), rank=rank, world=world, transform=layout
-        )
-        val_batches = fixed_batches(
-            val_loader,
-            build_batcher(k, built, device, dataset=val_loader.dataset),
-            int(k["VALIDATION"].get("batches", 4)),
-        )
+    ema = build_ema_for(k, built, bundle, names, rank)
+    writer = build_writer(k, loader, writes=data_rank == rank, rank=rank)
+    loader, batcher = _inputs(k, built, device, loader, writer)
+    timeline = build_timeline(device)
+    for enc in (built.text_encoder, built.vae):
+        if hasattr(enc, "set_timeline"):
+            enc.set_timeline(timeline)
+    val_batches = _validation_batches(k, built, device, kd, tokens, rank, world)
     logger = build_logger(
         k["LOGGER"],
         output_dir,
@@ -197,61 +296,130 @@ def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
             k, built, normalizer, autocast, device, sampler, stream_rank=data_rank
         )
 
-    ckpt = build_checkpoints(k, output_dir, ema, is_main, writer, rank, warm)
-    parts_args = (built.trainable, ema, bundle, step, loader)
-    if k["PARALLEL"] == "pipeline":
-        parts = PipelineParts(
-            *parts_args,
-            local_names=names,
-            rank=rank,
-            world=world,
-            extra=lambda: {"world": world},
-        )
-    elif k["PARALLEL"] == "fsdp":
-        parts = FsdpParts(
-            *parts_args, model=built.backbone, extra=lambda: {"world": world}
-        )
-    else:
-        parts = Parts(*parts_args, extra=lambda: {"world": world})
+    rng_devices = stage_devices if layout.stage_rng else warm
+    ckpt = build_checkpoints(k, output_dir, ema, is_main, writer, rank, rng_devices)
+    parts = _parts(ctx, (ema, bundle, step, loader), names)
+    rank_cbs = _rank_callbacks(ctx, [hooks.timing, *sources], share, traced)
     runner = build_callbacks(
-        k,
-        built,
+        ctx,
         bundle,
         logger,
-        output_dir,
-        device,
-        is_main,
         make_step,
         val_batches,
         ckpt,
         parts,
         reduce_loss=hooks.reduce_loss,
+        autocast=autocast,
+        timeline=timeline,
+        device_use=device_use,
+        rank_callbacks=rank_cbs,
+        recorder=recorder,
     )
     state = TrainState()
     resume = ckpt.resolve(k["RESUME"])
     if resume is not None:
+        log.info(f"resuming from {resume}")
         parts.restore(ckpt.load(resume), state)
+        built.engines.after_restore()
+        logger.resume_at(state.step)
     driver = build_driver(
-        k, batcher, normalizer, device, runner, ckpt, parts, accumulate, engine, world
+        ctx, batcher, normalizer, runner, ckpt, parts, accumulate, engine
     )
-    driver.run(step, loader, bundle, ema, state)
-    if writer is not None:
-        writer.close()
-    with full_weights(k["PARALLEL"], built.backbone):
+    log.info(f"training from step {state.step} to {k['STEPS']}")
+    try:
+        with bars():
+            driver.run(step, loader, bundle, ema, state)
+        if writer is not None:
+            writer.close()
+            writer = None
+        _export(k, layout, built, parts, state, output_dir, is_main)
+    finally:
+        close_memory(built.engines, bundle)
+        close_quietly(writer)
+        logger.close()
+        restore_lycoris_tuning(lycoris_tuning)
+    return state
+
+
+def _rank_callbacks(ctx: RunContext, sources: list, share: float, traced) -> list:
+    """The per-rank report and profiled windows of `ctx`'s rank over `sources`."""
+    k, built = ctx.k, ctx.built
+    return build_rank_callbacks(
+        k,
+        arch=built.backbone.cfg,
+        mode="full" if is_full(k) else "adapter",
+        recompute=getattr(built.plan, "checkpoint", "none") != "none",
+        rank=ctx.rank,
+        world=ctx.world,
+        data_world=ctx.data_world,
+        device=ctx.device,
+        output_dir=ctx.output_dir,
+        sources=sources,
+        share=share,
+        extra_devices=traced,
+    )
+
+
+def _inputs(k: dict, built, device, loader, writer):
+    """(loader, batcher): the encode-ahead wrappers (latents, then text) around the
+    training loader and the batcher that moves its batches to `device`."""
+    dataset = loader.dataset
+    attach_text_prewarm(k, built, dataset)
+    latent_ahead = build_latent_ahead(k, built, loader)
+    loader = loader if latent_ahead is None else latent_ahead
+    ahead = build_ahead(k, built, loader)
+    batcher = build_batcher(k, built, device, writer, dataset, ahead, latent_ahead)
+    return (loader if ahead is None else ahead), batcher
+
+
+def _validation_batches(k: dict, built, device, kd, tokens, rank, world) -> list:
+    """The fixed validation batches on `device` (none when VALIDATE_EVERY is 0)."""
+    if k["VALIDATE_EVERY"] <= 0:
+        return []
+    val_loader = writer_first(
+        rank,
+        world,
+        partial(build_loader, validation_data_config(kd), rank, world, tokens),
+    )
+    return fixed_batches(
+        val_loader,
+        build_batcher(k, built, device, dataset=val_loader.dataset),
+        int(k["VALIDATION"].get("batches", 4)),
+    )
+
+
+def _parts(ctx: RunContext, live: tuple, names) -> Parts:
+    """The checkpoint parts `ctx.layout` builds over `live` = (ema, bundle, step,
+    loader)."""
+
+    def extra() -> dict:
+        return {"world": ctx.world}
+
+    return ctx.layout.parts(ctx, (ctx.built.trainable, *live), names, extra)
+
+
+def _export(
+    k: dict, layout: Layout, built, parts, state, output_dir: str, is_main: bool
+) -> None:
+    """Every EXPORT_FORMATS output of the trained state (rank 0 writes; every rank
+    takes part in the stage merge and the FSDP2 unshard)."""
+    parts.before_export()
+    with layout.full_weights(built.backbone):
         if is_main:
             meta = {
                 "kohakumoss_step": str(state.step),
                 "kohakumoss_algo": str(k["ALGO"]),
             }
             for path in export(k, built, output_dir, meta):
-                print(f"exported {path}", file=sys.stderr)
-    logger.close()
-    return state
+                log.info(f"exported {path}")
 
 
-def full_weights(kind: str, backbone):
-    """Context in which every rank's backbone holds full weights (FSDP2: unsharded on
-    every rank; otherwise nothing to do)."""
-    if kind == "fsdp":
-        return unsharded(backbone)
-    return contextlib.nullcontext()
+def close_quietly(writer) -> None:
+    """End of a run that raised: flush and stop the online cache writer, logging (not
+    raising) its own failure so the run's error is the one reported."""
+    if writer is None:
+        return
+    try:
+        writer.close()
+    except Exception as err:  # noqa: BLE001 - the run's own exception is propagating
+        log.warning(f"online cache writer did not close cleanly: {err}")

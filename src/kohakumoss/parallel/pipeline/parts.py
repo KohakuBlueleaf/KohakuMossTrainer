@@ -2,14 +2,16 @@
 
 The engines need: `prologue(img, text, sigma, seq) -> (x, PartsCtx)`, `layers`,
 `epilogue(x, ctx) -> pred`, `prologue_modules()`, `epilogue_modules()`, `bands`,
-`residual_scale`. `BackboneParts` provides them for MossBackbone.
+`residual_scale`, `stream_dtype`, `conditioning_trainable()`. `BackboneParts` provides
+them for MossBackbone.
 """
 
 from dataclasses import dataclass
 
+import torch
 from torch import Tensor, nn
 
-from kohakumoss.types.api import BlockCtx
+from kohakumoss.types.context import BlockCtx
 from kohakumoss.types.seqinfo import SeqInfo
 
 
@@ -29,12 +31,34 @@ class BackboneParts(nn.Module):
         self.layers = backbone.layers
 
     @property
+    def cfg(self):
+        """The backbone's MossArchConfig."""
+        return self.backbone.cfg
+
+    @property
     def bands(self) -> Tensor:
         return self.backbone.rope.bands
 
     @property
     def residual_scale(self) -> tuple[float, ...]:
         return self.backbone.residual_scale
+
+    @property
+    def stream_dtype(self) -> torch.dtype:
+        """Dtype of the residual stream between blocks (fp32 under the fp32-residual
+        fix, else the compute dtype)."""
+        return self.backbone._stream_dtype
+
+    def conditioning_modules(self) -> list[nn.Module]:
+        bb = self.backbone
+        return [bb.time_embedding, bb.shared_block_modulation, bb.video_head_modulation]
+
+    def conditioning_trainable(self) -> bool:
+        """Whether the per-sample modulation carries a gradient (a conditioning
+        parameter trains)."""
+        return any(
+            p.requires_grad for m in self.conditioning_modules() for p in m.parameters()
+        )
 
     def prologue(self, img: Tensor, text: Tensor, sigma: Tensor, seq: SeqInfo):
         bb = self.backbone

@@ -1,8 +1,8 @@
 """CallbackRunner: the per-step action list, built once from each callback's cadence.
 
 Callbacks with `every == 1` run every step; periodic ones run when the step reaches the
-precomputed next firing step (one integer compare per step for all of them). Firing
-order is the order the callbacks were given. Callbacks themselves never check cadence.
+precomputed next firing step; a callback with `edges = True` also fires at the run's
+first step and at `last`. Firing order is the order the callbacks were given.
 """
 
 import math
@@ -17,26 +17,37 @@ from kohakumoss.training.state import TrainState
 class CallbackRunner:
     """`run(state, out)` once per optimiser step, after `state.step` advanced."""
 
-    def __init__(self, callbacks: list, start_step: int = 0):
+    def __init__(self, callbacks: list, start_step: int = 0, last: int | None = None):
         self.ordered = [cb for cb in callbacks if cb.every > 0]
         self.always = [cb for cb in self.ordered if cb.every == 1]
         self.periods = sorted({cb.every for cb in self.ordered if cb.every > 1})
+        self.edged = {id(cb) for cb in self.ordered if getattr(cb, "edges", False)}
+        self.last = last
         self.reset(start_step)
 
     def reset(self, step: int) -> None:
-        """Recompute the next firing step after `step` (resume)."""
+        """Recompute the run's edge steps (first step after `step`, `last`) and the next
+        firing step after `step` (resume)."""
+        ends = {step + 1} | ({self.last} if self.last is not None else set())
+        self.edges = frozenset(ends) if self.edged else frozenset()
         self.next_fire = self._next_after(step)
 
     def _next_after(self, step: int) -> float:
-        return (
+        periodic = (
             min(((step // p) + 1) * p for p in self.periods)
             if self.periods
             else math.inf
         )
+        return min([periodic, *(s for s in self.edges if s > step)])
 
     def due(self, step: int) -> list:
         """Callbacks firing at `step` (every-step ones included), in given order."""
-        return [cb for cb in self.ordered if step % cb.every == 0]
+        edge = step in self.edges
+        return [
+            cb
+            for cb in self.ordered
+            if step % cb.every == 0 or (edge and id(cb) in self.edged)
+        ]
 
     def run(self, state: TrainState, out) -> None:
         if state.step == self.next_fire:
@@ -58,6 +69,20 @@ class SaveCheckpoint:
 
     def on_step_end(self, state: TrainState, out) -> None:
         self.checkpoints.save(state.step, self.parts(state))
+
+
+class MeetRanks:
+    """Every `every` steps, after rank-0-only work of that cadence (the sample grid):
+    every rank calls `meet(what)` (a store barrier, `launch.ranks_meet`), so the peers
+    wait there, not in the next step's collective."""
+
+    def __init__(self, every: int, what: str, meet: Callable[[str], None]):
+        self.every = every
+        self.what = what
+        self.meet = meet
+
+    def on_step_end(self, state: TrainState, out) -> None:
+        self.meet(self.what)
 
 
 def _own_decision(due: bool) -> bool:

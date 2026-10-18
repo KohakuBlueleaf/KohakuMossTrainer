@@ -1,18 +1,24 @@
-"""Monitoring callbacks: throughput / MFU, VRAM, metric logging, instability dumps."""
+"""Monitoring callbacks: throughput / MFU, VRAM, the console step line, metric rows,
+instability dumps."""
 
 import json
 import math
 import time
 from pathlib import Path
 
-import torch
-
-from kohakumoss.training.flops import forward_flops, peak_tflops, step_flops
+from kohakumoss.logging.log import get_logger, hl
+from kohakumoss.memory.device_use import NoDeviceUse
+from kohakumoss.model.flops import forward_flops, peak_tflops, step_flops
 from kohakumoss.training.state import TrainState
+from kohakumoss_common.calls import nothing
+
+log = get_logger(__name__)
 
 
 class Throughput:
     """tokens/s, samples/s, step time and MFU between two log points."""
+
+    edges = True
 
     def __init__(self, every: int, arch, mode: str, recompute: bool, device):
         self.every = every
@@ -57,24 +63,130 @@ class Throughput:
 
 
 class Vram:
-    """Peak allocated / reserved GiB since the last log point (CUDA / XPU devices)."""
+    """Peak allocated / reserved GiB since the last log point (CUDA / XPU devices),
+    overall and per phase of the VRAM timeline (`te`: text-encoder passes, `step`: the
+    rest; `_after` is what stays allocated when the phase ends), plus the device-use
+    breakdown (`vram_device`, `vram_other`, `vram_context`, `vram_non_torch`,
+    `vram_fragmented`, `vram_cached`, `vram_allocated`) when `device_use` is given."""
 
-    def __init__(self, every: int, device):
+    edges = True
+
+    def __init__(self, every: int, timeline, device_use=None):
         self.every = every
-        self.device = device
-        self.dm = torch.get_device_module(device)
+        self.timeline = timeline
+        self.device_use = device_use if device_use is not None else NoDeviceUse()
 
     def on_step_end(self, state: TrainState, out) -> None:
-        gib = 1024**3
+        self.timeline.mark("step")
+        state.metrics.update(self.timeline.report())
+        state.metrics.update(self.device_use.metrics())
+
+
+class VramAtStepOne:
+    """Logs the device-use breakdown once, at the run's first step."""
+
+    every = 1
+
+    def __init__(self, device_use):
+        self.device_use = device_use
+
+    def on_step_end(self, state: TrainState, out) -> None:
+        self.device_use.log(log, "after step 1")
+        self.on_step_end = nothing
+
+
+class TextEncodeStats:
+    """Text-encoder share of the run between log points: seconds per step and of the
+    wall time, tokens/s, host-to-device weight GB per step, TFLOP/s and MFU."""
+
+    edges = True
+
+    def __init__(self, every: int, encoder, device):
+        self.every = every
+        self.encoder = encoder
+        self.peak = peak_tflops(device)
+        self.t0 = time.perf_counter()
+        self.mark = self._snapshot()
+        self.step0 = 0
+
+    def _snapshot(self) -> tuple:
+        s = self.encoder.stats
+        return (s["seconds"], s["tokens"], s.get("h2d_bytes", 0), s["passes"])
+
+    def on_step_end(self, state: TrainState, out) -> None:
+        now = time.perf_counter()
+        dt = max(now - self.t0, 1e-9)
+        cur = self._snapshot()
+        sec, tok, h2d, passes = (a - b for a, b in zip(cur, self.mark))
+        steps = max(state.step - self.step0, 1)
+        flops = tok * self.encoder.flops_per_token
         state.metrics.update(
-            vram_peak_alloc=self.dm.max_memory_allocated(self.device) / gib,
-            vram_peak_reserved=self.dm.max_memory_reserved(self.device) / gib,
+            te_time=sec / steps,
+            te_share=sec / dt,
+            te_tokens_per_s=tok / max(sec, 1e-9),
+            te_h2d_gb=h2d / 1e9 / steps,
+            te_passes=passes / steps,
+            te_tflops=flops / max(sec, 1e-9) / 1e12,
         )
-        self.dm.reset_peak_memory_stats(self.device)
+        if self.peak:
+            state.metrics["te_mfu"] = flops / dt / 1e12 / self.peak
+        self.t0, self.mark, self.step0 = now, cur, state.step
+
+
+class VaeEncodeStats:
+    """VAE share of the run between log points: seconds per step and of the wall time,
+    images per step, host-to-device weight GB per step."""
+
+    edges = True
+
+    def __init__(self, every: int, vae):
+        self.every = every
+        self.vae = vae
+        self.t0 = time.perf_counter()
+        self.mark = self._snapshot()
+        self.step0 = 0
+
+    def _snapshot(self) -> tuple:
+        s = self.vae.stats
+        return (s["seconds"], s["images"], s.get("h2d_bytes", 0))
+
+    def on_step_end(self, state: TrainState, out) -> None:
+        now = time.perf_counter()
+        cur = self._snapshot()
+        sec, images, h2d = (a - b for a, b in zip(cur, self.mark))
+        steps = max(state.step - self.step0, 1)
+        state.metrics.update(
+            vae_time=sec / steps,
+            vae_share=sec / max(now - self.t0, 1e-9),
+            vae_images=images / steps,
+            vae_h2d_gb=h2d / 1e9 / steps,
+        )
+        self.t0, self.mark, self.step0 = now, cur, state.step
+
+
+class StepLine:
+    """The console step line (`step N [loss=, grad_norm=, lr=]`) every `every` steps and
+    at the run's first and last step."""
+
+    edges = True
+
+    def __init__(self, every: int):
+        self.every = every
+
+    def on_step_end(self, state: TrainState, out) -> None:
+        log.info(
+            f"step {hl(state.step)}",
+            loss=state.loss,
+            grad_norm=state.grad_norm,
+            lr=state.lr,
+        )
 
 
 class LogMetrics:
-    """Pushes host metrics to the logger every `every` steps (one extra sync there)."""
+    """Pushes host metrics to the logger sinks every `every` steps (METRICS_EVERY) and at
+    the run's first and last step (one host sync per row: the step's device metrics)."""
+
+    edges = True
 
     def __init__(self, every: int, logger):
         self.every = every
@@ -88,6 +200,7 @@ class LogMetrics:
             "loss_scale": state.scale,
             "skipped_steps": float(state.skipped),
             "nonfinite_steps": float(state.nonfinite),
+            "nonfinite_params": float(state.nonfinite_params),
         }
         for k, v in out.metrics.items():
             metrics[k] = float(v)
@@ -102,8 +215,14 @@ class InstabilityDump:
     every = 1
 
     def __init__(
-        self, output_dir: str, factor: float = 5.0, beta: float = 0.98, warmup: int = 20
+        self,
+        output_dir: str,
+        factor: float = 5.0,
+        beta: float = 0.98,
+        warmup: int = 20,
+        bundle=None,
     ):
+        self.bundle = bundle
         self.root = Path(output_dir) / "instability"
         self.factor = factor
         self.beta = beta
@@ -131,9 +250,10 @@ class InstabilityDump:
                 "lr": state.lr,
                 "batch_ids": state.batch_ids,
                 "metrics": {k: float(v) for k, v in out.metrics.items()},
+                "nonfinite_grads": list(getattr(self.bundle, "nonfinite_grads", [])),
             }
             (self.root / f"step_{state.step:08d}.json").write_text(
-                json.dumps(record, indent=2)
+                json.dumps(record, indent=2), encoding="utf-8"
             )
         if math.isfinite(loss):
             self.avg = (

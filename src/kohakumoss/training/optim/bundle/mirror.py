@@ -7,11 +7,12 @@ import torch
 from kohakumoss.training.optim.schedule import build_schedule
 
 
-class _Holder(torch.optim.Optimizer):
-    """Carries the schedule's lr; never steps."""
+class LRHolder(torch.optim.Optimizer):
+    """Carries one schedule-driven lr per group of `groups`; never steps."""
 
-    def __init__(self, lr: float):
-        super().__init__([torch.zeros(1)], {"lr": lr})
+    def __init__(self, groups: list[dict]):
+        holder = [{"params": [torch.zeros(1)], "lr": g["lr"]} for g in groups]
+        super().__init__(holder, {"lr": groups[0]["lr"] if groups else 0.0})
 
     def step(self, closure=None):
         return None
@@ -26,7 +27,7 @@ class MirrorSchedule:
         self.target = target
         base = float(target.param_groups[0]["lr"])
         self.ratios = [float(g["lr"]) / base for g in target.param_groups]
-        self.holder = _Holder(base)
+        self.holder = LRHolder([{"lr": base}])
         self.schedule = build_schedule(self.holder, schedule, steps)
         self._mirror()
 

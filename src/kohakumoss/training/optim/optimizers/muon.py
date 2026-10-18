@@ -7,10 +7,18 @@ docs/concepts/training.md.
 """
 
 import math
+from functools import partial
 
 import torch
 from torch import Tensor
 from torch.optim import Optimizer
+
+from kohakumoss.training.optim.optimizers.skip import (
+    store,
+    store_unless,
+    working,
+    working_copy,
+)
 
 NS_COEFFS = (3.4445, -4.7750, 2.0315)
 
@@ -18,7 +26,7 @@ NS_COEFFS = (3.4445, -4.7750, 2.0315)
 def newton_schulz(g: Tensor, steps: int = 5, eps: float = 1e-7) -> Tensor:
     """Approximate the orthogonal factor of `g` (2-D) in bf16 iterations."""
     a, b, c = NS_COEFFS
-    x = g.to(torch.bfloat16 if g.is_cuda else torch.float32)
+    x = g.to(torch.bfloat16)
     transposed = x.shape[0] > x.shape[1]
     if transposed:
         x = x.T
@@ -63,14 +71,24 @@ class MuonHybrid(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
-        for group in self.param_groups:
-            if group["use_muon"]:
-                self._muon(group)
-            else:
-                self._adamw(group)
+        self._update(working, store)
         return None
 
-    def _muon(self, group: dict) -> None:
+    @torch.no_grad()
+    def step_masked(self, found: Tensor) -> None:
+        """`step` that leaves every parameter and state tensor unchanged where the 0-d
+        `found` is nonzero; host step counts still advance (the fused-step bundle puts
+        them back)."""
+        self._update(working_copy, partial(store_unless, found.bool()))
+
+    def _update(self, work, put) -> None:
+        for group in self.param_groups:
+            if group["use_muon"]:
+                self._muon(group, work, put)
+            else:
+                self._adamw(group, work, put)
+
+    def _muon(self, group: dict, work, put) -> None:
         lr, wd, mom = group["lr"], group["weight_decay"], group["momentum"]
         splits = group["splits"] or [1] * len(group["params"])
         for p, n in zip(group["params"], splits):
@@ -78,18 +96,22 @@ class MuonHybrid(Optimizer):
                 continue
             g = p.grad.float()
             state = self.state[p]
-            buf = state.setdefault("momentum_buffer", torch.zeros_like(g))
-            buf.mul_(mom).add_(g)
+            if "momentum_buffer" not in state:
+                state["momentum_buffer"] = torch.zeros_like(g)
+            buf = work(state["momentum_buffer"], torch.float32).mul_(mom).add_(g)
+            put(state["momentum_buffer"], buf)
             upd = g.add(buf, alpha=mom) if group["nesterov"] else buf
             chunks = upd.chunk(n, 0)
             ortho = torch.cat([newton_schulz(c, group["ns_steps"]) for c in chunks], 0)
             rows = p.shape[0] // n
             scale = group["rms_match"] * math.sqrt(max(rows, p.shape[1]))
+            q = work(p, p.dtype)
             if wd:
-                p.mul_(1 - lr * wd)
-            p.add_(ortho.to(p.dtype), alpha=-lr * scale)
+                q.mul_(1 - lr * wd)
+            q.add_(ortho.to(p.dtype), alpha=-lr * scale)
+            put(p, q)
 
-    def _adamw(self, group: dict) -> None:
+    def _adamw(self, group: dict, work, put) -> None:
         b1, b2 = group["betas"]
         lr, eps, wd = group["lr"], group["eps"], group["weight_decay"]
         for p in group["params"]:
@@ -103,11 +125,14 @@ class MuonHybrid(Optimizer):
             state["step"] += 1
             t = state["step"]
             g = p.grad.float()
-            state["exp_avg"].mul_(b1).add_(g, alpha=1 - b1)
-            state["exp_avg_sq"].mul_(b2).addcmul_(g, g, value=1 - b2)
-            denom = (state["exp_avg_sq"] / (1 - b2**t)).sqrt_().add_(eps)
+            m = work(state["exp_avg"], torch.float32).mul_(b1).add_(g, alpha=1 - b1)
+            v = work(state["exp_avg_sq"], torch.float32).mul_(b2)
+            v.addcmul_(g, g, value=1 - b2)
+            put(state["exp_avg"], m)
+            put(state["exp_avg_sq"], v)
+            denom = (v / (1 - b2**t)).sqrt_().add_(eps)
+            pf = work(p, torch.float32)
             if wd:
-                p.mul_(1 - lr * wd)
-            p.addcdiv_(
-                state["exp_avg"].to(p.dtype), denom.to(p.dtype), value=-lr / (1 - b1**t)
-            )
+                pf.mul_(1 - lr * wd)
+            pf.addcdiv_(m, denom, value=-lr / (1 - b1**t))
+            put(p, pf)

@@ -1,13 +1,12 @@
 """TrainStep (driver-independent) and the HostBatch -> DeviceBatch transfer.
 
-Every build-time condition (cached vs online encoders, loss mask on/off) is bound to a
-callable at construction; the per-step paths carry no configuration branches. The one
-per-batch choice is data: an online cache hit arrives with `latents` / `text` set and
-is used as is, a miss arrives with `pixels` / `prompts` and is encoded.
+An online cache hit arrives with `latents` / `text` set and is used as is; a miss
+arrives with `pixels` / `prompts` and is encoded.
 """
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 from torch import Tensor, nn
@@ -16,15 +15,12 @@ from kohakumoss.diffusion.objective import TokenNormalizer, noise_latents
 from kohakumoss.types.batch import DeviceBatch
 from kohakumoss.types.seqinfo import build_seqinfo
 from kohakumoss.types.step import StepOut
+from kohakumoss_common.calls import nothing
 from kohakumoss_data.seeds import seed_of
 
 
 def _move(t: Tensor, device) -> Tensor:
     return t.to(device, non_blocking=True)
-
-
-def _no_mask_move(hb, device) -> None:
-    return None
 
 
 def _mask_move(hb, device) -> Tensor:
@@ -39,10 +35,6 @@ def _cached_latents(hb, device) -> tuple[Tensor, None]:
     return _move(hb.latents, device), None
 
 
-def _no_write(hb, latents, text, text_len) -> None:
-    return None
-
-
 def cap_text(parts: list[Tensor], limits: list[int]) -> list[Tensor]:
     """Keep the first `limits[i]` rows of sample i (0 or no limits = all rows)."""
     if not limits:
@@ -54,24 +46,35 @@ def _as_is(x, *args):
     return x
 
 
-class OnlineText:
-    """A cache hit's `hb.text`, else `hb.prompts` encoded (EncodeText), rounded as the
-    cache stores it (`as_cached`, an online cache's `texts.as_cached`; identity with no
-    cache) and capped to `hb.text_limit`; the kept lengths become `text_len` and fill
-    `hb.text_len`."""
+def _encode_prompts(encode: Callable, hb) -> list[Tensor]:
+    return encode(hb.prompts)
 
-    def __init__(self, encode: Callable, as_cached: Callable = _as_is):
+
+class OnlineText:
+    """A cache hit's `hb.text`, else `hb.prompts` encoded, rounded as the cache stores it
+    (`as_cached`, an online cache's `texts.as_cached`; identity with no cache) and
+    capped to `hb.text_limit`; the kept lengths become `text_len` and fill
+    `hb.text_len`. `source(hb)` gives the encodings (default: EncodeText on
+    `hb.prompts`; encode-ahead hands over a pass made earlier)."""
+
+    def __init__(
+        self,
+        encode: Callable,
+        as_cached: Callable = _as_is,
+        source: Callable | None = None,
+    ):
         self.encode = encode
         self.as_cached = as_cached
+        self.source = source or partial(_encode_prompts, encode)
 
     @torch.no_grad()
     def __call__(self, hb, device) -> tuple[Tensor, Tensor]:
         if hb.text is not None:
             return _cached_text(hb, device)
-        parts = cap_text(self.as_cached(self.encode(hb.prompts)), hb.text_limit)
+        parts = cap_text(self.as_cached(self.source(hb)), hb.text_limit)
         lens = torch.tensor([p.shape[0] for p in parts], dtype=torch.int32)
         hb.text_len = lens
-        return torch.cat(parts, 0).to(device), lens
+        return _move(torch.cat(parts, 0), device), lens
 
 
 def gather_kept(latents: Tensor, hw: Tensor, img_keep) -> Tensor:
@@ -82,7 +85,7 @@ def gather_kept(latents: Tensor, hw: Tensor, img_keep) -> Tensor:
     parts = latents.split(sizes, 0)
     return torch.cat(
         [
-            p if keep is None else p.index_select(0, keep.to(p.device))
+            p if keep is None else p.index_select(0, _move(keep, p.device))
             for p, keep in zip(parts, img_keep)
         ],
         0,
@@ -94,17 +97,24 @@ class OnlineLatents:
     the planned latent grid `hb.hw` (EncodeImages), rounded as the cache stores it
     (`as_cached(full, hw)`, an online cache's `latents.as_cached`; identity with no
     cache) and gathered to the token-drop subset `hb.img_keep`. Returns (kept latents,
-    the raw full-grid encoding or None for a hit)."""
+    the raw full-grid encoding or None for a hit). `source(pixels, hw)` gives the
+    encoding (default: `encode`; encode-ahead hands over a pass made earlier)."""
 
-    def __init__(self, encode: Callable, as_cached: Callable = _as_is):
+    def __init__(
+        self,
+        encode: Callable,
+        as_cached: Callable = _as_is,
+        source: Callable | None = None,
+    ):
         self.encode = encode
         self.as_cached = as_cached
+        self.source = source or encode
 
     @torch.no_grad()
     def __call__(self, hb, device) -> tuple[Tensor, Tensor | None]:
         if hb.latents is not None:
             return _cached_latents(hb, device)
-        full = self.encode(hb.pixels, hb.hw).to(device)
+        full = _move(self.source(hb.pixels, hb.hw), device)
         kept = gather_kept(self.as_cached(full, hb.hw), hb.hw, hb.img_keep)
         return kept, full
 
@@ -138,7 +148,7 @@ class DeviceBatcher:
         rope_axes: int = 4,
         text: Callable = _cached_text,
         latents: Callable = _cached_latents,
-        on_encoded: Callable = _no_write,
+        on_encoded: Callable = nothing,
         masked: bool = False,
     ):
         self.device = device
@@ -146,7 +156,7 @@ class DeviceBatcher:
         self.text = text
         self.latents = latents
         self.on_encoded = on_encoded
-        self.mask = _mask_move if masked else _no_mask_move
+        self.mask = _mask_move if masked else nothing
 
     def __call__(self, hb) -> DeviceBatch:
         text, text_len = self.text(hb, self.device)
@@ -193,16 +203,8 @@ def token_counter(masked: bool) -> Callable:
     return mask_token_count if masked else image_token_count
 
 
-def _no_pre_forward(sigma: Tensor, seq, step: int) -> None:
-    return None
-
-
 def _batch_mask(batch: DeviceBatch) -> Tensor:
     return batch.loss_mask
-
-
-def _no_mask(batch: DeviceBatch) -> None:
-    return None
 
 
 def _image_count(batch: DeviceBatch) -> int:
@@ -231,7 +233,8 @@ class TrainStep:
 
     `__call__(batch, denom, step)` takes the global token denominator of the optimiser
     step; `denominator(batch)` gives the one of a lone batch (validation, tests). The
-    sigma and noise generators are seeded from `(seed, rank)`.
+    sigma and noise generators are seeded from `(seed, rank)`. `keep(prepared, denom)`
+    sees every prepared micro-batch (the non-finite recorder's last one).
     """
 
     def __init__(
@@ -245,10 +248,12 @@ class TrainStep:
         device: torch.device,
         seed: int = 0,
         masked: bool = False,
-        pre_forward: Callable = None,
+        pre_forward: Callable | None = None,
         rank: int = 0,
+        keep: Callable | None = None,
     ):
-        self.pre_forward = pre_forward or _no_pre_forward
+        self.pre_forward = pre_forward or nothing
+        self.keep = keep or nothing
         self.backbone = backbone
         self.loss_fn = loss_fn
         self.weighting = weighting
@@ -256,7 +261,7 @@ class TrainStep:
         self.normalizer = normalizer
         self.autocast = autocast
         self.device = device
-        self.mask_of = _batch_mask if masked else _no_mask
+        self.mask_of = _batch_mask if masked else nothing
         self.count_of = _mask_count if masked else _image_count
         self.sigma_gen = torch.Generator().manual_seed(seed_of("sigma", seed, rank))
         self.noise_gen = torch.Generator(device=device).manual_seed(
@@ -267,15 +272,22 @@ class TrainStep:
         return self.normalizer.denominator(self.count_of(batch), self.device)
 
     def prepare(self, batch: DeviceBatch, step: int) -> Prepared:
-        """Noise the batch: model inputs, velocity target, per-sample loss weight."""
+        """Noise the batch (`noise`) and install its adapter step state
+        (`pre_forward`) for the forward that follows."""
+        p = self.noise(batch, step)
+        self.pre_forward(p.sigma, p.seq, step)
+        return p
+
+    def noise(self, batch: DeviceBatch, step: int) -> Prepared:
+        """Model inputs, velocity target, per-sample loss weight; the adapter step
+        state is left to the caller (pipelines install it per micro-batch)."""
         seq = batch.seq
         z0 = batch.latents.float()
-        sigma = self.sample_sigma(seq.batch, self.sigma_gen, step).to(self.device)
+        sigma = _move(self.sample_sigma(seq.batch, self.sigma_gen, step), self.device)
         eps = torch.randn(
             z0.shape, generator=self.noise_gen, device=self.device, dtype=torch.float32
         )
         z_sigma, target = noise_latents(z0, eps, sigma, seq)
-        self.pre_forward(sigma, seq, step)
         weight = self.weighting(sigma, batch.weight.float())
         return Prepared(
             z_sigma, batch.text, sigma, seq, target, weight, self.mask_of(batch)
@@ -288,6 +300,7 @@ class TrainStep:
 
     def __call__(self, batch: DeviceBatch, denom: Tensor, step: int = 0) -> StepOut:
         p = self.prepare(batch, step)
+        self.keep(p, denom)
         with self.autocast():
             pred = self.backbone(p.z, p.text, p.sigma, p.seq)
         return StepOut(self.loss(pred, p, denom), denom, {"sigma_mean": p.sigma.mean()})

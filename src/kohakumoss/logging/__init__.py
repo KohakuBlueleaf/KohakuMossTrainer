@@ -1,7 +1,13 @@
 """Logging sinks, selected through LOGGERS (rank 0; other ranks get NullLogger)."""
 
-from kohakumoss.logging.sinks import BoardLogger, ConsoleLogger, NullLogger, WandbLogger
-from kohakumoss.registry import Registry
+from kohakumoss.logging.sinks import (
+    BoardLogger,
+    ConsoleLogger,
+    NullLogger,
+    WandbLogger,
+    fresh_run,
+)
+from kohakumoss_common.registry import Registry
 
 LOGGERS = Registry("logger")
 LOGGERS.add(
@@ -28,4 +34,5 @@ __all__ = [
     "NullLogger",
     "WandbLogger",
     "build_logger",
+    "fresh_run",
 ]

@@ -1,12 +1,15 @@
-"""Optimiser registry: name -> builder(groups, device, **hyper) -> torch Optimizer."""
+"""Optimiser registry: name -> builder(groups, device, **hyper) -> torch Optimizer.
+OPTIMIZER names an algorithm and implementation; the placement builders of `adamw`
+(INTERNAL) are chosen by OPTIM_STATE, never named by OPTIMIZER."""
 
 import torch
 
-from kohakumoss.offload.cpu_optim import CPUAdamW
-from kohakumoss.offload.gpu_adamw import HostStateAdamW, MasterAdamW
-from kohakumoss.registry import Registry
-from kohakumoss.training.optim.adamw16 import AdamW16
-from kohakumoss.training.optim.muon import MuonHybrid
+from kohakumoss.offload.optim.cpu_optim import CPUAdamW
+from kohakumoss.offload.optim.gpu_adamw import HostStateAdamW, MasterAdamW
+from kohakumoss.training.optim.optimizers.adamw8bit import AdamW8bitKernel
+from kohakumoss.training.optim.optimizers.adamw16 import AdamW16
+from kohakumoss.training.optim.optimizers.muon import MuonHybrid
+from kohakumoss_common.registry import Registry
 
 try:
     import bitsandbytes as bnb
@@ -23,6 +26,16 @@ except ImportError:
 
 OPTIMIZERS = Registry("optimizer")
 OPTIMIZER_SPECIAL_KEYS = ("names", "splits", "decay_to_one", "decay_to_one_coef")
+INTERNAL = {"cpu_adamw": "cpu", "host_state_adamw": "stream", "master_adamw": "gpu"}
+STATE_BYTES = {
+    "adamw": 8,
+    "adamw16": 4,
+    "adamw8bit": 2,
+    "adamw8bit_kernel": 2,
+    "muon": 8,
+    "prodigy": 16,
+    "schedule_free": 8,
+}
 
 
 def _plain_groups(groups: list[dict]) -> list[dict]:
@@ -33,7 +46,7 @@ def _plain_groups(groups: list[dict]) -> list[dict]:
     ]
 
 
-def _master_groups(groups: list[dict]) -> list[dict]:
+def master_groups(groups: list[dict]) -> list[dict]:
     """Groups for the offload AdamWs, which apply `decay_to_one` themselves."""
     return [
         {k: v for k, v in g.items() if k not in ("names", "splits", "use_muon")}
@@ -72,6 +85,13 @@ def build_adamw8bit(groups, device, lr, betas, eps, **_):
     return lib.optim.AdamW8bit(_plain_groups(groups), lr=lr, betas=betas, eps=eps)
 
 
+@OPTIMIZERS.register("adamw8bit_kernel")
+def build_adamw8bit_kernel(groups, device, lr, betas, eps, rounding="nearest", **_):
+    return AdamW8bitKernel(
+        _plain_groups(groups), lr=lr, betas=betas, eps=eps, rounding=rounding
+    )
+
+
 @OPTIMIZERS.register("muon")
 def build_muon(groups, device, lr, betas, eps, momentum=0.95, ns_steps=5, **_):
     keep = [{k: v for k, v in g.items() if k not in ("names",)} for g in groups]
@@ -85,21 +105,20 @@ def build_muon(groups, device, lr, betas, eps, momentum=0.95, ns_steps=5, **_):
 
 @OPTIMIZERS.register("cpu_adamw")
 def build_cpu_adamw(groups, device, lr, betas, eps, pinned=True, **_):
-    cls = CPUAdamW
-    return cls(_master_groups(groups), lr=lr, betas=betas, eps=eps, pinned=pinned)
+    return CPUAdamW(master_groups(groups), lr=lr, betas=betas, eps=eps, pinned=pinned)
 
 
 @OPTIMIZERS.register("master_adamw")
 def build_master_adamw(groups, device, lr, betas, eps, **_):
-    cls = MasterAdamW
-    return cls(_master_groups(groups), lr=lr, betas=betas, eps=eps, weight_decay=0.0)
+    return MasterAdamW(
+        master_groups(groups), lr=lr, betas=betas, eps=eps, weight_decay=0.0
+    )
 
 
 @OPTIMIZERS.register("host_state_adamw")
 def build_host_state_adamw(groups, device, lr, betas, eps, pinned=True, **_):
-    cls = HostStateAdamW
-    return cls(
-        _master_groups(groups),
+    return HostStateAdamW(
+        master_groups(groups),
         lr=lr,
         betas=betas,
         eps=eps,
