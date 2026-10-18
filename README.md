@@ -8,7 +8,7 @@ nodes.
 ![A style LoRA after 100 steps: MOSS-Image-Base (top row) against the LoRA (bottom row), same prompts and seeds](docs/assets/teaser-style-lora.webp)
 
 A style LoRA (rank 8, fp16, fp8 base GEMMs) after 100 steps at batch ~4 (20k tokens per
-step) on one RTX 4090, with the aggressive `ckpt-stream4-actoff` offload profile and the text
+step) on one RTX 4090, with the aggressive `ckpt-ring4-actoff` offload profile and the text
 encoder and VAE encoding online in every step: 12-13 GB on the card, about 0.85 images / s.
 Top row MOSS-Image-Base, bottom row the LoRA; 32 sampler steps, CFG 3, the same seed per
 column.
@@ -232,7 +232,7 @@ The other release setups, latent + text cache:
 | | RTX 3090 | 0.37 | 1472 | 2.15 | 2.01 / 3.62 | yes |
 | | RTX 2080 Ti | 0.17 | 706 | 2.15 | 1.81 / 3.50 | no |
 | | Tesla T10 | 0.16 | 639 | 2.15 | 1.79 / 3.45 | no |
-| LoKr 16, int8 base, fp16, `ckpt-stream2-actoff-optstream-gradoff` | RTX 5090 | 0.88 | 3555 | 1.81 | 2.73 / 4.58 | no |
+| LoKr 16, int8 base, fp16, `ckpt-ring2-actoff-optstream-gradoff` | RTX 5090 | 0.88 | 3555 | 1.81 | 2.73 / 4.58 | no |
 | | RTX 4090 (2) | 0.54 | 2166 | 1.67 | 3.67 / 8.19 | no |
 | | RTX 3090 | 0.31 | 1247 | 1.68 | 2.09 / 3.72 | no |
 | | RTX 2080 Ti | 0.17 | 686 | 1.68 | 2.06 / 2.90 | no |

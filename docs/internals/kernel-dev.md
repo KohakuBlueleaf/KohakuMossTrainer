@@ -7,7 +7,7 @@
 | --- | --- | --- |
 | sm70 / sm75 (V100, 2080 Ti) | TileLang | Triton has no tensor-core dots below sm80 (they lower to FMA) |
 | sm80 / sm86 / sm89 / sm120 | Triton (TileLang also registered) | Inductor sees `triton_op` launches |
-| XPU | Triton (Intel backend), per op where measured faster (see performance docs) | TileLang has no XPU target |
+| XPU | Triton (Intel backend), per op where measured faster ([performance](../performance/README.md)) | TileLang has no XPU target |
 | CPU | eager | |
 
 Every tuned kernel family times a PyTorch path inside its shortlist, and the winner is
@@ -24,22 +24,24 @@ stored per card, so a kernel is bound only where it beats PyTorch:
 | optimizer steps (`adamw_step`, `adamw8bit_step`, `adamw_step_multi`) | the reference step, timed once per key on scratch copies (`optim/choice.py`) |
 
 On XPU the Triton fused linears (`linear_situ`, `linear_gated_residual`,
-`linear_qk_rope`) and the `fp8_linear*` paths are registered too. Each tile that fails
-to build on the Intel backend is skipped by the tuner. A problem with no surviving
-candidate raises `BackendUnavailable`, and the registry rebinds the op to its next
-backend (`compile` for the fused linears, `eager` for fp8). Without fp8 matrix units the
-fp8 paths that dequantize in registers (`promote`, `fused`) and the 16-bit paths remain.
+`linear_qk_rope`) and the `fp8_linear*` paths are registered too:
+
+- Each tile that fails to build on the Intel backend is skipped by the tuner.
+- A problem with no surviving candidate raises `BackendUnavailable`, and the registry
+  rebinds the op to its next backend (`compile` for the fused linears, `eager` for fp8).
+- Without fp8 matrix units the fp8 paths that dequantize in registers (`promote`,
+  `fused`) and the 16-bit paths remain.
 
 ## Registry
 
 An implementation is a callable with the op's eager signature (`kohakumoss_kernels.ops`)
-that supports autograd and torch.compile. `register(op, backend, fn, supports)` adds it;
-`supports(query)` returns None when it can serve the `OpQuery` (op, arch, dtype, static
-options), or the reason it cannot. `resolve(op, device, dtype, **static)` walks the
-backend priority of the device's arch (`DEFAULT_PRIORITY`, overridable with
-`set_priority`), skipping backends that are unavailable, do not support the query, fail
-their probe on the device or have a recorded failure for the op, and returns a
-`Bound` op. `available(...)` lists every backend's reason (the doctor's view).
+that supports autograd and torch.compile.
+
+| call | does |
+| --- | --- |
+| `register(op, backend, fn, supports)` | adds an implementation; `supports(query)` returns None when it can serve the `OpQuery` (op, arch, dtype, static options), or the reason it cannot |
+| `resolve(op, device, dtype, **static)` | walks the backend priority of the device's arch (`DEFAULT_PRIORITY`, overridable with `set_priority`), skipping backends that are unavailable, do not support the query, fail their probe on the device or have a recorded failure for the op, and returns a `Bound` op |
+| `available(...)` | lists every backend's reason (the doctor's view) |
 
 Inside `recording()` (`kohakumoss_kernels.recording`) a `Bound` call is snapshotted and
 answered by the eager reference, so nothing is built or tuned; see
@@ -48,14 +50,16 @@ answered by the eager reference, so nothing is built or tuned; see
 ## Adding an op to a backend
 
 1. Write `backends/<backend>/<group>/<op>.py` (groups: `blocks/`, `attention/`,
-   `textenc/`, `optim/`, `fp8/`); the backend package imports every public module of
+   `textenc/`, `optim/`, `fp8/`). The backend package imports every public module of
    its package tree on import (files starting with `_` are helpers and are skipped), so
-   no `__init__` edit is needed. A submodule whose import raises `ImportError` (a missing
-   optional module) is listed in `backends.<backend>.FAILED` and logged at WARNING; the
-   rest still register. Any other error raised while importing a submodule (a
-   `NameError`, `TypeError`, ... in its code) propagates.
-   `tests/kernels/registry/test_backend_imports.py` asserts `FAILED` is empty for every backend
-   whose package is installed.
+   no `__init__` edit is needed.
+   - A submodule whose import raises `ImportError` (a missing optional module) is
+     listed in `backends.<backend>.FAILED` and logged at WARNING; the rest still
+     register.
+   - Any other error raised while importing a submodule (a `NameError`, `TypeError`,
+     ... in its code) propagates.
+   - `tests/kernels/registry/test_backend_imports.py` asserts `FAILED` is empty for
+     every backend whose package is installed.
 2. At module bottom call `registry.register(op, backend, fn, supports)`, with
    `supports` built from `constraints.requires(...)`. `fn` has the eager signature,
    supports autograd and `torch.compile(fullgraph=True)`, and handles every shape it
@@ -73,23 +77,25 @@ answered by the eager reference, so nothing is built or tuned; see
      caller-allocated outputs): tensors TileLang allocates lose autograd when a custom
      op returns them.
 4. Tiles come from `tuning.select` (see [tuning.md](tuning.md)).
-5. Tests in `tests/kernels/`: the error-statistics check of `tests/_util/error_stats.py` in fp16 and
-   bf16, forward and backward, plus a broken variant the check must reject
-   (`tests/_util/negative.py`). Benchmark in `scripts/bench/kernel/` against every
-   PyTorch alternative, eager and compiled, accuracy next to speed.
+5. Tests in `tests/kernels/`: the error-statistics check of `tests/_util/error_stats.py`
+   in fp16 and bf16, forward and backward, plus a broken variant the check must reject
+   (`tests/_util/negative.py`).
+6. Benchmark in `scripts/bench/kernel/` against every PyTorch alternative, eager and
+   compiled, accuracy next to speed ([Benches](#benches)).
 
 ## Per-sample vectors
 
 The segment-indexed ops (`rms_norm_mod` shift / scale, `gated_residual` and
 `linear_gated_residual` gate) receive `mod[:, k]` slices of the backbone's fp32
 `[B, 6, D]` block modulation and `[B, 2, D]` head modulation: row stride `6 D` (or
-`2 D`), not `D`. The kernels take the row and column strides of each per-sample vector
-as arguments and address `seg * row_stride + col * col_stride`; no copy is made. With a
-single sample every row reads row 0, so only packed batches of two or more samples
-expose a layout error.
-`tests/kernels/blocks/test_modulation_layout.py` runs every backend on the strided slices
-against its own result on contiguous copies; `tests/model/test_packed_kernels.py` runs a
-packed batch against per-sample runs under the device's default kernel selection.
+`2 D`), not `D`.
+
+- The kernels take the row and column strides of each per-sample vector as arguments and
+  address `seg * row_stride + col * col_stride`; no copy is made.
+- With a single sample every row reads row 0, so only packed batches of two or more
+  samples expose a layout error.
+- `tests/kernels/blocks/test_modulation_layout.py` runs every backend on the strided
+  slices against its own result on contiguous copies.
 
 ## TileLang notes (0.1.15)
 
@@ -123,17 +129,21 @@ implementation that cannot run here raises `errors.BackendUnavailable`:
 - the attention and text-encoder entries translate a build / launch error of their call
   into it (`errors.unavailable`).
 
-When the eager reference also rejects the failing call's arguments, `Bound` raises
-`errors.InputError` instead: a caller bug, nothing recorded, the op stays bound. A
-sticky device error (`errors.is_sticky_error`: the text names an illegal memory
-access, misaligned address, illegal instruction, device-side assert or unspecified
-launch failure, or synchronising the CUDA device raises) propagates unchanged, with
-nothing recorded and no rebind: the context is unusable, so any next backend would
-fail on it too (`tests/kernels/registry/test_fallback.py`, negative: the check off).
-The prewarm replay re-raises it as well instead of skipping the problem
-(`tests/kernels/tuning/test_replay_sticky.py`).
+Two errors are not a backend failure:
 
-`Bound` then records the failure in `registry.failures()` and rebinds to the next
+- When the eager reference also rejects the failing call's arguments, `Bound` raises
+  `errors.InputError` instead: a caller bug, nothing recorded, the op stays bound.
+- A sticky device error (`errors.is_sticky_error`: the text names an illegal memory
+  access, misaligned address, illegal instruction, device-side assert or unspecified
+  launch failure, or synchronising the CUDA device raises) propagates unchanged, with
+  nothing recorded and no rebind: the context is unusable, so any next backend would
+  fail on it too (`tests/kernels/registry/test_fallback.py`, negative: the check off).
+  The prewarm replay re-raises it as well instead of skipping the problem
+  (`tests/kernels/tuning/test_replay_sticky.py`).
+
+### Rebind
+
+Otherwise `Bound` records the failure in `registry.failures()` and rebinds to the next
 backend of the arch priority, together with every live `Bound` of the same query (op,
 arch, dtype, static options, priority) still on the failed backend: the prewarm twin's
 op and the model's op are such a pair, so a failure met in the prewarm moves the
@@ -143,22 +153,37 @@ model's op too. Each rebind logs one WARNING through the project logger:
 <op> on <arch>/<dtype>: backend <failed> failed, using <next> (<n> bound ops): <error>
 ```
 
-A record is keyed `op|backend|arch|dtype|static options` (`status.failure_key`), plus
-the problem (`<tuned kernel>:<key>`, the key holding the bucketed shapes) when the error
-names one: a `ConfigsFailed` (every shortlisted config of one problem failed) is a
-record of that problem only. Only a build / toolchain failure (`is_toolchain_error`)
-met at build time is written to `<kernel cache>/failures/backends.json`: inside
-`status.build_phase()`, which `registry.exercise` (the prewarm replay, the attention and
-block-op prewarms) enters. A failure met in a live call (a step, a sample) rebinds the
-op in this process and is never written to disk. `resolve` skips a backend for an op
-only on a record without a problem for the same dtype and static options, so a failure
-of one shape leaves the backend for every other shape, and a failure in fp16 leaves
-bf16; a backend skipped for a record on disk logs one WARNING (`backend <name> skipped,
-failed here (...)`) when the op resolves, so a run start shows every persisted demotion.
-Within the process the tuner raises the stored `ConfigsFailed` of a problem again on
-its next lookup without timing it again. A pinned backend (`resolve(..., backend=...)`)
-re-raises instead. The fallback covers failures raised while the forward runs, so a
-backend surfaces its backward failures there:
+A pinned backend (`resolve(..., backend=...)`) re-raises instead.
+
+### Failure records
+
+- **Key.** A record is keyed `op|backend|arch|dtype|static options`
+  (`status.failure_key`), plus the problem (`<tuned kernel>:<key>`, the key holding the
+  bucketed shapes) when the error names one: a `ConfigsFailed` (every shortlisted config
+  of one problem failed) is a record of that problem only.
+- **On disk.** Only a build / toolchain failure (`is_toolchain_error`) met at build time
+  is written to `<kernel cache>/failures/backends.json`: inside `status.build_phase()`,
+  which `registry.exercise` (the prewarm replay, `tuning/replay.py`, and the attention
+  prewarm, `tuning/prewarm.py`) enters. A failure met in a live call (a step, a sample) rebinds the op in this
+  process and is never written to disk.
+- **Scope.** `resolve` skips a backend for an op only on a record without a problem for
+  the same dtype and static options, so a failure of one shape leaves the backend for
+  every other shape, and a failure in fp16 leaves bf16.
+- **Visibility.** A backend skipped for a record on disk logs one WARNING (`backend
+  <name> skipped, failed here (...)`) when the op resolves, so a run start shows every
+  persisted demotion.
+- **In process.** The tuner raises the stored `ConfigsFailed` of a problem again on its
+  next lookup without timing it again.
+- **Environment.** A recorded failure is stored with the environment fingerprint
+  (package versions, toolchain, Intel source mode) and honoured by later processes with
+  the same fingerprint; a changed environment ignores it. `kohakumoss-doctor` lists the
+  probe results and the current-fingerprint failures; `kohakumoss-doctor
+  --clear-failures` forgets them.
+
+### Backward failures
+
+The fallback covers failures raised while the forward runs, so a backend surfaces its
+backward failures there:
 
 - the attention kernels build and launch their backward once (zero `dO`, no grad) on the
   first grad-enabled forward of a problem key, inside the same `BackendUnavailable`
@@ -173,58 +198,78 @@ backend surfaces its backward failures there:
 A backward failure that still reaches the backward pass (a new key first met inside a
 checkpoint recompute, where `_Guarded` does not run) raises there.
 
-The text-encoder ops (`encoders/text/forward.py`, `TextOps`) follow the same rule at
-their build-time probe: a RuntimeError (out-of-memory included) binds the eager
-reference with one WARNING (`text encoder op <name> on <device>: backend <b> failed its
-probe, using eager: <error>`), kept in `TextOps.fallbacks`, never written to disk; any
-other error propagates. An out-of-memory in the probe is retried once after the
-device's free blocks go back to the driver (`forward.probe`), since the eager
-reference usually needs more working memory than the kernel and a transient OOM
-would otherwise bind it for the run (`tests/kernels/textenc/test_textenc_probe.py`,
-negative: no retry).
+**Guarded calls.** Until one backward of the current backend has succeeded, a `Bound`
+call that records a plain autograd graph (grad on, not traced, no saved-tensor hooks, a
+tensor needing grad) runs through `registry._Guarded`:
 
-What counts as "cannot run here" is `errors.BUILD_ERRORS` (RuntimeError, OSError,
-UnicodeError, Triton's `TritonError`), never out-of-memory: an OOM or a bug propagates and
-disables nothing. Before any op binds a backend on a device, `resolve` runs that
-backend's probe once per process and device (`status.register_check`): Triton
-builds and launches one minimal kernel (this also initialises Intel's driver utilities
-on XPU), the compile backend inherits Triton's result on a GPU and needs the host C++
-compiler on CPU, and TileLang needs the host compiler for nvcc. A failed probe logs one
-WARNING and the backend is skipped for every op on that device, so a missing compiler
-costs one build, not one per op. A recorded failure is stored with the environment fingerprint
-(package versions, toolchain, Intel source mode) and honoured by later processes with
-the same fingerprint; a changed environment ignores it. `kohakumoss-doctor` lists the
-probe results and the current-fingerprint failures; `kohakumoss-doctor
---clear-failures` forgets them.
+- the implementation runs on detached leaves and its backward through `autograd.grad`,
+  so a failure raised only in the backward also falls back and the gradient is
+  recomputed on the next backend;
+- the recompute reads the call's tensor inputs from `save_for_backward`, so an input
+  modified in place since the forward raises autograd's version error instead of
+  recomputing on the new values;
+- checkpointed and offloaded calls (saved-tensor hooks) keep their own graph semantics
+  and are not guarded.
 
-Until one backward of the current backend has succeeded, a `Bound` call that records a
-plain autograd graph (grad on, not traced, no saved-tensor hooks, a tensor needing grad)
-runs through `registry._Guarded`: the implementation runs on detached leaves and its
-backward through `autograd.grad`, so a failure raised only in the backward also falls
-back and the gradient is recomputed on the next backend. The recompute reads the
-call's tensor inputs from `save_for_backward`, so an input modified in place since the
-forward raises autograd's version error instead of recomputing on the new values.
-Checkpointed and offloaded calls (saved-tensor hooks) keep their own graph semantics
-and are not guarded.
+**Call paths.** A `Bound` binds its call path once per state instead of testing it per
+call:
 
-A `Bound` binds its call path once per state instead of testing it per call: inside
-`recording()` the recording path, while `guard` is on the guarded path (the per-call
-`_records_grad` test), otherwise the implementation directly inside the fallback's
-`try`. Setting `guard` (the first good backward, a fallback) and entering or leaving a
+| state | path |
+| --- | --- |
+| inside `recording()` | the recording path |
+| `guard` on | the guarded path (the per-call `_records_grad` test) |
+| otherwise | the implementation directly inside the fallback's `try` |
+
+Setting `guard` (the first good backward, a fallback) and entering or leaving a
 recording (`recording.on_change`) rebind every live `Bound`.
+
+### What counts as a failure
+
+"Cannot run here" is `errors.BUILD_ERRORS` (RuntimeError, OSError, UnicodeError,
+Triton's `TritonError`), never out-of-memory: an OOM or a bug propagates and disables
+nothing.
+
+**Backend probes.** Before any op binds a backend on a device, `resolve` runs that
+backend's probe once per process and device (`status.register_check`):
+
+| backend | probe |
+| --- | --- |
+| Triton | builds and launches one minimal kernel (this also initialises Intel's driver utilities on XPU) |
+| compile | inherits Triton's result on a GPU; needs the host C++ compiler on CPU |
+| TileLang | needs the host compiler for nvcc |
+
+A failed probe logs one WARNING and the backend is skipped for every op on that device,
+so a missing compiler costs one build, not one per op.
+
+**Text-encoder ops.** The text-encoder ops (`encoders/text/forward.py`, `TextOps`)
+follow the same rule at their build-time probe:
+
+- a RuntimeError (out-of-memory included) binds the eager reference with one WARNING
+  (`text encoder op <name> on <device>: backend <b> failed its probe, using eager:
+  <error>`), kept in `TextOps.fallbacks`, never written to disk; any other error
+  propagates;
+- an out-of-memory in the probe is retried once after the device's free blocks go back
+  to the driver (`forward.probe`), since the eager reference usually needs more working
+  memory than the kernel and a transient OOM would otherwise bind it for the run
+  (`tests/kernels/textenc/test_textenc_probe.py`, negative: no retry).
 
 ## Lazy backends
 
-`import kohakumoss_kernels` does no backend work. The first kernel build
-(`registry.resolve` or `available`, i.e. the first `OpSet.resolve` of a model) runs
-`registry.load_backends()` once per process: it appends the compile-cache key tag
-(`cache_tag.apply()`), then imports the eager, compile, Triton and TileLang backend
-packages; the Triton and TileLang packages set up the host toolchain on import
-(`ensure_toolchain()`: `vcvars64` and `PATH` / `CXX` on Windows, the Intel Triton UTF-8
-sources), the compile backend at its first CPU probe. A data helper or a CLI
-that never builds a kernel pays none of it. `CompiledOp` also applies the key tag
-before its first compile. `tests/kernels/registry/test_lazy_backends.py` checks it in a fresh
-process (negative: backends loaded at import).
+`import kohakumoss_kernels` does no backend work, so a data helper or a CLI that never
+builds a kernel pays none of it. The first kernel build (`registry.resolve` or
+`available`, i.e. the first `OpSet.resolve` of a model) runs `registry.load_backends()`
+once per process:
+
+1. it appends the compile-cache key tag (`cache_tag.apply()`,
+   [Compile cache key](#compile-cache-key));
+2. it imports the eager, compile, Triton and TileLang backend packages; the Triton and
+   TileLang packages set up the host toolchain on import (`ensure_toolchain()`:
+   `vcvars64` and `PATH` / `CXX` on Windows, the Intel Triton UTF-8 sources), the
+   compile backend at its first CPU probe.
+
+`CompiledOp` also applies the key tag before its first compile.
+`tests/kernels/registry/test_lazy_backends.py` checks it in a fresh process (negative:
+backends loaded at import).
 
 ## Current device
 
@@ -232,18 +277,23 @@ Kernels launch on the current device's queue, so every Triton launch (`Launcher`
 TileLang launch (`_blockops.compiled`) runs under `hardware.current.on_device(...)` for
 its tensors' device; without it a tensor on `cuda:1` / `xpu:1` launched while device 0
 is current reads the wrong device (DEVICE_LOST on Intel Arc).
-`hardware.current.synchronize(device)` is the one device-wait helper of the package;
-`hardware.current` also holds the accelerator device types (`ACCEL`, `is_accel`,
-`device_module`) and `saved_tensor_hooks_active()` (a checkpointed forward or its
-recompute, activation offload), the one probe of torch's saved-tensor hook stack.
-`rng_kept(devices)` (`torch.random.fork_rng` over the CPU and the given accelerator
-devices) wraps every random draw tuning makes: `select`'s shortlist timing, the
-prewarm replay's materialized inputs, the attention, block-op and adapter prewarms,
+
+`hardware.current` also holds:
+
+| name | role |
+| --- | --- |
+| `synchronize(device)` | the one device-wait helper of the package |
+| `ACCEL`, `is_accel`, `device_module` | the accelerator device types |
+| `saved_tensor_hooks_active()` | the one probe of torch's saved-tensor hook stack (a checkpointed forward or its recompute, activation offload) |
+| `rng_kept(devices)` | `torch.random.fork_rng` over the CPU and the given accelerator devices |
+
+`rng_kept` wraps every random draw tuning makes: `select`'s shortlist timing, the
+prewarm replay's materialized inputs, the attention and adapter prewarms,
 `retune_pending`'s rebuilt inputs, the device probe, the recorded twin pass and the
-text-encoder op probe. The caller's generators are where they were after it, so a
-run's random stream (adapter init, noise, timesteps) never depends on what the kernel
-cache held; `tests/kernels/tuning/test_rng_kept.py` checks it (negative: the draws without
-the fork).
+text-encoder op probe. The caller's generators are where they were after it, so a run's
+random stream (adapter init, noise, timesteps) never depends on what the kernel cache
+held; `tests/kernels/tuning/test_rng_kept.py` checks it (negative: the draws without the
+fork).
 
 ## Compile backend
 
@@ -252,24 +302,32 @@ the eager compositions of the fused linear ops (`compile/ops.py`, `COMPILED`). K
 backends choose against it per shape (`compile/choice.py`); its probe on a GPU is
 Triton's (inductor's GPU code is Triton), on CPU it needs the host C++ compiler.
 
-A `CompiledOp` keeps one compiled callable, with its own code object and Dynamo cache,
-per call pattern: the device, grad mode, intra-op thread count, autocast on the
-arguments' device, and per argument tensor dtype / requires_grad / rank, None and
-Python scalars: what Dynamo guards on besides shapes (Dynamo recompiles per device, so
-a threaded run over several GPUs gets one callable per device instead of piling their
-graphs onto one pattern). The thread count is part of it because a checkpoint
-recompute runs on the autograd thread, whose intra-op thread count differs; the
-recompute then has its own compiled callable instead of recompiling the forward's. A
-pattern that needs more than
-`GRAPH_LIMIT` graphs raises `GraphLimitError`; Dynamo's own recompile limits are raised
-above it, so Dynamo's silent eager fallback is never reached. A build failure of the
-first call raises `BackendUnavailable`; inside an outer torch.compile the eager
-reference is traced. `CompiledOp.resolved(args)` is the runner of `args`' pattern: a
+**Call patterns.** A `CompiledOp` keeps one compiled callable, with its own code object
+and Dynamo cache, per call pattern: what Dynamo guards on besides shapes.
+
+- The pattern is the device, grad mode, intra-op thread count, autocast on the
+  arguments' device, and per argument tensor dtype / requires_grad / rank, None and
+  Python scalars.
+- Dynamo recompiles per device, so a threaded run over several GPUs gets one callable
+  per device instead of piling their graphs onto one pattern.
+- The thread count is part of it because a checkpoint recompute runs on the autograd
+  thread, whose intra-op thread count differs; the recompute then has its own compiled
+  callable instead of recompiling the forward's.
+
+**Limits and failures.**
+
+- A pattern that needs more than `GRAPH_LIMIT` graphs raises `GraphLimitError`;
+  Dynamo's own recompile limits are raised above it, so Dynamo's silent eager fallback
+  is never reached.
+- A build failure of the first call raises `BackendUnavailable`.
+- Inside an outer torch.compile the eager reference is traced.
+
+**Binding.** `CompiledOp.resolved(args)` is the runner of `args`' pattern. A
 kernel-vs-compile op binds it per call key (the device, grad mode, thread count and
 autocast dtype, then every argument's shape / dtype / grad flag or value, which holds
-the pattern), so a bound call computes one key and calls the runner, not the pattern
-as well. The adapter compile candidate (`adapters/bind/autotuned.py`, `CompiledBody`)
-binds the `CompiledOp` of an autotuned op's operand shapes once per bucket
+the pattern), so a bound call computes one key and calls the runner, not the pattern as
+well. The adapter compile candidate (`adapters/bind/autotuned.py`, `CompiledBody`) binds
+the `CompiledOp` of an autotuned op's operand shapes once per bucket
 (`CompiledBody.at`).
 
 ## Fused linear ops
@@ -321,20 +379,22 @@ keeps every op in `KEPT` as it keeps aten `mm` / `linear` / SDPA.
 
 torch's on-disk compile caches (the FX graph cache and the AOT-autograd cache under
 `TORCHINDUCTOR_CACHE_DIR`) key an entry on the traced forward graph. A custom op's
-`register_autograd` backward and its schema are not part of that key. So after an op
-changes, for example when its backward drops an argument, a cached entry from the old
-code replays the old backward and calls the op with the old argument list ("expected at
-most 10 argument(s) but received 11").
+`register_autograd` backward and its schema are not part of that key, so a cached entry
+built from different op code (for example a backward with one argument fewer) would
+replay that code's backward and call the op with its argument list ("expected at most
+10 argument(s) but received 11").
 
 `kohakumoss_kernels.cache_tag.apply()` appends `kohakumoss-<sha1[:12]>` to
 `torch.compiler.config.cache_key_tag` on the first kernel build (`load_backends`) and
-before a `CompiledOp`'s first compile. The hash covers the `kohakumoss` package version plus the
-text of every module under `kohakumoss_kernels` that registers a custom op or its
-autograd (sources containing `custom_op(`, `register_autograd(` or `torch.library`).
-Any edit to such a module, or a version change, gives every compile cache entry a new
-key, and the old entries are never read again. A tag the user already set is kept, and
-ours is appended after a `|`. Computing the tag reads those sources once per process,
-a few milliseconds.
+before a `CompiledOp`'s first compile:
+
+- The hash covers the `kohakumoss` package version plus the text of every module under
+  `kohakumoss_kernels` that registers a custom op or its autograd (sources containing
+  `custom_op(`, `register_autograd(` or `torch.library`).
+- Any edit to such a module, or a version change, gives every compile cache entry a new
+  key, and entries under other keys are never read.
+- A tag the user already set is kept, and ours is appended after a `|`.
+- Computing the tag reads those sources once per process, a few milliseconds.
 
 ## Peak windows
 
@@ -350,18 +410,23 @@ per device type (tests use a fake allocator).
 ## Optimizer
 
 `kohakumoss_kernels.optim` binds `adamw_step`, `adamw8bit_step` and `adamw_step_multi`
-once (`resolve`); `optim.reference` defines what each computes. AdamW keeps `m` and
-`r = sqrt(v)`, so the squared magnitude never reaches 16-bit storage. Writeback modes:
-`nearest`, `stochastic` (bf16: add a random 16-bit integer to the fp32 bit pattern, then
-truncate) and `kahan` (a compensation buffer in the parameter dtype carries what rounding
-dropped). The 8-bit variant stores m and r per block of `BLOCK` values as int8 / uint8
-codes of a square-root companding of value / block absmax. The multi-tensor step seeds
-tensor t with `seed + t * SEED_STRIDE`. Each backend kernel is chosen against the
-reference per problem key (`optim/choice.py`); scratch copies of the arguments are made
-only when a key is actually timed. The gradient may come in its own dtype (a 16-bit
-parameter with an fp32 gradient) in both backends. The trainer's optimizers
-(`kohakumoss.training.optim`) do not call these ops: they serve the kernel benches and
-tests.
+once (`resolve`); `optim.reference` defines what each computes. The trainer's
+`adamw8bit_kernel` optimizer (`kohakumoss.training.optim.optimizers.adamw8bit`) steps
+through `adamw8bit_step`; `adamw_step` and `adamw_step_multi` serve the kernel benches
+and tests.
+
+- **State.** AdamW keeps `m` and `r = sqrt(v)`, so the squared magnitude never reaches
+  16-bit storage. The 8-bit variant stores m and r per block of `BLOCK` values as int8 /
+  uint8 codes of a square-root companding of value / block absmax.
+- **Writeback modes.** `nearest`, `stochastic` (bf16: add a random 16-bit integer to the
+  fp32 bit pattern, then truncate) and `kahan` (a compensation buffer in the parameter
+  dtype carries what rounding dropped).
+- **Seeds.** The multi-tensor step seeds tensor t with `seed + t * SEED_STRIDE`.
+- **Selection.** Each backend kernel is chosen against the reference per problem key
+  (`optim/choice.py`); scratch copies of the arguments are made only when a key is
+  actually timed.
+- **Gradient dtype.** The gradient may come in its own dtype (a 16-bit parameter with an
+  fp32 gradient) in both backends.
 
 ## Test budgets
 
@@ -389,25 +454,29 @@ Paths without `tests/` are under `tests/kernels/`.
 
 ## Benches
 
-`kohakumoss_kernels.bench.blockops` is the block-op harness of `scripts/bench/kernel/`:
-per case the backend kernel, the eager composition, torch.compile of it (static shapes)
-and the registered compile path (dynamic shapes) are timed forward and forward +
-backward (best of N with the L2 flushed and clocks warmed, plus CUDA-graph replay), and
-every output and input gradient is compared through the error statistics against an
-fp64 run of the eager reference, with the per-statistic worse-list against the eager
-composition. An entry that chooses per shape reports its choice (`selected`). Rows go to
-`runs/kernel/<op>-<card>.json`.
+`kohakumoss_kernels.bench.blockops` is the block-op harness of `scripts/bench/kernel/`.
+Per case:
+
+- **Timed:** the backend kernel, the eager composition, torch.compile of it (static
+  shapes) and the registered compile path (dynamic shapes), forward and forward +
+  backward (best of N with the L2 flushed and clocks warmed, plus CUDA-graph replay).
+- **Compared:** every output and input gradient through the error statistics against an
+  fp64 run of the eager reference, with the per-statistic worse-list against the eager
+  composition.
+- An entry that chooses per shape reports its choice (`selected`).
+- Rows go to `runs/kernel/<op>-<card>.json`.
 
 ## Varlen attention
 
 `attention_varlen(q, k, v, cu_seqlens, max_seqlen, scale)` on packed `[N, H, D]`
-tensors (any token and head strides, contiguous head dim for Triton). The grid's first
-axis covers the longest segment; programs past their segment's end exit, so no host
-work is needed per batch. The Triton kernels compute token offsets in int64 (a segment
-start times a row stride passes 2^31 elements past about 233k tokens of a qkv-strided
-view).
+tensors (any token and head strides, contiguous head dim for Triton).
 
-Numerics (the three attention fixes, all applied in both backends):
+- The grid's first axis covers the longest segment; programs past their segment's end
+  exit, so no host work is needed per batch.
+- The Triton kernels compute token offsets in int64 (a segment start times a row stride
+  passes 2^31 elements past about 233k tokens of a qkv-strided view).
+
+Numerics (three rules, applied in both backends):
 
 1. **Two-plane row statistics.** The forward stores the raw score max `m` and
    `log2(l)` as separate fp32 planes `[H, N]`, not one log-sum-exp. A single
@@ -432,10 +501,7 @@ compiled kernel):
 The register / shared-buffer variants trade shared memory for registers so more
 programs fit on cards with small shared memory per SM (Turing: 64 KiB).
 
-The fp16 / bf16 MMAs use fp32 accumulation everywhere. GeForce tensor cores run fp16
-accumulation about twice as fast, but rounding each partial sum to fp16 adds an error
-the size of the output rounding to O and to the gradients, a regression of the error
-statistics; bf16 MMAs have no fp16-accumulating form at all.
+The fp16 / bf16 MMAs use fp32 accumulation everywhere.
 
 ### Measured design per arch
 
@@ -453,27 +519,35 @@ first legal seed runs untimed, as it does in a trace.
 | XPU | the shared seeds, tuned per key | | | | |
 | sm70 / sm75 (TileLang) | measured per-arch seeds | see `SEEDS` | | | |
 
-On sm120 the fused backward (dQ through fp32 atomics) beats the split one at every
-measured shape (11.6 vs 14.7 ms at 2 MP x1) and reaches 86 % of FA2's backward; FA2 and
-our forward both run at the card's measured MMA rate (233 TFLOP/s probe), so a single
-long segment ties with SDPA ([performance](../performance/attention.md#the-single-segment-ceiling)).
-The fused kernel holds BN = 128 keys with dK and dV in fp32 registers; larger query
-tiles than 16 rows lose to register pressure. TileLang builds on sm120 too; there it is
-reached only through the registry fallback. sm80 seeds are a design point for A100-class
-cards; the tuner replaces them with measured choices on first use.
+On sm120:
 
-Registry entry per backend (`backends/triton/attention/entry.py` on sm80+ / XPU,
+- The fused backward (dQ through fp32 atomics) beats the split one at every measured
+  shape (11.6 vs 14.7 ms at 2 MP x1) and reaches 86 % of FA2's backward.
+- FA2 and our forward both run at the card's measured MMA rate (233 TFLOP/s probe), so a
+  single long segment ties with SDPA
+  ([performance](../performance/attention.md#the-single-segment-ceiling)).
+- The fused kernel holds BN = 128 keys with dK and dV in fp32 registers; larger query
+  tiles than 16 rows lose to register pressure.
+- TileLang builds on sm120 too; there it is reached only through the registry fallback.
+
+sm80 seeds are a design point for A100-class cards; the tuner replaces them with
+measured choices when a problem is first tuned.
+
+**Registry entry per backend** (`backends/triton/attention/entry.py` on sm80+ / XPU,
 `backends/tilelang/attention/entry.py`): a `VarlenChoice` (`backends/varlen_choice.py`)
 that times, per problem key, the backend's own kernels against torch's `varlen_attn`
 (when the torch build and card have flash) or else the per-segment SDPA loop, and binds
-the winner (table `attn_varlen_impl_<backend>`). The key carries whether a backward
-runs through the call: `-g1` (grad mode on, an input requiring grad) is timed forward +
-backward on leaf copies, `-g0` (inference, sampling) the forward alone under no_grad,
-so a training run and an inference run on one card each bind their own winner. It
-times only outside inference mode, checkpointed forwards, recomputes and traces;
-inside torch.compile the SDPA loop is never used. Trainers call
-`tuning.prewarm_attention` before step 0 so every length bucket and segment-count
-bucket is decided ahead of the checkpointed training forward.
+the winner (table `attn_varlen_impl_<backend>`).
+
+- The key carries whether a backward runs through the call: `-g1` (grad mode on, an
+  input requiring grad) is timed forward + backward on leaf copies, `-g0` (inference,
+  sampling) the forward alone under no_grad, so a training run and an inference run on
+  one card each bind their own winner.
+- It times only outside inference mode, checkpointed forwards, recomputes and traces;
+  inside torch.compile the SDPA loop is never used.
+- Trainers call `tuning.prewarm_attention` in the prewarm before the first step, so every
+  length bucket and segment-count bucket is decided ahead of the checkpointed training
+  forward ([tuning.md](tuning.md#prewarm)).
 
 The tile and strategy keys of both backends are
 `<dtype>-h<heads>-d<head dim>-L<longest segment bucket>-S<segment count bucket>`
@@ -482,52 +556,64 @@ The tile and strategy keys of both backends are
 and one long one fills the card differently from a two-segment pack of the same
 longest segment.
 
-Call path: the first call of a problem key tunes (or reads the table) and binds the
-chosen kernels into one launch callable; later calls look the binding up by key and
-launch. Provisional picks made while tracing are not bound.
+**Call path.** The first call of a problem key reads the table, or tunes where timing
+is allowed ([tuning windows](tuning.md#tuning-windows)), and binds the chosen kernels
+into one launch callable; later calls look the binding up by key and launch.
+Provisional picks made while tracing are not bound.
 
-Guards: masked key columns are `-inf` before the max (fully valid rows always have a
-finite max), masked tiles zero `p` explicitly so out-of-range rows never produce
-`inf * 0`, empty segments launch nothing. The backward kernels read row statistics
-(`m`, `log2 l`, delta) only for rows inside the segment; rows past the segment end read
-0 (explicit `if_then_else`, independent of TileLang's automatic bounds guards).
+**Guards.**
+
+- Masked key columns are `-inf` before the max (fully valid rows always have a finite
+  max).
+- Masked tiles zero `p` explicitly so out-of-range rows never produce `inf * 0`.
+- Empty segments launch nothing.
+- The backward kernels read row statistics (`m`, `log2 l`, delta) only for rows inside
+  the segment; rows past the segment end read 0 (explicit `if_then_else`, independent of
+  TileLang's automatic bounds guards).
 
 ### Matmul precision and error statistics
 
 Every MMA takes 16-bit operands with fp32 accumulation, as flash attention does: P is
 rounded once before P·V and P^T·dO, dS once before dS·K and dS^T·Q, delta comes from the
 16-bit O, and the accumulators, row statistics and softmax stay fp32 until the single
-rounding at the store. There is no multi-pass (hi / lo) or fp32 MMA.
+rounding at the store.
 
 The tests check o, dQ, dK, dV through the error statistics
-(`tests/_util/error_stats.py`): kernel and PyTorch are both measured against fp64
-(cosine; abs and rel error as mean / median / min / max), every check appends its table
-to `$KOHAKUMOSS_PRECISION_DIR/attention.jsonl`, and a test fails only on a regression
-(non-finite, or `MAX_ERROR_RATIO` x PyTorch or more on the cosine deficit or the mean /
-median errors). "PyTorch" is plain PyTorch as it computes the op, never an emulation of
-the kernels' precision: `pytorch_sdpa` (`tests/kernels/attention/_attention_case.py`), one
-`torch.nn.functional.scaled_dot_product_attention` call per segment in the inputs'
-16-bit dtype with gradients by autograd, on whichever SDPA backend the device selects.
+(`tests/_util/error_stats.py`):
+
+- Kernel and PyTorch are both measured against fp64 (cosine; abs and rel error as mean /
+  median / min / max).
+- Every check appends its table to `$KOHAKUMOSS_PRECISION_DIR/attention.jsonl`.
+- A test fails only on a regression: non-finite, or `MAX_ERROR_RATIO` x PyTorch or more
+  on the cosine deficit or the mean / median errors.
+- "PyTorch" is plain PyTorch as it computes the op: `pytorch_sdpa` (`tests/kernels/attention/_attention_case.py`), one
+  `torch.nn.functional.scaled_dot_product_attention` call per segment in the inputs'
+  16-bit dtype with gradients by autograd, on whichever SDPA backend the device
+  selects.
+
 The measured stats per arch are in
 [performance/attention.md](../performance/attention.md#precision).
 
-Huge logits (clustered q / k, logits ~1e5): the softmax is nearly one-hot and
+**Huge logits** (clustered q / k, logits ~1e5). The softmax is nearly one-hot and
 `sum_j dS_ij = 0` holds only before rounding. dQ = `scale * sum_j dS_ij K_j`, and K
 carries a large component common to all keys, so rounding dS to 16 bits (bf16: 8 bits)
-leaves a residue `(sum_j round(dS_ij)) * K` that the true dQ cancels. Every 16-bit-
-operand implementation shares it (flash SDPA included); the huge-logit stats are in
-[performance/attention.md](../performance/attention.md#precision). The test pools 16
-draws (a handful of elements carry each draw's error) and applies the regression check to
-the cosine and absolute stats only: with a one-hot softmax most fp64 dQ / dK elements
-are around 1e-190, far below any 16-bit dtype's range, so their relative error (mean and
-median up to 1e18 - 1e91 for flash SDPA and ours alike) measures the reference,
-not the kernel. The relative stats are still written to the table.
+leaves a residue `(sum_j round(dS_ij)) * K` that the true dQ cancels. Every
+16-bit-operand implementation shares it (flash SDPA included); the huge-logit stats are
+in [performance/attention.md](../performance/attention.md#precision).
+
+The test pools 16 draws (a handful of elements carry each draw's error) and applies the
+regression check to the cosine and absolute stats only: with a one-hot softmax most fp64
+dQ / dK elements are around 1e-190, far below any 16-bit dtype's range, so their
+relative error (mean and median up to 1e18 - 1e91 for flash SDPA and ours alike)
+measures the reference, not the kernel. The relative stats are still written to the
+table.
 
 `torch.compile` (fullgraph) of the kernels is compared with the eager call through the
 error statistics, not bitwise: Inductor rebuilds the launched Triton kernels with its
 own compile options, which may contract operations differently.
 
-Determinism per backend and strategy (repeat calls on the same inputs and card):
+Bitwise repeatability per backend and strategy (repeat calls on the same inputs and
+card):
 
 | path | o | dK, dV | dQ |
 | --- | --- | --- | --- |
@@ -539,10 +625,12 @@ Determinism per backend and strategy (repeat calls on the same inputs and card):
 The Triton strategy is a tuned choice, so dQ is bitwise only when `split` wins. A
 different tuned tile config gives different (equally accurate) bits.
 
-The eager reference runs one SDPA per segment and needs the segment bounds on the host. It
-takes them from a cache keyed by the `cu_seqlens` tensor: `SeqInfo.to` registers the
-bounds it already holds (`remember_bounds`) when it moves the plan to the device, so the
-eager path never syncs; an unregistered tensor is read back once. An entry is used only
-while the tensor lives and its version counter is unchanged, so an in-place rewrite or
-a new tensor at a reused address reads back again. Inference tensors carry no version
-counter and are read back on every call.
+**Eager bounds.** The eager reference runs one SDPA per segment and needs the segment
+bounds on the host. It takes them from a cache keyed by the `cu_seqlens` tensor:
+
+- `SeqInfo.to` registers the bounds it already holds (`remember_bounds`) when it moves
+  the plan to the device, so the eager path never syncs; an unregistered tensor is read
+  back once.
+- An entry is used only while the tensor lives and its version counter is unchanged, so
+  an in-place rewrite or a new tensor at a reused address reads back again.
+- Inference tensors carry no version counter and are read back on every call.

@@ -2,7 +2,7 @@
 
 `kohakumoss.model.MossBackbone` is a re-implementation of the MOSS-Image transformer with
 module names equal to the official state-dict keys, so HF and ComfyUI checkpoints load
-without renaming.
+as they are.
 
 ## Shape (base / sft)
 
@@ -30,8 +30,8 @@ cfg = backbone.bind_forward(segment_skip_layers=(22,))    # bound once
 v = cfg(img, text, sigma, seq, mask)                      # skipped where mask[b] is True
 ```
 
-- `img` [N_img, 128] and `text` [N_txt, 4096] are packed (see `seqinfo.md`); `sigma` is
-  fp32 [B].
+- `img` [N_img, 128] and `text` [N_txt, 4096] are packed (see
+  [seqinfo.md](seqinfo.md)); `sigma` is fp32 [B].
 - `bind_forward` resolves the block plan once (re-bind after a fold or fp16-fix change).
   With `segment_skip_layers`, one bool mask [B] applies to every listed block: each
   listed block runs on the whole packed batch and its output is kept only on the tokens
@@ -43,14 +43,7 @@ v = cfg(img, text, sigma, seq, mask)                      # skipped where mask[b
 - Time embedding, shared modulation and head modulation are computed per sample; those
   modules store fp32 weights (`KEEP_FP32`). Their linears are plain PyTorch linears
   under the caller's autocast, and their outputs are cast to fp32 for the modulation
-  (`docs/concepts/numerics.md`, Conditioning). The timestep sinusoid is fp32.
-
-## Ops and runners
-
-Blocks call ops through the `OpSet` resolved once per (device, dtype). `bind_ops()` binds
-each layer's fused linear+epilogue callables; it runs after any structural change
-(adapter attach, base storage swap). The block loop calls `runner.run(i, block, x, ctx)`;
-`PlainRunner` calls the block directly, the memory engine supplies the others.
+  ([numerics.md](numerics.md#conditioning)). The timestep sinusoid is fp32.
 
 ## Checkpoints
 
@@ -58,8 +51,17 @@ each layer's fused linear+epilogue callables; it runs after any structural chang
 | --- | --- |
 | HF `transformer/` dir (3 shards + index) | as is |
 | ComfyUI single file, bare or `model.diffusion_model.` keys | prefix stripped, fused `proj.qkv` split into q / k / v |
-| our single-file saves | as is |
+| KohakuMoss single-file saves | as is |
 
-Loading is strict: every model key must be filled and every source key consumed
-(`rope.bands` is derived and optional). Savers write a single bare-key file (split or
-fused qkv) or diffusers shards with `config.json`; the residual fold is undone first.
+- Loading is strict: every model key must be filled and every source key consumed
+  (`rope.bands` is derived and optional).
+- Savers write a single bare-key file (split or fused qkv) or diffusers shards with
+  `config.json`; the residual fold is undone first.
+
+## Ops and runners
+
+- Blocks call ops through the `OpSet` resolved once per (device, dtype).
+- `bind_ops()` binds each layer's fused linear+epilogue callables; it runs after any
+  structural change (adapter attach, base storage swap).
+- The block loop calls `runner.run(i, block, x, ctx)`; `PlainRunner` calls the block
+  directly, the memory engine supplies the others.

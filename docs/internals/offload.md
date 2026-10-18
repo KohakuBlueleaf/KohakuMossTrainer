@@ -3,7 +3,7 @@
 `kohakumoss.memory` turns a profile name into a `MemoryPlan` once, and
 `apply_to_backbone` (training) / `apply_inference_plan` (`MossPipeline.from_pretrained
 (memory=...)`, `MEMORY_PROFILE` in `sample.py`) install the engines the plan names. The training
-loop then calls one composed `BlockRunner`; nothing branches on the plan per step. The
+loop then calls one composed `BlockRunner`, bound at build time. The
 text encoder has its own `TextEncoderPlan`, placed by `apply_to_text_encoder` (section
 "Text encoder" below and [text-encoder.md](text-encoder.md)).
 
@@ -17,9 +17,8 @@ text encoder has its own `TextEncoderPlan`, placed by `apply_to_text_encoder` (s
 | `minimal` | block | yes | ring (2 resident) | host, streamed to the GPU | yes | yes |
 | `auto` | the fastest of the above whose estimate fits the device's free memory (see [Memory model](#memory-model)) | | | | | |
 
-No profile sets the base precision: every profile keeps the compute dtype, and
-`BASE_PRECISION` (`compute`, `int8`, `fp8`, `quant`, `fp8_compute`, `mxfp8`) applies under
-any profile. The catalog entries (`ckpt-stream4-actoff-optstream`, ...) are every
+Every profile keeps the compute dtype; `BASE_PRECISION` (`compute`, `int8`, `fp8`,
+`quant`, `fp8_compute`, `mxfp8`) sets the base precision under any profile. The catalog entries (`ckpt-ring4-actoff-optstream`, ...) are every
 combination of the placement axes; [../concepts/profiles.md](../concepts/profiles.md)
 lists them with their estimates.
 
@@ -66,6 +65,22 @@ fp32): a pointer of a freed bf16 weight would otherwise stay excluded, and an ac
 the allocator later places at that address would never be offloaded. Combined with block
 checkpointing, the checkpoint's saved block inputs are the offloaded tensors.
 
+Every unpack prefetches the previous block (a no-op once its packets are fetched), so
+in backward each block's packets are queued one block of compute ahead of their use,
+and only the first block of a backward is fetched on demand. On an RTX 5090 one async
+copy engine carries every host-to-device copy: activation packets and `ring` weight
+loads run one after the other on it, never concurrently (an nsys GPU-metrics trace
+shows only engine 0 active). A packet fetched only at its unpack would wait behind the
+next block's weight load; prefetched, it is copied before its block runs. With `ring`,
+the step's copy floor is the weight bytes plus the activation bytes over the H2D
+bandwidth (19.18 GB at 28.3 GB/s for the 1 MP LoRA step below).
+
+The pack and unpack hooks run under `torch.compiler.disable`: they are host
+bookkeeping (side streams, events, the pinned pool) and run as plain Python wherever
+autograd calls them, including from the eager ops of a compiled frame its backend gave
+up (inductor skips a bf16 graph on a GPU without native bf16, sm75), where Dynamo would
+otherwise trace them with symbolic shapes.
+
 Two saved tensors are not copied. A saved dtype cast of a leaf parameter, or a view of
 one (autocast's weight cast under a full-FT forward without checkpointing, saved as
 `w.t()` by the linear: view nodes over `ToCopyBackward0` over the parameter's
@@ -103,7 +118,11 @@ their device-to-host copy.
 Host buffers come from a pool of pinned byte buffers in power-of-two size classes (at
 least 1 MiB). A packet takes the smallest free class that holds it, so a smaller bucket
 shape reuses a larger buffer. A buffer returns to the pool when its H2D copy is queued,
-and it is reused only after that copy has finished. New pinned memory is allocated only
+and it is reused only after that copy has finished. The fetched device copy stays with
+its packet until the packet is freed, so a saved tensor that backward reads more often
+than it was saved never re-reads a recycled host buffer. The kept (never offloaded)
+storages are rebuilt from the live tensors after the build (`exclude_params` ->
+`rebuild`), so an address freed by a parameter dtype change never stays kept. New pinned memory is allocated only
 when a packet is larger than every free buffer. A pinned allocation (`cudaHostAlloc`)
 blocks the host for about 10-30 ms per 8-32 MiB buffer on the V100 host, and 42 of them
 per step cost more than the step's compute. With the pool, the LoRA `balanced` step on
@@ -112,7 +131,7 @@ V100 with offload takes 1207 ms against 1199 ms without it.
 ## Weight streaming
 
 `WeightStream` keeps every streamed `MossLinear` weight in (pinned) host memory and a ring
-of `resident` device slots. `enter(i)` makes block `i` resident and prefetches `i+1`;
+of `slots` device slots (`STREAM_RESIDENT`). `enter(i)` makes block `i` resident and prefetches `i+1`;
 backward makes `i` resident again and prefetches `i-1`. A slot is overwritten only after
 the compute stream records that it is done with the slot's previous block. A streamed
 linear (`_StreamedLinear`) saves only its input for the backward, never the slot. Its
@@ -136,7 +155,7 @@ by five parts in `offload/weights/streaming/`, built once per stream for its dev
 | `SlotRing` (`ring`) | the device slots, which block each holds, the LRU victim that skips the active and kept blocks; `ensure` / `prefetch` / `release` |
 | `H2DCopier` (`copier`) | host -> slot copies on the H2D side stream (pinned, or through the two staging sets), the per-slot `ready` / `free` and per-block `host_ready` events; a plain copy on the host |
 | `SpanTimer` (`timer`) | copy and copy-wait spans while timing is on, cut per step (`set_timing`, `cut_timing`, `read_timing`) |
-| `GradSink` (`grads`) | the fp32 host gradient sums (`host_grad`, `filled`), the D2H through `HostAccumulator`, `.grad` exposure for `flush_grads` |
+| `GradSink` (`grads`) | the fp32 host gradient sums (`host_grad`, `filled`), the D2H through `HostAccumulator`, `.grad` exposure for `expose_grads` |
 | `BlockReducer` (`reducer`) | the last micro-batch's cross-rank block sum: the one fp32 flat buffer, the side stream, `reduce` |
 
 The device-dependent calls (`copier.copy` / `wait` / `mark_free`,
@@ -160,13 +179,13 @@ share one `stats` dict (loads, H2D / D2H bytes, host syncs).
   memory estimate uses): 3 x 18 B per parameter in bf16 with resident states, 3 x 54 B
   with streamed states. A block whose slot is needed again before its last gradient
   arrived, or that is never stepped in the backward, raises instead of having its state
-  rows overwritten. The host gradient sums are never zeroed: a step's first gradient
-  of a weight is copied into its sum and later ones added (`grad_filled` marks the sums
+  rows overwritten. A step's first gradient of a weight is copied into its host sum and
+  later ones added (`grad_filled` marks the sums
   that hold this step's gradients). With `optim_state="cpu"`
-  the sums land in the masters' `.grad` (`flush_grads()`), `CPUAdamW` steps, and
+  the sums land in the masters' `.grad` (`expose_grads()`), `CPUAdamW` steps, and
   `refresh()` updates the streaming copies; under DDP each block's last-micro-batch
   gradient plus the host sum becomes one fp32 buffer on a side stream that is reduced
-  onto the block's owner and copied to its host gradient (`BlockReducer.flush_block`). Under DDP
+  onto the block's owner and copied to its host gradient (`BlockReducer.reduce_block`). Under DDP
   the masters and streaming copies
   are one shared host region for all ranks of the node (see
   [multi-gpu.md](../guides/multi-gpu.md#shared-host-masters)).
@@ -191,7 +210,7 @@ allocated peak and steady from step to step:
   size never needs a new segment), torch's settings elsewhere. A
   `PYTORCH_CUDA_ALLOC_CONF` / `PYTORCH_ALLOC_CONF` in the environment wins. The
   settings in force are logged at the start of the run.
-- **No per-step allocation on a side stream.** A block allocated while a side stream is
+- **Side-stream buffers allocated once.** A block allocated while a side stream is
   current belongs to that stream's pool, which the compute stream never draws from. The
   offload engines therefore allocate their device buffers once and copy into them:
   the weight ring slots (`WeightStream`), the optimiser-state rings (`HostStateAdamW`:
@@ -202,34 +221,29 @@ allocated peak and steady from step to step:
   gradients are summed across ranks in (`WeightStream.reduce_with`, allocated once on
   the compute stream), and the activation-offload fetch buffers, which are allocated
   on the compute stream (see Activation offload).
-- **No release between steps** (below).
+- **Cached memory kept between steps** (below).
 
 ### Between-step release
 
-The trainer returns no memory to the driver between steps. The caching allocator keeps
-the blocks a step freed and hands them to the next step's allocations of the same
-stream; the offload engines copy into the fixed buffers above, so a step neither frees
-nor re-reserves what the previous step used, and reserved memory stays at the steady
-peak instead of being unmapped and mapped again every step. Memory goes back to the
-driver only at phase boundaries: after the build, after the kernel and adapter
-prewarm and the text-encoder prewarm, and around sampling (`MossPipeline` releases
-after a generate); the between-step retune of the first steps returns nothing (only a
-queued problem whose inputs do not fit releases before it is dropped), and no step
-after the tuning windows tunes (docs/internals/tuning.md#tuning-windows). Under memory pressure the allocator itself frees cached blocks and retries an
-allocation before it reports out-of-memory. `STEP_RELEASE` (default `"none"`) is the
-only explicit release inside the loop: `"empty_cache"` (every optimizer step) or N
-(every N steps) are opt-ins, each a device synchronise plus `empty_cache` that the next
-step pays back as fresh allocations.
+The trainer keeps its cached memory between steps. The caching allocator keeps the
+blocks a step freed and hands them to the next step's allocations of the same stream;
+the offload engines copy into the fixed buffers above, so a step reuses what the
+previous step reserved, and reserved memory stays at the steady peak. Memory goes back to
+the driver at phase boundaries: after the build, after the kernel and adapter prewarm
+and the text-encoder prewarm, around sampling (`MossPipeline` releases after a
+generate), and before a between-step retune drops a queued problem whose inputs do not
+fit. Under memory pressure the allocator itself frees cached blocks and retries an
+allocation before it reports out-of-memory. `STEP_RELEASE` (default `"none"`) adds a
+release inside the loop: `"empty_cache"` (every optimizer step) or N (every N steps),
+each a device synchronise plus `empty_cache` that the next step pays back as fresh
+allocations.
 
 `kohakumoss.memory.release.CacheReleaseStats` runs after every step on CUDA /
 XPU and reports the bytes returned to the driver at that step, as reserved bytes
 before minus reserved bytes after. With a STEP_RELEASE callback bound, these are its
 release's (`memory_reserved` read around the synchronise + empty_cache, 0 on a step
 it does not run); without one, they are the drop of the allocator's reserved bytes
-since the previous step end. It frees nothing. The allocator's
-`reserved_bytes.all.freed` counter is not used: it counts every segment freed and
-re-reserved inside a step, so its per-step difference exceeds the device's memory
-under churn. The metric rows carry `cache_released_gib` (GiB returned at that step)
+since the previous step end. It only reads the counters. The metric rows carry `cache_released_gib` (GiB returned at that step)
 and, averaged since the previous row, `cache_releases` (share of steps in which memory
 went back) and `cache_release_time` (host seconds per step of the release). With no
 release bound a steady run shows zeros, and a nonzero row marks an allocation retry or
@@ -265,7 +279,7 @@ The optimiser step runs on the GPU by default, including under every offload kno
   joins the worker and makes the compute stream wait for the copies. The host update
   therefore overlaps the rest of backward. A 16-bit host gradient is converted for the
   update into one reused fp32 host buffer (one for the worker thread, one for the
-  caller's thread), not a new tensor per parameter and step; a parameter's pinned
+  caller's thread); a parameter's pinned
   gradient buffer is allocated on its first D2H, so parameters that read gradient
   offload's host sums (`use_host_grads`) never hold one. `load_state_dict` keeps the
   masters and moments as host fp32 tensors (torch's loader casts optimiser state to each
@@ -276,8 +290,6 @@ The optimiser step runs on the GPU by default, including under every offload kno
   (`handles_decay_to_one`), so the bundle's post-step decay is skipped for them.
 - `FusedStep` registers post-accumulate-grad hooks that step each parameter as soon as its
   gradient is complete and free it, so only one block's gradients are alive.
-  `PerParamOptimizer` gives any torch optimiser that per-parameter interface behind a
-  torch-style `param_groups` view for schedules (one view dict per source group).
   `FusedStepBundle.step` marks the schedule's optimiser as stepped (`_opt_called`)
   before `schedule.step()`: the in-backward updates are that optimiser's step, and
   torch's LRScheduler otherwise warns that the schedule stepped before the optimiser.
@@ -356,7 +368,7 @@ before the next forward reads the parameters.
 | --- | --- | --- | --- |
 | `optim_state='gpu'` | `adamw` (torch AdamW, also in MemorySession by default) | `StreamedAdamW`, resident states | in backward for `swap`, `fused_step` or `grad_offload`; else at `step()` |
 | `optim_state='stream'` | `HostStateAdamW` | `StreamedAdamW`, streamed states | same |
-| `optim_state='cpu'` | `CPUAdamW` | `CPUAdamW` after `flush_grads` | at `step()`; with `fused_step`, device parameters in backward |
+| `optim_state='cpu'` | `CPUAdamW` | `CPUAdamW` after `expose_grads` | at `step()`; with `fused_step`, device parameters in backward |
 
 `resolve` sets `fused_step` for `swap` with a GPU optim_state (blocks can only step inside
 backward) and for `grad_offload` with a GPU optim_state (otherwise every summed gradient
@@ -387,8 +399,7 @@ one process (notebooks, sweeps, test sessions) do not accumulate threads.
 `GradOffload` registers a post-accumulate-grad hook per device parameter: as soon as
 autograd has the micro-batch's gradient it is copied device -> pinned host on a side
 stream and the device gradient is freed; a host worker thread (`HostAccumulator`) keeps
-an fp32 sum across the `GRAD_ACC` micro-batches. No full-size gradient buffer stays on
-the device. On the last micro-batch (`start(last=True, final=opt.step_param)`) each
+an fp32 sum across the `GRAD_ACC` micro-batches. On the last micro-batch (`start(last=True, final=opt.step_param)`) each
 parameter's host sum comes back through a 3-buffer device ring on an H2D stream, is
 added to the fresh device gradient on an update stream, and the GPU optimiser steps
 that parameter right there; `finish()` makes the compute stream wait for the updates. A
@@ -397,13 +408,13 @@ sums that hold this step's gradients). Streamed `swap` blocks accumulate on the 
 through `WeightStream`.
 
 A step's first gradient of a parameter is copied into its host sum and later ones are
-added, so no sum is zeroed between steps (no multi-GB host memset on the main thread);
-`filled` marks the sums holding this step's gradients, and a parameter with none gets no
+added; `filled` marks the sums holding this step's gradients, and a parameter with none gets no
 gradient (`restore` leaves `.grad` None, as without offload). A parameter whose hook does
 not fire on the last micro-batch but whose sum holds earlier micro-batches' gradients
-(module dropout, a branch a batch skips) is finished by `settle()` after that backward
-(its sum becomes its gradient and goes through the same final callback), before the DDP
-reduction ends. Under DDP a gradient absent on some ranks counts as zero there; one
+(module dropout, a branch a batch skips) is finished by `finish_unhooked()` after that
+backward (its sum becomes its gradient and goes through the same final callback), before
+the DDP reduction ends: the fused bundle runs `GradOffload.finish` first and
+`ddp.finish` after it, so the late parameters are in the reduction. Under DDP a gradient absent on some ranks counts as zero there; one
 absent on every rank is not delivered (each bucket carries one presence count per
 parameter in its all-reduce, read on the host only when a parameter is missing
 locally), so it is not stepped, as on one GPU.
@@ -423,7 +434,7 @@ both parts keep the group's hyperparameters and extra keys, so per-group rules (
 weight decay on biases / norms / 1-D parameters, decay-to-one, LoRA+ ratios) reach
 every optimiser path. Every trainable parameter must be in a group.
 
-## Rejected combinations
+## Invalid combinations
 
 Combinations the knobs reject (`swap` with a contradicting `fused_step`) are rejected by
 `validate`; invalid plan combinations by `resolve`. A quantized base cannot be trained
@@ -460,10 +471,10 @@ the offline cache factory. It quantizes the linears (`precision`), resolves
 | --- | --- | --- | --- |
 | `resident` | everything | everything | 0 |
 | `offload` | nothing | everything but the embedding table | all weights (pinned copies) |
-| `stream` | final norm, rotary tables | + a ring of `stream_resident` slots per layer kind | all layer weights, prefetched one layer ahead |
+| `ring` | final norm, rotary tables | + a ring of `stream_resident` slots per layer kind | all layer weights, prefetched one layer ahead |
 | `cpu` | nothing (runs on the host) | nothing | 0 |
 
-Under `offload` / `stream` the 2 GiB embedding table never moves: the pass looks up
+Under `offload` / `ring` the 2 GiB embedding table never moves: the pass looks up
 the rows on the host and sends only them. Every placement's `end()` releases the
 pass's device weight buffers (the ring slots are freed, offloaded copies dropped)
 before the caller's next work, so the DiT step never shares the device with them; the
@@ -479,11 +490,13 @@ encoded in it and kept). Training sets it when text is cached offline: the sampl
 prompts are encoded once at build and the encoder is freed.
 
 The memory model adds the text encoder (`kohakumoss.offload.encoders.text_memory`): resident
-weights count against the DiT step peak; an offload / stream pass peaks at the
+weights count against the DiT step peak; an offload / ring pass peaks at the
 persistent DiT parts plus the pass's weights and activations (all pack hidden states,
 one call's MLP intermediates, the delta-rule scratch). `with_text` and
 `auto_plan(text=...)` use it; `memory="auto"` picks the fastest placement that fits
-next to the step: `resident`, else `stream`. `offload` is never picked: streaming
+next to the step: `resident`, else `ring` (a ring pass is bounded by its own
+peak: the DiT step runs after the pass has released its buffers). `offload` is never
+picked: streaming
 prefetches each layer while the previous one computes, so it is faster than the bulk
 copy of `offload` and holds one ring instead of every weight (Qwen3.5-9B, 64 captions
 per pass, packed, 32 per call: 3090 bf16 4328 vs 3777 tok/s, V100 fp16 4613 vs 2735;
@@ -536,8 +549,6 @@ It is `auto` | `bf16` | `fp16` | `fp32`.
   dtype, a per-channel shift and scale on every latent).
 - The VAE dtype is part of the latent cache key (`LATENT_ENCODER_SPEC`,
   [data.md](../concepts/data.md#cache-keys)).
-- The diffusers config sets `force_upcast: True`. Only diffusers' own pipelines read it,
-  so KohakuMoss ignores it.
 - fp16 is allowed because it stayed finite on real images (table below):
   `FP16_PROBLEM = None`. Setting `FP16_PROBLEM` to a reason rejects `VAE_DTYPE='fp16'`
   with that reason, and `auto` then never picks fp16.
@@ -613,8 +624,8 @@ recompute window, text-refiner activations, dequant transients and IO, times the
 fragmentation factor (`fragmentation(plan)`: 1.08, or 1.12 with side-stream buffers),
 plus the 0.88 GiB outside the allocator ([profiles.md](../concepts/profiles.md#estimated-peak-vram)). The full-FT offload optimiser buffers are what the engines
 allocate: `StreamedAdamW`'s slot ring for `swap` blocks (`stream_optim.slot_bytes`),
-`HostStateAdamW`'s state ring under `optim_state='stream'` (`gpu_adamw.ring_bytes`)
-and gradient offload's staging ring (`grad.ring_bytes`), both sized by the largest
+`HostStateAdamW`'s state ring under `optim_state='stream'` (`gpu_adamw.state_ring_bytes`)
+and gradient offload's staging ring (`grad.grad_ring_bytes`), both sized by the largest
 device parameter (`largest_device_param`). Under FSDP2 the full-FT gradients count as sharded, except with
 `GRAD_ACC > 1` and `FSDP_REDUCE='step'`, where every rank holds the unsharded gradients
 of the whole model between the micro-batches (`Workload.sharded_grads`). EMA averages
@@ -629,10 +640,11 @@ already excludes the CUDA / XPU context, so each estimate (context included) is 
 with the budget plus its context part. The trainer and the pipeline plan from the
 estimate alone.
 
-Measured on a V100 32 GB (PCIe gen3 x8), MOSS-Image base, random weights, fp16, one
-4096 + 300-token sample, norm + embedder weights trainable, TileLang block ops. "step
-peak" and "resident" are the torch allocator's allocated-bytes counters (live tensors,
-not reserved or device use; see [../guides/logging.md](../guides/logging.md#vram)):
+MOSS-sized synthetic blocks (copy / compute cost only, no model output), tree a3cfbe0.
+V100 32 GB (PCIe gen3 x8), fp16, one 4096 + 300-token sample, norm + embedder weights
+trainable, TileLang block ops. "step peak" and "resident" are the torch allocator's
+allocated-bytes counters (live tensors, not reserved or device use; see
+[../guides/logging.md](../guides/logging.md#vram)):
 
 | profile | ms / step | tokens / s | step peak GiB (allocated) | resident GiB (allocated) | estimate GiB |
 | --- | --- | --- | --- | --- | --- |
@@ -641,92 +653,100 @@ not reserved or device use; see [../guides/logging.md](../guides/logging.md#vram
 | low | 3667 | 1200 | 6.13 | 4.76 | 7.09 |
 | minimal | 5446 | 808 | 3.61 | 0.53 | 2.54 |
 
-`int8` runs dequantize per call on this card (no `quant_linear` kernel was registered);
-`minimal` is bound by host-device copies (every block's int8 weights cross PCIe twice
-per step, forward and backward, plus the activation packets).
+The `minimal` row of this run used an int8 base, dequantized per call, and is bound by
+host-device copies: every block's int8 weights cross PCIe twice per step, forward and
+backward, plus the activation packets. The `minimal` profile itself keeps
+`base_precision="compute"` (`kohakumoss.memory.profiles`); an int8 base is a
+`BASE_PRECISION` choice, and on sm70+ it runs TileLang's int8 `quant_linear` kernel
+(`kohakumoss_kernels.backends.tilelang.quant`).
 
-Copy bandwidth and streaming cost on the same card (8 MOSS-sized synthetic blocks,
-4400 tokens, frozen blocks):
+The same benches on MOSS-sized synthetic blocks on a V100 32 GB and an RTX 4090 (each
+knob alone, the hardware-limit check, copy bandwidth):
+[performance/offload-synthetic.md](../performance/offload-synthetic.md).
 
-| | pinned H2D | pinned D2H | pageable H2D | pageable D2H |
+### Real-model benches (RTX 5090)
+
+The three offload benches (`scripts/bench/offload/{stream,knobs,limits}.py`) run the
+trainer itself on the real MOSS-Image base weights and real data, one process per case:
+LoRA rank 16 unless the case is full FT, bf16, one 1 MP image per micro-batch (about
+4000 image tokens), offline latent and text caches, 3 warmup steps then 8 measured
+steps. Each case reports the median step time with its min-max over the measured steps,
+the torch allocated peak and the nvidia-smi device peak over the run. Tree content id
+7209a988 (2026-10-18), RTX 5090 32 GB, Linux.
+
+Copy bandwidth (`stream.py`):
+
+| GB/s | pinned H2D | pinned D2H | pageable H2D | pageable D2H |
 | --- | --- | --- | --- | --- |
-| GB/s (256 MB) | 6.24 | 6.15 | 5.23 | 3.34 |
+| 4 MB | 18.44 | 25.79 | 10.13 | 0.88 |
+| 64 MB | 26.04 | 26.32 | 10.52 | 0.89 |
+| 256 MB | 26.27 | 26.33 | 10.53 | 0.89 |
 
-| case | ms / step | peak GiB (alloc) | H2D GB / step |
-| --- | --- | --- | --- |
-| resident | 245 | 7.59 | — |
-| block checkpoint | 355 | 3.44 | — |
-| checkpoint + activation offload | 369 | 3.79 | — |
-| checkpoint + stream (pinned) | 439 | 4.36 | 2.33 |
-| checkpoint + stream (staged) | 676 | 4.71 | 2.33 |
+Streaming and activation offload (`stream.py`, GRAD_ACC 1): the `speed` profile plus
+each case's `MEMORY_OVERRIDES` (`CASES` in `stream.py`). Every case but `resident` is
+block-checkpointed, and the `ring` cases keep `stream_resident=2`:
 
-Each VRAM knob in isolation (`scripts/bench/offload/knobs.py`, one process per case,
-8 MOSS-sized synthetic blocks = 0.75 B parameters, 4400 tokens, GRAD_ACC = 2):
-
-| knob | V100 32 GB fp16: ms / step | peak GiB (alloc) | H2D / D2H GB per step | RTX 4090 Windows (4 blocks, bf16): ms / step | peak GiB (alloc) |
+| case | ms / step (min-max) | tokens / s | peak GiB (alloc) | smi GiB | H2D GB / step |
 | --- | --- | --- | --- | --- | --- |
-| full FT, device AdamW | 832 | 6.92 | 0 / 0 | 301 | 4.01 |
-| full FT, CPUAdamW (grads on device) | 1607 | 4.11 | 0 / 0 | 421 | 2.60 |
-| full FT, gradient offload + CPUAdamW | 1808 | 2.71 | 0 / 3.02 | 455 | 1.90 |
-| frozen blocks, checkpoint none | 490 | 7.59 | — | 187 | 3.94 |
-| frozen blocks, checkpoint block | 708 | 2.56 | — | 317 | 1.76 |
-| frozen blocks, checkpoint sub-block | 703 | 2.49 | — | 233 | 1.58 |
-| frozen blocks, checkpoint selective | 542 | 4.04 | — | 204 | 2.39 |
-| frozen blocks, checkpoint partial:0.5 | 601 | 4.75 | — | 211 | 2.52 |
-| full FT, stream (swap) + gradient offload + checkpoint, 4400 tokens | 2363 (537 / 1k tok) | 1.65 | 6.54 / 4.03 | 513 (117 / 1k tok) | 1.55 |
-| same, 17600 tokens | 4229 (240 / 1k tok) | 5.43 | 6.54 / 4.03 | 1407 (80 / 1k tok) | 5.03 |
+| resident (checkpoint none) | out of memory | | | | |
+| block checkpoint | 818 (785-844) | 4884 | 12.02 | 12.84 | 0 |
+| checkpoint + activation offload | 831 (784-1117) | 4775 | 10.94 | 11.83 | 1.06 (D2H 1.06) |
+| checkpoint + `ring` stream, pinned | 918 (875-1170) | 4361 | 3.27 | 4.28 | 18.12 |
+| checkpoint + `ring` stream, staged | 1055 (1006-1389) | 3767 | 3.27 | 4.25 | 18.12 |
 
-Streaming moves the same bytes per step regardless of the token budget, so the larger
-batch halves (V100) or one-thirds (4090) the time per token.
+Checkpoint granularity on the `speed` profile (`knobs.py`, GRAD_ACC 2, about 8000
+tokens per step):
 
-Under Windows WDDM on the RTX 4090 (4 blocks): pinned H2D 19.7 GB/s, pinned D2H
-24.3 GB/s, pageable H2D 8.3 GB/s, pageable D2H 13.5 GB/s; checkpointed streaming costs
-122 ms / step pinned vs 152 ms staged.
+| checkpoint | ms / step (min-max) | ms / 1k tokens | peak GiB (alloc) | smi GiB |
+| --- | --- | --- | --- | --- |
+| none | out of memory | | | |
+| block | 1622 (1392-1924) | 205 | 11.86 | 12.80 |
+| sub-block | 1655 (1435-6024) | 207 | 12.69 | 13.63 |
+| selective | 1485 (1422-1806) | 189 | 23.28 | 24.08 |
+| partial:0.5 | 1413 (1182-4208) | 176 | 25.14 | 26.64 |
+
+The full-FT knob rows (device / CPU AdamW, gradient offload, `swap` + gradient offload +
+streamed states at batch 1 and 4) were not run on this tree; their synthetic-block
+numbers on a V100 and an RTX 4090 are in
+[offload-synthetic.md](../performance/offload-synthetic.md#each-vram-knob-in-isolation).
 
 ### Hardware-limit check
 
-`scripts/bench/offload/limits.py` runs each combination in its own process (MOSS-sized
-synthetic blocks, 4400 tokens, block checkpointing, `stream_resident=2`) and divides
-the step time by `max(copy bound, compute)`: copy bound = the largest of H2D bytes /
-pinned H2D bandwidth, D2H bytes / pinned D2H bandwidth and all bytes / measured
-concurrent (both directions) bandwidth; compute = the resident step at the same
-GRAD_ACC. 1.00 = the step costs only its bound.
+`scripts/bench/offload/limits.py` runs each combination in its own process (block
+checkpointing, `stream_resident=2`) and divides the step time by `max(copy bound,
+compute)`. The copy bound is the largest of H2D bytes / pinned H2D bandwidth, D2H bytes
+/ pinned D2H bandwidth and all bytes / measured concurrent (both directions) bandwidth.
+Compute is the resident step at the same GRAD_ACC, or the MMA FLOP bound when no
+resident step fits. 1.00 = the step costs only its bound.
 
-| case | V100 32 GB, 8 blocks, fp16: ms | overlap | RTX 4090 Windows, 4 blocks, bf16: ms | overlap |
-| --- | --- | --- | --- | --- |
-| full FT resident, GPU AdamW | 459 | 1.00 | 228 | 1.00 |
-| same, GRAD_ACC 4 | 1756 | 1.00 | 564 | 1.00 |
-| gradient offload, GPU AdamW in backward, GRAD_ACC 4 | 2116 | 1.20 | 584 | 1.03 |
-| optimiser states streamed (`stream`), fused step | 2474 | 1.34 | 416 | 1.18 |
-| CPUAdamW | 1220 | 2.66 | 260 | 1.14 |
-| `swap`, GPU AdamW, resident states | 666 | 1.45 | 170 | 0.74 |
-| `swap`, GPU AdamW, streamed states | 3068 | 1.35 | 457 | 1.07 |
-| same, GRAD_ACC 4 | 5190 | 1.39 | 925 | 1.40 |
-| `swap`, CPUAdamW | 1558 | 3.40 | 285 | 1.25 |
-| adapter (frozen blocks) resident | 354 | 1.00 | 120 | 1.00 |
-| adapter, activation offload | 355 | 1.00 | 120 | 1.00 |
-| adapter, `ring` | 439 | 1.24 | 118 | 0.98 |
-| adapter, `ring` + activation offload | 452 | 1.22 | 126 | 1.06 |
-| adapter, `ring` + gradient offload | 501 | 1.42 | 116 | 0.97 |
-| adapter, `ring` + activation + gradient offload | 512 | 1.38 | 125 | 1.05 |
-| adapter, `ring`, int8 base | 389 | 1.10 | 131 | 1.10 |
+Adapter (LoRA) cases, GRAD_ACC 1: the `balanced` profile plus each case's
+`MEMORY_OVERRIDES` from `case_knobs` in `limits.py` (block checkpointing,
+`stream_resident=2`, the case's base precision and its knobs from `CASES`):
 
-Bandwidth: V100 pinned H2D 6.70 GB/s, D2H 6.61 GB/s, both directions 9.80 GB/s total;
-RTX 4090 (WDDM) 25.1 / 26.3 GB/s, both directions 25.7 GB/s total (no duplex gain).
-MMA peak 90 TFLOP/s (V100 fp16), 175 TFLOP/s (4090 bf16).
+| case | ms (min-max) | copy bound ms | overlap | H2D / D2H GB | peak GiB (alloc) | smi GiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| resident | 813 (765-1046) | 0 | 1.00 | 0 / 0 | 11.69 | 12.74 |
+| activation offload | 828 (780-1121) | 42 | 1.02 | 1.06 / 1.06 | 10.94 | 11.83 |
+| `ring` | 913 (875-1138) | 639 | 1.12 | 18.12 / 0 | 3.27 | 4.28 |
+| `ring` + gradient offload | 907 (894-1196) | 639 | 1.12 | 18.12 / 0 | 3.27 | 4.12 |
+| `ring` + activation offload | 1181 (1083-1499) | 676 | 1.45 | 19.18 / 1.06 | 2.50 | 3.42 |
+| `ring` + activation + gradient offload | 992 (960-1279) | 676 | 1.22 | 19.18 / 1.06 | 2.50 | 3.27 |
+| `ring`, int8 base | 951 (901-2850) | 320 | 1.17 | 9.07 / 0 | 3.02 | 4.05 |
 
-- Streamed optimiser states move 12 bytes per parameter each way per step; the V100
-  rows at 1.34-1.39 are copy-bound (profiled: update kernels fully hidden, the copy
-  engines busy for the whole step).
-- CPUAdamW is bound by the host update, not by PCIe or the GPU.
-- `swap` with resident states and `ring` alone are copy-bound per phase: forward with a
-  2-slot ring waits on each block's H2D, so the per-step sum understates the bound.
-- `ring` + gradient offload on the V100 is slower than `ring` alone although only
-  adapter-sized gradients go to the host: the H2D of the weight ring runs about 18%
-  slower while D2H gradient copies are in flight.
-- 4090 `swap` with resident states at 0.74: the resident reference runs its AdamW
-  after backward over full-size gradients, while `swap` steps each block inside
-  backward; the reference is therefore not a lower bound for in-backward steps.
+Bandwidth in the limits process: pinned H2D 28.36 GB/s, D2H 28.28 GB/s, both
+directions 50.54 GB/s total. bf16 MMA 254 TFLOP/s (8192 x 8192 x 8192 GEMM). The MMA FLOP bound of
+the resident adapter step is 570 ms.
+
+- Activation offload costs 2% next to the resident step: its 1.06 GB each way per
+  step overlaps the compute.
+- `ring` alone and with gradient offload sit at 1.12 of the compute.
+- `ring` + activation offload is the slowest adapter case (overlap 1.45), slower than
+  the same case with gradient offload added (1.22).
+- The full-FT limit cases (resident, gradient offload, streamed states, CPUAdamW,
+  `swap` with resident / streamed states, GRAD_ACC 4) were not run on this tree; their
+  synthetic-block numbers on a V100 and an RTX 4090, with the copy-bound and
+  host-bound readings, are in
+  [offload-synthetic.md](../performance/offload-synthetic.md#hardware-limit-check).
 
 ## Windows and XPU
 

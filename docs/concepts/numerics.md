@@ -1,11 +1,20 @@
 # Numerics
 
+What runs in which dtype, which PyTorch precision defaults apply, and how fp16 runs
+keep the residual stream in range.
+
+| question | section |
+| --- | --- |
+| which dtype does each part run in? | [Dtypes](#dtypes), [Conditioning](#conditioning) |
+| which `FP16_FIX` for an fp16 run? | [FP16_FIX modes](#fp16_fix-modes) |
+| why fp16 needs a fix at all | [Why fp16 needs a fix](#why-fp16-needs-a-fix), [The fold](#the-fold) |
+
 ## Dtypes
 
-The trunk runs in the compute dtype (bf16 or fp16). `time_embedding`,
-`shared_block_modulation` and `video_head_modulation` store fp32 weights and biases; RoPE
-bands are always fp32. Eager ops accumulate in at least fp32 and round once. No model,
-kernel, trainer or inference code computes in fp64; fp64 is the precision reference only.
+- The trunk runs in the compute dtype (bf16 or fp16).
+- `time_embedding`, `shared_block_modulation` and `video_head_modulation` store fp32
+  weights and biases; RoPE bands are always fp32.
+- Eager ops accumulate in at least fp32 and round once.
 
 ## Conditioning
 
@@ -17,50 +26,25 @@ kernel, trainer or inference code computes in fp64; fp64 is the precision refere
   forwards run under training's autocast, `kohakumoss.precision.autocast_for`). The
   outputs are cast to fp32 for the per-sample modulation math.
 - **Sinusoid.** `timestep_embedding` is the official MOSS formula, `[cos | sin](t f_k)`
-  with `t = 1000 sigma` and `f_k = 10000^(-k/128)`, evaluated in fp32 (the official code
-  evaluates the same formula in fp64). `t f_k` reaches ~1e3 rad, whose fp32 ulp is 6e-5,
+  with `t = 1000 sigma` and `f_k = 10000^(-k/128)`, evaluated in fp32. `t f_k` reaches ~1e3 rad, whose fp32 ulp is 6e-5,
   so the phase carries up to ~1e-4 rad of rounding at large t.
 
 ## PyTorch defaults
 
-KohakuMoss sets none of PyTorch's precision switches (no `set_float32_matmul_precision`,
-`allow_tf32` or `fp32_precision` anywhere); PyTorch 2.14's defaults apply:
+PyTorch 2.14's precision defaults apply throughout:
 
 | switch | default | effect |
 | --- | --- | --- |
-| fp32 matmul precision | `highest` (`allow_tf32=False`) | fp32 matmuls run IEEE fp32, never TF32 |
-| cuDNN fp32 convolution / RNN (`cudnn.allow_tf32`) | `tf32` | fp32 convolutions run TF32 on sm80+ |
+| cuDNN fp32 convolution (`torch.backends.cudnn.allow_tf32`) | True | fp32 convolutions run TF32 on sm80+ |
 | `allow_fp16_reduced_precision_reduction`, `allow_bf16_reduced_precision_reduction` | True | cuBLAS may reduce split-K partials of a 16-bit GEMM in 16 bit |
 
-Where fp32 runs outside autocast: the DiT runs under autocast in training and in the
-sampler (16-bit GEMM inputs); the VAE and the text encoder run outside it. The VAE runs in `VAE_DTYPE`, whose `auto` is bf16 where the card has it
-(sm80+, Intel Arc) and fp16 or fp32 elsewhere, so fp32 VAE convolutions run only on
-sm70 / sm75 (no TF32 there: plain fp32) or with `VAE_DTYPE="fp32"`, which on sm80+
-runs them TF32 by the default above. A text encoder with `"dtype": "fp32"` runs IEEE
-fp32 matmuls.
+Autocast and dtype per part:
 
-## Fold arithmetic
-
-The fold multiplies weights in fp32 (or in the tensor's own dtype when wider) and rounds
-once. For a power-of-two c and s the product is exact in every dtype except where a
-folded fp16 value lands in the subnormal range.
-
-## Why fp16 needs a fix
-
-The fp16 probe (`scripts/probe/activations.py`, fp32 model, prompts x sigmas x
-resolutions) measures the joint residual stream at up to ~6.2e4 — within 6 % of the fp16
-maximum 65504 — while every other value is small: attention logits <= ~600, `o` outputs
-<= ~1.3e3, `ffn_down` outputs <= ~700, `ffn_up_gate` <= ~170, text stream <= ~1.8e3. The
-stream is the only thing to move.
-
-## The fold
-
-Every reader of a residual stream (joint and text) is an RMSNorm, and RMSNorm is scale
-invariant except for its eps: `rms(c x)` with eps `c^2 eps` equals `rms(x)` with eps. So
-scaling every writer of a stream by `c` and every reading norm's eps by `c^2` leaves the
-function unchanged while the stream shrinks by `c`. A pre-gate scale `s` additionally
-moves magnitude from a block's `o` / `ffn_down` output into its gate (`o * s`,
-`gate / s`).
+| part | autocast | dtype |
+| --- | --- | --- |
+| DiT, training and sampler | inside | 16-bit GEMM inputs |
+| VAE | outside | `VAE_DTYPE`, whose `auto` is bf16 where the card has it (sm80+, Intel Arc) and fp16 or fp32 elsewhere; `VAE_DTYPE="fp32"` convolutions run IEEE fp32 on sm70 / sm75 and TF32 on sm80+ by the default above |
+| text encoder | outside | `TEXT_ENCODE["dtype"]`: bf16 or fp16 |
 
 ## FP16_FIX modes
 
@@ -83,26 +67,62 @@ on-device counters, `clamp_counts(model)`), as a last resort.
 
 `scripts/export/fp16_fix.py` writes `weights`-mode tensors to a normal single-file
 checkpoint (same keys and shapes, loadable by ComfyUI and HF code) and records c and s in
-the safetensors metadata (`kohakumoss_fp16_fix`). Other runtimes keep the stock eps
-(1e-6) instead of `1e-6 c^2`; the output differs only slightly because the stream rms
-is far above `sqrt(eps) / c`, and `EPS_CHECK = True` measures the difference on the
-real weights. KohakuMoss
-reads the metadata: the model is recorded as folded (savers and adapter exports undo it),
-and `fp16_fix_eps="exact"` switches to the exact eps.
+the safetensors metadata (`kohakumoss_fp16_fix`).
+
+- **Other runtimes** keep the stock eps (1e-6) instead of `1e-6 c^2`; the output
+  differs only slightly because the stream rms is far above `sqrt(eps) / c`, and
+  `EPS_CHECK = True` measures the difference on the real weights.
+- **KohakuMoss** reads the metadata: the model is recorded as folded (savers and adapter
+  exports undo it), and `fp16_fix_eps="exact"` switches to the exact eps.
 
 ### Adapters and gradients
 
 With the uniform fold, adapters on `q`, `k`, `v`, `ffn_up_gate` (read through an
-RMSNorm) and on `o`, `ffn_down` (written through the gates, s = 1) see identical inputs and
-produce identical outputs, so `weights` and `online` give the same function and the same
-adapter gradients. Differences appear only for trained parameters inside the rescaled writers —
-the embedders, the text-refiner outputs, the modulation gate rows, `o` / `ffn_down` when
-s != 1 — and for full finetuning, where Adam's step is relative to a weight that is c
+RMSNorm) and on `o`, `ffn_down` (written through the gates, s = 1) see identical inputs
+and produce identical outputs, so `weights` and `online` give the same function and the
+same adapter gradients.
+
+Differences appear only for trained parameters inside the rescaled writers (the
+embedders, the text-refiner outputs, the modulation gate rows, `o` / `ffn_down` when
+s != 1) and for full finetuning, where Adam's step is relative to a weight that is c
 (or s) times smaller. `online` exists for those cases: the weights keep their scale.
+
+## Why fp16 needs a fix
+
+The fp16 probe (`scripts/probe/activations.py`, fp32 model, prompts x sigmas x
+resolutions) measures the joint residual stream at up to ~6.2e4, within 6 % of the fp16
+maximum 65504, while every other value is small:
+
+| value | max |
+| --- | --- |
+| joint residual stream | ~6.2e4 |
+| attention logits | ~600 |
+| `o` outputs | ~1.3e3 |
+| `ffn_down` outputs | ~700 |
+| `ffn_up_gate` | ~170 |
+| text stream | ~1.8e3 |
+
+The stream is the only thing to move.
+
+## The fold
+
+Every reader of a residual stream (joint and text) is an RMSNorm, and RMSNorm is scale
+invariant except for its eps: `rms(c x)` with eps `c^2 eps` equals `rms(x)` with eps. So
+scaling every writer of a stream by `c` and every reading norm's eps by `c^2` leaves the
+function unchanged while the stream shrinks by `c`. A pre-gate scale `s` additionally
+moves magnitude from a block's `o` / `ffn_down` output into its gate (`o * s`,
+`gate / s`).
+
+### Fold arithmetic
+
+The fold multiplies weights in fp32 (or in the tensor's own dtype when wider) and rounds
+once. For a power-of-two c and s the product is exact in every dtype except where a
+folded fp16 value lands in the subnormal range.
 
 ## Saturation counters
 
-`SaturationCounters(model, threshold)` hooks every block and keeps the running max |x| and
-the count of values above `threshold` on the device; `read()` syncs once. A block under
-activation checkpointing runs its forward again inside backward; the hooks skip that
-recompute (a backward graph task is running), so each value is counted once per forward.
+`SaturationCounters(model, threshold)` hooks every block and keeps the running max |x|
+and the count of values above `threshold` on the device; `read()` syncs once. A block
+under activation checkpointing runs its forward again inside backward; the hooks skip
+that recompute (a backward graph task is running), so each value is counted once per
+forward.

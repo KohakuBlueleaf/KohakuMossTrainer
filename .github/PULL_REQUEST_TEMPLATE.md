@@ -43,7 +43,7 @@ pytest -q -m real_weights     # if you touched a path the real model runs (needs
 - [ ] If this is a feature / behavior / architecture change, an issue was opened before this PR and a maintainer approved it
 - [ ] I kept this PR focused and did not include unrelated changes
 - [ ] Code files carry only *what*; every *why* is in `docs/`
-- [ ] No imports inside functions; no file over 600 lines; ASCII-only source and messages
+- [ ] No imports inside functions; ASCII-only source and messages
 - [ ] Every new check has a negative case (`tests/_util/negative.py`) and no fake / stand-in model
 - [ ] A new or changed kernel matches the eager reference within the precision bar (fp16 and bf16, forward and backward) and is selected only where it is faster
 - [ ] Docs are updated for user-visible behavior, knobs, CLI or config changes

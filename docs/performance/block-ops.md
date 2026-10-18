@@ -1,15 +1,24 @@
 # Block ops: kernels vs PyTorch per GPU
 
-Forward + backward device time in ms (best of 20, L2 flushed, `scripts/bench/kernel/`,
-`kohakumoss_kernels/bench/blockops.py`), MOSS shapes (D = 3072, FFN 2 x 8192, 24 heads x
-128). Columns: the TileLang kernel, the Triton kernel, `torch.compile` of the eager reference
-with dynamic shapes (the compile candidate, `compile`), the eager composition (`eager`),
-and the candidate the per-shape choice binds (`bound`; `kernel` is the arch's first
-backend). No listed kernel's error statistics regress against PyTorch's
-(docs/internals/fp16.md#eager-reference-and-error-statistics) in any row. The choice
-times every candidate per problem and binds the fastest, so an op never runs a candidate
-slower than the fastest one it measured; rows whose candidates are within a few percent
-bind either way between runs.
+Forward + backward device time in ms of the MOSS block ops (norm, residual, qk-norm +
+rope, SiTU, loss, fused linears) per GPU: each kernel against `torch.compile` and the
+eager composition, and the candidate the per-shape choice binds.
+
+| column | meaning |
+| --- | --- |
+| TileLang, Triton | the backend's kernel |
+| compile | `torch.compile` of the eager reference with dynamic shapes (the compile candidate) |
+| eager | the eager composition |
+| bound | the candidate the per-shape choice binds; `kernel` is the arch's first backend, "a / b" means either binds between runs |
+
+- **Method:** best of 20, L2 flushed (`scripts/bench/kernel/`,
+  `kohakumoss_kernels/bench/blockops.py`); MOSS shapes (D = 3072, FFN 2 x 8192, 24 heads
+  x 128).
+- **Choice:** the per-shape choice times every candidate per problem and binds the
+  fastest, so an op never runs a candidate slower than the fastest one it measured; rows
+  whose candidates are within a few percent bind either way between runs.
+- **Precision:** every listed kernel passes the error-statistics check against PyTorch
+  ([fp16.md](../internals/fp16.md#eager-reference-and-error-statistics)) in every row.
 
 ## sm75 (Tesla T10), fp16
 
@@ -115,19 +124,21 @@ re-measure on an idle V100.
 | linear_gated_residual, out proj | N=17381 | 3.09 | 3.30 | 3.05 | 3.26 | kernel |
 | linear_qk_rope | N=17381 | 6.51 | 10.23 | 6.41 | 10.06 | kernel |
 
-## Where no kernel wins
+## Where torch.compile wins
 
 - One-sample norm, residual and the loss (N of a few thousand tokens) on sm86 / sm120:
   compile is faster, and the choice binds compile there (sm70: compile also beats
-  TileLang above; its binding is pending the re-measure). These rows are host
-  bound: on the 5090 the Triton `rms_norm_mod` forward + backward costs about 430 us of
-  host time against about 170 us of device time, compile about 350 us. The Triton path
-  already avoids the custom-op dispatch (`_common.eager_function`), binds its tuned
-  configs, caches the segment bounds per `seg` tensor and runs the parameter-gradient
-  epilogue in one launch with the segment sums; what is left is the autograd engine,
-  two Python `autograd.Function` nodes and two Triton launches per call, against
-  Inductor's single generated graph. Closing it needs fewer launches per block (fusing
-  neighbouring ops) or a captured step, not a faster kernel.
+  TileLang above; its binding is pending the re-measure).
+  - These rows are host bound: on the 5090 the Triton `rms_norm_mod` forward + backward
+    costs about 430 us of host time against about 170 us of device time, compile about
+    350 us.
+  - The Triton path skips the custom-op dispatch (`_common.eager_function`), binds its
+    tuned configs, caches the segment bounds per `seg` tensor and runs the
+    parameter-gradient epilogue in one launch with the segment sums. What is left is the
+    autograd engine, two Python `autograd.Function` nodes and two Triton launches per
+    call, against Inductor's single generated graph.
+  - Closing the gap needs fewer launches per block (fusing neighbouring ops) or a
+    captured step, not a faster kernel.
 - `token_mse`: launch-bound on every card; compile and Triton trade places.
 - The TileLang row kernels reach 25-60 % of DRAM bandwidth on sm70 / sm75 with the
   per-element loads; the forward and dx-only backward also have a `vec` variant (one row

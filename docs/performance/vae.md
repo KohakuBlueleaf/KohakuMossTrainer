@@ -1,18 +1,29 @@
 # VAE: speed and VRAM per dtype
 
-FLUX.2 VAE (real weights). Images are real dataset images, centre-cropped to 1 MP (1024²)
-or 2 MP (1440²).
+Encode (pixels to latents) and decode (latents to pixels) time and peak memory of the
+FLUX.2 VAE per GPU, dtype and variant. The chosen defaults and the VAE's precision are
+in [internals/offload.md#vae](../internals/offload.md#vae).
 
-- Encode: pixels to latents. Decode: latents to pixels.
-- ms per image is the median of 3 timed repeats over 4 images. Peak is the peak
-  allocated memory during one repeat.
-- `eager` is the default layout. `cl_compile` is channels_last plus
-  `torch.compile(dynamic=True)` (`FluxVae.accelerate`). `cl` alone loses everywhere and
-  is in the raw JSON only. Tiled means the diffusers tiled / sliced encode and decode.
-- Bench: `scripts/bench/vae/vae.py`, which writes `runs/bench/vae/<gpu>.json`. Precision
-  and the chosen defaults are in [internals/offload.md#vae](../internals/offload.md#vae).
+How to read the tables:
 
-Batch 1, the defaults (`VAE_ENCODE` batch 1, `compile='auto'`):
+| term | meaning |
+| --- | --- |
+| ms | per image: the median of 3 timed repeats over 4 images |
+| GiB (peak alloc) | the peak allocated memory during one repeat |
+| `eager` | the default layout |
+| `cl_compile` | channels_last plus `torch.compile(dynamic=True)` (`FluxVae.accelerate`) |
+| `tiled` | the diffusers tiled / sliced encode and decode |
+| `cl` | channels_last alone; it loses everywhere and is in the raw JSON only |
+| bold | the fastest row of a GPU and area (batch 1) |
+
+Inputs are real dataset images with the real weights, centre-cropped to 1 MP (1024²) or
+2 MP (1440²). Bench: `scripts/bench/vae/vae.py`, which writes
+`runs/bench/vae/<gpu>.json`; a configuration that runs out of memory is recorded as an
+`oom` row and the bench continues.
+
+## Batch 1
+
+The defaults (`VAE_ENCODE` batch 1, `compile='auto'`):
 
 | GPU | dtype | variant | area | encode ms | encode GiB (peak alloc) | decode ms | decode GiB (peak alloc) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -46,7 +57,9 @@ Batch 1, the defaults (`VAE_ENCODE` batch 1, `compile='auto'`):
 | V100 32G | fp16 | tiled | 2MP | 408.2 | 1.42 | 581.8 | 1.56 |
 | V100 32G | fp16 | cl_compile | 2MP | **314.1** | 2.15 | **377.6** | 2.37 |
 
-Batch 4 (4 same-size images per call; ms per image):
+## Batch 4
+
+4 same-size images per call; ms per image:
 
 | GPU | dtype | variant | area | encode ms | encode GiB (peak alloc) | decode ms | decode GiB (peak alloc) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -64,6 +77,5 @@ Batch 4 (4 same-size images per call; ms per image):
 | V100 32G | fp16 | eager | 2MP | 335.2 | 5.13 | 662.2 | 10.55 |
 | V100 32G | fp16 | cl_compile | 2MP | 366.0 | 4.15 | 433.7 | 9.05 |
 
-The RTX 3090's fp32 eager decode at 2 MP and batch 4 ran out of its 24 GB. The bench
-now records an out-of-memory row and continues. The fp32 tiled rows on the 3090 come
-after that row, so they are missing from this run.
+The RTX 3090's fp32 eager decode at 2 MP and batch 4 ran out of its 24 GB. The 3090
+fp32 tiled rows are missing: that run stopped at its first out-of-memory.

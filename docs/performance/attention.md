@@ -1,25 +1,37 @@
 # Varlen attention
 
-`scripts/bench/kernel/attention.py`, 24 heads x 128, packed segments (image tokens of
-a 1 MP / 2 MP / 512 px MOSS image plus its caption; the text-refiner case is caption
-only). Device time per call, best of 10 (CUDA events). "SDPA" is PyTorch's per-segment
-`scaled_dot_product_attention` (flash on sm80+ Linux, memory-efficient on sm70 / sm75
-and on Windows); `varlen_attn` is torch's FA2-based varlen op (Linux sm80+ builds only).
+The packed variable-length attention of each arch against PyTorch, forward + backward
+and forward only, then its precision against fp64. Forward + backward, the bound entry
+beats SDPA on every measured card and case; on the long single-segment shapes it binds
+torch's own `varlen_attn` where the build has it
+([The single-segment ceiling](#the-single-segment-ceiling)).
 
-"ours" is the registered `attention_varlen` of the arch (bench label
-`kohakumoss_<backend>_chosen`): per problem key, the backend's kernels (TileLang on
-sm70 / sm75, Triton on sm80+) timed forward + backward against torch's `varlen_attn`
-where the torch build has it, else the per-segment SDPA loop, and the faster bound.
-"kernels" is the backend's kernels alone (`kohakumoss_<backend>_kernels`). Among the
-implementations whose precision stats match PyTorch's (see [Precision](#precision)), the
-entry binds the fastest per shape. Each bench row records what a chosen entry bound
-(`bound`) and the error statistics of o, dq, dk, dv against fp64 (`stats`).
+## Columns
 
-Method: fwd + bwd is the median over interleaved rounds (`--rounds`; each round times
-every implementation in turn, best of the calls); peak memory is measured above the
-allocation at the start of the case; errors are computed on 2 of the heads against an
-fp64 run. The padded SDPA baseline reads the segment bounds on the host inside its timed
-region, as that PyTorch path does in use.
+| column | meaning |
+| --- | --- |
+| ours | the registered `attention_varlen` of the arch (bench label `kohakumoss_<backend>_chosen`): per problem key, the backend's kernels (TileLang on sm70 / sm75, Triton on sm80+) timed forward + backward against torch's `varlen_attn` where the torch build has it, else the per-segment SDPA loop, and the faster bound |
+| kernels | the backend's kernels alone (`kohakumoss_<backend>_kernels`) |
+| SDPA | PyTorch's per-segment `scaled_dot_product_attention` (flash on sm80+ Linux, memory-efficient on sm70 / sm75 and on Windows) |
+| varlen_attn | torch's FA2-based varlen op (Linux sm80+ builds only) |
+
+Among the implementations whose precision stats match PyTorch's (see
+[Precision](#precision)), the entry binds the fastest per shape. Each bench row records
+what a chosen entry bound (`bound`) and the error statistics of o, dq, dk, dv against
+fp64 (`stats`).
+
+## Method
+
+- Bench: `scripts/bench/kernel/attention.py`, 24 heads x 128.
+- Cases: packed segments, each the image tokens of a 1 MP / 2 MP / 512 px MOSS image
+  plus its caption; the text-refiner case is caption only.
+- Time: device time per call, best of 10 (CUDA events). fwd + bwd is the median over
+  interleaved rounds (`--rounds`; each round times every implementation in turn, best of
+  the calls).
+- Memory: the peak above the allocation at the start of the case.
+- Errors: computed on 2 of the heads against an fp64 run.
+- The padded SDPA baseline reads the segment bounds on the host inside its timed region,
+  as that PyTorch path does in use.
 
 ## fwd + bwd, ms
 
@@ -74,11 +86,13 @@ card's measured 16-bit MMA rate (fp32 accumulation; `hardware.device.measure_rat
 
 (fwd = 2 GEMMs, bwd = 5 GEMMs of `2 N^2 D H` flops each.) There is no headroom left on
 those shapes for any fp32-accumulating kernel, so the entry binds torch's `varlen_attn`
-there and is 0.7 - 1 % faster than SDPA (it saves SDPA's layout transposes). Our
+there and is 0.6 - 1.6 % faster than SDPA fwd + bwd on 2 MP x1 (1.01x / 1.02x in the
+speed-up table; it saves SDPA's layout transposes). Our
 forward reaches the same rate; our backward stays at 85 - 86 % of FA2's on both cards;
 see [kernel-dev.md](../internals/kernel-dev.md#measured-design-per-arch) for the tile
 study. On every packed or short-segment shape our kernels (or the `varlen_attn` the
-entry binds) beat SDPA by 1.1 - 4.8x, because one launch covers every segment.
+entry binds) beat SDPA fwd + bwd by 1.08 - 4.39x (the speed-up table), because one
+launch covers every segment.
 
 ## Precision
 

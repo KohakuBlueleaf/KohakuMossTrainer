@@ -1,9 +1,14 @@
 # Scripts
 
-Every script runs from the repository root. `kogine run <script> --config <file> --set
-KEY=VALUE` scripts take their settings as module-level knobs ([configs.md](configs.md));
-`python <script> --flag` scripts take command-line flags. Each script's docstring holds
-its full usage.
+Every script runs from the repository root, in one of three ways (the "runs as" column):
+
+| runs as | command | settings |
+| --- | --- | --- |
+| kogine | `kogine run <script> --config <file> --set KEY=VALUE` | module-level knobs ([configs.md](configs.md)) |
+| python | `python <script> --flag` | command-line flags |
+| shell | `.\<script>.ps1` (PowerShell) or `bash <script>.sh` | script parameters |
+
+Each script's docstring (or header) holds its full usage.
 
 ## Train, sample, export
 
@@ -36,6 +41,7 @@ its full usage.
 | `scripts/data/cache_latents.py` | kogine | the offline latent cache |
 | `scripts/data/cache_merge.py` | kogine | fold an online cache's per-rank shards into the main files |
 | `scripts/data/catalog_cache.py` | kogine | show, drop or compact the catalog cache files |
+
 ## Setup
 
 | script | runs as | what it does |

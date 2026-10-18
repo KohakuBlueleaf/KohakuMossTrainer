@@ -1,15 +1,22 @@
 # Adapter binding
 
+How each adapted layer's forward is chosen once, at bind time, from its kind record
+([adapter-kinds.md](adapter-kinds.md)): the bound forwards, the kernel ops they call,
+the autotuned kernel-or-compile choice, the fused base add, and quantized or streamed
+bases.
+
 ## Bound forwards
 
 `bind.select.bind_target` resolves each layer's forward once from its kind record and a
-`BindCtx` (mode, backend, the layer's kernel ops, multiplier, DoRA-detach, module
-dropout, training state, whether the kernel ops apply, draws). Every forward is a
-closure built at bind time (`bind.forwards`, `bind.eager`, `bind.compose`): each variant
-(scalar parameter or not, rescale or not, multiplier 1 or not, bias or not, base add
-inside the op or not) is its own closure, and no bound forward branches on bound
-state. The kernel ops apply unless the module trains with input or rank dropout, which
-only the LyCORIS module methods carry (`eager.module_bypass`).
+`BindCtx`: mode, backend, the layer's kernel ops, multiplier, DoRA-detach, module
+dropout, training state, whether the kernel ops apply, draws.
+
+- Every forward is a closure built at bind time (`bind.forwards`, `bind.eager`,
+  `bind.compose`).
+- Each variant (scalar parameter or not, rescale or not, multiplier 1 or not, bias or
+  not, base add inside the op or not) is its own closure, selected at bind time.
+- The kernel ops apply unless the module trains with input or rank dropout, which only
+  the LyCORIS module methods carry (`eager.module_bypass`).
 
 ## Kernel ops
 
@@ -46,21 +53,27 @@ cast to its dtype as the modules do; weight ops take the fp32 base weight.
 
 ## Autotuned ops
 
-An `AutotunedOp` has two candidates: `kernel` (the fused op of the device's most-prior
-fused backend, `lycoris.kernels.dispatch` order) and `compile` (`torch.compile` of the
-eager body through `kohakumoss_kernels.backends.compile.ops.CompiledOp`; see
-[Checkpoint recompute](#checkpoint-recompute) for how its graphs are cached;
-`AdapterConfig.compile_dynamic`: `tokens` (default) marks the token axes dynamic,
-`static`, `dynamic`). The first call of a bucket (token bucket, a power of two from
-`TOKEN_FLOOR`, activation dtype, grad pattern) asks
-`kohakumoss_kernels.tuning.tuner.select` with the problem key (every operand's shape,
-token axes bucketed, dtype and grad flag, and the grad mode): a stored winner of this
-card binds at once; otherwise both candidates are timed, forward plus backward, on
-detached copies of the operands, and the winner is stored and bound. A candidate
-raising a build or scope error loses. Where the tuner may not time (inference mode, a
-backward, a trace) the bucket runs the kernel unsettled and is asked again on its next
-call. Operands no fused kernel takes (mixed fp16 / bf16, bf16 below sm_80) bind the
-compiled body. Inside an enclosing `torch.compile` the eager body is traced.
+An `AutotunedOp` has two candidates:
+
+| candidate | what it runs |
+| --- | --- |
+| `kernel` | the fused op of the device's most-prior fused backend (`lycoris.kernels.dispatch` order) |
+| `compile` | `torch.compile` of the eager body through `kohakumoss_kernels.backends.compile.ops.CompiledOp` ([Checkpoint recompute](#checkpoint-recompute) covers how its graphs are cached); `AdapterConfig.compile_dynamic`: `tokens` (default) marks the token axes dynamic, `static`, `dynamic` |
+
+- **The first call of a bucket** (token bucket, a power of two from `TOKEN_FLOOR`,
+  activation dtype, grad pattern) asks `kohakumoss_kernels.tuning.tuner.select` with the
+  problem key (every operand's shape, token axes bucketed, dtype and grad flag, and the
+  grad mode).
+- **A stored winner** of this card binds at once. Otherwise both candidates are timed,
+  forward plus backward, on detached copies of the operands, and the winner is stored
+  and bound. A candidate raising a build or scope error loses.
+- **Where the tuner may not time** (inference mode, a backward, a trace) the bucket runs
+  the kernel unsettled and is asked again on its next call. Outside the tuning windows
+  ([tuning.md](tuning.md#tuning-windows)) a missing key binds its first candidate
+  untimed, with one WARNING line.
+- **Operands no fused kernel takes** (mixed fp16 / bf16, bf16 below sm_80) bind the
+  compiled body.
+- **Inside an enclosing `torch.compile`** the eager body is traced.
 
 ### Checkpoint recompute
 
@@ -106,16 +119,21 @@ before any recompute), another stage's thread, the autograd thread. Three things
 ### Body candidate
 
 Precision is a pass/fail threshold. The speed choice only ever sees candidates that
-pass it. A body that runs through a custom `torch.autograd.Function` (LoHa: LyCORIS's
-`HadaWeight` behind `bodies.loha`, `loha_with_base`, `loha_weight`, `loha_merged`, the
-set `bodies.AUTOGRAD_FUNCTION_BODIES`) runs the Function's backward outside autocast in
-eager, which makes it an fp32 backward. torch.compile traces that same backward under
-autocast with 16-bit matmuls. The compiled candidate's gradients then fall below
-PyTorch's (fp16 loha.weight grad: abs_mean 8.1e-4 compiled against 2.0e-7 eager), so
-it fails the threshold. `autotuned.body_candidate` resolves this at bind time: such an
-op's body candidate is `eager` (the eager body), not `compile`. An `AutotunedOp` over
-it times kernel against eager. A layer outside the kernel's scope, and the fixed
-`compile` backend, run the eager body.
+pass it.
+
+- A body that runs through a custom `torch.autograd.Function` (LoHa: LyCORIS's
+  `HadaWeight` behind `bodies.loha`, `loha_with_base`, `loha_weight`, `loha_merged`, the
+  set `bodies.AUTOGRAD_FUNCTION_BODIES`) runs the Function's backward outside autocast
+  in eager, which makes it an fp32 backward.
+- torch.compile traces that same backward under autocast with 16-bit matmuls. The
+  compiled candidate's gradients then fall below PyTorch's (fp16 loha.weight grad:
+  abs_mean 8.1e-4 compiled against 2.0e-7 eager), so it fails the threshold.
+- `autotuned.body_candidate` resolves this at bind time: such an op's body candidate is
+  `eager` (the eager body), not `compile`. An `AutotunedOp` over it times kernel against
+  eager. A layer outside the kernel's scope, and the fixed `compile` backend, run the
+  eager body.
+
+### Prewarm
 
 `AdapterSet.prewarm(rows, dtype, devices)` settles every distinct autotuned op
 (`AutotunedOp.signature`: name and the layouts of the operands without a token axis)
@@ -150,7 +168,8 @@ weight-only storage, fp8-compute copies, ring / swap streamed slots) keeps the e
 `in_features` / `out_features` and, seeing a non-native linear, runs it in bypass; the
 construction-time state LyCORIS would read from the base weight (the DoRA magnitude,
 the T-LoRA SVD, the OFT / BOFT rescale) is built by `network.Deferred` from one
-transient copy of each layer's base. No dense base weight and no dense dW is held:
+transient copy of each layer's base. The layer holds its stored base and the adapter
+factors:
 
 - training binds bypass only (`ADAPTER_MODE='merge'` on such a base is a validation
   error naming the base); the bypass kernel ops take the 16-bit activation and add to
@@ -170,20 +189,10 @@ transient copy of each layer's base. No dense base weight and no dense dW is hel
 
 ## Tests
 
-`tests/adapters/test_kernel_ops.py` checks every kernel op on one linear's LyCORIS
-module: each candidate the bind can run (the fused kernel where it applies, the body
-candidate, the eager body) against the eager body under autocast to the test dtype (as
-training runs it) and in fp64, forward and backward, fp16 and bf16. A candidate's
-output dtype is eager's or the promotion of the operand dtypes (a kernel stores in the
-operands' natural dtype and never forces 16-bit). `tests/adapters/test_body_candidate.py`
-checks that the LoHa ops bind kernel against eager, with no compile candidate. `tests/adapters/test_stored_bypass.py` checks one
-linear on an int8 / fp8 weight-only base per kind (LoRA, LoHa, LoKr full matrix factor
-16, OFT, BOFT, IA3, GLoRA, DoRA, T-LoRA): the bound forward and the inference attach
-(bypass and merge mode) against an independent fp64 formula through the error
-statistics, with the same adapter on a dense base as the baseline; no stored-weight
-read in a bypass forward (DoRA: exactly one); the merge error; the dense-diff refusal.
-`tests/training/prewarm/test_adapter_prewarm*.py` check the prewarm's buckets, that it leaves
-no gradient on the factors, and that a restart times nothing.
-`tests/integration/test_adapters_real.py` runs LoRA and LoKr on the real backbone over
-16-bit, int8 and fp8-compute bases: a training step, the adapted layer against fp64,
-and the LyCORIS export re-imported.
+| test | checks |
+| --- | --- |
+| `tests/adapters/test_kernel_ops.py` | every kernel op on one linear's LyCORIS module: each candidate the bind can run (the fused kernel where it applies, the body candidate, the eager body) against the eager body under autocast to the test dtype (as training runs it) and in fp64, forward and backward, fp16 and bf16. A candidate's output dtype is eager's or the promotion of the operand dtypes (a kernel stores in the operands' natural dtype) |
+| `tests/adapters/test_body_candidate.py` | the LoHa ops bind kernel against eager, with no compile candidate |
+| `tests/adapters/test_stored_bypass.py` | one linear on an int8 / fp8 weight-only base per kind (LoRA, LoHa, LoKr full matrix factor 16, OFT, BOFT, IA3, GLoRA, DoRA, T-LoRA): the bound forward and the inference attach (bypass and merge mode) against an independent fp64 formula through the error statistics, with the same adapter on a dense base as the baseline; no stored-weight read in a bypass forward (DoRA: exactly one); the merge error; the dense-diff refusal |
+| `tests/training/prewarm/test_adapter_prewarm*.py` | the prewarm's buckets, that it leaves no gradient on the factors, and that a restart times nothing |
+| `tests/integration/test_adapters_real.py` | LoRA and LoKr on the real backbone over 16-bit, int8 and fp8-compute bases: a training step, the adapted layer against fp64, and the LyCORIS export re-imported |

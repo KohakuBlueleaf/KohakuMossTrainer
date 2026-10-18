@@ -1,11 +1,15 @@
 # The real-GPU bench matrix
 
 One frozen copy of the working tree (plus the extra repos, such as LyCORIS) runs on
-every card of every host: real weights, real data, every speed / VRAM setting, the
-training quality runs with their comparison grids, inference checks, the ncu efficiency
-pass and the feature-coverage runs. Every run writes its config, log, metric rows,
-nvidia-smi trace and result record to disk, and one report answers speed, VRAM, whether
-a step is optimized, quality and coverage per card model.
+every card of every host:
+
+- real weights, real data, every speed / VRAM setting;
+- the training quality runs with their comparison grids, and inference checks;
+- the ncu efficiency pass and the feature-coverage runs.
+
+Every run writes its config, log, metric rows, nvidia-smi trace and result record to
+disk, and one report answers speed, VRAM, whether a step is optimized, quality and
+coverage per card model.
 
 ```
 scripts/bench/matrix/launch.py                   local driver: plan, freeze, ship, install, start, status, join, collect, report
@@ -13,10 +17,30 @@ scripts/bench/matrix/host.py                     host runner (on the host, from 
 scripts/bench/matrix/src/kohakumoss_bench/       the dev package both use: run/, plan/, measure/, report/
 ```
 
-The package is not part of the kohakumoss wheel; install it next to the editable
-kohakumoss install with `uv pip install -e scripts/bench/matrix` (the hosts' default
+The package installs separately from the kohakumoss wheel, next to the editable
+kohakumoss install, with `uv pip install -e scripts/bench/matrix` (the hosts' default
 `install` command installs both from the frozen tree). Module paths below are relative
 to `kohakumoss_bench/`.
+
+## Launch
+
+`launch.py --phase <phase>` runs one phase per call against a [hosts file](#hosts-file):
+
+| phase | what it does |
+| --- | --- |
+| `plan` | the dry run, nothing trains: per host the cards nvidia-smi lists (over ssh; which ones the host would use and the memory in use now), read-only preflight checks (venv interpreter, weights, fix file, datasets, `/dev/shm` space, `ncu --version`), the card pools and every run of each pool's queue with an expected duration ([Plan](#plan)), written to `runs/bench/<bench>/plan.md` and `plan.json` |
+| `start` | freezes, ships and installs the trees, then starts the [host runner](#host-runner) (below) |
+| `status` | prints each host's `status.json` |
+| `join --gpus 2,3` | writes `join.json` into a running bench: those cards join the pool of their model once idle |
+| `collect` | copies `runs/<bench>/<host>/` to `runs/bench/<bench>/<host>/` |
+| `report` | writes `report.md` and `report.json` there ([Report](#report)) |
+
+`start` lists the shipped files of each repo (tracked and untracked, not ignored,
+without the local-only directories in `run/remote.py` `SKIP`) and hashes them into one
+identity per repo (`<HEAD>-<sha1 of paths and bytes>`). It ships each as one tar
+(skipped when the identity is there), runs the install command for each, uploads the
+host runner config (`configs/<bench>-<host>.json`) and starts the host runner (`nohup`
+over ssh). Later edits never reach a running bench: every host runs the trees it got.
 
 ## Hosts file
 
@@ -39,25 +63,6 @@ host fills `Host`:
 
 The bench block's `repos` (`{"lycoris": "<local path>"}`) lists the extra repos frozen,
 shipped and installed next to the main tree.
-
-## Launch
-
-`launch.py --phase plan` is the dry run: per host the cards nvidia-smi lists (over ssh;
-which ones the host would use and the memory in use now), read-only preflight checks
-(venv interpreter, weights, fix file, datasets, `/dev/shm` space, `ncu --version`), the
-card pools and every run of each pool's queue with an expected duration, written to
-`runs/bench/<bench>/plan.md` and `plan.json`. Nothing trains.
-
-`--phase start` lists the shipped files of each repo (tracked and untracked, not
-ignored, without the local-only directories in `run/remote.py` `SKIP`), hashes them
-into one identity per repo (`<HEAD>-<sha1 of paths and bytes>`), ships each as one tar
-(skipped when the identity is there), runs the install command for each, uploads the
-host runner config (`configs/<bench>-<host>.json`) and starts the host runner (`nohup`
-over ssh). Later edits never reach a running bench: every host runs the trees it got.
-`status` prints each host's `status.json`, `join --gpus 2,3` writes `join.json` into a
-running bench (those cards join the pool of their model once idle), `collect` copies
-`runs/<bench>/<host>/` to `runs/bench/<bench>/<host>/`, `report` writes
-`report.md` and `report.json` there.
 
 ## Host runner
 
@@ -89,7 +94,7 @@ One process per run: the weights load from the stage in seconds, and the kernel 
 tables, the torch.compile cache and the Triton / TileLang caches are on disk, so only a
 pool's first run tunes; every later run (and the restart run at the end) binds from the
 tables. Tables are per card model; each write merges the file first
-(docs/internals/tuning.md), so cards of one pool tuning at once keep each other's rows.
+([tuning.md](../internals/tuning.md)), so cards of one pool tuning at once keep each other's rows.
 
 ## Matrix
 
@@ -98,8 +103,8 @@ Per pool (`plan/matrix.py`):
 | kind | runs |
 | --- | --- |
 | speed | precision (bf16 where the card has it, fp16) x base (compute and int8 weight-only everywhere, plus fp8_compute and MXFP8 on sm89+; `bases` keeps a subset) x algo (LoRA r32, LoKr factor 16 full matrix) x the named profiles (speed, balanced, low, minimal, auto) that fit; one `auto` row each for DoRA r16, LoHa r16 and OFT block 64; the reference combination (first precision, compute base, LoRA r32) over the catalog points that fit |
-| cache | the flagship setups under three cache modes: no cache (`LATENT_CACHE` and `TEXT_CACHE` "off": the VAE and text encoder run every step), the offline latent cache, both offline caches. Setups: LoRA r32 `balanced` in the first precision and in fp16, LoRA r32 `minimal`, LoKr 16 `balanced`, fp8_compute LoRA r32 `balanced` (sm89+), and LoKr 16 fp16 on an int8 base under `ckpt-stream2-actoff-optstream-gradoff` with the text encoder streamed 8 batches ahead; on a card without bf16 the fp16 equivalents once. The encoders take the profile's placement (text streamed and VAE offloaded under `low` / `minimal`). They run right after the pool's first run, ahead of every other rank-1 run |
-| placement | no cache, per text-encoder / VAE placement: LoRA r32 `balanced` (text `auto`, `resident`, `offload`, and `stream` with the VAE `resident` and `offload`), LoRA r32 `minimal` and the low-VRAM LoKr setup (text `auto`, `resident`, `offload`, `stream`; the profile's VAE). A placement past the card's memory ends `oom`. The report's "auto picked" column is what the `auto` row of the same setup logged (`text encoder placement:` / `VAE placement:`). They run right after the cache rows |
+| cache | the flagship setups under three cache modes: no cache (`LATENT_CACHE` and `TEXT_CACHE` "off": the VAE and text encoder run every step), the offline latent cache, both offline caches. Setups: LoRA r32 `balanced` in the first precision and in fp16, LoRA r32 `minimal`, LoKr 16 `balanced`, fp8_compute LoRA r32 `balanced` (sm89+), and LoKr 16 fp16 on an int8 base under `ckpt-ring2-actoff-optstream-gradoff` with the text encoder streamed 8 batches ahead; on a card without bf16 the fp16 equivalents once. The encoders take the profile's placement (text streamed and VAE offloaded under `low` / `minimal`). They run right after the pool's first run, ahead of every other rank-1 run |
+| placement | no cache, per text-encoder / VAE placement: LoRA r32 `balanced` (text `auto`, `resident`, `offload`, and `ring` with the VAE `resident` and `offload`), LoRA r32 `minimal` and the low-VRAM LoKr setup (text `auto`, `resident`, `offload`, `ring`; the profile's VAE). A placement past the card's memory ends `oom`. The report's "auto picked" column is what the `auto` row of the same setup logged (`text encoder placement:` / `VAE placement:`). They run right after the cache rows |
 | batch | LoRA r32 under `balanced` and `ckpt-resident` in the first precision, plus fp16 `balanced` on a bf16 card, at `batch_scales` (2, 4, 8) x `max_tokens` tokens per step (MAX_TOKENS, the BatchLimits budget); past the card's memory a row ends `oom`. They run right after the pool's first run |
 | online | the reference combination under `auto` with online latent and text caches into an empty directory |
 | cap | `minimal`, LoRA r8 and LoKr 16, every base, under each VRAM target below the card's memory (8 GB, 6 GB) |
@@ -120,21 +125,28 @@ fitting entries (`catalog="all"`) or their frontier (`catalog="frontier"`, the d
 an entry is dropped when an entry that streams, offloads and recomputes no more on every
 axis needs at most `frontier_slack` (3%) more estimated memory.
 
-Speed runs: 40 steps, one metric row per step (one host sync per step, the same in
-every run); steps 38 .. 39 (`trace_steps`, 2) run under `TRACE_STEPS` (torch.profiler) for the step
-breakdown (`trace_compute_ms`, `trace_copy_ms`, `trace_idle_ms` per step,
-docs/guides/multi-gpu.md). Medians are over the steps after step 10 outside the
-profiled steps.
+Speed runs:
+
+- 40 steps, one metric row per step (one host sync per step, the same in every run).
+- Steps 38 .. 39 (`trace_steps`, 2) run under `TRACE_STEPS` (torch.profiler) for the
+  step breakdown (`trace_compute_ms`, `trace_copy_ms`, `trace_idle_ms` per step,
+  [multi-gpu.md](../guides/multi-gpu.md)).
+- Medians are over the steps after step 10 outside the profiled steps.
 
 ## Plan
 
-The plan's durations are estimates: a training step is its model FLOPs
-(`kohakumoss/model/flops.py`, recompute included) at `plan_mfu` (0.4) of the nominal peak
-(`plan_tflops` for a card missing from the table), or the streamed weight and
-activation bytes at `plan_link_gbps` (20 GB/s) when that is longer; every process adds
-`plan_overhead_s` (120 s), a pool's first run `plan_tuning_s` (1800 s), each ncu step
-`plan_ncu_step_s` (300 s); images are sampler steps x 2 (CFG) forwards at 1 MP. A pool's
-wall time places its units longest-first on the least-loaded card after the first unit.
+The plan's durations are estimates:
+
+| part | estimate |
+| --- | --- |
+| a training step | its model FLOPs (`kohakumoss/model/flops.py`, recompute included) at `plan_mfu` (0.4) of the nominal peak (`plan_tflops` for a card missing from the table), or the streamed weight and activation bytes at `plan_link_gbps` (20 GB/s) when that is longer |
+| every process | + `plan_overhead_s` (120 s) |
+| a pool's first run | + `plan_tuning_s` (1800 s) |
+| each ncu step | + `plan_ncu_step_s` (300 s) |
+| images | sampler steps x 2 (CFG) forwards at 1 MP |
+
+A pool's wall time places its units longest-first on the least-loaded card after the
+first unit.
 
 ## ncu
 
@@ -151,13 +163,14 @@ replay mode `ncu_replay` picks (`measure/ncu.py` `REPLAYS`):
 | `kernel` | one per kernel (`--profile-from-start off`) | as `application`, plus a device-memory save / restore around every kernel |
 
 The four metrics need 6 (ga100) to 9 (gb202) passes, so a per-kernel pass of one step
-takes 2-3.5 h; `app-range` measures the same step in minutes and gives the whole-step
+takes 2-3.5 h. `app-range` measures the same step in minutes and gives the whole-step
 tensor / SM / DRAM % the bound result uses, without the per-kernel split (the speed
 runs' torch traces carry the kernel times). ncu rejects `--profile-from-start` under
-range replay: the profiler calls themselves delimit the range. Collected per result:
-`gpu__time_duration.sum`, the
-tensor-pipe metric `.avg.pct_of_peak_sustained_elapsed`, `sm__throughput` and
-`dram__throughput` (% of peak, elapsed). The tensor metric is the first of
+range replay: the profiler calls themselves delimit the range.
+
+Collected per result: `gpu__time_duration.sum`, the tensor-pipe metric
+`.avg.pct_of_peak_sustained_elapsed`, `sm__throughput` and `dram__throughput` (% of
+peak, elapsed). The tensor metric is the first of
 `sm__pipe_tensor_subpipe_hmma_cycles_active`, `sm__pipe_tensor_op_hmma_cycles_active`,
 `sm__pipe_tensor_cycles_active` that `ncu --query-metrics --chip <chip>` lists for the
 card (else the subpipe name on sm90+ and the op name below).
@@ -165,8 +178,9 @@ card (else the subpipe name on sm90+ and the op name below).
 Under `sudo` the environment is reset, so the run's environment goes through an env file
 (`run/child.py --env-file`), and the run's caches (HOME, Triton, inductor) and a copy
 of the kernel tables live inside the run directory: nothing the root process writes
-lands in the runner account's own caches. The report is `ncu.ncu-rep`, imported as `ncu.csv` and
-summarized into `ncu.json`:
+lands in the runner account's own caches.
+
+The report is `ncu.ncu-rep`, imported as `ncu.csv` and summarized into `ncu.json`:
 
 - per kernel (per range under `app-range`; grouped by name): calls, ms per step, time share, duration-weighted
   tensor / SM / DRAM %, and the class: compute (SM % leads and reaches `ncu_bound_pct`,
@@ -198,16 +212,19 @@ tests.
 
 ## Host RAM
 
-Concurrent runs on one host share what the host has free (`plan/hostmem.py`):
-`MemAvailable` of /proc/meminfo, after every process's resident, pinned and shared use
-(other jobs on the host included), minus `host_ram_reserve_gib` (16) and the shares of
-runs started in the last 3 minutes (not yet resident); without /proc,
-`host_ram_share` (0.6) of `ram_gib`. A run's share is a process baseline (8 GiB), the streamed base
-weights when its profile streams, the offloaded activations when it offloads them
-(tokens x saved elements per token x depth x 2 bytes: about 42 GiB at 8192 tokens
-without checkpointing, 2 GiB with block checkpointing) and, for a full finetune, host
-optimizer state and gradients. A run waits until its share fits; a run larger than the
-whole budget waits until nothing else holds any.
+Concurrent runs on one host share what the host has free (`plan/hostmem.py`).
+
+- **Budget:** `MemAvailable` of /proc/meminfo, after every process's resident, pinned
+  and shared use (other jobs on the host included), minus `host_ram_reserve_gib` (16)
+  and the shares of runs started in the last 3 minutes (not yet resident). Without
+  /proc: `host_ram_share` (0.6) of `ram_gib`.
+- **A run's share:** a process baseline (8 GiB), plus the streamed base weights when its
+  profile streams, the offloaded activations when it offloads them (tokens x saved
+  elements per token x depth x 2 bytes: about 42 GiB at 8192 tokens without
+  checkpointing, 2 GiB with block checkpointing) and, for a full finetune, host
+  optimizer state and gradients.
+- **Admission:** a run waits until its share fits; a run larger than the whole budget
+  waits until nothing else holds any.
 
 ## Release
 
@@ -273,17 +290,22 @@ queue ([Failures](#failures)).
 
 ## VRAM
 
-A 500 ms nvidia-smi sampler for the whole host (two `--loop-ms` processes): per run, the
-child process's used memory and its card's used memory, written to `vram_smi.csv`, with
-the process peak and steady value (the median of the second half of the samples), the
-card peak, and the card peak and steady value above the idle baseline taken before
-launch. Under Windows WDDM the per-process column is [N/A] and the card above its
-baseline stands in. A training run's samples are also split at the start of its first
-step (the first metric row's `time` less its `step_time`) into the startup + prewarm
-phase and the step loop, each with its own peak and steady values
-(`vram_smi_phases`), so the prewarm spike does not hide the loop's own use. The metric
-rows add torch's allocated / reserved peaks, the per-step peak (`vram_step_peak`) and
-the device-use breakdown (docs/guides/logging.md#vram).
+A 500 ms nvidia-smi sampler runs for the whole host (two `--loop-ms` processes). Per
+run, it writes the child process's used memory and its card's used memory to
+`vram_smi.csv`, with:
+
+- the process peak and steady value (the median of the second half of the samples);
+- the card peak, and the card peak and steady value above the idle baseline taken before
+  launch. Under Windows WDDM the per-process column is [N/A] and the card above its
+  baseline stands in;
+- for a training run, the same split at the start of its first step (the first metric
+  row's `time` less its `step_time`) into the startup + prewarm phase and the step loop,
+  each with its own peak and steady values (`vram_smi_phases`), so the prewarm spike
+  does not hide the loop's own use.
+
+The metric rows add torch's allocated / reserved peaks, the per-step peak
+(`vram_step_peak`) and the device-use breakdown
+([logging.md](../guides/logging.md#vram)).
 
 A cap run caps the caching allocator at the target minus `cap_allowance_gib` (1.5) and
 passes when the nvidia-smi peak stays at or below the target.
@@ -325,25 +347,27 @@ the nvidia-smi peaks and steady values).
 
 ## Report
 
-Per card model: each card's probe ceilings; the cache-mode table (samples/s, tokens/s,
-TFLOP/s, text-encoder and VAE seconds per step and share of the wall time, the median
-per-step torch peak, nvidia-smi peak / steady of the prewarm phase and of the step
-loop, the fp16 loss scale, non-finite steps); the speed table (card, samples/s, s/step,
-tokens/s, nominal MFU, share of the measured GEMM rate, nvidia-smi peak / steady,
-allocated / reserved, compute / copy / idle ms per step, GB moved per step, transfer
-share, the bound class, prewarm tuned / from the table, non-finite steps, loss first ->
-last); the VRAM targets with pass / fail; the ncu efficiency table and top kernels;
-quality, grids and inference; the kernel tables (per tuned kernel: problems, chosen
-configs, and where the table timed a PyTorch / compile path the chosen config's speedup
-over it). Then the feature coverage (`plan/coverage.py` `FEATURES`: working / broken
-/ does not fit / not run, or test passed / failed / present from a `--junit` XML) and
-every failure.
+Per card model, in order:
+
+| section | content |
+| --- | --- |
+| probes | each card's probe ceilings |
+| cache modes | samples/s, tokens/s, TFLOP/s, text-encoder and VAE seconds per step and share of the wall time, the median per-step torch peak, nvidia-smi peak / steady of the prewarm phase and of the step loop, the fp16 loss scale, non-finite steps |
+| speed | card, samples/s, s/step, tokens/s, nominal MFU, share of the measured GEMM rate, nvidia-smi peak / steady, allocated / reserved, compute / copy / idle ms per step, GB moved per step, transfer share, the bound class, prewarm tuned / from the table, non-finite steps, loss first -> last |
+| VRAM targets | pass / fail |
+| ncu | the efficiency table and top kernels |
+| quality | quality, grids and inference |
+| kernels | per tuned kernel: problems, chosen configs, and where the table timed a PyTorch / compile path the chosen config's speedup over it |
+
+Then the feature coverage (`plan/coverage.py` `FEATURES`: working / broken / does not
+fit / not run, or test passed / failed / present from a `--junit` XML) and every
+failure.
 
 The bound class of a speed run:
 
 - transfer share: (h2d GB / pinned h2d GB/s + d2h GB / pinned d2h GB/s) / step time, over
-  the DiT engines (`xfer_*_gb`, docs/guides/logging.md#transfer) and the text encoder /
-  VAE weight traffic;
+  the DiT engines (`xfer_*_gb`, [logging.md](../guides/logging.md#transfer)) and the
+  text encoder / VAE weight traffic;
 - compute share: model TFLOP/s (kohakumoss/model/flops.py) / the probe's GEMM rate (fp8 for an
   fp8 base);
 - transfer-bound at a transfer share of `--transfer-bound` (0.7) or more, else

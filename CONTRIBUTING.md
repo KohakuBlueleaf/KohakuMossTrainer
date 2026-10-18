@@ -90,16 +90,15 @@ non-negotiables:
   `if-elif-else`.
 - **Imports**: built-in, third-party, first-party; `import` before `from`. No imports inside
   functions (optional dependencies such as triton / tilelang are guarded at module level).
-- **Files**: at most 600 lines (hard cap 1000); one responsibility per module; nest, do not
-  flatten.
+- **Files**: one responsibility per module; nest, do not flatten.
 - **Select, don't dispatch**: configuration resolves a concrete class or callable once, at
   build time (`kohakumoss_common.registry.build`, `kohakumoss_kernels.registry.resolve`);
   no per-step `if mode == ...` in high-multiplicity code.
 - **The backbone is a pure function** `MossBackbone(img, text, sigma, seq) -> v`; objectives
   live in `kohakumoss.diffusion.objective`. Packed is the layout: attention never crosses a
   sample boundary.
-- **Numerics**: reduce in fp32; matmuls on fp16 / bf16 inputs with fp32 accumulation; no
-  fp64 outside the precision reference. A kernel must match PyTorch or beat it against the
+- **Numerics**: reduce in fp32; matmuls on fp16 / bf16 inputs with fp32 accumulation. A
+  kernel must match PyTorch or beat it against the
   fp64 reference (fp16 and bf16, forward and backward), and is selected only where it is
   measured faster.
 - **Windows parity**: every single-GPU feature works on Windows; multi-GPU training is
@@ -109,7 +108,7 @@ non-negotiables:
 
 ### Before opening the PR
 
-1. Re-read your diff against CLAUDE.md, especially in-function imports and file length.
+1. Re-read your diff against CLAUDE.md, especially in-function imports.
 2. Run `black` and `ruff` over every directory.
 3. Add tests in the right kind (model-free or real-weights), each with its negative.
 4. Split commits along logical boundaries: a sentence-case imperative subject, and a body
