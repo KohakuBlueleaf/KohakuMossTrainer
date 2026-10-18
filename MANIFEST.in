@@ -1,0 +1,4 @@
+graft configs
+graft scripts
+prune configs/user
+global-exclude __pycache__ *.pyc
