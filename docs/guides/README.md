@@ -6,6 +6,7 @@ In the order a first run follows them:
 | --- | --- |
 | [install.md](install.md) | one install command per platform (Linux, Windows, Intel Arc, Google Colab), extras, the doctor |
 | [install-windows.md](install-windows.md) | Windows toolchain, feature matrix |
+| [weights.md](weights.md) | where each weight file goes: the ComfyUI layout, the HF layout, VAE and text-encoder files |
 | [first-lora.md](first-lora.md) | train a first LoRA / LyCORIS adapter, end to end |
 | [configs.md](configs.md) | kogine configs, preset layers, recipes, `kohakumoss-config`, host RAM per VRAM layer |
 | [datasets.md](datasets.md) | preparing data, inspecting the plan, caching, importing to the dataset format |
