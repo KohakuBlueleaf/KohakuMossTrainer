@@ -63,6 +63,16 @@ def weights_root() -> Path:
 
 
 @pytest.fixture(scope="session")
+def comfy_root() -> Path:
+    """A ComfyUI models folder with the Comfy-Org MOSS-Image files (KOHAKUMOSS_COMFY:
+    diffusion_models/, text_encoders/, vae/)."""
+    root = os.environ.get("KOHAKUMOSS_COMFY")
+    if not root:
+        pytest.skip("KOHAKUMOSS_COMFY unset")
+    return Path(root)
+
+
+@pytest.fixture(scope="session")
 def fix_file(weights_root) -> Path | None:
     """The fp16-fix DiT file (KOHAKUMOSS_FP16_FIX_FILE, else <weights>/fp16fix/...)."""
     path = Path(os.environ.get("KOHAKUMOSS_FP16_FIX_FILE") or weights_root / FIX_FILE)
