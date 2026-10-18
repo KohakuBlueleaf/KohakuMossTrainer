@@ -2,7 +2,6 @@
 
 import json
 
-import torch
 from safetensors import safe_open
 from torch import Tensor, nn
 
@@ -102,10 +101,7 @@ def group(
     return out, unmatched
 
 
-def spec_from_meta(meta: dict[str, str]) -> dict | None:
+def config_from_meta(meta: dict[str, str]) -> dict | None:
+    """The adapter configuration fields a training-state file records, or None."""
     raw = meta.get("kohakumoss_spec")
     return None if raw is None else json.loads(raw)
-
-
-def as_float(t: Tensor, device: torch.device) -> Tensor:
-    return t.to(device=device, dtype=torch.float32)

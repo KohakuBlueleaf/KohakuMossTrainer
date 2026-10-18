@@ -30,7 +30,3 @@ def detach(module: nn.Module, bake: bool, name: str = "weight") -> None:
     """Remove the parametrization, baking the adapted value in when `bake`."""
     if parametrize.is_parametrized(module, name):
         parametrize.remove_parametrizations(module, name, leave_parametrized=bake)
-
-
-def original(module: nn.Module, name: str = "weight") -> Tensor:
-    return module.parametrizations[name].original

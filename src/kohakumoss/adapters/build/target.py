@@ -16,17 +16,23 @@ from kohakumoss.adapters.kinds.common import delta_builder
 CHILD = "lyco"
 
 
-def kind_of(lyco: nn.Module) -> str:
-    """Algorithm kind name of a LyCORIS module instance."""
-    return record_of(lyco).name
+def is_stored(linear: nn.Module) -> bool:
+    """A linear whose base is quantized / streamed storage or runs through fp8
+    compute copies (anything but a plain 16/32-bit dense parameter)."""
+    return (
+        getattr(linear, "base", None) is not None
+        or getattr(linear, "compute", None) is not None
+    )
+
+
+def base_kind(linear: nn.Module) -> str:
+    """A short name of a stored base for error messages."""
+    base = getattr(linear, "base", None) or getattr(linear, "compute", None)
+    return type(base).__name__ if base is not None else "dense"
 
 
 def _override_base(tensor: Tensor, dtype: torch.dtype) -> Tensor:
     return tensor.to(dtype)
-
-
-def _full_base(lyco: nn.Module, dtype: torch.dtype) -> Tensor:
-    return lyco.org_weight.to(device=lyco.weight.device, dtype=dtype)
 
 
 def _dense_base(linear: nn.Module, dtype: torch.dtype) -> Tensor:
@@ -35,7 +41,8 @@ def _dense_base(linear: nn.Module, dtype: torch.dtype) -> Tensor:
 
 @dataclass
 class Target:
-    """An adapted linear: `path` is its module path, `lora_name` its LyCORIS key."""
+    """An adapted linear: `path` is its module path, `lora_name` its LyCORIS key;
+    `autotuned` the AutotunedOps of its current bound forward."""
 
     path: str
     lora_name: str
@@ -44,7 +51,7 @@ class Target:
     base_override: Tensor | None = None
     backend: str | None = None
     axis: str = "joint"
-    fused: bool = False
+    autotuned: list = field(default_factory=list)
     record: Kind = field(init=False)
     wd: bool = field(init=False)
     wd_on_out: bool = field(init=False)
@@ -58,38 +65,26 @@ class Target:
         self.wd_on_out = bool(getattr(self.lyco, "wd_on_out", True))
         self.draws = Draws(int(getattr(self.lyco, "lora_dim", 0) or 0))
         self.resolve_base()
-        self.unit_fn = self.record.unit(self)
-
-    @property
-    def kind(self) -> str:
-        return self.record.name
+        self.unit_fn = partial(self.record.diff_weight, self)
 
     def resolve_base(self) -> None:
-        """Bind the base-weight source: override, the cached original of `full`, the
-        attached quantized / streamed storage, or the dense parameter."""
+        """Bind the base-weight source: override, the attached quantized / streamed
+        storage (one transient dequantized copy per call), or the dense parameter."""
         if self.base_override is not None:
             self.base_fn = partial(_override_base, self.base_override)
-        elif self.record.owns_weight:
-            self.base_fn = partial(_full_base, self.lyco)
-        elif self.stored:
+        elif getattr(self.linear, "base", None) is not None:
             self.base_fn = self.linear.base.weight
         else:
             self.base_fn = partial(_dense_base, self.linear)
 
-    def set_override(self, tensor: Tensor | None) -> None:
-        self.base_override = tensor
-        self.resolve_base()
-
     @property
     def stored(self) -> bool:
-        """The base weight lives in quantized / streamed storage, not a dense parameter."""
-        return getattr(self.linear, "base", None) is not None
+        """The base is not a plain 16/32-bit dense parameter: quantized or streamed
+        storage, or fp8 compute copies; such a base runs bypass only."""
+        return is_stored(self.linear)
 
     def base_bias(self) -> Tensor | None:
-        """The frozen base bias (the cached original for `full`)."""
-        if self.record.owns_weight:
-            org = self.lyco.org_bias
-            return None if not org else org[0]
+        """The frozen base bias."""
         return self.linear.bias
 
     def base_weight(self, dtype: torch.dtype = torch.float32) -> Tensor:
@@ -107,7 +102,7 @@ class Target:
 
 @dataclass
 class NormTarget:
-    """A norm whose weight (and bias) carry a trained delta (adapters.norms.NormDelta)."""
+    """A norm whose weight (and bias) carry a trained delta (adapters.train.norms.NormDelta)."""
 
     path: str
     lora_name: str

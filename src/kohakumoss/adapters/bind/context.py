@@ -14,14 +14,16 @@ class Draws:
 
 @dataclass(frozen=True)
 class BindCtx:
-    """mode / kit / multiplier / flags of one bind, and the layer's draws."""
+    """One bind: mode, backend, the layer's kernel ops (`bind.kernel_ops`), multiplier,
+    DoRA-detach, module dropout, training state, whether the kernel ops apply
+    (`use_ops`: no input / rank dropout in training), and the layer's draws."""
 
     mode: str
     backend: str
-    kit: object
+    ops: object
     m: float
     detach: bool
     module_p: float
     training: bool
-    use_fused: bool
+    use_ops: bool
     draws: Draws

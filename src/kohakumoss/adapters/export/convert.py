@@ -5,8 +5,9 @@ docs/guides/export-to-comfy.md)."""
 import torch
 from torch import Tensor
 
-from kohakumoss.adapters.kinds.common import diff_set
-from kohakumoss.adapters.target import NormTarget, Target
+from kohakumoss.adapters.build.target import NormTarget, Target
+from kohakumoss.adapters.kinds.common import names
+from kohakumoss.adapters.kinds.record import Stacking
 
 
 def native(t: Target) -> dict[str, Tensor]:
@@ -40,8 +41,8 @@ def _comfy_dora_scale(t: Target, dora_scale: Tensor) -> Tensor:
 
 def comfy(t: Target) -> dict[str, Tensor]:
     """Tensors ComfyUI evaluates to this layer's dW at strength 1."""
-    if t.record.comfy is not None:
-        return t.record.comfy(t)
+    if t.record.comfy_tensors is not None:
+        return t.record.comfy_tensors(t)
     out = native(t)
     if t.wd and "dora_scale" in out:
         out["dora_scale"] = _comfy_dora_scale(t, out["dora_scale"])
@@ -60,7 +61,9 @@ def _per_row(scale) -> bool:
     )
 
 
-def _scaled_diff(t: Target, scale) -> dict[str, Tensor]:
+def scaled_diff(t: Target, scale) -> dict[str, Tensor]:
+    """{"diff": dW (, "diff_b": db)} at multiplier 1, rows times `scale` (uniform or
+    per output row)."""
     dw, db = t.delta(1.0)
     s = scale.float() if isinstance(scale, Tensor) else torch.tensor(float(scale))
     s = s.to(dw.device).reshape(-1, *[1] * (dw.dim() - 1))
@@ -70,23 +73,34 @@ def _scaled_diff(t: Target, scale) -> dict[str, Tensor]:
     return out
 
 
-def apply_row_scale(t: Target, tensors: dict, scale: Tensor | float) -> dict:
-    """Multiply this layer's dW rows by `scale`: one factor per term for a uniform
-    scale, an exact `diff` for a per-row one or a set with no such factor."""
-    if _per_row(scale):
-        return _scaled_diff(t, scale)
-    if t.record.stacking == "commuting" and "diff" not in tensors:
-        return dict(tensors)
-    names = ("diff", "diff_b") if "diff" in tensors else t.record.row_names(tensors)
-    if not names:
-        return _scaled_diff(t, scale)
-    c = float(scale.flatten()[0]) if isinstance(scale, Tensor) else float(scale)
+def _rows_of(scale, like: Tensor) -> Tensor:
+    s = scale.float() if isinstance(scale, Tensor) else torch.tensor(float(scale))
+    s = s.to(like.device).flatten()
+    return s.reshape(-1, *[1] * (like.dim() - 1)) if s.numel() > 1 else s.reshape(())
+
+
+def _row_scaled(tensors: dict, scaled: tuple, scale) -> dict:
     out = dict(tensors)
-    for name in names:
-        out[name] = out[name] * c
-    if "dora_scale" in out:
-        out["dora_scale"] = out["dora_scale"] * c
+    for name in scaled:
+        out[name] = out[name] * _rows_of(scale, out[name]).to(out[name].dtype)
     return out
 
 
-__all__ = ["apply_row_scale", "comfy", "diff_set", "native", "reciprocal", "row_norm"]
+def apply_row_scale(t: Target, tensors: dict, scale: Tensor | float) -> dict:
+    """Multiply this layer's dW rows by `scale` (uniform or per output row) in the
+    same tensor set: the output-row factor of each term, a uniform factor of each term,
+    or an exact `diff` when the set has neither for this scale."""
+    per_row = _per_row(scale)
+    if "diff" in tensors:
+        return _row_scaled(tensors, names(("diff", "diff_b"), tensors), scale)
+    if t.record.stacking == Stacking.COMMUTING and not per_row:
+        return dict(tensors)
+    out_axis_dora = not t.wd or t.wd_on_out
+    scaled = t.record.row_scale_tensors(tensors) if out_axis_dora else ()
+    if not scaled and not per_row:
+        scaled = t.record.uniform_scale_tensors(tensors)
+    if not scaled:
+        return scaled_diff(t, scale)
+    if "dora_scale" in tensors:
+        scaled = (*scaled, "dora_scale")
+    return _row_scaled(tensors, scaled, scale)

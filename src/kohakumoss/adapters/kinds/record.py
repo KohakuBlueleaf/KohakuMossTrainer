@@ -6,10 +6,22 @@ record's callables. `register` adds an algorithm without touching the applier.
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 
 from torch import nn
 
-STACKING = ("additive", "commuting", "chained", "dense")
+
+class Stacking(str, Enum):
+    """How a kind's delta composes with the base and with other stacked adapters (see
+    docs/internals/adapter-kinds.md)."""
+
+    ADDITIVE = "additive"
+    COMMUTING = "commuting"
+    CHAINED = "chained"
+    DENSE = "dense"
+
+
+STACKING = tuple(s.value for s in Stacking)
 
 
 def no_path(*args):
@@ -22,34 +34,50 @@ def always(m: float) -> bool:
 
 @dataclass(frozen=True)
 class Kind:
-    """The per-algorithm behaviour of one LyCORIS module class.
-
-    `algos` maps each ALGO name to the LyCORIS network_module that builds it. Every
-    callable is documented on its field in docs/internals/adapter-kinds.md.
-    """
+    """The per-algorithm behaviour of one LyCORIS module class (`t` a Target, `ctx` a
+    BindCtx, `ops` its kernel ops; see docs/internals/adapter-kinds.md)."""
 
     name: str
     module: type
+    # ALGO name -> the LyCORIS network_module that builds it.
     algos: dict[str, str]
-    unit: Callable
-    at: Callable | None = None
-    fused_unit: Callable = no_path
-    bypass: Callable = no_path
-    merge: Callable | None = None
-    eager: Callable | None = None
-    special: Callable | None = None
-    comfy: Callable | None = None
-    row_names: Callable = no_path
-    stacking: str = "dense"
-    exact_at: Callable[[float], bool] = always
-    up_side: tuple[str, ...] = ()
-    token_axis: bool = False
-    dora: bool = False
+    # t -> dW at multiplier 1 (fp32, the layer's shape).
+    diff_weight: Callable
+    # (t, m) -> a (dW, db) builder at multiplier m, or None where m * dW is exact.
+    diff_weight_at: Callable | None = None
+    # (t, ops) -> W -> dW at multiplier 1 from the kernel ops, or None.
+    kernel_diff_weight: Callable = no_path
+    # (t, ops) -> W -> W + dW (the base add inside the op), or None.
+    kernel_merged_weight: Callable = no_path
+    # (t, ctx) -> the bypass forward from the kernel ops, or None.
+    kernel_bypass: Callable = no_path
+    # (t, ctx) -> the merge forward, in place of the default W + dW one.
+    kernel_merge: Callable | None = None
+    # (t, ctx) -> the forward over module methods, in place of the module bypass.
+    module_forward: Callable | None = None
+    # (t, ctx) -> the whole forward, in place of every other path.
+    own_forward: Callable | None = None
+    # t -> the tensors ComfyUI evaluates to dW, in place of the native set.
+    comfy_tensors: Callable | None = None
+    # (lyco, file tensors) -> undo our comfy export's conversions on a loaded module.
+    undo_comfy: Callable = no_path
+    # tensors -> the names whose uniform scaling scales dW.
+    uniform_scale_tensors: Callable = no_path
+    # tensors -> the names whose output rows scale dW's rows.
+    row_scale_tensors: Callable = no_path
+    stacking: Stacking = Stacking.DENSE
+    # m -> whether the bypass at multiplier m equals the merged delta at m.
+    bypass_exact_at: Callable[[float], bool] = always
+    # The zero-initialised factors the LoRA+ ratio applies to.
+    loraplus_tensors: tuple[str, ...] = ()
+    # Ranks masked per token (T-LoRA).
+    per_token_mask: bool = False
+    supports_dora: bool = False
     training_dependent: bool = False
-    draw: Callable | None = None
-    from_comfy: Callable = no_path
-    owns_weight: bool = False
-    dimless: bool = False
+    # (t, generator) -> this step's random draws of the layer.
+    draw_step: Callable | None = None
+    # No rank (DIM is unused).
+    rankless: bool = False
 
 
 REGISTRY: dict[str, Kind] = {}

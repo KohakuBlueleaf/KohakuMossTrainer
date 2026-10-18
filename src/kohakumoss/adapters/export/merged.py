@@ -4,7 +4,7 @@ norm delta) baked in, through `kohakumoss.model.io.save.export_state`."""
 import torch
 from torch import Tensor
 
-from kohakumoss.adapters.target import NormTarget, Target
+from kohakumoss.adapters.build.target import NormTarget, Target
 from kohakumoss.model.io.save import export_state
 
 

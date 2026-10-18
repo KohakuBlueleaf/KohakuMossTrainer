@@ -8,14 +8,14 @@ from functools import partial
 
 from torch import nn
 
-from kohakumoss.adapters.backend import is_fused
-from kohakumoss.adapters.bind import compose, dora, eager, fused, kits
+from kohakumoss.adapters.bind import compose, dora, eager, forwards
 from kohakumoss.adapters.bind.context import BindCtx
-from kohakumoss.adapters.target import Target
+from kohakumoss.adapters.bind.kernel_ops import kernel_ops
+from kohakumoss.adapters.build.target import Target
 
 
 def dropping(lyco) -> bool:
-    """Input or rank dropout configured on this module (fused kernels carry neither)."""
+    """Input or rank dropout configured on this module (the kernel ops carry neither)."""
     drop = getattr(lyco, "dropout", 0.0)
     input_drop = (
         isinstance(drop, nn.Dropout) if isinstance(drop, nn.Module) else drop > 0
@@ -25,39 +25,64 @@ def dropping(lyco) -> bool:
 
 def _merge(t: Target, ctx: BindCtx):
     rec = t.record
-    if rec.merge is not None:
-        return rec.merge(t, ctx)
-    unit = compose.scalared(t.lyco, rec.fused_unit(t, ctx.kit))
-    return compose.merged(t, unit, ctx.m)
+    if rec.kernel_merge is not None:
+        return rec.kernel_merge(t, ctx)
+    unit = compose.with_scalar(t.lyco, rec.kernel_diff_weight(t, ctx.ops))
+    if unit is None:
+        return None
+    merge = None
+    if ctx.m == 1.0 and not compose.has_scalar_param(t.lyco):
+        merge = rec.kernel_merged_weight(t, ctx.ops)
+    return compose.merged(t, unit, ctx.m, merge)
 
 
 def _eager(t: Target, ctx: BindCtx):
     if ctx.mode == "merge":
         lin = compose.lin_of(t)
-        return partial(
-            eager.eager_merged, t.base_fn, t.lyco.shape, t.delta_at(ctx.m), lin
-        )
-    if t.record.eager is not None:
-        return t.record.eager(t, ctx)
-    return partial(eager.module_bypass, t.lyco, ctx.m)
+        return eager.eager_merged(t.base_fn, t.lyco.shape, t.delta_at(ctx.m), lin)
+    if t.record.module_forward is not None:
+        return t.record.module_forward(t, ctx)
+    return eager.module_bypass(t.linear, t.lyco, ctx.m)
+
+
+def _dora_kernel(t: Target, ctx: BindCtx, mix, lin):
+    """DoRA through the kernel ops (W + dW read inside the decompose op where it can),
+    or None where the kind has no kernel dW."""
+    unit = compose.with_scalar(t.lyco, t.record.kernel_diff_weight(t, ctx.ops))
+    if unit is None:
+        return None
+    with_delta = ctx.ops.decompose_with_delta(t.lyco, t.wd_on_out)
+    if with_delta is not None:
+        return forwards.dora_with_delta(t.base_fn, t.lyco, unit, with_delta, mix, lin)
+    decompose = ctx.ops.decompose(t.lyco, t.wd_on_out)
+    if decompose is None:
+        return None
+    return forwards.dora(t.base_fn, t.lyco, unit, decompose, mix, lin)
+
+
+def _stored_dora(t: Target):
+    """The DoRA bypass of a stored base: input or output axis, with or without bias."""
+    if not t.wd_on_out:
+        return dora.bypass_in
+    return dora.bypass_out if t.linear.bias is None else dora.bypass_out_biased
 
 
 def _dora(t: Target, ctx: BindCtx):
-    grad_free = not (ctx.detach and ctx.training)
-    unit = None
-    if ctx.use_fused and grad_free:
-        unit = compose.scalared(t.lyco, t.record.fused_unit(t, ctx.kit))
+    detach = ctx.detach and ctx.training
+    if t.stored:
+        fn = _stored_dora(t)
+        return partial(fn, t.linear, t.base_fn, t.unit_fn, t.lyco, ctx.m, detach)
     mix, lin = compose.mix_of(ctx.m), compose.lin_of(t)
-    if unit is not None:
-        t.fused = True
-        decompose = ctx.kit.decompose(t.lyco, t.wd_on_out)
-        return partial(fused.dora_forward, t.base_fn, t.lyco, unit, decompose, mix, lin)
-    if ctx.detach and ctx.training:
+    if ctx.use_ops and not detach:
+        fn = _dora_kernel(t, ctx, mix, lin)
+        if fn is not None:
+            return fn
+    if detach:
         fn = dora.detached_out if t.wd_on_out else dora.detached_in
-        decompose = partial(dora.detached, fn, t.lyco)
+        decompose = dora.detached(fn, t.lyco)
     else:
-        decompose = partial(dora.decomposed, t, ctx.backend)
-    return partial(eager.eager_dora, t.base_fn, t.unit_fn, decompose, mix, lin)
+        decompose = dora.decomposer(t, ctx.backend)
+    return eager.eager_dora(t.base_fn, t.unit_fn, decompose, mix, lin)
 
 
 def bind_target(
@@ -67,40 +92,43 @@ def bind_target(
     m: float,
     detach: bool,
     module_p: float,
-    race: bool = False,
+    autotune: bool = False,
+    fuse_base_add: bool = True,
+    dynamic: str = "tokens",
 ):
     """The forward to install on `t.linear` for this mode / backend / multiplier /
-    training state; fused ops raced (`race`) or pinned to `backend`."""
+    training state. Its kernel ops are autotuned (`autotune`) or fixed to `backend`,
+    the base add inside the op where one exists (`fuse_base_add`); the autotuned ops
+    are kept on `t.autotuned` for the prewarm."""
     lyco = t.lyco
     lyco.multiplier = m
-    lyco.kernel_backend = backend
     t.backend = backend
     training = lyco.training
+    ops = kernel_ops(backend, autotune, fuse_base_add, dynamic)
     ctx = BindCtx(
         mode="bypass" if t.stored else mode,
         backend=backend,
-        kit=kits.kit(backend, race),
+        ops=ops,
         m=m,
         detach=detach,
         module_p=module_p,
         training=training,
-        use_fused=is_fused(backend) and not (training and dropping(lyco)),
+        use_ops=not (training and dropping(lyco)),
         draws=t.draws,
     )
-    t.fused = False
     rec = t.record
-    if rec.special is not None:
-        return rec.special(t, ctx)
-    if t.wd:
+    if rec.own_forward is not None:
+        fn = rec.own_forward(t, ctx)
+    elif t.wd:
         fn = _dora(t, ctx)
     else:
         fn = None
-        if ctx.use_fused:
-            fn = rec.bypass(t, ctx) if ctx.mode == "bypass" else _merge(t, ctx)
-        t.fused = fn is not None
+        if ctx.use_ops:
+            fn = rec.kernel_bypass(t, ctx) if ctx.mode == "bypass" else _merge(t, ctx)
         fn = fn or _eager(t, ctx)
-    if module_p > 0 and training:
-        fn = partial(eager.module_dropout, t.linear, t.draws, fn)
+    t.autotuned = ops.autotuned
+    if rec.own_forward is None and module_p > 0 and training:
+        fn = eager.module_dropout(t.linear, t.draws, fn)
     return fn
 
 

@@ -11,7 +11,7 @@ from lycoris.modules.tlora import (
 )
 from torch import Tensor
 
-from kohakumoss.adapters.presets import (
+from kohakumoss.adapters.build.presets import (
     EMBED_HEAD,
     JOINT_ATTN,
     JOINT_MLP,

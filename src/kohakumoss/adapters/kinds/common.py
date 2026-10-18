@@ -1,7 +1,6 @@
 """Builders shared by the kind records, and the multiplier-bound (dW, db) builder."""
 
 from collections.abc import Callable
-from functools import partial
 
 import torch
 from torch import Tensor
@@ -9,11 +8,6 @@ from torch import Tensor
 from kohakumoss.adapters.bind.dora import decomposed
 
 F32 = torch.float32
-
-
-def bound(fn: Callable, t) -> Callable[[], Tensor]:
-    """`fn(t)` as a zero-argument builder bound to its Target."""
-    return partial(fn, t)
 
 
 def names(candidates: tuple[str, ...], tensors: dict) -> tuple[str, ...]:
@@ -35,35 +29,38 @@ def diff_set(t, multiplier: float = 1.0) -> dict[str, Tensor]:
     return out
 
 
-def _unit_only(t) -> tuple[Tensor, None]:
-    return t.unit_fn(), None
+def _dora_at(t, multiplier: float) -> Callable[[], tuple[Tensor, None]]:
+    """DoRA's dW = m (decompose(W + dW) - W)."""
+
+    def build() -> tuple[Tensor, None]:
+        w = t.base_fn(F32)
+        dw = t.unit_fn().to(w.device)
+        delta = decomposed(t, t.backend, w + dw) - w
+        return (delta if multiplier == 1.0 else delta * multiplier), None
+
+    return build
 
 
-def _unit_times(t, multiplier: float) -> tuple[Tensor, None]:
-    return t.unit_fn() * multiplier, None
+def _unit_at(t, multiplier: float) -> Callable[[], tuple[Tensor, None]]:
+    if multiplier == 1.0:
 
+        def unit() -> tuple[Tensor, None]:
+            return t.unit_fn(), None
 
-def _dora(t, scale: Callable) -> tuple[Tensor, None]:
-    w = t.base_fn(F32)
-    dw = t.unit_fn().to(w.device)
-    return scale(decomposed(t, t.backend, w + dw) - w), None
+        return unit
 
+    def scaled() -> tuple[Tensor, None]:
+        return t.unit_fn() * multiplier, None
 
-def _times(multiplier: float, x: Tensor) -> Tensor:
-    return x * multiplier
-
-
-def _same(x: Tensor) -> Tensor:
-    return x
+    return scaled
 
 
 def delta_builder(t, multiplier: float) -> Callable[[], tuple[Tensor, Tensor | None]]:
     """(dW, db) builder for `t` at a fixed multiplier, fp32 on the adapter device."""
-    one = multiplier == 1.0
     if t.wd:
-        return partial(_dora, t, _same if one else partial(_times, multiplier))
-    if t.record.at is not None:
-        special = t.record.at(t, multiplier)
+        return _dora_at(t, multiplier)
+    if t.record.diff_weight_at is not None:
+        special = t.record.diff_weight_at(t, multiplier)
         if special is not None:
             return special
-    return partial(_unit_only, t) if one else partial(_unit_times, t, multiplier)
+    return _unit_at(t, multiplier)

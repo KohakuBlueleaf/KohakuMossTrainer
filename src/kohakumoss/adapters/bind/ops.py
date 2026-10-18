@@ -1,81 +1,190 @@
-"""The LyCORIS tier ops of each adapter kind, as `race.Op`s over one layer's module,
-mirroring the `tier.run` calls of `lycoris.functional` (see
-docs/internals/adapter-binding.md)."""
+"""The activation-side kernel ops of each adapter kind as `autotuned.Op`s over one
+layer's module: the LyCORIS fused op (`lycoris.kernels.autograd`, by `backend=`), its
+eager formula (`bind.bodies`) and the fused kernel's scope on the layer; plus the
+per-layer readers and scopes `bind.weight_ops` shares. See
+docs/internals/adapter-binding.md#kernel-ops."""
 
-from functools import partial
+import importlib
+import math
+from collections.abc import Callable
+from functools import cache
 
-from lycoris.functional import boft as f_boft
-from lycoris.functional import diag_oft as f_oft
-from lycoris.functional import general as f_general
-from lycoris.functional import locon as f_locon
-from lycoris.functional import loha as f_loha
-from lycoris.functional import lokr as f_lokr
+import torch
 from lycoris.functional.diag_oft import MAX_BLOCK
-from lycoris.kernels import MAX_HADA_RANK
 from lycoris.kernels.autograd import (
-    apply_dora,
     boft_bypass_diff,
-    boft_diff_weight,
     diag_oft_bypass_diff,
-    diag_oft_diff_weight,
+    ia3_bypass,
     locon_bypass_diff,
-    locon_diff_weight,
     loha_bypass_diff,
-    loha_diff_weight,
     lokr_kron_bypass,
-    lokr_kron_weight,
 )
+from lycoris.kernels.limits import MAX_HADA_RANK
 from lycoris.kernels.select import static_scale
 from torch import Tensor
 
-from kohakumoss.adapters.bind.fused import kron_factors, kron_getters
-from kohakumoss.adapters.bind.race import Op
+from kohakumoss.adapters.bind import bodies
+from kohakumoss.adapters.bind.autotuned import Op, Tokens, TokensWithBase
+
+KRON_SIDE1 = {True: ("lokr_w1", None, None), False: (None, "lokr_w1_a", "lokr_w1_b")}
+KRON_SIDE2 = {True: ("lokr_w2", None, None), False: (None, "lokr_w2_a", "lokr_w2_b")}
+TOKEN = (0,)
+TOKEN_AND_BASE = (0, -1)
 
 
-def _then(tail: tuple, ops: tuple) -> tuple:
-    """Eager-body arguments: the operands followed by the bound constants."""
-    return (*ops, *tail)
+def in_features(lyco) -> int:
+    return int(lyco.shape[1])
 
 
-def _rescale(lyco):
-    return lyco.rescale
+def out_features(lyco) -> int:
+    return int(lyco.shape[0])
 
 
-def _no_rescale(lyco):
-    return None
+def _param(lyco, name: str | None, dtype: torch.dtype | None):
+    if name is None:
+        return None
+    p = getattr(lyco, name)
+    return p if dtype is None else p.to(dtype)
 
 
-def rescale_getter(lyco):
-    return _rescale if lyco.rescaled else _no_rescale
+def kron_reader(lyco) -> Callable[..., tuple]:
+    """dtype -> (w1, w1a, w1b, w2, w2a, w2b) of a LoKr module (None for the absent half
+    of each side; cast to dtype unless None), the sides chosen once per layer."""
+    names = KRON_SIDE1[bool(lyco.use_w1)] + KRON_SIDE2[bool(lyco.use_w2)]
+
+    def read(dtype: torch.dtype | None = None) -> tuple:
+        return tuple(_param(lyco, n, dtype) for n in names)
+
+    return read
 
 
-# Low-rank bypass: dy of the flattened input.
+def hada_rank(lyco) -> int:
+    """The larger hadamard rank of a LoHa module."""
+    return max(lyco.hada_w1_b.shape[0], lyco.hada_w2_b.shape[0])
 
 
-def _lora_operands(lyco, x: Tensor) -> tuple:
-    dt = x.dtype
-    return (x, lyco.lora_down.weight.to(dt), lyco.lora_up.weight.to(dt))
+@cache
+def _backend_limit(backend: str, module: str, name: str, default: float) -> float:
+    try:
+        mod = importlib.import_module(f"lycoris.kernels.{backend}.{module}")
+    except ImportError:
+        return default
+    return getattr(mod, name, default)
 
 
-def _lora_fused(gamma, backend: str, ops: tuple) -> Tensor:
-    return locon_bypass_diff(*ops, gamma, backend)
+def oft_block_limit(backend: str) -> int:
+    """The largest diag-OFT block `backend`'s fused kernels take."""
+    return _backend_limit(backend, "oft", "MAX_BLOCK", MAX_BLOCK)
+
+
+def kron_factor_limit(backend: str) -> float:
+    """The largest kron factor dim `backend`'s fused kron apply takes."""
+    return _backend_limit(backend, "lokr", "MAX_KRON_FACTOR", math.inf)
+
+
+def kron_plain(lyco) -> bool:
+    """The kron's second half a plain matrix (the fused layout): no tucker core."""
+    w2 = lyco.lokr_w2 if lyco.use_w2 else lyco.lokr_w2_b
+    return not lyco.tucker and w2.dim() == 2
+
+
+def kron_dims(lyco) -> tuple[int, int, int, int]:
+    """(a, b, c, d) of kron(w1 (a, b), w2 (c, d)), off the parameters."""
+    w1, w1a, w1b, w2, w2a, w2b = kron_reader(lyco)()
+    a, b = w1.shape if w1 is not None else (w1a.shape[0], w1b.shape[1])
+    c, d = w2.shape if w2 is not None else (w2a.shape[0], w2b.shape[1])
+    return a, b, c, d
+
+
+def fixed_scope(value: bool) -> Callable[[str], bool]:
+    """A scope that is `value` on every backend."""
+
+    def in_scope(backend: str) -> bool:
+        return value
+
+    return in_scope
+
+
+def loha_scope(lyco, scale) -> Callable[[str], bool]:
+    """A static scale and the hadamard rank within the fused kernels' bound."""
+    return fixed_scope(static_scale(scale) and hada_rank(lyco) <= MAX_HADA_RANK)
+
+
+def oft_scope(lyco) -> Callable[[str], bool]:
+    """The diag-OFT block within the backend's bound."""
+    size = lyco.oft_blocks.shape[-1]
+
+    def in_scope(backend: str) -> bool:
+        return size <= oft_block_limit(backend)
+
+    return in_scope
+
+
+def _rescale_reader(lyco) -> Callable:
+    """() -> the rotation's rescale (None when not rescaled), chosen once per layer."""
+    if lyco.rescaled:
+        return lambda: lyco.rescale
+    return lambda: None
+
+
+def rotation_operands(lyco) -> Callable[[Tensor], tuple]:
+    """t -> (t, the rotation blocks, the rescale or None)."""
+    rescale = _rescale_reader(lyco)
+
+    def operands(t: Tensor) -> tuple:
+        return (t, lyco.oft_blocks, rescale())
+
+    return operands
+
+
+# Low-rank bypass: dy of a (tokens, in) activation; with base: base + dy, the add
+# inside the op.
 
 
 def lora_bypass(lyco, gamma: float) -> Op:
+    def operands(x: Tensor) -> tuple:
+        dt = x.dtype
+        return (x, lyco.lora_down.weight.to(dt), lyco.lora_up.weight.to(dt))
+
+    def kernel(backend: str, ops: tuple) -> Tensor:
+        return locon_bypass_diff(*ops, gamma, backend)
+
     return Op(
         "locon.bypass",
-        partial(_lora_operands, lyco),
-        static_scale(gamma),
-        partial(_lora_fused, gamma),
-        f_locon.eager_bypass_diff,
-        partial(_then, (None, gamma, {})),
+        Tokens(in_features(lyco)),
+        operands,
+        kernel,
+        bodies.lora,
+        (gamma,),
+        fixed_scope(static_scale(gamma)),
+        TOKEN,
     )
 
 
-def _loha_operands(lyco, x: Tensor) -> tuple:
-    dt = x.dtype
+def lora_bypass_with_base(lyco, gamma: float) -> Op:
+    def operands(t: tuple) -> tuple:
+        x, base = t
+        dt = x.dtype
+        return (x, lyco.lora_down.weight.to(dt), lyco.lora_up.weight.to(dt), base)
+
+    def kernel(backend: str, ops: tuple) -> Tensor:
+        x, d, u, base = ops
+        return locon_bypass_diff(x, d, u, gamma, backend, base=base)
+
+    return Op(
+        "locon.bypass_with_base",
+        TokensWithBase(in_features(lyco), out_features(lyco)),
+        operands,
+        kernel,
+        bodies.lora_with_base,
+        (gamma,),
+        fixed_scope(static_scale(gamma)),
+        TOKEN_AND_BASE,
+    )
+
+
+def _loha_factors(lyco, dt: torch.dtype) -> tuple:
     return (
-        x,
         lyco.hada_w1_b.to(dt),
         lyco.hada_w1_a.to(dt),
         lyco.hada_w2_b.to(dt),
@@ -83,220 +192,183 @@ def _loha_operands(lyco, x: Tensor) -> tuple:
     )
 
 
-def _loha_fused(gamma, backend: str, ops: tuple) -> Tensor:
-    return loha_bypass_diff(*ops, gamma, backend)
-
-
-def hada_rank(lyco) -> int:
-    """The larger hadamard rank of a LoHa module (the fused kernels' scope term)."""
-    return max(lyco.hada_w1_b.shape[0], lyco.hada_w2_b.shape[0])
-
-
-def _rank_product(gamma, ops: tuple) -> Tensor:
-    return f_loha.rank_product_bypass(*ops, gamma)
-
-
 def loha_bypass(lyco, gamma: float) -> Op:
-    extras = {}
-    if lyco.hada_w1_b.shape[0] * lyco.hada_w2_b.shape[0] <= f_loha.RANK_PRODUCT_MAX:
-        extras["rank_product"] = partial(_rank_product, gamma)
+    def operands(x: Tensor) -> tuple:
+        return (x, *_loha_factors(lyco, x.dtype))
+
+    def kernel(backend: str, ops: tuple) -> Tensor:
+        return loha_bypass_diff(*ops, gamma, backend)
+
     return Op(
         "loha.bypass",
-        partial(_loha_operands, lyco),
-        static_scale(gamma) and hada_rank(lyco) <= MAX_HADA_RANK,
-        partial(_loha_fused, gamma),
-        f_loha.eager_bypass_diff,
-        partial(_then, (None, None, gamma, {})),
-        extras,
+        Tokens(in_features(lyco)),
+        operands,
+        kernel,
+        bodies.loha,
+        (bodies.hada_scale(gamma),),
+        loha_scope(lyco, gamma),
+        TOKEN,
     )
 
 
-def _kron_operands(lyco, getters, x: Tensor) -> tuple:
-    return (x, *kron_factors(lyco, getters, x.dtype))
+def loha_bypass_with_base(lyco, gamma: float) -> Op:
+    def operands(t: tuple) -> tuple:
+        x, base = t
+        return (x, *_loha_factors(lyco, x.dtype), base)
+
+    def kernel(backend: str, ops: tuple) -> Tensor:
+        return loha_bypass_diff(*ops[:-1], gamma, backend, base=ops[-1])
+
+    return Op(
+        "loha.bypass_with_base",
+        TokensWithBase(in_features(lyco), out_features(lyco)),
+        operands,
+        kernel,
+        bodies.loha_with_base,
+        (bodies.hada_scale(gamma),),
+        loha_scope(lyco, gamma),
+        TOKEN_AND_BASE,
+    )
 
 
-def _kron_fused(scale, backend: str, ops: tuple) -> Tensor:
-    return lokr_kron_bypass(*ops, None, scale, backend)
+def _kron_apply_scope(lyco, scale) -> Callable[[str], bool]:
+    plain = kron_plain(lyco) and static_scale(scale)
+    widest = max(kron_dims(lyco))
+
+    def in_scope(backend: str) -> bool:
+        return plain and widest <= kron_factor_limit(backend)
+
+    return in_scope
 
 
 def lokr_bypass(lyco, scale: float) -> Op:
-    raw = kron_factors(lyco, kron_getters(lyco, cast=False))
+    read = kron_reader(lyco)
+
+    def operands(x: Tensor) -> tuple:
+        return (x, *read(x.dtype))
+
+    def kernel(backend: str, ops: tuple) -> Tensor:
+        return lokr_kron_bypass(*ops, None, scale, backend)
+
     return Op(
         "lokr.bypass",
-        partial(_kron_operands, lyco, kron_getters(lyco)),
-        f_lokr.apply_supported(*raw, None) and static_scale(scale),
-        partial(_kron_fused, scale),
-        f_lokr.eager_kron_bypass,
-        partial(_then, (None, scale, {})),
+        Tokens(in_features(lyco)),
+        operands,
+        kernel,
+        bodies.lokr,
+        (scale,),
+        _kron_apply_scope(lyco, scale),
+        TOKEN,
     )
 
 
-# Rotation bypass: dy of the flattened base output.
+def lokr_bypass_with_base(lyco, scale: float) -> Op:
+    read = kron_reader(lyco)
+
+    def operands(t: tuple) -> tuple:
+        x, base = t
+        return (x, *read(x.dtype), base)
+
+    def kernel(backend: str, ops: tuple) -> Tensor:
+        return lokr_kron_bypass(*ops[:-1], None, scale, backend, base=ops[-1])
+
+    return Op(
+        "lokr.bypass_with_base",
+        TokensWithBase(in_features(lyco), out_features(lyco)),
+        operands,
+        kernel,
+        bodies.lokr_with_base,
+        (scale,),
+        _kron_apply_scope(lyco, scale),
+        TOKEN_AND_BASE,
+    )
 
 
-def _oft_operands(lyco, rescale, t: Tensor) -> tuple:
-    return (t, lyco.oft_blocks, rescale(lyco))
-
-
-def _oft_fused(lyco, backend: str, ops: tuple) -> Tensor:
-    return diag_oft_bypass_diff(*ops, lyco.constraint, False, backend)
-
-
-def _oft_args(lyco, ops: tuple) -> tuple:
-    return (ops[0], *ops, lyco.constraint, False)
+# Rotations on a (tokens, out) base output y: dy, or the rotated y itself (y + dy, the
+# add inside the op).
 
 
 def oft_bypass(lyco) -> Op:
+    constraint = lyco.constraint
+
+    def kernel(backend: str, ops: tuple) -> Tensor:
+        return diag_oft_bypass_diff(*ops, constraint, False, backend)
+
     return Op(
         "diag_oft.bypass",
-        partial(_oft_operands, lyco, rescale_getter(lyco)),
-        lyco.oft_blocks.shape[-1] <= MAX_BLOCK,
-        partial(_oft_fused, lyco),
-        f_oft.eager_bypass_diff,
-        partial(_oft_args, lyco),
+        Tokens(out_features(lyco)),
+        rotation_operands(lyco),
+        kernel,
+        bodies.oft,
+        (constraint,),
+        oft_scope(lyco),
+        TOKEN,
     )
 
 
-def _boft_fused(lyco, m, backend: str, ops: tuple) -> Tensor:
-    return boft_bypass_diff(*ops, lyco.constraint, m, False, backend)
+def oft_rotate(lyco) -> Op:
+    constraint = lyco.constraint
 
+    def kernel(backend: str, ops: tuple) -> Tensor:
+        return diag_oft_bypass_diff(*ops, constraint, False, backend, diff=False)
 
-def _boft_args(lyco, m, ops: tuple) -> tuple:
-    return (*ops, lyco.constraint, False, m)
+    return Op(
+        "diag_oft.rotate",
+        Tokens(out_features(lyco)),
+        rotation_operands(lyco),
+        kernel,
+        bodies.oft_rotated,
+        (constraint,),
+        oft_scope(lyco),
+        TOKEN,
+    )
 
 
 def boft_bypass(lyco, m: float) -> Op:
+    constraint = lyco.constraint
+
+    def kernel(backend: str, ops: tuple) -> Tensor:
+        return boft_bypass_diff(*ops, constraint, m, False, backend)
+
     return Op(
         "boft.bypass",
-        partial(_oft_operands, lyco, rescale_getter(lyco)),
-        True,
-        partial(_boft_fused, lyco, m),
-        f_boft.eager_bypass_diff,
-        partial(_boft_args, lyco, m),
+        Tokens(out_features(lyco)),
+        rotation_operands(lyco),
+        kernel,
+        bodies.boft,
+        (constraint, m),
+        tokens=TOKEN,
     )
 
 
-# Merge: dW at multiplier 1 (BOFT: at the bound multiplier) from the base weight.
+def boft_rotate(lyco, m: float) -> Op:
+    constraint = lyco.constraint
 
+    def kernel(backend: str, ops: tuple) -> Tensor:
+        return boft_bypass_diff(*ops, constraint, m, False, backend, diff=False)
 
-def _scaled(lyco, ops: tuple) -> tuple:
-    return (*ops, lyco.scale)
-
-
-def _lora_weights(lyco, w: Tensor) -> tuple:
-    return (lyco.lora_down.weight, lyco.lora_up.weight, None)
-
-
-def _lora_weight_fused(lyco, backend: str, ops: tuple) -> Tensor:
-    return locon_diff_weight(*ops, lyco.scale, backend).reshape(lyco.shape)
-
-
-def lora_merge(lyco) -> Op:
     return Op(
-        "locon.merge",
-        partial(_lora_weights, lyco),
-        static_scale(lyco.scale),
-        partial(_lora_weight_fused, lyco),
-        f_locon.eager_diff_weight,
-        partial(_scaled, lyco),
+        "boft.rotate",
+        Tokens(out_features(lyco)),
+        rotation_operands(lyco),
+        kernel,
+        bodies.boft_rotated,
+        (constraint, m),
+        tokens=TOKEN,
     )
 
 
-def _loha_weights(lyco, w: Tensor) -> tuple:
-    return (lyco.hada_w1_b, lyco.hada_w1_a, lyco.hada_w2_b, lyco.hada_w2_a, None, None)
+def ia3_bypass_scale(lyco, m: float) -> Op:
+    """IA3's channel scale x (w m + 1) of the input (train_input) or the base output."""
+    width = in_features(lyco) if lyco.train_input else out_features(lyco)
 
+    def operands(x: Tensor) -> tuple:
+        return (x, lyco.weight.to(x.dtype))
 
-def _loha_weight_fused(lyco, backend: str, ops: tuple) -> Tensor:
-    return loha_diff_weight(*ops, lyco.scale, backend)
+    def kernel(backend: str, ops: tuple) -> Tensor:
+        x, w = ops
+        return ia3_bypass(x, w, -1, m, False, backend)
 
-
-def loha_merge(lyco) -> Op:
     return Op(
-        "loha.merge",
-        partial(_loha_weights, lyco),
-        static_scale(lyco.scale) and hada_rank(lyco) <= MAX_HADA_RANK,
-        partial(_loha_weight_fused, lyco),
-        f_loha.eager_diff_weight,
-        partial(_scaled, lyco),
-    )
-
-
-def _kron_weights(lyco, getters, w: Tensor) -> tuple:
-    return (*kron_factors(lyco, getters), None)
-
-
-def _kron_weight_fused(lyco, backend: str, ops: tuple) -> Tensor:
-    return lokr_kron_weight(*ops, lyco.scale, backend)
-
-
-def lokr_merge(lyco) -> Op:
-    getters = kron_getters(lyco, cast=False)
-    w2, w2b = kron_factors(lyco, getters)[3::2]
-    return Op(
-        "lokr.merge",
-        partial(_kron_weights, lyco, getters),
-        f_lokr.plain_w2(w2, w2b, None) and static_scale(lyco.scale),
-        partial(_kron_weight_fused, lyco),
-        f_lokr.eager_kron_weight,
-        partial(_scaled, lyco),
-    )
-
-
-def _oft_weight_fused(lyco, backend: str, ops: tuple) -> Tensor:
-    return diag_oft_diff_weight(*ops, lyco.constraint, backend)
-
-
-def _constrained(lyco, ops: tuple) -> tuple:
-    return (*ops, lyco.constraint)
-
-
-def oft_merge(lyco) -> Op:
-    return Op(
-        "diag_oft.merge",
-        partial(_oft_operands, lyco, rescale_getter(lyco)),
-        lyco.oft_blocks.shape[-1] <= MAX_BLOCK,
-        partial(_oft_weight_fused, lyco),
-        f_oft.eager_diff_weight,
-        partial(_constrained, lyco),
-    )
-
-
-def _boft_weight_fused(lyco, m, backend: str, ops: tuple) -> Tensor:
-    return boft_diff_weight(*ops, lyco.constraint, m, backend)
-
-
-def _boft_weight_args(lyco, m, ops: tuple) -> tuple:
-    return (*ops, lyco.constraint, m)
-
-
-def boft_merge(lyco, m: float) -> Op:
-    return Op(
-        "boft.merge",
-        partial(_oft_operands, lyco, rescale_getter(lyco)),
-        True,
-        partial(_boft_weight_fused, lyco, m),
-        f_boft.eager_diff_weight,
-        partial(_boft_weight_args, lyco, m),
-    )
-
-
-# DoRA epilogue on the merged weight.
-
-
-def _dora_operands(lyco, merged: Tensor) -> tuple:
-    return (merged, lyco.dora_scale)
-
-
-def _dora_fused(on_out: bool, backend: str, ops: tuple) -> Tensor:
-    return apply_dora(*ops, 1.0, on_out, backend)
-
-
-def decompose(lyco, on_out: bool) -> Op:
-    return Op(
-        "weight_decompose",
-        partial(_dora_operands, lyco),
-        True,
-        partial(_dora_fused, on_out),
-        f_general.eager_weight_decompose,
-        partial(_then, (1.0, on_out)),
+        "ia3.scale", Tokens(width), operands, kernel, bodies.ia3, (m,), tokens=TOKEN
     )

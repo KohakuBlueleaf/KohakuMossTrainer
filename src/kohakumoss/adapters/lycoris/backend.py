@@ -1,16 +1,15 @@
-"""LyCORIS kernel tier for one device, chosen once per apply. See docs/concepts/adapters.md."""
+"""LyCORIS kernel backend for one device, chosen once per apply. See
+docs/concepts/adapters.md."""
 
 import torch
 from lycoris.kernels.dispatch import available_backends, resolve_backend
-
-FUSED = ("triton", "tilelang")
 
 
 def pick_backend(device: torch.device | str, requested: str = "auto") -> str:
     """`triton` | `tilelang` | `compile` | `torch` for adapters on `device`.
 
     `auto` takes LyCORIS's per-arch order on CUDA and the eager bodies elsewhere; a
-    named tier the device cannot run raises ValueError.
+    named backend the device cannot run raises ValueError.
     """
     device = torch.device(device)
     if device.type != "cuda":
@@ -28,7 +27,3 @@ def pick_backend(device: torch.device | str, requested: str = "auto") -> str:
             f"available: {available_backends(device)}"
         )
     return resolve_backend(None if requested == "auto" else requested, device)
-
-
-def is_fused(backend: str) -> bool:
-    return backend in FUSED

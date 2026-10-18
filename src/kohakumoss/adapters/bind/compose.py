@@ -1,11 +1,12 @@
-"""Shared pieces of bound forwards, chosen at bind time (bias, multiplier, scalar,
-the layer's matmul precision)."""
+"""Shared pieces of bound forwards, chosen at bind time (bias, multiplier, scalar)."""
 
-from functools import partial
+from collections.abc import Callable
 
 import torch
+import torch.nn.functional as F
+from torch import Tensor
 
-from kohakumoss.adapters.bind import fused
+from kohakumoss.adapters.bind import forwards
 
 
 def has_scalar_param(lyco) -> bool:
@@ -13,56 +14,73 @@ def has_scalar_param(lyco) -> bool:
     return isinstance(scalar, torch.Tensor) and scalar.requires_grad
 
 
-def _input_dtype(linear):
-    return getattr(linear, "input_dtype", None)
+def _lin_nobias(x: Tensor, w: Tensor) -> Tensor:
+    return F.linear(x, w.to(x.dtype))
 
 
-def lin_of(t):
-    """F.linear with or without the layer's bias, in the layer's matmul precision
-    (16-bit operands into fp32 for a MossLinear with an input dtype)."""
-    dtype = _input_dtype(t.linear)
-    match (dtype is not None, t.linear.bias is not None):
-        case (True, True):
-            return partial(fused.lin_wide_bias, t.linear, dtype)
-        case (True, False):
-            return partial(fused.lin_wide, dtype)
-        case (False, True):
-            return partial(fused.lin_bias, t.linear)
-    return fused.lin_nobias
+def lin_of(t) -> Callable[[Tensor, Tensor], Tensor]:
+    """(x, W) -> F.linear in x's dtype, with or without the layer's bias."""
+    linear = t.linear
+    if linear.bias is None:
+        return _lin_nobias
+
+    def biased(x: Tensor, w: Tensor) -> Tensor:
+        return F.linear(x, w.to(x.dtype), linear.bias.to(x.dtype))
+
+    return biased
 
 
-def dense_of(linear):
-    """(x, dW) -> x @ dW^T in the layer's matmul precision (no bias)."""
-    dtype = _input_dtype(linear)
-    return fused.lin_nobias if dtype is None else partial(fused.lin_wide, dtype)
+def dense_of(linear) -> Callable[[Tensor, Tensor], Tensor]:
+    """(x, dW) -> x @ dW^T in x's dtype (no bias)."""
+    return _lin_nobias
 
 
-def scale_of(m: float):
-    return fused.same if m == 1.0 else partial(fused.times, m)
+def _keep(w: Tensor, wp: Tensor) -> Tensor:
+    return wp
 
 
-def mix_of(m: float):
-    return fused.keep if m == 1.0 else partial(fused.interpolate, m)
+def mix_of(m: float) -> Callable[[Tensor, Tensor], Tensor]:
+    """(W, W') -> W + m (W' - W): the multiplier's interpolation of a whole weight."""
+    if m == 1.0:
+        return _keep
+
+    def mix(w: Tensor, wp: Tensor) -> Tensor:
+        return w + m * (wp - w)
+
+    return mix
 
 
-def scalared(lyco, unit):
+def with_scalar(lyco, unit: Callable | None) -> Callable | None:
     """A dW builder times the module's trainable scalar, when it has one."""
     if unit is None or not has_scalar_param(lyco):
         return unit
-    return partial(fused.with_scalar, lyco, unit)
+
+    def scaled(w: Tensor) -> Tensor:
+        return unit(w) * lyco.scalar
+
+    return scaled
 
 
-def added(t, diff):
-    """base(x) + diff(x) (times the trainable scalar), or None without a diff."""
+def plus_base(t, diff: Callable | None, with_base: Callable | None = None):
+    """base(x) + diff(x) (times the trainable scalar), or None without a diff; the
+    `with_base` op (the add inside the op) when given and no scalar trains."""
     if diff is None:
         return None
     if has_scalar_param(t.lyco):
-        return partial(fused.add_base_scalar, t.linear, t.lyco, diff)
-    return partial(fused.add_base, t.linear, diff)
+        return forwards.plus_base_scalar(t.linear, t.lyco, diff)
+    if with_base is not None:
+        return forwards.with_base(t.linear, with_base)
+    return forwards.plus_base(t.linear, diff)
 
 
-def merged(t, unit, m: float):
-    """lin(x, W + m * unit(W)), or None without a unit."""
+def merged(t, unit: Callable | None, m: float, merge: Callable | None = None):
+    """lin(x, W + m unit(W)), or None without a unit; lin(x, merge(W)) when a W + dW
+    op is given (multiplier 1)."""
     if unit is None:
         return None
-    return partial(fused.merged_forward, t.base_fn, unit, scale_of(m), lin_of(t))
+    lin = lin_of(t)
+    if merge is not None:
+        return forwards.merged_with_base(t.base_fn, merge, lin)
+    if m == 1.0:
+        return forwards.merged(t.base_fn, unit, lin)
+    return forwards.merged_scaled(t.base_fn, unit, m, lin)

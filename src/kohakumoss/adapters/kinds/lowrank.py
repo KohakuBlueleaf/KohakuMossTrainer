@@ -12,8 +12,9 @@ from lycoris.modules import (
 )
 
 from kohakumoss.adapters.bind import compose, eager
-from kohakumoss.adapters.kinds.common import bound, names, unit_diff
-from kohakumoss.adapters.kinds.record import Kind, register
+from kohakumoss.adapters.bind.context import Draws
+from kohakumoss.adapters.kinds.common import names, unit_diff
+from kohakumoss.adapters.kinds.record import Kind, Stacking, register
 
 
 def _locon_unit(t):
@@ -27,29 +28,50 @@ def _kron_hada_unit(t):
 
 
 def _locon_bypass(t, ctx):
-    return compose.added(t, ctx.kit.lora(t.lyco, t.lyco.scale * ctx.m))
+    gamma = t.lyco.scale * ctx.m
+    ops = ctx.ops
+    diff, with_base = ops.lora(t.lyco, gamma), ops.lora_with_base(t.lyco, gamma)
+    return compose.plus_base(t, diff, with_base)
 
 
 def _loha_bypass(t, ctx):
-    return compose.added(t, ctx.kit.loha(t.lyco, t.lyco.scale * ctx.m))
+    gamma = t.lyco.scale * ctx.m
+    ops = ctx.ops
+    diff, with_base = ops.loha(t.lyco, gamma), ops.loha_with_base(t.lyco, gamma)
+    return compose.plus_base(t, diff, with_base)
 
 
 def _lokr_bypass(t, ctx):
     if t.lyco.tucker:
         return None
-    return compose.added(t, ctx.kit.lokr(t.lyco, t.lyco.scale * ctx.m))
+    scale = t.lyco.scale * ctx.m
+    ops = ctx.ops
+    diff, with_base = ops.lokr(t.lyco, scale), ops.lokr_with_base(t.lyco, scale)
+    return compose.plus_base(t, diff, with_base)
 
 
-def _locon_fused_unit(t, kit):
-    return kit.lora_unit(t.lyco)
+def _locon_kernel_unit(t, ops):
+    return ops.lora_weight(t.lyco)
 
 
-def _loha_fused_unit(t, kit):
-    return kit.loha_unit(t.lyco)
+def _loha_kernel_unit(t, ops):
+    return ops.loha_weight(t.lyco)
 
 
-def _lokr_fused_unit(t, kit):
-    return None if t.lyco.tucker else kit.lokr_unit(t.lyco)
+def _lokr_kernel_unit(t, ops):
+    return None if t.lyco.tucker else ops.lokr_weight(t.lyco)
+
+
+def _locon_kernel_merged(t, ops):
+    return ops.lora_merged_weight(t.lyco)
+
+
+def _loha_kernel_merged(t, ops):
+    return ops.loha_merged_weight(t.lyco)
+
+
+def _lokr_kernel_merged(t, ops):
+    return None if t.lyco.tucker else ops.lokr_merged_weight(t.lyco)
 
 
 def _lokr_rows(out: dict) -> tuple:
@@ -97,12 +119,11 @@ def _dylora_draw(t, gen: torch.Generator) -> None:
 
 
 def _dylora_forward(t, ctx):
-    """Training: the step's drawn rank prefix; eval: every block."""
-    dense = compose.dense_of(t.linear)
+    """Training: the step's drawn rank prefix; eval: every block, whatever a step
+    draws (both as bypass products, no dW)."""
     if ctx.training:
-        return partial(eager.dylora_train, t.linear, t.lyco, ctx.m, ctx.draws, dense)
-    shape = t.lyco.shape
-    return partial(eager.delta_bypass, t.linear, shape, t.delta_at(ctx.m), dense)
+        return eager.dylora_train(t.linear, t.lyco, ctx.m, ctx.draws)
+    return eager.dylora_train(t.linear, t.lyco, ctx.m, Draws(t.lyco.lora_dim))
 
 
 LOCON = register(
@@ -110,13 +131,15 @@ LOCON = register(
         name="locon",
         module=LoConModule,
         algos={"lora": "lora", "locon": "locon"},
-        unit=partial(bound, _locon_unit),
-        fused_unit=_locon_fused_unit,
-        bypass=_locon_bypass,
-        row_names=partial(names, ("lora_up.weight",)),
-        stacking="additive",
-        up_side=("lora_up.weight",),
-        dora=True,
+        diff_weight=_locon_unit,
+        kernel_diff_weight=_locon_kernel_unit,
+        kernel_merged_weight=_locon_kernel_merged,
+        kernel_bypass=_locon_bypass,
+        uniform_scale_tensors=partial(names, ("lora_up.weight",)),
+        row_scale_tensors=partial(names, ("lora_up.weight",)),
+        stacking=Stacking.ADDITIVE,
+        loraplus_tensors=("lora_up.weight",),
+        supports_dora=True,
     )
 )
 LOHA = register(
@@ -124,13 +147,15 @@ LOHA = register(
         name="loha",
         module=LohaModule,
         algos={"loha": "loha"},
-        unit=partial(bound, _kron_hada_unit),
-        fused_unit=_loha_fused_unit,
-        bypass=_loha_bypass,
-        row_names=partial(names, ("hada_w1_a",)),
-        stacking="additive",
-        up_side=("hada_w2_a",),
-        dora=True,
+        diff_weight=_kron_hada_unit,
+        kernel_diff_weight=_loha_kernel_unit,
+        kernel_merged_weight=_loha_kernel_merged,
+        kernel_bypass=_loha_bypass,
+        uniform_scale_tensors=partial(names, ("hada_w1_a",)),
+        row_scale_tensors=partial(names, ("hada_w1_a",)),
+        stacking=Stacking.ADDITIVE,
+        loraplus_tensors=("hada_w2_a",),
+        supports_dora=True,
     )
 )
 LOKR = register(
@@ -138,13 +163,14 @@ LOKR = register(
         name="lokr",
         module=LokrModule,
         algos={"lokr": "lokr"},
-        unit=partial(bound, _kron_hada_unit),
-        fused_unit=_lokr_fused_unit,
-        bypass=_lokr_bypass,
-        row_names=_lokr_rows,
-        stacking="additive",
-        up_side=("lokr_w2", "lokr_w2_b"),
-        dora=True,
+        diff_weight=_kron_hada_unit,
+        kernel_diff_weight=_lokr_kernel_unit,
+        kernel_merged_weight=_lokr_kernel_merged,
+        kernel_bypass=_lokr_bypass,
+        uniform_scale_tensors=_lokr_rows,
+        stacking=Stacking.ADDITIVE,
+        loraplus_tensors=("lokr_w2", "lokr_w2_b"),
+        supports_dora=True,
     )
 )
 TLORA = register(
@@ -152,12 +178,17 @@ TLORA = register(
         name="tlora",
         module=TLoraModule,
         algos={"tlora": "tlora"},
-        unit=partial(bound, unit_diff),
-        comfy=_tlora_as_lora,
-        row_names=partial(names, ("lora_up.weight", "lambda_layer", "base_lambda")),
-        stacking="additive",
-        up_side=("p_layer.weight",),
-        token_axis=True,
+        diff_weight=unit_diff,
+        comfy_tensors=_tlora_as_lora,
+        uniform_scale_tensors=partial(
+            names, ("lora_up.weight", "lambda_layer", "base_lambda")
+        ),
+        row_scale_tensors=partial(
+            names, ("lora_up.weight", "p_layer.weight", "base_p")
+        ),
+        stacking=Stacking.ADDITIVE,
+        loraplus_tensors=("p_layer.weight",),
+        per_token_mask=True,
     )
 )
 DYLORA = register(
@@ -165,13 +196,14 @@ DYLORA = register(
         name="dylora",
         module=DyLoraModule,
         algos={"dylora": "dylora"},
-        unit=partial(bound, _dylora_unit),
-        special=_dylora_forward,
-        comfy=_dylora_as_lora,
-        row_names=partial(names, ("lora_up.weight",)),
-        stacking="dense",
-        up_side=("up_list",),
+        diff_weight=_dylora_unit,
+        own_forward=_dylora_forward,
+        comfy_tensors=_dylora_as_lora,
+        uniform_scale_tensors=partial(names, ("lora_up.weight",)),
+        row_scale_tensors=partial(names, ("lora_up.weight",)),
+        stacking=Stacking.DENSE,
+        loraplus_tensors=("up_list",),
         training_dependent=True,
-        draw=_dylora_draw,
+        draw_step=_dylora_draw,
     )
 )
