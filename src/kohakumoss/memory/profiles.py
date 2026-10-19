@@ -12,6 +12,7 @@ from kohakumoss.quant.compute import COMPUTE as FP8_COMPUTE
 from kohakumoss.quant.compute import DGRAD as FP8_DGRAD
 from kohakumoss.quant.compute import FP8_RECIPES
 from kohakumoss.types.plans import MemoryPlan
+from kohakumoss_common.typecheck import describe, mismatches
 from kohakumoss_kernels.hardware.arch import arch_of
 
 CHECKPOINT_MODES = ("none", "block", "sub-block", "selective")
@@ -94,8 +95,14 @@ def validate(
     inference: bool = False,
     device: torch.device | str | None = None,
 ) -> list[str]:
-    """Every problem with `plan`, as messages (empty = valid)."""
-    problems = []
+    """Every problem with `plan`, as messages (empty = valid); a field of the wrong type
+    is reported alone, ahead of the checks that read its value."""
+    problems = [
+        f"{name}={value!r} is not {describe(annotation)}"
+        for name, value, annotation in mismatches(plan)
+    ]
+    if problems:
+        return problems
     if (
         device is not None
         and plan.base_precision in ("fp8", *FP8_COMPUTE)

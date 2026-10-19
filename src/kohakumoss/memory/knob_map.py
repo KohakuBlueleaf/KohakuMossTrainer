@@ -2,7 +2,13 @@
 MEMORY_PROFILE='manual' the memory knobs set the plan; with a named profile they must be
 unset. Precision knobs are independent of the profile. See docs/concepts/profiles.md."""
 
+import typing
+
 from kohakumoss.memory.profiles import profile_name
+from kohakumoss.types.plans import MemoryPlan
+
+PLAN_TYPES = typing.get_type_hints(MemoryPlan)
+BOOL_WORDS = {"true": True, "1": True, "false": False, "0": False}
 
 MANUAL = "manual"
 MEMORY_KNOBS = {
@@ -30,9 +36,30 @@ def primary_names(k: dict) -> dict:
     return {**k, "MEMORY_PROFILE": profile_name(k["MEMORY_PROFILE"])}
 
 
+def coerce(value, annotation):
+    """A command-line string as the plan field's int / float / bool type; any other
+    value, or a string that does not parse, unchanged (validation reports it)."""
+    if not isinstance(value, str):
+        return value
+    try:
+        match annotation:
+            case _ if annotation is bool:
+                return BOOL_WORDS.get(value.strip().lower(), value)
+            case _ if annotation in (int, float):
+                return annotation(value)
+    except ValueError:
+        return value
+    return value
+
+
 def knob_fields(k: dict, knobs: dict[str, str]) -> dict:
-    """The plan fields of every knob in `knobs` that is set (not None)."""
-    return {field: k[name] for name, field in knobs.items() if k.get(name) is not None}
+    """The plan fields of every knob in `knobs` that is set (not None), strings coerced
+    to the field's type (`coerce`)."""
+    return {
+        field: coerce(k[name], PLAN_TYPES.get(field))
+        for name, field in knobs.items()
+        if k.get(name) is not None
+    }
 
 
 def plan_fields(k: dict, profile: str) -> dict:
