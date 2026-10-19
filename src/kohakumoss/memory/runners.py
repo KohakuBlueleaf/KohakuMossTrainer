@@ -17,6 +17,7 @@ from torch.utils.checkpoint import (
     create_selective_checkpoint_contexts,
 )
 
+from kohakumoss.logging.phases import RECOMPUTE, phase
 from kohakumoss.model.runner import PlainRunner
 from kohakumoss.types.context import BlockCtx
 from kohakumoss_kernels.saved_ops import KEPT
@@ -52,14 +53,17 @@ def selective_context():
 
 class ForwardThreads:
     """Recompute context: the intra-op thread count of the forward (`threads`) for the
-    recompute, the caller's restored after it, around an `inner` recompute context.
-    See docs/internals/adapter-binding.md#checkpoint-recompute."""
+    recompute, the caller's restored after it, around an `inner` recompute context,
+    inside a `recompute` profiler range. See
+    docs/internals/adapter-binding.md#checkpoint-recompute."""
 
     def __init__(self, threads: int, inner=None):
         self.threads = threads
         self.inner = inner if inner is not None else contextlib.nullcontext()
 
     def __enter__(self):
+        self.range = phase(RECOMPUTE)
+        self.range.__enter__()
         self.prev = torch.get_num_threads()
         if self.prev != self.threads:
             torch.set_num_threads(self.threads)
@@ -71,6 +75,7 @@ class ForwardThreads:
         finally:
             if self.prev != self.threads:
                 torch.set_num_threads(self.prev)
+            self.range.__exit__(*exc)
 
 
 def forward_state(inner: Callable | None = None) -> Callable:

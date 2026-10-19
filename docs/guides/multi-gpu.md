@@ -381,8 +381,19 @@ The `TRACE_STEPS` kernel timeline gives, per step:
   kernels), `trace_comm_exposed_ms` (NCCL time with no compute kernel running),
   `trace_copy_ms`, `trace_idle_ms` (no kernel or copy running) and the busy / compute
   fractions.
+- `trace_phase_<p>_ms` for `p` in data, forward, backward, recompute, optimizer and
+  other: the union of the compute kernels launched inside that step phase. The drivers
+  open a profiler range per micro-batch around the host-to-device batch (`data`), the
+  forward and the backward, and one around the optimiser step; every checkpoint
+  recompute runs in a `recompute` range (`kohakumoss.logging.phases`). A kernel belongs
+  to the innermost range open, on any host thread, when it was launched, so the
+  autograd thread's kernels count as backward and a recompute inside backward counts
+  as recompute. A kernel launched outside every range is `other`.
+- `<output>/ranks/trace.rank<r>.kernels.json` lists, per phase, the 40 kernels with the
+  most device time (ms and calls per step).
 - Under the pipelines an NCCL receive kernel spins while it waits for its peer, so there
-  `trace_comm_ms` includes waiting; `1 - trace_compute_frac` is the bubble.
+  `trace_comm_ms` includes waiting; `1 - trace_compute_frac` is the bubble. Under DDP the
+  same spin counts the wait for the slowest rank.
 
 The `TRACE_STEPS` steps run slower (CUPTI tracing). The steps of either window are left
 out of the steady-state summary.

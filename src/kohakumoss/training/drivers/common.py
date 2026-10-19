@@ -3,6 +3,7 @@
 import contextlib
 from collections.abc import Callable, Iterable, Iterator
 
+from kohakumoss.logging.phases import BACKWARD, DATA, FORWARD, OPTIMIZER, phase
 from kohakumoss.training.state import TrainState
 from kohakumoss.training.step import image_token_count, image_tokens_per_sample
 from kohakumoss_common.calls import nothing
@@ -64,11 +65,14 @@ def micro_steps(
     join = getattr(ema, "join", nothing)
     out = None
     for hb, last in zip(group, lasts):
-        batch = batcher(hb)
+        with phase(DATA):
+            batch = batcher(hb)
         with accumulate(last):
-            out = step(batch, denom, index)
+            with phase(FORWARD):
+                out = step(batch, denom, index)
             join()
-            bundle.backward(out.loss)
+            with phase(BACKWARD):
+                bundle.backward(out.loss)
             out = out.detached()
     return out
 
@@ -78,7 +82,9 @@ def finish_step(state: TrainState, group: list, bundle, ema, runner, out) -> Non
     bind the plain call path of the kernels proven in this step (`settle_guards`),
     advance `state.step`, record the step and run the callbacks."""
     account(state, group)
-    if bundle.step():
+    with phase(OPTIMIZER):
+        ok = bundle.step()
+    if ok:
         ema.update(state.step)
     settle_guards()
     state.step += 1

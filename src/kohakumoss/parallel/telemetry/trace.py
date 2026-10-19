@@ -12,7 +12,7 @@ import torch
 from torch.profiler import ProfilerActivity, profile
 
 from kohakumoss.logging.log import get_logger, hl
-from kohakumoss.parallel.telemetry.timeline import breakdown
+from kohakumoss.parallel.telemetry.timeline import breakdown, phase_breakdown
 from kohakumoss_common.calls import nothing
 from kohakumoss_kernels.hardware.current import synchronize
 
@@ -21,10 +21,11 @@ log = get_logger(__name__)
 
 class StepTrace:
     """Profiles steps `first + 1 .. last` (the window opens at the end of step
-    `first`); at the end of step `last` writes `<root>/trace.rank<r>.json.gz` and
-    `<root>/trace.rank<r>.breakdown.json` and adds the `trace_*` breakdown (per step)
-    of `device` to the step's metrics, and `trace_dev<i>_*` of every other device in
-    `extra_devices` (the threaded pipeline's stages)."""
+    `first`); at the end of step `last` writes `<root>/trace.rank<r>.json.gz`,
+    `<root>/trace.rank<r>.breakdown.json` and the top kernels per step phase
+    `<root>/trace.rank<r>.kernels.json`, and adds the `trace_*` breakdown (per step,
+    with `trace_phase_*`) of `device` to the step's metrics, and `trace_dev<i>_*` of
+    every other device in `extra_devices` (the threaded pipeline's stages)."""
 
     every = 1
 
@@ -69,6 +70,10 @@ class StepTrace:
             events = json.load(f).get("traceEvents", [])
         steps = self.last - self.first
         out = breakdown(events, _index(self.device), wall_us, steps)
+        phases, top = phase_breakdown(events, _index(self.device), steps)
+        out.update(phases)
+        kernels = self.root / f"trace.rank{self.rank}.kernels.json"
+        kernels.write_text(json.dumps(top, indent=1), encoding="utf-8")
         for device in self.extra:
             i = _index(device)
             part = breakdown(events, i, wall_us, steps)
