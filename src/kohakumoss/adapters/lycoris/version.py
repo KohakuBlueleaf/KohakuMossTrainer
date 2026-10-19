@@ -7,7 +7,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from packaging.version import InvalidVersion, Version
 
-LYCORIS_MIN = "4.1.2"
+LYCORIS_MIN = "4.1.3"
 NOT_FOUND = "no installed distribution"
 REQUIRED = (
     "lycoris.kernels.autograd",

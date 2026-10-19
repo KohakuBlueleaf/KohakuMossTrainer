@@ -535,6 +535,15 @@ The adapter prewarm (`AdapterSet.prewarm`) settles each distinct `AutotunedOp` o
   it, and a measured problem's free blocks go back to the driver (`release`) before the
   next, so the cached blocks of one token count never stack under the next.
 - Each problem's body candidate is timed first (`select(lean=BODY)`).
+- Before a problem is timed, the LyCORIS kernel runs once on copies of its operands
+  (forward, and backward under grad), untimed, within the tuning budget below but
+  outside the working-memory bound (`AutotunedOp._settle_tiles`). That call holds LyCORIS's cold tile tuning, whose
+  inputs, candidate outputs and split-K partials are several times the kernel's own
+  working memory: 470-880 MiB at 1024-8192 tokens for the LoKr factor-8 linears of the
+  model. Inside the timed call, that tuning passed the bound of 8 x the body's working
+  memory (at least 256 MiB). The kernel was then skipped as "over the working-memory
+  bound", and every larger bucket inherited the body. With the tiles settled first, the
+  bound and the timing see the kernel's own calls.
 - The prewarm starts and ends on an empty allocator cache and its device peak enters
   `note_peak`, so the step-1 line `VRAM peak: prewarm` and the `prewarm_peak_*` metrics
   cover it.

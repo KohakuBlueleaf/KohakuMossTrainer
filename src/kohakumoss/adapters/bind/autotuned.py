@@ -20,16 +20,18 @@ from kohakumoss_kernels.backends.compile.ops import CompiledOp
 from kohakumoss_kernels.dtypes import short
 from kohakumoss_kernels.errors import BUILD_ERRORS
 from kohakumoss_kernels.hardware.current import rng_kept, saved_tensor_hooks_active
-from kohakumoss_kernels.hardware.memory import release
+from kohakumoss_kernels.hardware.memory import release, working
 from kohakumoss_kernels.tuning.buckets import TOKEN_FLOOR, pow2, pow2_buckets
 from kohakumoss_kernels.tuning.tuner import (
     OverBound,
+    cap_of,
     decided,
     inherit,
     on_reset,
     row,
     select,
     stored,
+    will_time,
 )
 
 ERRORS = (*BUILD_ERRORS, ValueError)
@@ -400,6 +402,10 @@ class AutotunedOp:
         device = _device(ops)
         key = problem_key(ops, self.op.tokens)
         grad = torch.is_grad_enabled()
+        if self._times(device, key):
+            self._settle_tiles(
+                ops, grad, device, cap if cap is not None else cap_of(device)
+            )
         cfg = select(
             self.name,
             device,
@@ -417,6 +423,26 @@ class AutotunedOp:
         if decided(self.name, device, key) or _recomputed():
             self.bound[self._bucket(t)] = run
         return run
+
+    def _times(self, device: torch.device, key: str) -> bool:
+        """Whether `select` times this problem here (neither settled nor stored, and
+        timing allowed)."""
+        if decided(self.name, device, key) or stored(self.name, device, key):
+            return False
+        return will_time(autograd=True)
+
+    def _settle_tiles(
+        self, ops: tuple, grad: bool, device: torch.device, cap: int | None
+    ) -> None:
+        """One untimed kernel call on copies of `ops` (forward, and backward under
+        grad) within the tuning budget `cap` but outside the working-memory bound, so
+        LyCORIS settles its tiles for this problem before the kernel is timed against
+        the body. See docs/internals/tuning.md#adapter-autotuned-op-prewarm."""
+        try:
+            with working(device, cap):
+                _launch(self.candidates, ops, grad, self.configs[0])()
+        except (*ERRORS, torch.OutOfMemoryError):
+            release(device)
 
     def _configs(self) -> tuple:
         return self.configs

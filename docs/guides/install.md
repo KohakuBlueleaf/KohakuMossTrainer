@@ -87,7 +87,7 @@ uv pip install "kohakumoss[cuda]" "torch>=2.13,<2.15" --extra-index-url https://
 - Without uv, the same two steps with `pip install` (`--extra-index-url`, no
   `--index-strategy`).
 
-LyCORIS (`lycoris-lora>=4.1.2`) installs from PyPI as a dependency. A LyCORIS checkout
+LyCORIS (`lycoris-lora>=4.1.3`) installs from PyPI as a dependency. A LyCORIS checkout
 replaces it with `uv pip install -e <path to LyCORIS>` after the package (the Colab
 setup's `--lycoris <path>` does the same).
 

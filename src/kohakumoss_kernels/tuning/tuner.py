@@ -305,6 +305,11 @@ def clear_caps() -> None:
     _CAPS.clear()
 
 
+def cap_of(device: torch.device | str) -> int | None:
+    """The process tuning budget of `device` in bytes (`set_cap`), None when unset."""
+    return _CAPS.get(str(device))
+
+
 def _over_budget(ident, key: str, ranked: list) -> dict:
     """A budgeted key whose timing would pass the process's tuning budget: its first
     candidate binds for the process, untimed and unstored (in DEFERRED, one INFO

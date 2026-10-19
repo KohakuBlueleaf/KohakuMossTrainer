@@ -71,7 +71,7 @@ source .venv/bin/activate
 ```
 
 By hand (here CUDA 13 drivers; `nvidia-smi` prints yours: cu126 / cu128 / cu130), from
-PyPI or, with `-e ".[cuda]"`, from a clone; LyCORIS (`lycoris-lora>=4.1.2`) comes with
+PyPI or, with `-e ".[cuda]"`, from a clone; LyCORIS (`lycoris-lora>=4.1.3`) comes with
 the package:
 
 ```bash
