@@ -55,7 +55,7 @@ def check_recompute_binds_the_forward_pick() -> None:
         fn()
         return 2.0 if timed.pop() == "kernel" else 1.0
 
-    tuner.TIMINGS["events"] = measure
+    tuner.TIMINGS["burst"] = measure
     x, base = _inputs()
     out = checkpoint(lambda a, b: checkpointed((a, b)), x, base, use_reentrant=False)
     forward = list(picks)
@@ -77,7 +77,7 @@ def tuning(monkeypatch, tmp_path):
     monkeypatch.setenv("KOHAKUMOSS_KERNEL_CACHE", str(tmp_path))
     monkeypatch.setattr(tuner, "_TABLES", {})
     monkeypatch.setattr(autotuned, "fusable", lambda operands: True)
-    monkeypatch.setitem(tuner.TIMINGS, "events", tuner.TIMINGS["events"])
+    monkeypatch.setitem(tuner.TIMINGS, "burst", tuner.TIMINGS["burst"])
     tuner.set_mode("table")
     yield
     tuner.reset()

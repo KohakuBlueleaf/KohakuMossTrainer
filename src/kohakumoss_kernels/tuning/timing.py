@@ -1,14 +1,19 @@
-"""Device-time measurement: busy warmup, L2 flush between calls, CUDA-graph replay."""
+"""Device-time measurement: busy warmup, L2 flush between calls, CUDA-graph replay,
+back-to-back bursts queued behind a device spin."""
 
 import time
 from collections.abc import Callable
+from functools import cache
 
 import torch
 
-from kohakumoss_kernels.hardware.current import on_device, synchronize
+from kohakumoss_kernels.hardware.current import on_device, synchronize, with_index
 
 WARMUP_MS = 25.0
 CAPTURE = "thread_local"
+SPIN_PROBE = 1 << 22
+# The spin covers this multiple of the burst's measured host launch time.
+SPIN_MARGIN = 2.0
 
 
 def _elapsed_ms(fn: Callable[[], object], calls: int, device: torch.device) -> float:
@@ -50,6 +55,51 @@ def best_ms(
         if flush is not None:
             flush.zero_()
         best = min(best, _elapsed_ms(fn, 1, device))
+    return best
+
+
+@cache
+def spin_cycles_per_ms(index: int) -> float:
+    """Clock cycles `torch.cuda._sleep` spins per device ms on CUDA device `index`."""
+    device = torch.device("cuda", index)
+    with on_device(device):
+        torch.cuda._sleep(SPIN_PROBE)
+        start = torch.Event(device=device, enable_timing=True)
+        end = torch.Event(device=device, enable_timing=True)
+        start.record()
+        torch.cuda._sleep(SPIN_PROBE)
+        end.record()
+        end.synchronize()
+        return SPIN_PROBE / max(start.elapsed_time(end), 1e-3)
+
+
+def burst_ms(
+    fn: Callable[[], object], device: torch.device, calls: int = 8, iters: int = 5
+) -> float:
+    """Best-of-`iters` device ms per call of `calls` back-to-back calls, issued while
+    the device spins so that all of them are queued before the first starts: the host's
+    launch time is not counted (plain event timing off CUDA)."""
+    if device.type != "cuda":
+        return best_ms(fn, device, iters)
+    warm(fn, device)
+    began = time.perf_counter()
+    for _ in range(calls):
+        fn()
+    host_ms = (time.perf_counter() - began) * 1e3
+    synchronize(device)
+    cycles = int(spin_cycles_per_ms(with_index(device).index) * SPIN_MARGIN * host_ms)
+    best = float("inf")
+    with on_device(device):
+        for _ in range(iters):
+            start = torch.Event(device=device, enable_timing=True)
+            end = torch.Event(device=device, enable_timing=True)
+            torch.cuda._sleep(cycles)
+            start.record()
+            for _ in range(calls):
+                fn()
+            end.record()
+            end.synchronize()
+            best = min(best, start.elapsed_time(end) / calls)
     return best
 
 

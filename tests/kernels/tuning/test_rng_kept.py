@@ -55,7 +55,12 @@ def _unkept(monkeypatch, module) -> None:
 def tuning(tmp_path, monkeypatch):
     monkeypatch.setenv("KOHAKUMOSS_KERNEL_CACHE", str(tmp_path))
     monkeypatch.setattr(tuner, "_TABLES", {})
-    monkeypatch.setattr(tuner, "TIMINGS", {"events": lambda fn, dev: (fn(), 1.0)[1]})
+
+    def unit(fn, dev):
+        fn()
+        return 1.0
+
+    monkeypatch.setattr(tuner, "TIMINGS", {"events": unit, "burst": unit})
     tuner.reset()
     tuner.set_mode("table")
     yield

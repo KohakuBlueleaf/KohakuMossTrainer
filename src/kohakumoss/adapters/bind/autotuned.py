@@ -409,6 +409,7 @@ class AutotunedOp:
             shortlist=len(self.configs),
             errors=ERRORS,
             autograd=True,
+            timing="burst",
             lean=BODY,
             cap=cap,
         )

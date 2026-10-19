@@ -41,15 +41,26 @@ from kohakumoss_kernels.hardware.device import (
 from kohakumoss_kernels.hardware.memory import release, trim, working
 from kohakumoss_kernels.hardware.toolchain import version
 from kohakumoss_kernels.tuning import decisions, window
-from kohakumoss_kernels.tuning.timing import best_ms, graph_ms
+from kohakumoss_kernels.tuning.timing import best_ms, burst_ms, graph_ms
 from kohakumoss_kernels.tuning.window import STATE as WINDOW
 
 MODES = ("table", "off")
 OOM_SKIPPED: tuple[type[BaseException], ...] = (torch.OutOfMemoryError,)
 WORKING_FACTOR = 8.0
 WORKING_FLOOR = 256 << 20
-TIMINGS = {"graph": graph_ms, "events": lambda fn, device: best_ms(fn, device, 10)}
-TAGGED = ("kohakumoss", "triton", "triton-windows", "triton-xpu", "tilelang")
+TIMINGS = {
+    "graph": graph_ms,
+    "events": lambda fn, device: best_ms(fn, device, 10),
+    "burst": burst_ms,
+}
+TAGGED = (
+    "kohakumoss",
+    "lycoris-lora",
+    "triton",
+    "triton-windows",
+    "triton-xpu",
+    "tilelang",
+)
 _STATE = {"mode": "table"}
 # (device, kernel, key) bound untimed and unstored: frozen, deferred, or over the budget
 DEFERRED: set[tuple[str, str, str]] = set()
@@ -220,7 +231,7 @@ def select(
     cap: int | None = None,
 ) -> dict:
     """The config for problem `key`: a stored winner that is still a candidate, else
-    the fastest of the shortlist (`timing`: events | graph) within the working-memory
+    the fastest of the shortlist (`timing`: events | graph | burst) within the working-memory
     bound (`factor` x the leanest, default WORKING_FACTOR); the shortlist's config
     `lean` is timed first, the first candidate stays the default. A config raising one
     of `errors` or exceeding the bound is skipped; one running out of memory otherwise

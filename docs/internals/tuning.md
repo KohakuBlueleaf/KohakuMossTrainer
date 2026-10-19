@@ -158,15 +158,21 @@ key, candidates, launch)`:
 2. **Shortlist timing.** The top `shortlist` configs are timed with device events
    around plain launches (`timing="events"`): a busy warmup to boost clocks, then the
    best of ten calls, host launch cost included as the eager training loop pays it.
+   `timing="burst"` (the adapter ops' `AutotunedOp`) times a burst of back-to-back calls
+   issued while the device spins (`torch.cuda._sleep` over twice the burst's measured
+   host launch time), so every call is queued before the first starts and the burst's
+   device time per call is what is compared: a GPU-bound training step hides the host
+   launch time of an adapter op, which a single synchronised call would count.
    `timing="graph"` (CUDA-graph replay, launch cost excluded) is for benches. The tuner
-   times with events only: a capture in the training process makes CUDA calls of other
+   never captures a graph: a capture in the training process makes CUDA calls of other
    threads (the DataLoader's pin-memory thread) fail, in global and, as measured on
    Windows, thread-local capture mode alike. Every config runs under the
    [working-memory bound](#working-memory-bound).
 3. **Table.** The winner, every timing, every config's working memory (`working_mib`)
    and every failure are written to
    `<cache>/tuning/<card-sm-cuda-torch>/<tag>/<kernel>.json` (atomic replace), where
-   `<tag>` hashes the kohakumoss / triton / tilelang versions. Later processes read the
+   `<tag>` hashes the kohakumoss / lycoris-lora / triton / tilelang versions (a LyCORIS
+   release changes the adapter ops' kernel candidates). Later processes read the
    table and never time again; a stored config that is not among the current candidates
    is re-tuned.
 
