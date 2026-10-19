@@ -21,8 +21,12 @@ class FsdpParts(Parts):
     def full_trainable(self) -> dict:
         """The trainable state as full host tensors in the shards' (master) dtype,
         gathered from the sharded parameters (every rank)."""
-        state = full_tensors(self.trainable.state_dict())
-        return {k: v.detach().to("cpu", copy=True) for k, v in state.items()}
+        live = self.trainable.state_dict()
+        state = full_tensors(live)
+        return {
+            k: v if v is not live[k] else v.detach().to("cpu", copy=True)
+            for k, v in state.items()
+        }
 
     def __call__(self, state: TrainState) -> dict:
         parts = super().__call__(state)

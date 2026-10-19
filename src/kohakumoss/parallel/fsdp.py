@@ -127,11 +127,18 @@ def unsharded(model: nn.Module):
 
 
 def full_tensors(state: dict) -> dict:
-    """DTensor values gathered to full tensors (collective, same key order on every
-    rank); other values unchanged."""
-    return {
-        k: v.full_tensor() if isinstance(v, DTensor) else v for k, v in state.items()
-    }
+    """DTensor values gathered to full host tensors one at a time (collective, same key
+    order on every rank; the device holds one gathered tensor at a time); other values
+    unchanged."""
+    out = {}
+    for k, v in state.items():
+        if isinstance(v, DTensor):
+            full = v.full_tensor()
+            out[k] = full.detach().to("cpu", copy=True)
+            del full
+        else:
+            out[k] = v
+    return out
 
 
 def shard_like(state: dict, templates: dict) -> dict:
