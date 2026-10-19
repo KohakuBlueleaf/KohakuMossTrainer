@@ -74,6 +74,47 @@ def test_eager_fp32_butterflies_match_fp64(group):
     must_fail(lambda: close_fp32(got, rot64(x, group, normalise=False)), "unscaled")
 
 
+def _index_order(x: torch.Tensor, group: int) -> torch.Tensor:
+    """The fp32 butterflies with each stage's sum written out in index order."""
+    v, rows = x.float(), x.numel() // group
+    for a in range(stages(group)):
+        v = v.reshape(rows * 4**a, 4, group // 4 ** (a + 1))
+        total = ((v[:, 0] + v[:, 1]) + v[:, 2]) + v[:, 3]
+        v = torch.stack([total - 2.0 * v[:, 3 - k] for k in range(4)], 1)
+    return v.reshape(x.shape) * 2.0 ** -stages(group)
+
+
+def _pairwise(x: torch.Tensor, group: int) -> torch.Tensor:
+    v, rows = x.float(), x.numel() // group
+    for a in range(stages(group)):
+        v = v.reshape(rows * 4**a, 4, group // 4 ** (a + 1))
+        total = (v[:, 0] + v[:, 1]) + (v[:, 2] + v[:, 3])
+        v = torch.stack([total - 2.0 * v[:, 3 - k] for k in range(4)], 1)
+    return v.reshape(x.shape) * 2.0 ** -stages(group)
+
+
+def assert_index_order(fn, x: torch.Tensor, group: int) -> None:
+    assert torch.equal(fn(x, group), _index_order(x, group))
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("group", (4, *GROUPS))
+def test_eager_fp32_sums_in_index_order(group):
+    """The fp32 butterflies add each 4-point sum in index order, so every device
+    rounds them the same (a dequantized weight equals across host and GPU)."""
+    x = torch.randn(512, 2 * group) * torch.logspace(-4, 4, 2 * group)
+    assert_index_order(group_hadamard_eager, x, group)
+    must_fail(lambda: assert_index_order(_pairwise, x, group), "pairwise sums")
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("group", (4, *GROUPS))
+def test_eager_fp32_equals_across_devices(device, group):
+    x = torch.randn(512, 2 * group) * torch.logspace(-4, 4, 2 * group)
+    got = group_hadamard_eager(x.to(device), group).cpu()
+    assert torch.equal(got, group_hadamard_eager(x, group))
+
+
 @pytest.mark.cpu
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 @pytest.mark.parametrize("group", GROUPS)

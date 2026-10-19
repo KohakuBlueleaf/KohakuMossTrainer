@@ -75,13 +75,15 @@ def _traced_matrix(group: int, j: int, dtype: torch.dtype, device) -> Tensor:
 
 
 def _butterflies(x: Tensor, group: int, j: int) -> Tensor:
-    """x . blockdiag(H_group) by j fp32 4-point stages: y_k = sum(x) - 2 x_(3-k)."""
+    """x . blockdiag(H_group) by j fp32 4-point stages: y_k = sum(x) - 2 x_(3-k), the
+    sum added in index order (the same rounding on every device)."""
     shape = x.shape
     v = x.float()
     rows = v.numel() // group
     for a in range(j):
-        v = v.reshape(rows * 4**a, 4, group // 4 ** (a + 1))
-        v = v.sum(1, keepdim=True) - 2.0 * v.flip(1)
+        x0, x1, x2, x3 = v.reshape(rows * 4**a, 4, group // 4 ** (a + 1)).unbind(1)
+        total = ((x0 + x1) + x2) + x3
+        v = torch.stack([total - 2.0 * p for p in (x3, x2, x1, x0)], 1)
     return (v.reshape(shape) * 2.0**-j).to(x.dtype)
 
 
