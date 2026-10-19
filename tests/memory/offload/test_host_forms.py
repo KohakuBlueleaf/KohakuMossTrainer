@@ -1,14 +1,17 @@
 """The host forms of the frozen-encoder offload, model-free: `host="file"` keeps each
 host tensor's own storage (no copy) and casts to its device dtype (`dtypes`) on the
-way in; `host="copy"` holds copies already in the device dtype. Both give the values
-of the cast model, for HostCopies and a LayerStreamer ring."""
+way in; `host="copy"` holds copies already in the device dtype; a Deferred host form
+moves its int8 base and builds the dense weight on the way in. All give the values
+of the cast (dequantized) model, for HostCopies and a LayerStreamer ring."""
 
 import pytest
 import torch
 from torch import nn
 
 from kohakumoss.offload.encoders.placement import HostCopies
+from kohakumoss.offload.weights.deferred import Deferred, placeholder
 from kohakumoss.offload.weights.layers import LayerStreamer, module_tensors
+from kohakumoss.quant.weights import QuantWeight
 from tests._util.negative import must_fail
 
 pytestmark = pytest.mark.cpu
@@ -73,6 +76,57 @@ def test_streamer_forms(host):
     assert_ring(host)
 
 
+def _quantized_layers():
+    """Three linears whose weights are Deferred over an int8 base (placeholders between
+    passes), the dense weights they stand for, and the Deferred map."""
+    layers = _layers()
+    dense, deferred = [], {}
+    for m in layers:
+        base = QuantWeight.from_weight(m.weight.detach().float(), "int8")
+        dense.append(base.weight(COMPUTE))
+        m.weight = nn.Parameter(placeholder(m.weight.shape, COMPUTE), False)
+        m.bias = nn.Parameter(m.bias.detach().to(COMPUTE), False)
+        deferred[id(m.weight)] = Deferred(base, m.weight.shape)
+    return layers, dense, deferred
+
+
+def assert_deferred_copies(make=HostCopies) -> None:
+    layers, dense, deferred = _quantized_layers()
+    weights = [m.weight for m in layers]
+    copies = make(weights, torch.device("cpu"), False, "copy", None, deferred)
+    assert copies.nbytes == sum(d.nbytes for d in deferred.values())
+    copies.begin()
+    assert all(torch.equal(w, d) for w, d in zip(weights, dense))
+    copies.end()
+    assert all(w.untyped_storage().nbytes() == 2 for w in weights)
+
+
+def test_deferred_host_form_builds_on_the_way_in():
+    assert_deferred_copies()
+
+
+def test_deferred_ring_runs_the_dense_layers():
+    layers, dense, deferred = _quantized_layers()
+    x = torch.randn(2, DIM, dtype=COMPUTE)
+    with torch.no_grad():
+        want = x
+        for m, w in zip(layers, dense):
+            want = torch.nn.functional.linear(want, w, m.bias)
+        streamer = LayerStreamer(layers, "cpu", 2, False, True, "file", None, deferred)
+        got = x
+        for m in layers:
+            got = m(got)
+    streamer.close()
+    assert torch.equal(got, want)
+    assert streamer.h2d_bytes == sum(streamer.layer_bytes)
+
+
+class _NoBuild(HostCopies):
+    def begin(self) -> None:
+        for t, h, _ in self.pairs:
+            t.data = h.to(self.device)
+
+
 class _NoCast(HostCopies):
     def begin(self) -> None:
         for t, h, _ in self.pairs:
@@ -86,3 +140,4 @@ def _streamer_copying(layers, device, slots, pinned, hooks, host, dtypes):
 def test_checks_fail_on_broken_forms():
     must_fail(lambda: assert_copies("file", _NoCast), "file pages not cast")
     must_fail(lambda: assert_ring("file", _streamer_copying), "file form copied")
+    must_fail(lambda: assert_deferred_copies(_NoBuild), "placeholders moved as is")

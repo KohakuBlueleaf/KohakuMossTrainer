@@ -496,7 +496,12 @@ The host form of the weights `offload` / `ring` hold on the host is the plan's `
 allocator block per tensor, rounded up to a power of two); `file` keeps the
 checkpoint's file pages, copied from pageable memory and cast to the compute dtype by
 the copy (`HostCopies` / `LayerStreamer` with `dtypes`). File pages are page cache: the
-kernel reclaims them under memory pressure and reads them again on the next pass.
+kernel reclaims them under memory pressure and reads them again on the next pass. A
+weight dequantized from a stored base (a ComfyUI int8 file at `precision="compute"`)
+has a `Deferred` host form (`kohakumoss.offload.weights.deferred`): the base's codes and
+scales cross the bus and the dense weight is built on the device, into the ring slot
+or the offload copy; between passes the parameter points at a one-element host
+placeholder.
 
 ### Host room
 

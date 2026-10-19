@@ -9,6 +9,7 @@ import torch
 from torch import Tensor, nn
 
 from kohakumoss.offload.accel import module, streamed, with_index
+from kohakumoss.offload.weights.deferred import Deferred, put
 from kohakumoss.offload.weights.streaming.events import SlotEvents
 from kohakumoss_common.calls import nothing
 
@@ -108,10 +109,12 @@ class LayerStreamer:
     """Streams `layers` through `slots` device slots per layer signature.
 
     `host` "copy" copies the layers' tensors to the host in their device dtype
-    (`dtypes`), pinned when `pinned`; "file" keeps them as they are. `open()` allocates the slots (implicitly on the first entry), `close()` orders the
-    compute stream after the last H2D copy, points every layer back at its host copy
-    and drops the slots; `h2d_bytes` counts every host-to-device byte copied. The
-    streamer holds the layers' tensors, not the layers (their hooks hold it)."""
+    (`dtypes`), pinned when `pinned`; "file" keeps them as they are; a tensor in
+    `deferred` is copied from its Deferred host form. `open()` allocates the slots
+    (implicitly on the first entry), `close()` orders the compute stream after the
+    last H2D copy, points every layer back at its host copy and drops the slots;
+    `h2d_bytes` counts every host-to-device byte copied. The streamer holds the
+    layers' tensors, not the layers (their hooks hold it)."""
 
     def __init__(
         self,
@@ -122,25 +125,29 @@ class LayerStreamer:
         hooks: bool = True,
         host: str = "copy",
         dtypes: Mapping[int, torch.dtype] | None = None,
+        deferred: Mapping[int, Deferred] | None = None,
     ):
         layers = list(layers)
+        deferred = deferred or {}
         self.device = with_index(device)
         self.streamed = streamed(self.device)
         self.dm = module(self.device)
         self.host: list[list[Tensor]] = []
+        self.sources: list[list] = []
         self.targets: list[list[Tensor]] = []
         self.pool_of: list[_Pool] = []
         self.layer_bytes: list[int] = []
         pools: dict[tuple, _Pool] = {}
         for layer in layers:
             params = module_tensors(layer)
-            hosts, wants = [], []
+            hosts, wants, sources = [], [], []
             for t in params.values():
                 want = device_dtype(t, dtypes)
-                if host == "copy":
+                if host == "copy" and id(t) not in deferred:
                     t.data = host_copy(t, pinned and self.streamed, want)
                 hosts.append(t.data)
                 wants.append(want)
+                sources.append(deferred.get(id(t), t.data))
             shapes = [tuple(h.shape) for h in hosts]
             sig = tuple(zip(params, shapes, wants))
             if sig not in pools:
@@ -151,8 +158,9 @@ class LayerStreamer:
                 pools[sig] = _Pool(template, slots)
             self.pool_of.append(pools[sig])
             self.host.append(hosts)
+            self.sources.append(sources)
             self.targets.append(list(params.values()))
-            self.layer_bytes.append(tensor_bytes(hosts))
+            self.layer_bytes.append(tensor_bytes(sources))
         self.pools = list(pools.values())
         self.slot_of: dict[int, int] = {}
         self.is_open = False
@@ -214,19 +222,19 @@ class LayerStreamer:
             self.slot_of.pop(old, None)
         pool.held[slot] = i
         self.slot_of[i] = slot
-        self._copy(self, pool, slot, self.host[i])
+        self._copy(self, pool, slot, self.sources[i])
         self.h2d_bytes += self.layer_bytes[i]
         return slot
 
-    def _copy_host(self, pool: _Pool, slot: int, src: list[Tensor]) -> None:
+    def _copy_host(self, pool: _Pool, slot: int, src: list) -> None:
         for dst, s in zip(pool.slots[slot], src):
-            dst.copy_(s)
+            put(dst, s, self.device, False)
 
-    def _copy_device(self, pool: _Pool, slot: int, src: list[Tensor]) -> None:
+    def _copy_device(self, pool: _Pool, slot: int, src: list) -> None:
         self.stream.wait_event(pool.free[slot])
         with self.dm.stream(self.stream):
             for dst, s in zip(pool.slots[slot], src):
-                dst.copy_(s, non_blocking=True)
+                put(dst, s, self.device, True)
         pool.ready[slot].record(self.stream)
 
     def _wait_device(self, pool: _Pool, slot: int) -> None:
@@ -272,4 +280,5 @@ class LayerStreamer:
             h.remove()
         self.handles = []
         self.host = []
+        self.sources = []
         self.targets = []

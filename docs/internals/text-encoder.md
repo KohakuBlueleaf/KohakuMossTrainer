@@ -219,8 +219,15 @@ streams onto it, the tokenizer is the packaged one.
   base, its int8 embedding as `QuantEmbedding`; nothing is quantized at load. On the
   host (memory `cpu`) `auto` is `compute`.
 - Any other precision dequantizes the stored layers into the dense model (one INFO
-  line) and quantizes from there. Away from `resident` the dequantized layers are host
-  memory of their own (a WARNING when they do not fit the host's room).
+  line) and quantizes from there. Under `offload` / `ring` the host keeps each
+  dequantized layer's stored codes and scales (file pages) and the copy to the device
+  dequantizes them there (`Deferred`, [offload.md](offload.md#text-encoder)). For the
+  int8 ConvRot file in fp16 (RTX 3090) the peak private host memory of load + encode +
+  release is 3.6 GiB under `ring` / `offload`, against 19.0 GiB dequantizing every
+  layer on the host (the embedding table is still dequantized there). The weight equals
+  the host dequantization bit for bit (elementwise scaling, and fp32 Hadamard
+  butterflies that add in index order on every device). Under `cpu` the dense layers
+  are host memory (a WARNING when they do not fit the host's room).
 - `w4a8` on a W4A8 file: `int8` decodes every layer once at load (on the compute device,
   the result at the layer's home), `packed` keeps the 4-bit codes and decodes per call
   (the compiled decode on CUDA / XPU), `auto` (`default_w4a8`) takes `int8` when the

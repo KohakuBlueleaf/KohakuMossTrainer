@@ -1,8 +1,8 @@
 """The streamed text-encoder load's model-free parts: checkpoint keys to text-model
 names, file tensors read by those names in their stored dtype, the quantization source's dtype
 filter, `linear_fate` / `quantizes` agreeing with what `quantize_text_linears`
-replaces, the meta-device size delta of a quantized load, and the host bytes a copy
-adds."""
+replaces, the meta-device size delta of a quantized load, a stored base dequantized
+by row chunks, and the host bytes a copy adds."""
 
 import pytest
 import torch
@@ -10,9 +10,16 @@ from safetensors.torch import save_file
 from torch import nn
 
 from kohakumoss.encoders.text.files import TextFiles, hf_text_name
-from kohakumoss.encoders.text.load import _Fill, copy_bytes, pow2, quantized_delta
+from kohakumoss.encoders.text.load import (
+    _Fill,
+    copy_bytes,
+    dense_weight,
+    pow2,
+    quantized_delta,
+)
 from kohakumoss.encoders.text.plan import text_plan
 from kohakumoss.quant.text import linear_fate, quantize_text_linears, quantizes
+from kohakumoss.quant.weights import QuantWeight
 from tests._util.negative import must_fail
 
 pytestmark = pytest.mark.cpu
@@ -118,11 +125,33 @@ def test_quantized_delta_matches_a_real_quantize():
     assert after - before == delta
 
 
+def assert_rows(build) -> None:
+    torch.manual_seed(0)
+    w = torch.randn(300, 512) * torch.logspace(-2, 2, 512)
+    base = QuantWeight.from_weight(w, "int8")
+    base.rotation = 64
+    whole = base.weight(torch.float16)
+    assert torch.equal(build(base, torch.float16, rows=64), whole)
+
+
+def _shifted_rows(base, dtype, rows):
+    rolled = QuantWeight(base.q.roll(1, 0), base.scale, base.fmt, base.rotation)
+    return dense_weight(rolled, dtype, rows=rows)
+
+
+def test_dense_weight_by_rows_equals_the_whole():
+    assert_rows(dense_weight)
+    must_fail(lambda: assert_rows(_shifted_rows), "rows paired with the wrong scales")
+
+
 def test_copy_bytes():
     assert [pow2(n) for n in (1, 2, 3, 4096, 4097)] == [1, 2, 4, 4096, 8192]
     fill = _Fill.__new__(_Fill)
     view = torch.empty(3, 4, dtype=torch.bfloat16)
     private = torch.empty(5, dtype=torch.int8)
     fill.views, fill.dtypes = {id(view)}, {id(view): torch.float32}
+    fill.deferred = {}
     assert copy_bytes([view, private], fill, pinned=False) == 48
     assert copy_bytes([view, private], fill, pinned=True) == 64 + (8 - 5)
+    fill.deferred = {id(view): None}
+    assert copy_bytes([view, private], fill, pinned=False) == 0

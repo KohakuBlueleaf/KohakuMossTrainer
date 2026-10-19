@@ -20,6 +20,7 @@ from torch import Tensor, nn
 
 from kohakumoss.offload.accel import streamed
 from kohakumoss.offload.encoders.placement import HostCopies
+from kohakumoss.offload.weights.deferred import Deferred
 from kohakumoss.offload.weights.layers import (
     LayerStreamer,
     device_dtype,
@@ -53,12 +54,14 @@ class TextPlacement:
         pinned: bool = True,
         host: str = "copy",
         dtypes: Mapping[int, torch.dtype] | None = None,
+        deferred: Mapping[int, Deferred] | None = None,
     ):
         self.model = model
         self.layers = list(layers)
         self.embedding = embedding
         self.emb_ids = frozenset() if embedding is None else tensor_ids([embedding])
         self.dtypes = dict(dtypes or {})
+        self.deferred = dict(deferred or {})
         self.lookup = host_lookup(embedding, self.dtypes)
         self.device = torch.device(device)
         self.pinned = pinned and streamed(self.device)
@@ -70,7 +73,8 @@ class TextPlacement:
 
     def to_device(self, t: Tensor) -> None:
         """Point `t` at its copy on the compute device, in its compute dtype."""
-        t.data = t.data.to(self.device, device_dtype(t, self.dtypes))
+        src = self.deferred.get(id(t), t.data)
+        t.data = src.to(self.device, device_dtype(t, self.dtypes))
 
     def place(self) -> None:
         for t in module_tensors(self.model).values():
@@ -102,6 +106,7 @@ class TextPlacement:
             t.data = torch.empty(0, dtype=t.dtype)
         self.layers = []
         self.lookup = None
+        self.deferred = {}
 
 
 class HostPlacement(TextPlacement):
@@ -123,7 +128,7 @@ class OffloadPlacement(TextPlacement):
         tensors = list(module_tensors(self.model).values())
         moved = [t for t in tensors if id(t) not in self.emb_ids]
         self.copies = HostCopies(
-            moved, self.device, self.pinned, self.host, self.dtypes
+            moved, self.device, self.pinned, self.host, self.dtypes, self.deferred
         )
 
     def embed(self, ids: Tensor) -> Tensor:
@@ -169,6 +174,7 @@ class RingPlacement(TextPlacement):
             pinned=self.pinned,
             host=self.host,
             dtypes=self.dtypes,
+            deferred=self.deferred,
         )
         n = len(self.layers)
         self.enter = [partial(self.streamer.enter, i) for i in range(n)]
@@ -296,10 +302,11 @@ def place_text(
     compute_dtype: torch.dtype,
     host: str = "copy",
     dtypes: Mapping[int, torch.dtype] | None = None,
+    deferred: Mapping[int, Deferred] | None = None,
 ) -> TextPlacement:
     """Place a (quantized) text model under `plan.memory` (resolved) with the host form
-    `host` of its host-held weights, and bind its quantized GEMMs to the compute
-    device."""
+    `host` of its host-held weights (`deferred`: the tensors built on the device from
+    a stored base), and bind its quantized GEMMs to the compute device."""
     layers = list(getattr(text_model, "layers", []))
     embedding = getattr(text_model, "embed_tokens", None)
     kw = {"slots": plan.stream_resident} if plan.memory == "ring" else {}
@@ -311,6 +318,7 @@ def place_text(
         plan.pinned,
         host=host,
         dtypes=dtypes,
+        deferred=deferred,
         **kw,
     )
     rebind_quant(text_model, placement.device, compute_dtype, autograd=False)

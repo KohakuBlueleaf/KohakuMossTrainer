@@ -29,6 +29,7 @@ from kohakumoss.offload.encoders.text import (
     place_text,
     w4a8_extra_bytes,
 )
+from kohakumoss.offload.weights.deferred import Deferred, placeholder
 from kohakumoss.offload.weights.layers import device_dtype, module_tensors
 from kohakumoss.quant.bind import work_device
 from kohakumoss.quant.comfy_format import comfy_layers, layer_base
@@ -38,12 +39,14 @@ from kohakumoss.quant.source import STORED, log_sources
 from kohakumoss.quant.stored import SCALE
 from kohakumoss.quant.stored_text import stored_base
 from kohakumoss.quant.text import linear_fate, quantize_text_linears, quantizes
+from kohakumoss.quant.weights import QuantWeight
 from kohakumoss.types.plans import TextEncoderPlan
 from kohakumoss_common.hostmem import host_fits
 from kohakumoss_common.units import GIB
 
 HOST = torch.device("cpu")
 COMFY_VALUES = (torch.bfloat16, torch.float16)
+DENSE_ROWS = 16384
 log = get_logger(__name__)
 
 
@@ -52,7 +55,7 @@ class TextCheckpoint:
     """A text encoder's checkpoint: the text model's `config` (or a multimodal config
     holding it) and tensors (`files`); its stored-quantized layers by module path, kept
     as stored bases (`kept`: (() -> base over the file pages, bias name | None)) or
-    dequantized (`dense`: dtype -> the dense weight on the host); the file names those
+    dequantized into the dense weight (`dense`: () -> that base); the file names those
     layers own (`owned`); the stored dtypes a quantize-at-load source reads
     (`values`); `strict`: every other file tensor must be the model's."""
 
@@ -60,7 +63,7 @@ class TextCheckpoint:
     config: PretrainedConfig
     files: TextFiles
     kept: dict[str, tuple[Callable, str | None]] = field(default_factory=dict)
-    dense: dict[str, Callable[[torch.dtype], Tensor]] = field(default_factory=dict)
+    dense: dict[str, Callable] = field(default_factory=dict)
     owned: set[str] = field(default_factory=set)
     values: tuple[torch.dtype, ...] = VALUES
     strict: bool = False
@@ -76,10 +79,6 @@ def _under(key: str, path: str) -> bool:
     return key.startswith(path + ".")
 
 
-def _dequantized(layer, get, dtype: torch.dtype) -> Tensor:
-    return layer_base(layer, get).weight(dtype)
-
-
 def comfy_checkpoint(path: Path, keep: bool) -> TextCheckpoint:
     """A ComfyUI text-encoder file under the packaged config: its quantized layers kept
     as stored bases (`keep`) or dequantized."""
@@ -93,7 +92,7 @@ def comfy_checkpoint(path: Path, keep: bool) -> TextCheckpoint:
             ck.kept[p] = (partial(layer_base, layer, files.get), bias)
             ck.owned.update(k for k in files.keys() if _under(k, p))
         else:
-            ck.dense[p] = partial(_dequantized, layer, files.get)
+            ck.dense[p] = partial(layer_base, layer, files.get)
     return ck
 
 
@@ -142,23 +141,44 @@ def attach_base(model: nn.Module, path: str, base, bias, dtype: torch.dtype) -> 
     setattr(parent, name, quant)
 
 
+def dense_weight(base, dtype: torch.dtype, rows: int = DENSE_ROWS) -> Tensor:
+    """`base.weight(dtype)`, a per-row QuantWeight built `rows` rows at a time (each
+    row dequantizes and unrotates on its own, so the values are the same)."""
+    if not isinstance(base, QuantWeight) or base.q.shape[0] <= rows:
+        return base.weight(dtype)
+    n = base.q.shape[0]
+    out = torch.empty(base.q.shape, dtype=dtype)
+    for i in range(0, n, rows):
+        part = QuantWeight(base.q[i : i + rows], base.scale[i : i + rows], base.fmt, base.rotation)  # fmt: skip
+        out[i : i + rows] = part.weight(dtype)
+    return out
+
+
 class _Fill:
     """The per-module fill of one load: `dtypes` (compute dtype by tensor id of a host
-    file page stored in another), `views` (ids of tensors left as file pages), `used`
-    (file names read)."""
+    file page stored in another), `views` (ids of tensors left as file pages),
+    `deferred` (Deferred host forms by tensor id), `used` (file names read)."""
 
     def __init__(self, ck: TextCheckpoint, dtype: torch.dtype):
         self.ck = ck
         self.dtype = dtype
         self.dtypes: dict[int, torch.dtype] = {}
         self.views: set[int] = set()
+        self.deferred: dict[int, Deferred] = {}
         self.used: set[str] = set()
+
+    def dense_base(self, name: str):
+        """The stored base dequantized into weight `name`, or None."""
+        path = name.removesuffix(".weight")
+        if name.endswith(".weight") and path in self.ck.dense:
+            return self.ck.dense[path]()
+        return None
 
     def value(self, name: str) -> tuple[Tensor, bool]:
         """(the values of tensor `name`, whether they are the file pages)."""
-        path = name.removesuffix(".weight")
-        if name.endswith(".weight") and path in self.ck.dense:
-            return self.ck.dense[path](self.dtype), False
+        base = self.dense_base(name)
+        if base is not None:
+            return dense_weight(base, self.dtype), False
         if name not in self.ck.files:
             raise ValueError(
                 f"{self.ck.name}: the text model's {name!r} is not in the checkpoint"
@@ -167,16 +187,31 @@ class _Fill:
         return self.ck.files.get(name), True
 
     def __call__(
-        self, module: nn.Module, prefix: str, home: torch.device | None
+        self,
+        module: nn.Module,
+        prefix: str,
+        home: torch.device | None,
+        defer: bool = False,
     ) -> None:
         """Replace every meta parameter / buffer of `module` by its checkpoint values:
-        a copy on `home` in its dtype, or (home None) the host value as read."""
+        a copy on `home` in its dtype, or (home None) the host value as read; `defer`
+        keeps a dequantized weight's stored base as its Deferred host form."""
         for path, sub in module.named_modules():
             at = f"{prefix}{path}." if path else prefix
             for kind in (sub._parameters, sub._buffers):
                 for name, t in list(kind.items()):
-                    if t is not None and t.device.type == "meta":
+                    if t is None or t.device.type != "meta":
+                        continue
+                    base = self.dense_base(at + name) if defer else None
+                    if base is not None:
+                        kind[name] = self._deferred(t, base)
+                    else:
                         kind[name] = self._made(t, *self.value(at + name), home)
+
+    def _deferred(self, t: Tensor, base) -> Tensor:
+        new = nn.Parameter(placeholder(t.shape, t.dtype), requires_grad=False)
+        self.deferred[id(new)] = Deferred(base, t.shape)
+        return new
 
     def _made(self, t: Tensor, src: Tensor, view: bool, home) -> Tensor:
         if home is not None:
@@ -257,23 +292,25 @@ def pow2(nbytes: int) -> int:
 def copy_bytes(held: list[Tensor], fill: _Fill, pinned: bool) -> int:
     """Host bytes `host="copy"` adds over the loaded form of `held`: each copy in its
     compute dtype (a pinned one rounded to its size class), less the private host
-    tensor it replaces."""
+    tensor it replaces; a Deferred host form is not copied."""
     total = 0
     for t in held:
+        if id(t) in fill.deferred:
+            continue
         n = t.numel() * device_dtype(t, fill.dtypes).itemsize
         total += (pow2(n) if pinned else n) - (0 if id(t) in fill.views else t.nbytes)
     return total
 
 
-def _warn_dense(ck: TextCheckpoint, text: nn.Module, dtype: torch.dtype, memory):
-    """A WARNING when the dequantized layers `memory` holds on the host do not fit the
-    host's room."""
+def _warn_dense(ck: TextCheckpoint, text: nn.Module, dtype: torch.dtype) -> None:
+    """A WARNING when the dequantized layers an encoder running on the host holds do
+    not fit the host's room."""
     need = sum(text.get_submodule(p).weight.numel() * dtype.itemsize for p in ck.dense)
     if not host_fits(need):
         log.warning(
-            f"text encoder memory {memory!r}: the {len(ck.dense)} dequantized layers "
-            f"of {ck.name} take {need / GIB:.2f} GiB of host memory, more than the "
-            "host has room for; precision 'auto' keeps the stored codes"
+            f"text encoder memory 'cpu': the {len(ck.dense)} dequantized layers of "
+            f"{ck.name} take {need / GIB:.2f} GiB of host memory, more than the host "
+            "has room for"
         )
 
 
@@ -309,8 +346,9 @@ def load_placed_text(
             extra += quantized_delta(text, plan, dtype)
         plan = replace(plan, memory=choose(text, device, extra_layers=extra))
     resident = plan.memory == "resident"
-    if ck.dense and not resident:
-        _warn_dense(ck, text, dtype, plan.memory)
+    streams = plan.memory in ("offload", "ring")
+    if ck.dense and plan.memory == "cpu":
+        _warn_dense(ck, text, dtype)
     report = {"stored": plan.stored} if plan.stored else {}
     if quantize:
         report.update(layers=0, dense_bytes=0, quant_bytes=0, skipped=0, sources={})
@@ -338,7 +376,7 @@ def load_placed_text(
             for t in module_tensors(module).values():
                 t.data = t.data.to(home or HOST)
         else:
-            fill(module, prefix, home)
+            fill(module, prefix, home, defer=layer and streams and home is None)
             if quantize:
                 fates = (linear_fate(m, plan.precision, plan.quant_group) for m in module.modules())  # fmt: skip
                 report["skipped"] += sum(f == "skip" for f in fates)
@@ -355,5 +393,5 @@ def load_placed_text(
         need = copy_bytes(held_on_host(text, plan.memory), fill, pinned)
         host = "copy" if host_fits(need) else "file"
     plan = replace(plan, host=host)
-    placement = place_text(text, plan, device, dtype, host, fill.dtypes)
+    placement = place_text(text, plan, device, dtype, host, fill.dtypes, fill.deferred)
     return text, placement, report, plan
