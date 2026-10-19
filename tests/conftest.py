@@ -7,7 +7,8 @@ per-test time budget.
 The budget fails any test whose call phase runs longer than KOHAKUMOSS_TEST_BUDGET
 seconds (default BUDGET; a `budget(seconds)` marker overrides it). Tests marked `slow`
 or `real_weights` (the whole-integration runs) have no budget, and
-KOHAKUMOSS_TEST_BUDGET=0 disables it for a first run that compiles the kernels. A
+KOHAKUMOSS_TEST_BUDGET=0 disables every budget, markers included, for a first run that
+compiles the kernels. A
 failed test's frames drop their locals once it is reported.
 
 Environment variables the suite reads:
@@ -65,13 +66,17 @@ def pytest_unconfigure(config):
 
 
 def _budget(item) -> float:
+    """The call-phase budget of `item` in seconds (0: none): KOHAKUMOSS_TEST_BUDGET=0
+    disables every budget, markers included; else its `budget` marker, else the env
+    value, else BUDGET."""
+    env = os.environ.get("KOHAKUMOSS_TEST_BUDGET")
     marks = {m.name for m in item.iter_markers()}
-    if marks & UNBUDGETED:
+    if marks & UNBUDGETED or (env is not None and float(env) == 0):
         return 0.0
     mark = item.get_closest_marker("budget")
     if mark is not None:
         return float(mark.args[0])
-    return float(os.environ.get("KOHAKUMOSS_TEST_BUDGET", BUDGET))
+    return float(env if env is not None else BUDGET)
 
 
 @pytest.hookimpl(wrapper=True)
