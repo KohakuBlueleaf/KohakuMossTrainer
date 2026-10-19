@@ -41,7 +41,11 @@ def te_line(te, path, device) -> tuple[str, dict]:
     _, host = split_bytes(te.model)
     res, run = placement.resident_bytes(), placement.pass_bytes()
     dev = placement.device if name != "cpu" else torch.device("cpu")
-    pinned = ", pinned" if placement.pinned else ""
+    match placement.host:
+        case "file":
+            pinned = ", file pages"
+        case _:
+            pinned = ", pinned" if placement.pinned else ""
     precision = f"precision {te.plan.precision}, {te.plan.dtype}"
     match name:
         case "resident":

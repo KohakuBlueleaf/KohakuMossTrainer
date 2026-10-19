@@ -61,7 +61,14 @@ class QuantEmbedding(nn.Module):
         return self.q.nbytes + self.scale.nbytes
 
 
-def dense_lookup(embedding: nn.Embedding, ids: Tensor, device: torch.device) -> Tensor:
+def dense_lookup(
+    embedding: nn.Embedding,
+    ids: Tensor,
+    device: torch.device,
+    dtype: torch.dtype | None = None,
+) -> Tensor:
     """`QuantEmbedding.lookup` of a dense table: rows gathered where it lives, then
-    moved to `device`."""
-    return F.embedding(ids.to(embedding.weight.device), embedding.weight).to(device)
+    moved to `device` in `dtype` (default the table's)."""
+    weight = embedding.weight
+    rows = F.embedding(ids.to(weight.device), weight)
+    return rows.to(device, dtype or weight.dtype)

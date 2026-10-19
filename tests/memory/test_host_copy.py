@@ -70,7 +70,7 @@ def test_tensor_ids():
 
 class _Uncounted(HostCopies):
     def begin(self) -> None:
-        for t, h in self.pairs:
+        for t, h, _ in self.pairs:
             t.data = h
 
 

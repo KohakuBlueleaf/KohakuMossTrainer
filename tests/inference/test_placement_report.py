@@ -65,6 +65,7 @@ class Placement:
     def __init__(self, name, device, slots=2, res=GIB // 4, run=GIB):
         self.name, self.device, self.slots = name, torch.device(device), slots
         self.pinned = name in ("ring", "offload")
+        self.host = "copy"
         self._res, self._run = res, run
 
     def resident_bytes(self):

@@ -56,6 +56,12 @@ def release_cache(device: torch.device | str) -> None:
         module(device).empty_cache()
 
 
+def release_host_cache() -> None:
+    """Return the caching host allocator's free pinned blocks to the system."""
+    if torch.accelerator.is_available():
+        torch.accelerator.empty_host_cache()
+
+
 def configure_allocator(device: torch.device | str) -> str:
     """Before the run's first allocation: expandable segments for the CUDA caching
     allocator where it has them (Linux), else power-of-2 rounding of request sizes

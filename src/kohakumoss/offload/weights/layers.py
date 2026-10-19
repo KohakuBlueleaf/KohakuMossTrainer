@@ -2,7 +2,7 @@
 are on the device only while it runs (forward hooks, or `enter(i)` / `leave(i)` from a
 forward that drives the layers itself). See docs/internals/offload.md."""
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from functools import partial
 
 import torch
@@ -40,6 +40,12 @@ def host_copy(t: Tensor, pinned: bool, dtype: torch.dtype | None = None) -> Tens
     a contiguous host tensor already in `dtype` is returned as is."""
     h = t.detach().to("cpu", dtype or t.dtype).contiguous()
     return h.pin_memory() if pinned else h
+
+
+def device_dtype(t: Tensor, dtypes: Mapping[int, torch.dtype] | None) -> torch.dtype:
+    """The dtype module tensor `t` has on the device: its entry in `dtypes` (by tensor
+    id: a host form stored in another dtype, cast by the copy), else its own."""
+    return dtypes.get(id(t), t.dtype) if dtypes else t.dtype
 
 
 def tensor_ids(modules: Sequence[nn.Module]) -> frozenset[int]:
@@ -101,7 +107,8 @@ class _Pool:
 class LayerStreamer:
     """Streams `layers` through `slots` device slots per layer signature.
 
-    `open()` allocates the slots (implicitly on the first entry), `close()` orders the
+    `host` "copy" copies the layers' tensors to the host in their device dtype
+    (`dtypes`), pinned when `pinned`; "file" keeps them as they are. `open()` allocates the slots (implicitly on the first entry), `close()` orders the
     compute stream after the last H2D copy, points every layer back at its host copy
     and drops the slots; `h2d_bytes` counts every host-to-device byte copied. The
     streamer holds the layers' tensors, not the layers (their hooks hold it)."""
@@ -113,6 +120,8 @@ class LayerStreamer:
         slots: int = 2,
         pinned: bool = True,
         hooks: bool = True,
+        host: str = "copy",
+        dtypes: Mapping[int, torch.dtype] | None = None,
     ):
         layers = list(layers)
         self.device = with_index(device)
@@ -125,14 +134,21 @@ class LayerStreamer:
         pools: dict[tuple, _Pool] = {}
         for layer in layers:
             params = module_tensors(layer)
-            hosts = []
+            hosts, wants = [], []
             for t in params.values():
-                h = host_copy(t, pinned and self.streamed)
-                t.data = h
-                hosts.append(h)
-            sig = tuple((n, tuple(t.shape), t.dtype) for n, t in zip(params, hosts))
+                want = device_dtype(t, dtypes)
+                if host == "copy":
+                    t.data = host_copy(t, pinned and self.streamed, want)
+                hosts.append(t.data)
+                wants.append(want)
+            shapes = [tuple(h.shape) for h in hosts]
+            sig = tuple(zip(params, shapes, wants))
             if sig not in pools:
-                pools[sig] = _Pool(hosts, slots)
+                template = [
+                    torch.empty(s, dtype=w, device="meta")
+                    for s, w in zip(shapes, wants)
+                ]
+                pools[sig] = _Pool(template, slots)
             self.pool_of.append(pools[sig])
             self.host.append(hosts)
             self.targets.append(list(params.values()))
@@ -250,5 +266,10 @@ class LayerStreamer:
         self.leave(i)
 
     def remove(self) -> None:
+        """Drop the hooks and the host copies (the caller re-points the layers'
+        tensors)."""
         for h in self.handles:
             h.remove()
+        self.handles = []
+        self.host = []
+        self.targets = []
