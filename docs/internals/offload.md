@@ -477,17 +477,34 @@ int8 checkpoints (`scale_weight` or `weight_scale` keys). The text encoder's lin
 
 ## Text encoder
 
-`apply_to_text_encoder(text_model, TextEncoderPlan, device, dtype)` is the one entry for
-training (`build_encoders`, the online text cache, sample prompts), `MossPipeline` and
-the offline cache factory. It quantizes the linears (`precision`), resolves
-`memory="auto"`, then places the model (`kohakumoss.offload.encoders.text`):
+`QwenTextEncoder.from_pretrained` is the one entry for training (`build_encoders`, the
+online text cache, sample prompts), `MossPipeline` and the offline cache factory. It
+streams the checkpoint straight to the placement ([text-encoder.md](text-encoder.md#streamed-load)),
+quantizing at load (`precision`) and resolving `memory="auto"` on the way, then places
+the model (`place_text`, `kohakumoss.offload.encoders.text`); a model built in memory
+goes through `apply_to_text_encoder(text_model, TextEncoderPlan, device, dtype)`:
 
 | memory | between passes on the device | during a pass | host-to-device per pass |
 | --- | --- | --- | --- |
 | `resident` | everything | everything | 0 |
-| `offload` | nothing | everything but the embedding table | all weights (pinned copies) |
+| `offload` | nothing | everything but the embedding table | all weights (from their host form) |
 | `ring` | final norm, rotary tables | + a ring of `stream_resident` slots per layer kind | all layer weights, prefetched one layer ahead |
 | `cpu` | nothing (runs on the host) | nothing | 0 |
+
+The host form of the weights `offload` / `ring` hold on the host is the plan's `host`:
+`copy` makes host copies in the compute dtype (pinned when `pinned`, one caching host
+allocator block per tensor, rounded up to a power of two); `file` keeps the
+checkpoint's file pages, copied from pageable memory and cast to the compute dtype by
+the copy (`HostCopies` / `LayerStreamer` with `dtypes`). File pages are page cache: the
+kernel reclaims them under memory pressure and reads them again on the next pass.
+
+### Host room
+
+`auto` takes `copy` when the bytes it adds fit 0.9x the host's room now
+(`kohakumoss_common.hostmem.host_room`): the tightest of /proc/meminfo MemAvailable and,
+for the process's memory cgroup and each ancestor (v2 `memory.max`, v1
+`memory.limit_in_bytes`), the limit minus the usage plus the reclaimable inactive file
+pages; on Windows the available physical memory.
 
 Under `offload` / `ring` the 2 GiB embedding table never moves: the pass looks up
 the rows on the host and sends only them. Every placement's `end()` releases the
@@ -502,7 +519,9 @@ pools; `h2d_bytes` counts the copies.
 
 `free_after_use` drops every weight after the first pass (the empty-prompt embedding is
 encoded in it and kept). Training sets it when text is cached offline: the sample
-prompts are encoded once at build and the encoder is freed.
+prompts are encoded once at build and the encoder is freed. A release drops the host
+forms with the device weights and returns the caching host allocator's free pinned
+blocks to the system (`torch.accelerator.empty_host_cache`).
 
 The memory model adds the text encoder (`kohakumoss.offload.encoders.text_memory`): resident
 weights count against the DiT step peak; an offload / ring pass peaks at the

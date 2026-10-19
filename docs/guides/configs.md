@@ -167,7 +167,7 @@ int8 / fp8 base halves the DiT parts):
 | --- | --- | --- |
 | trainer process and its `NUM_WORKERS` loader workers (spawned processes on Windows, each importing torch) | always | the bench matrix budgets 8 per run (`kohakumoss_bench/plan/hostmem.py`) |
 | the DiT, loaded on the host before placement | build | 9.47 |
-| the text encoder, read into host RAM | build, when `SAMPLE_EVERY > 0` or `TEXT_CACHE` is not `offline`; with an offline text cache it is freed after the sample prompts | 15.63 |
+| the text encoder, streamed from its file pages to its placement ([streamed load](../internals/text-encoder.md#streamed-load)) | when `SAMPLE_EVERY > 0` or `TEXT_CACHE` is not `offline`; with an offline text cache it is freed after the sample prompts | private only for what `ring` / `offload` copy to the host (`host` copy: 15.63 in bf16 / fp16, rounded up per tensor when pinned; `host` file: none, the file pages are page cache) and for layers quantized at load held on the host |
 | streamed DiT blocks, pinned (0.21 per block of 42; the device keeps `stream_resident`) | streaming profiles | about 5.5 (`balanced`) to 8.4 (two resident blocks) |
 | offloaded activations (block inputs, one per block, in pinned buffers rounded up to a power of two) | `act_offload` | about 1 at 4352 tokens, 2 at 8192 |
 | adapter master, moments and gradient sums (16 bytes per trainable parameter) | `optim_state` `stream` / `cpu`, `grad_offload` | about 1.1 for LoRA DIM 32 on `attn-mlp` (74 M parameters) |
@@ -180,7 +180,7 @@ Totals per layer:
 | `24g` (`balanced`) | near 29 GiB | about 14 GiB |
 
 With `SAMPLE_EVERY = 0` and both caches offline only the caches are read and the text
-encoder stays on disk, which removes the 15.63 GiB build peak. Full finetune:
+encoder stays on disk. Full finetune:
 [full-finetune.md](full-finetune.md#host-ram).
 
 ### Multi-GPU layers

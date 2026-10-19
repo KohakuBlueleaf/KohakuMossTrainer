@@ -21,6 +21,7 @@ LAYOUT = ("single", "padded", "packed")
 FORWARD = ("kernels", "hf")
 DTYPES = {name: BY_NAME[name] for name in ("bf16", "fp16")}
 AHEAD_DEVICE = ("host", "device")
+HOST_FORMS = ("auto", "copy", "file")
 
 
 def text_plan(
@@ -91,6 +92,7 @@ def plan_problems(
         ("dtype", plan.dtype, (*DTYPES, "auto")),
         ("ahead_device", plan.ahead_device, AHEAD_DEVICE),
         ("w4a8", plan.w4a8, W4A8),
+        ("host", plan.host, HOST_FORMS),
     ):
         if value not in opts:
             p.append(f"text-encoder {name}={value!r} not in {opts}")

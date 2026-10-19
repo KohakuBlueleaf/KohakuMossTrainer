@@ -284,8 +284,8 @@ def load_text_encoder(
     choose = partial(default_auto_memory, plan=spec, reserve=reserve)
     w4a8 = partial(default_w4a8, plan=spec, reserve=reserve)
     what = (
-        f"text encoder weights -> host RAM, then placed (memory "
-        f"{spec.memory}, compute on {te_device})"
+        f"text encoder streamed to its placement (memory {spec.memory}, compute "
+        f"on {te_device})"
     )
     with timed(log, what) as done:
         te = QwenTextEncoder.from_pretrained(

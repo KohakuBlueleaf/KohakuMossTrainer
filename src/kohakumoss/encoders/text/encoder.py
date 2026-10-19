@@ -8,16 +8,12 @@ from pathlib import Path
 
 import torch
 from torch import Tensor
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoTokenizer
 from transformers.utils import logging as hf_logging
 
 from kohakumoss.encoders.specs import text_spec
 from kohakumoss.encoders.text.comfy_files import is_comfy_text_file, packaged_tokenizer
-from kohakumoss.encoders.text.comfy_load import (
-    comfy_text_source,
-    load_comfy_text,
-    text_file_format,
-)
+from kohakumoss.encoders.text.comfy_load import text_file_format
 from kohakumoss.encoders.text.forward import (
     KernelForward,
     TextOps,
@@ -25,6 +21,12 @@ from kohakumoss.encoders.text.forward import (
     op_static,
 )
 from kohakumoss.encoders.text.hf import HfForward
+from kohakumoss.encoders.text.load import (
+    comfy_checkpoint,
+    hf_checkpoint,
+    load_placed_text,
+    stored_checkpoint,
+)
 from kohakumoss.encoders.text.plan import (
     DTYPES,
     check_plan,
@@ -41,12 +43,12 @@ from kohakumoss.encoders.text.tokens import (
 )
 from kohakumoss.logging.log import bar as log_bar
 from kohakumoss.logging.log import get_logger, hl
-from kohakumoss.offload.accel import device_budget
+from kohakumoss.offload.accel import device_budget, release_host_cache
 from kohakumoss.offload.encoders.text import apply_to_text_encoder, w4a8_extra_bytes
 from kohakumoss.offload.encoders.text_memory import choose_text_memory, text_sizes
 from kohakumoss.quant.convert import QuantLinear
-from kohakumoss.quant.source import SourceWeights, text_source
-from kohakumoss.quant.stored_text import load_stored_text, read_text_record
+from kohakumoss.quant.source import SourceWeights
+from kohakumoss.quant.stored_text import read_text_record
 from kohakumoss.quant.text import GroupQuantLinear
 from kohakumoss.types.plans import TextEncoderPlan
 from kohakumoss.weights import TEXT, comfy_file, is_comfy_folder
@@ -75,13 +77,18 @@ def _subdir(path: Path, name: str) -> Path:
 
 
 def default_auto_memory(
-    text, device: torch.device, plan: TextEncoderPlan, reserve: int = 0
+    text,
+    device: torch.device,
+    plan: TextEncoderPlan,
+    reserve: int = 0,
+    extra_layers: int = 0,
 ) -> str:
     """The fastest placement whose footprint fits the device's free memory (minus
-    `reserve` bytes kept for the caller's own peak); the host has no limit."""
+    `reserve` bytes kept for the caller's own peak) once the load adds `extra_layers`
+    bytes to the decoder layers; the host has no limit."""
     if device.type == "cpu":
         return "resident"
-    sizes = text_sizes(text, plan.stream_resident)
+    sizes = text_sizes(text, plan.stream_resident, extra_layers)
     budget = int(device_budget(device))
     tokens = plan.max_tokens or 16384
     choice, _ = choose_text_memory(sizes, budget, reserve, tokens, tokens)
@@ -89,7 +96,7 @@ def default_auto_memory(
 
 
 def _stored(model_dir: Path, plan: TextEncoderPlan):
-    """The model of `model_dir` with the plan's pre-quantized file attached."""
+    """The checkpoint of the plan's pre-quantized file under `model_dir`'s config."""
     record = read_text_record(plan.stored)
     if record is None or record["precision"] != plan.precision:
         found = None if record is None else record["precision"]
@@ -97,7 +104,7 @@ def _stored(model_dir: Path, plan: TextEncoderPlan):
             f"text-encoder stored file {plan.stored} holds precision {found!r}, the "
             f"plan asks for {plan.precision!r}"
         )
-    return load_stored_text(model_dir, plan.stored, DTYPES[plan.dtype])
+    return stored_checkpoint(model_dir, Path(plan.stored), record)
 
 
 def text_source_of(path: str | Path) -> Path:
@@ -182,7 +189,8 @@ class QwenTextEncoder:
     embedding is encoded with the first pass. `stats` accumulates passes, prompts,
     tokens, seconds and host-to-device weight bytes. `progress = True` shows a bar per
     pass (layers or packs) at INFO level. `encoder_spec` is the compute spec a text
-    cache key records."""
+    cache key records. `placed` (placement, quantization report, plan) is a model
+    the streamed load already placed in compute dtype `dtype`."""
 
     encoder_id = ENCODER_ID
 
@@ -198,6 +206,8 @@ class QwenTextEncoder:
         source: SourceWeights | None = None,
         layout: str = "",
         auto_w4a8: Callable | None = None,
+        placed: tuple | None = None,
+        dtype: torch.dtype | None = None,
     ):
         plan = text_plan(plan)
         compute = torch.device("cpu") if plan.memory == "cpu" else torch.device(device)
@@ -212,12 +222,14 @@ class QwenTextEncoder:
         self.max_length = max_length
         self.device = compute
         self.output_device = torch.device(output_device or device)
-        self.dtype = text.norm.weight.dtype
-        choose = auto_memory or partial(default_auto_memory, plan=plan)
-        w4a8 = auto_w4a8 or partial(default_w4a8, plan=plan)
-        self.placement, self.quant, plan = apply_to_text_encoder(
-            text, plan, compute, self.dtype, choose, source, w4a8
-        )
+        self.dtype = dtype or text.norm.weight.dtype
+        if placed is None:
+            choose = auto_memory or partial(default_auto_memory, plan=plan)
+            w4a8 = auto_w4a8 or partial(default_w4a8, plan=plan)
+            placed = apply_to_text_encoder(
+                text, plan, compute, self.dtype, choose, source, w4a8
+            )
+        self.placement, self.quant, plan = placed
         self.plan = plan
         self.layout = layout
         self.encoder_spec = text_spec(plan, self.dtype, layout)
@@ -258,10 +270,11 @@ class QwenTextEncoder:
         """`path` is a pipeline root (text_encoder/ + tokenizer/), a model dir (its own
         tokenizer files, else a sibling tokenizer/), a ComfyUI text-encoder file (the
         packaged config and tokenizer) or a ComfyUI models folder (its default text
-        encoder file). Loaded on the host in the plan's dtype at the plan's precision
-        (`auto`: the stored one; a pre-quantized file's bases kept, or dequantized for
-        another precision; quantized from the checkpoint's stored values), then
-        placed; `auto_memory(text_model, device) -> memory mode` resolves
+        encoder file). Streamed from the memory-mapped checkpoint in the plan's dtype
+        at the plan's precision (`auto`: the stored one; a pre-quantized file's bases
+        kept, or dequantized for another precision; quantized from the checkpoint's
+        stored values) straight to each tensor's placed home (`load_placed_text`);
+        `auto_memory(text_model, device, extra_layers=...) -> memory mode` resolves
         `memory="auto"` (default: the fastest placement that fits the free memory),
         `auto_w4a8(text_model, device)` a W4A8 file's `w4a8="auto"`."""
         path = text_source_of(path)
@@ -273,36 +286,30 @@ class QwenTextEncoder:
         if is_comfy_text_file(path):
             tok = packaged_tokenizer()
             keep = plan.precision == stored and stored != "compute"
-            with hf_bars_off():
-                model = load_comfy_text(path, dtype, keep)
+            ck = comfy_checkpoint(path, keep)
             if stored != "compute" and not keep:
                 log.info(
                     f"text encoder precision {hl(plan.precision)}: the {hl(stored)} "
                     f"layers of {hl(path, 'path')} dequantized to {short(dtype)}"
                 )
-            source = comfy_text_source(path) if plan.precision != "compute" else None
         else:
             model_dir = _subdir(path, "text_encoder")
             tok = AutoTokenizer.from_pretrained(str(tokenizer_dir(model_dir)))
-            with hf_bars_off():
-                model = (
-                    _stored(model_dir, plan)
-                    if plan.stored
-                    else AutoModel.from_pretrained(str(model_dir), dtype=dtype)
-                )
-            quantized = plan.precision != "compute" and not plan.stored
-            source = text_source(model_dir) if quantized else None
+            ck = _stored(model_dir, plan) if plan.stored else hf_checkpoint(model_dir)
+        choose = auto_memory or partial(default_auto_memory, plan=plan)
+        w4a8 = auto_w4a8 or partial(default_w4a8, plan=plan)
+        with hf_bars_off():
+            text, placement, report, plan = load_placed_text(ck, plan, on, choose, w4a8)
         return cls(
-            model,
+            text,
             tok,
             device,
             plan,
             max_length,
             output_device,
-            auto_memory,
-            source=source,
             layout=layout,
-            auto_w4a8=auto_w4a8,
+            placed=(placement, report, plan),
+            dtype=dtype,
         )
 
     def format(self, prompt: str) -> str:
@@ -365,13 +372,15 @@ class QwenTextEncoder:
         return out
 
     def release(self) -> None:
-        """Free every weight (host and device); later encodes raise."""
+        """Free every weight (host and device, the cached pinned host blocks too);
+        later encodes raise."""
         self.placement.release()
         self.model = None
         self.forward = None
         self._run = _released
         if torch.accelerator.is_available():
             torch.accelerator.empty_cache()
+        release_host_cache()
 
     def before_first(self, fn: Callable[[], None]) -> None:
         """Run `fn()` once, right before the next pass (the kernel prewarm of a run

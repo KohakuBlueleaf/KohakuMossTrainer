@@ -1,18 +1,15 @@
 """Pre-quantized text-encoder files: the quantized linears of a frozen text model as
 `<n>.weight` (the q codes) plus `<n>.weight_scale` (and `<n>.bias`), every other tensor
 in the save dtype, the precision / recipe / layer list in the safetensors metadata
-(`kohakumoss_text_quant`). Loading builds the model from its config without reading the
-dense weights and attaches the stored bases. See
+(`kohakumoss_text_quant`). The streamed text-encoder load (`encoders.text.load`)
+attaches the stored bases. See
 docs/internals/text-encoder.md#pre-quantized-text-encoder."""
 
 import json
 from pathlib import Path
 
 import torch
-from safetensors import safe_open
 from torch import Tensor, nn
-from transformers import AutoConfig, AutoModel
-from transformers.initialization import no_init_weights
 
 from kohakumoss.quant.compute import COMPUTE, ComputeWeight
 from kohakumoss.quant.convert import QuantLinear
@@ -79,51 +76,8 @@ def _under(key: str, layers: set[str]) -> bool:
     return any(".".join(parts[:i]) in layers for i in range(1, len(parts)))
 
 
-def _base(record: dict, q: Tensor, scale: Tensor):
+def stored_base(record: dict, q: Tensor, scale: Tensor):
+    """The base of one stored layer's codes `q` and `scale` under the file's record."""
     if record["precision"] in COMPUTE:
         return ComputeWeight.from_stored(record["recipe"], q, scale)
     return QuantWeight(q, scale, record["precision"])
-
-
-@torch.no_grad()
-def load_stored_text(
-    model_dir: str | Path, path: str | Path, dtype: torch.dtype
-) -> nn.Module:
-    """The text-encoder model of `model_dir`'s config with the stored file's quantized
-    linears attached and its other tensors loaded (no dense weight is read)."""
-    record = read_text_record(path)
-    if record is None:
-        raise ValueError(f"{path} carries no {TEXT_QUANT_KEY} record")
-    config = AutoConfig.from_pretrained(str(model_dir))
-    with no_init_weights():
-        model = AutoModel.from_config(config, dtype=dtype)
-    text = text_of(model)
-    with safe_open(str(path), framework="pt") as f:
-        for p in record["layers"]:
-            parent_path, _, name = p.rpartition(".")
-            parent = text.get_submodule(parent_path) if parent_path else text
-            dense = getattr(parent, name)
-            q = f.get_tensor(f"{p}.weight")
-            base = _base(record, q, f.get_tensor(p + SCALE))
-            bias = f.get_tensor(f"{p}.bias") if f"{p}.bias" in f.keys() else None
-            setattr(
-                parent,
-                name,
-                QuantLinear.from_base(
-                    dense.in_features, dense.out_features, base, bias, dtype
-                ),
-            )
-        layers = set(record["layers"])
-        rest = {
-            k: f.get_tensor(k)
-            for k in f.keys()
-            if k.rpartition(".")[0] not in layers and not k.endswith(SCALE)
-        }
-    missing, unexpected = text.load_state_dict(rest, strict=False)
-    left = sorted(k for k in missing if not _under(k, layers))
-    if left or unexpected:
-        raise ValueError(
-            f"{path} does not match {model_dir}: missing {left[:4]}, "
-            f"unexpected {list(unexpected)[:4]}"
-        )
-    return model

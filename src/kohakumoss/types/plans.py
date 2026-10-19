@@ -75,7 +75,11 @@ class TextEncoderPlan:
     encoded per pass by the online text cache, held on `ahead_device` host | device.
     `kernels` maps a text op to a backend. `stored` is a pre-quantized text-encoder
     file (scripts/export/text_quant.py) of the same precision: its quantized linears
-    are attached instead of quantizing at load. See docs/internals/text-encoder.md."""
+    are attached instead of quantizing at load. `host`: the host form of the weights
+    offload / ring keep on the host: copy (copies in the compute dtype, pinned when
+    `pinned`) | file (the checkpoint's own file pages, cast by the copy to the device)
+    | auto (copy when it fits the host's free memory, else file). See
+    docs/internals/text-encoder.md."""
 
     memory: str = "resident"
     free_after_use: bool = False
@@ -87,6 +91,7 @@ class TextEncoderPlan:
     dtype: str = "auto"
     stream_resident: int = 2
     pinned: bool = True
+    host: str = "auto"
     batch: int = 32
     max_tokens: int = 16384
     layout: str = "packed"
