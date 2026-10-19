@@ -407,6 +407,16 @@ def validation_data_config(k: dict):
     )
 
 
+def final_checkpoint(k: dict) -> bool:
+    """Whether the run ends with a resume checkpoint: FINAL_CHECKPOINT, where "auto" is
+    on when periodic checkpoints are (SAVE_EVERY or SAVE_MINUTES > 0)."""
+    match k.get("FINAL_CHECKPOINT", "auto"):
+        case "auto":
+            return k["SAVE_EVERY"] > 0 or k["SAVE_MINUTES"] > 0
+        case choice:
+            return bool(choice)
+
+
 def build_checkpoints(
     k, output_dir, ema, is_main, writer=None, rank: int = 0, devices=()
 ) -> CheckpointManager:
@@ -416,6 +426,7 @@ def build_checkpoints(
     return CheckpointManager(
         output_dir,
         k["KEEP_LAST"],
+        final=final_checkpoint(k),
         snapshot_ema=ema_is_power(ema),
         is_main=is_main,
         rank=rank,

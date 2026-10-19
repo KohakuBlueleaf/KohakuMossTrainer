@@ -47,6 +47,7 @@ class CheckpointManager:
         self,
         output_dir: str | Path,
         keep_last: int,
+        final: bool = True,
         snapshot_ema: bool = False,
         is_main: bool = True,
         before_save=nothing,
@@ -64,10 +65,20 @@ class CheckpointManager:
         self.last_saved = -1
         self._save = CheckpointManager._write if is_main else nothing
         self._clear = self._clear_partial if is_main else nothing
+        self._finish = CheckpointManager._final if final else nothing
 
     def saved(self, step: int) -> bool:
         """Whether this manager already wrote the checkpoint of `step`."""
         return step == self.last_saved
+
+    def finish(self, step: int, parts: dict) -> None:
+        """Every rank, at the run's end: the final checkpoint when `final` is on and
+        `step` is not saved yet; nothing otherwise."""
+        self._finish(self, step, parts)
+
+    def _final(self, step: int, parts: dict) -> None:
+        if not self.saved(step):
+            self.save(step, parts)
 
     def save(self, step: int, parts: dict) -> Path | None:
         """Every rank: its RNG file (and its optimiser shard, `parts["optim_rank"]`);

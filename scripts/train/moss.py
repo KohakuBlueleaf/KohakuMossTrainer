@@ -226,6 +226,7 @@ SAVE_MINUTES = (
     0  # also a checkpoint every N minutes (checked every LOG_EVERY steps); 0 = off
 )
 KEEP_LAST = 3
+FINAL_CHECKPOINT = "auto"  # resume checkpoint at the run's end: "auto" = when SAVE_EVERY or SAVE_MINUTES is on | True | False (exports are always written)
 RESUME = ""  # checkpoint dir | "latest"
 SAVE_FORMAT = "comfy"  # exports: "comfy" (ComfyUI LyCORIS file; full FT: one ComfyUI DiT file) | "hf" (LyCORIS file with diffusers keys; full FT: the diffusers folder) | "both" | "none"
 SAVE_MERGED = False  # adapters: also the merged DiT in SAVE_FORMAT (ComfyUI single file / diffusers folder)

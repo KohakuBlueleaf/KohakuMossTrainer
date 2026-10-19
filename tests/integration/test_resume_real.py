@@ -295,8 +295,9 @@ def test_swap_cpu_adamw_full_resume(
 ):
     """Full FT, swap-streamed blocks, host AdamW: the resumed run's first step reads
     the restored masters (the streaming copies refreshed), so its loss is the
-    uninterrupted run's. Each run's final checkpoint (every master and moment of the
-    backbone) is removed once written; only the step-2 one stays on disk."""
+    uninterrupted run's. The straight run's final checkpoint (every master and moment of
+    the backbone) is removed once written and the resumed runs write none
+    (SAVE_EVERY=0); only the step-2 one stays on disk."""
     steps = SAVED + 1
 
     def knobs(out: Path, **kw) -> dict:
@@ -313,11 +314,10 @@ def test_swap_cpu_adamw_full_resume(
     shutil.rmtree(_ckpt(straight, steps))
     resume = str(_ckpt(straight, SAVED))
     assert run(knobs(resumed, RESUME=resume, SAVE_EVERY=0)).step == steps
-    shutil.rmtree(_ckpt(resumed, steps))
+    assert not _ckpt(resumed, steps).exists()
     check_first_step(_rows(straight), _rows(resumed), SAVED, steps)
     monkeypatch.setattr(MemoryEngines, "after_restore", _no_refresh)
     run(knobs(stale, RESUME=resume, SAVE_EVERY=0))
-    shutil.rmtree(_ckpt(stale, steps))
     must_fail(
         lambda: check_first_step(_rows(straight), _rows(stale), SAVED, steps),
         "resume without refreshing the streaming copies from the restored masters",

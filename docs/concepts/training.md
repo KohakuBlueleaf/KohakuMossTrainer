@@ -379,6 +379,11 @@ RNG, the CUDA state of that rank's devices, the σ and noise generators).
   saved it.
 - **`SAVE_MINUTES`** is checked every `LOG_EVERY` steps, and every rank takes rank 0's
   decision.
+- **`FINAL_CHECKPOINT`** sets the resume checkpoint at the run's end: `"auto"` (the
+  default) writes it only when `SAVE_EVERY` or `SAVE_MINUTES` is on, `True` / `False`
+  force it. The exports (`SAVE_FORMAT`) are written either way; a full finetune's resume
+  checkpoint holds the fp32 masters and the optimiser state (about 15 B per trainable
+  parameter).
 
 ### Callbacks
 

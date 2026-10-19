@@ -159,8 +159,7 @@ class LightningDriver:
             use_distributed_sampler=False,
         )
         trainer.fit(module, train_dataloaders=_Groups(loader, self.grad_acc))
-        if not self.checkpoints.saved(state.step):
-            self.checkpoints.save(state.step, self.parts(state))
+        self.checkpoints.finish(state.step, self.parts(state))
         return state
 
 

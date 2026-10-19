@@ -52,6 +52,9 @@ def io_problems(k: dict) -> list[str]:
         p.append("VALIDATE_EVERY > 0 needs VALIDATION['datasets']")
     if k["SAVE_EVERY"] < 0 or k["KEEP_LAST"] < 0:
         p.append("SAVE_EVERY and KEEP_LAST must be >= 0")
+    final = k.get("FINAL_CHECKPOINT", "auto")
+    if final not in ("auto", True, False):
+        p.append(f"FINAL_CHECKPOINT={final!r} must be 'auto', True or False")
     resume = k["RESUME"]
     if resume not in ("", "latest") and not Path(resume).exists():
         p.append(f"RESUME={resume!r} does not exist")
