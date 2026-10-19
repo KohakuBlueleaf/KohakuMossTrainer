@@ -61,26 +61,46 @@ holds one sample (4608 tokens) leaves the most memory for uncheckpointed blocks.
 | `partial:0.25` | 6287 | 5761 | 0.638 | 1.55 | 206 | 26.3 / 27.8 | 28.6 |
 | `partial:0.3`, `BASE_PRECISION="fp8_compute"` | out of memory | | | | | | |
 | `partial:0.4`, `fp8_compute`, `FP8_DGRAD="16bit"` | 5713 | 5103 | 0.671 | 1.38 | 182 | 24.3 / 25.7 | 25.7 |
+| `partial:0.15`, `OPTIM_STATE="stream"`, `FUSED_STEP=True` | 5995 | 5764 | 0.654 | 1.55 | 206 | 27.7 / 29.2 | 30.0 |
+| `partial:0.15`, `OPTIM_STATE="cpu"` | 5392 | 5246 | 0.719 | 1.41 | 188 | 27.6 / 29.2 | 30.0 |
+| `partial:0.1`, `OPTIM_STATE="cpu"` | 5594 | 5393 | 0.713 | 1.45 | 193 | 28.6 / 30.1 | 31.0 |
 
 - `partial:0.2` is the fastest setting whose full-batch estimate keeps 1.7 GiB free;
   `partial:0.25` keeps 2.7 GiB for a card that also drives a display.
 - The fp8 base needs more memory than the bf16 base at the same checkpoint share
   (`partial:0.3` runs out of memory), and its fp8 GEMMs do not make up for the extra
   recompute.
+- Host AdamW states free 0.6 GiB (the LoRA states are 0.9 GB), less than one 5 % step of
+  the checkpoint share, and add 0.04-0.10 s to each step: every offload row is slower
+  than `partial:0.2` on the GPU.
 
 ## LoRA, four GPUs
 
-| setup (per rank: `MAX_TOKENS=4608`, manual profile) | tokens/s | window | s/step | samples/s | TF/s | peak | full batch | scaling |
+`MAX_TOKENS` is per GPU per micro-batch. tokens/s is the whole job's; "per GPU" is it
+over four. Scaling is against 4x the one-GPU `partial:0.2` row (6385).
+
+| setup (manual profile) | MAX_TOKENS | tokens/s | per GPU | s/step | TF/s | peak | full batch | scaling |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| **DDP, `partial:0.2`** (recipe) | **23509** | 22827 | 0.646 | 1.47 | 205 | 27.3 / 29.2 | 30.0 | 0.92 |
-| DDP, `partial:0.25` | 23435 | 20239 | 0.655 | 1.31 | 181 | 26.4 / 28.3 | 29.0 | 0.93 |
-| stock torch DDP (`DDP_BACKEND="torch"`), `partial:0.25` | 23790 | 22361 | 0.656 | 1.44 | 200 | 26.4 / 28.4 | 29.0 | 0.95 |
-| pipeline `zbv`, 16 micro-batches, `CHECKPOINT="none"` | out of memory | | | | | | | |
+| **DDP, `partial:0.2`** (recipe) | 4608 | **23509** | 5877 | 0.646 | 205 | 27.3 / 29.2 | 30.0 | 0.92 |
+| DDP, `partial:0.25` | 4608 | 23435 | 5859 | 0.655 | 181 | 26.4 / 28.3 | 29.0 | 0.92 |
+| stock torch DDP (`DDP_BACKEND="torch"`), `partial:0.25` | 4608 | 23790 | 5948 | 0.656 | 200 | 26.4 / 28.4 | 29.0 | 0.93 |
+| pipeline `1f1b`, 32 micro-batches, `CHECKPOINT="none"` | 4608 | 19500 | 4875 | 6.49 | 111-122 | 25.7 / 27.7 | | 0.76 |
+| pipeline `interleaved-1f1b`, 32 micro-batches, `CHECKPOINT="none"` | 4608 | out of memory | | | | | | |
+| pipeline `zbv`, 16 micro-batches, `CHECKPOINT="none"` | 4608 | out of memory | | | | | | |
+| FSDP2 (parameters, gradients and states sharded), `CHECKPOINT="none"` | 4608 | 5627 | 1407 | 2.76 | 34 | 23.7 / 26.5 | 27.0 | 0.22 |
+| FSDP2, `partial:0.4` | 9216 | 11426 | 2857 | 2.81 | 102 | 28.4 / 31.4 | 32.0 | 0.45 |
 
 - The gradient all-reduce (284 MB per step) waits 11-12 ms per step (median).
 - The median DDP step is 3 % longer than the one-GPU step; the rest of the scaling loss is
   the one-time recompiles of new batch shapes, during which the other ranks wait. The
   three DDP rows differ by less than this step-to-step spread.
+- FSDP2 shards the frozen base, which frees 7 GiB per GPU and lets the blocks run
+  without recompute, but it all-gathers each block's 16-bit weights in forward and again
+  in backward through host memory (no peer-to-peer). Its micro-batch takes 2.8 s at 4608
+  and at 9216 tokens alike, so its step time is the gather.
+- The pipeline needs no checkpointing (stage 0 peaks at 25.7 GiB, stage 3 at 9.7 GiB)
+  but pads every micro-batch to the static 4608-token shape (about 4000 real tokens) and
+  idles in the 3-of-35 bubble; its global batch is 32 samples per step against DDP's 4.
 
 ## Full finetune, one GPU
 
@@ -114,9 +134,13 @@ backward. Rows marked "lanes" ran next to three other full-finetune jobs on the 
 | **DDP, `ckpt-ring8-actoff-optstream`, 36864 per rank** (recipe) | **15271** | 9.25 | 3.92 | 184 | 18.6 / 24.0 | 0.93 |
 | pipeline `1f1b`, `ckpt-resident`, 16 x 9216 | 10.3k | 12.54 | 2.70 | 123 | 28.3 / 30.4 | |
 | FSDP2, `ckpt-resident`, 18432 per rank | 8306 | 7.83 | 2.23 | 99 | 27.6 / 31.4 | |
+| FSDP2, manual `partial:0.88`, 9216 per rank | 4180 | 7.71 | 1.12 | 50 | 26.1 / 31.4 | |
 | pipeline `interleaved-1f1b`, `ckpt-resident`, 32 x 4608 | out of memory in step 2 | | | | | |
 
 - DDP waits 6 ms per step for its reduction (median); the four ranks used 71 GiB of host
   RAM in all.
-- The pipeline and FSDP2 rows trained every step and then ran out of memory in the
-  end-of-run checkpoint, which gathers the full-finetune state on the GPU.
+- FSDP2 gathers the fp32 masters for every micro-batch: its step takes 7.7-7.8 s at 9216
+  and 18432 tokens per rank alike, so a lower checkpoint share buys nothing, and 18432
+  tokens already fill the card.
+- A checkpoint of an FSDP2 or pipeline full finetune gathers the state one tensor at a
+  time through host memory.
