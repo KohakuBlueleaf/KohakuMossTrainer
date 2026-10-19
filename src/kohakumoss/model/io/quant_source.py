@@ -41,14 +41,24 @@ def fold_since_load(model: MossBackbone, file_fold: dict | None) -> dict[str, Te
     return out
 
 
+CODES = (torch.int8, torch.uint8, torch.float8_e4m3fn, torch.float8_e5m2)
+
+
 def backbone_source(
     model: MossBackbone,
 ) -> tuple[SourceWeights | None, dict[str, Tensor]]:
-    """(the checkpoint `model` was loaded from, by model weight name; the fold rows
-    applied since), or (None, {}) for a backbone not loaded from a file."""
+    """(the checkpoint `model` was loaded from, by model weight name, its 16-bit and
+    fp32 weights only (stored codes are not values); the fold rows applied since), or
+    (None, {}) for a backbone not loaded from a file."""
     if model.weight_path is None:
         return None, {}
     path = Path(model.weight_path)
     view = ModelKeyView(CheckpointSource(path))
-    source = SourceWeights(view, lambda name: name if name in view.map else None)
+
+    def resolve(name: str) -> str | None:
+        if name not in view.map or view.dtype(name) in CODES:
+            return None
+        return name
+
+    source = SourceWeights(view, resolve)
     return source, fold_since_load(model, file_fold_record(read_fp16_fix(path)))

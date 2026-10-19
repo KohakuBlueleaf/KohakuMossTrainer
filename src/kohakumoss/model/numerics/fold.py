@@ -128,6 +128,21 @@ def unscaled(t: Tensor, s: Tensor | float) -> Tensor:
     return _multiply(t, s, inverse=True)
 
 
+def _dense_targets(model: MossBackbone, names) -> None:
+    """ValueError when a fold would scale a weight held as stored (quantized /
+    streamed) base storage, whose dense parameter is a placeholder."""
+    stored = []
+    for name in names:
+        path, _, _ = name.rpartition(".")
+        if getattr(model.get_submodule(path), "base", None) is not None:
+            stored.append(path)
+    if stored:
+        raise ValueError(
+            f"the fold scales stored bases {stored[:3]} ({len(stored)}): run the "
+            "16-bit weights (BASE_PRECISION='compute'), or fold without pre-gate scales"
+        )
+
+
 def _record(model, cs, via, pregate, eps_mode, base_eps) -> None:
     model.fold_scales = cs
     model.fold_via = via
@@ -150,7 +165,9 @@ def fold(
     cs = _scales(model, c)
     via = via or ("gate" if len(set(cs)) == 1 else "proj")
     params = dict(model.named_parameters())
-    for name, s in _row_scales(model, cs, via, pregate).items():
+    rows = _row_scales(model, cs, via, pregate)
+    _dense_targets(model, rows)
+    for name, s in rows.items():
         params[name].copy_(_multiply(params[name], s, inverse=False))
     mult = norm_eps_scales(model, cs, per_block=via == "proj")
     modules = dict(model.named_modules())
@@ -184,7 +201,9 @@ def unfold(model: MossBackbone) -> None:
     if model.fold_scales is None:
         return
     params = dict(model.named_parameters())
-    for name, s in fold_rows(model).items():
+    rows = fold_rows(model)
+    _dense_targets(model, rows)
+    for name, s in rows.items():
         params[name].copy_(unscaled(params[name], s))
     modules = dict(model.named_modules())
     for name, eps in model._fold_eps.items():

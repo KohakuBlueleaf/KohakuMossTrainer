@@ -8,7 +8,12 @@ import torch
 from safetensors import safe_open
 from torch import Tensor
 
-from kohakumoss.model.io.keymap import FUSED_QKV, strip_prefix
+from kohakumoss.model.io.keymap import (
+    FUSED_QKV_PARTS,
+    RUNTIME_HINTS,
+    UNSPLIT,
+    strip_prefix,
+)
 from kohakumoss_kernels.dtypes import SAFETENSORS as SAFETENSORS_DTYPES
 
 INDEX = "diffusion_pytorch_model.safetensors.index.json"
@@ -84,22 +89,30 @@ class CheckpointSource:
 
 class ModelKeyView:
     """Model-key view of a source: format prefix stripped, fused `proj.qkv` split into
-    q / k / v (the fused tensor is read once per layer)."""
+    q / k / v (its weight and row scales by rows, its ComfyUI quant record shared; the
+    fused tensor is read once per layer), ComfyUI runtime hints (`comfy_attention.*`,
+    counted in `hints`) left out."""
 
     def __init__(self, source: TensorSource):
         self.source = source
         raw = source.keys()
         self.prefix = strip_prefix(raw)
         self.n_source = len(raw)
+        self.hints = 0
         self.map: dict[str, tuple[str, int | None]] = {}
         for key in raw:
             name = key[len(self.prefix) :]
-            m = FUSED_QKV.match(name)
+            if RUNTIME_HINTS.match(name):
+                self.hints += 1
+                continue
+            m = FUSED_QKV_PARTS.match(name)
             if m is None:
                 self.map[name] = (key, None)
                 continue
+            tail = m.group(2)
             for i, part in enumerate("qkv"):
-                self.map[f"{m.group(1)}.{part}.weight"] = (key, i)
+                index = None if tail in UNSPLIT else i
+                self.map[f"{m.group(1)}.{part}.{tail}"] = (key, index)
         self._fused: tuple[str, Tensor] | None = None
 
     def keys(self) -> list[str]:

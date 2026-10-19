@@ -9,6 +9,9 @@ PREFIXES = ("model.diffusion_model.", "diffusion_model.", "transformer.")
 DERIVED = ("rope.bands",)
 FP16_FIX_KEY = "kohakumoss_fp16_fix"
 FUSED_QKV = re.compile(r"^(layers\.\d+\.proj)\.qkv\.weight$")
+FUSED_QKV_PARTS = re.compile(r"^(layers\.\d+\.proj)\.qkv\.(weight|weight_scale|comfy_quant)$")  # fmt: skip
+UNSPLIT = ("comfy_quant",)
+RUNTIME_HINTS = re.compile(r"^layers\.\d+\.comfy_attention\.")
 
 
 def strip_prefix(keys: list[str]) -> str:

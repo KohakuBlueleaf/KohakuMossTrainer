@@ -8,7 +8,7 @@ from torch import Tensor, nn
 from torch.autograd import Function
 
 from kohakumoss.quant.compute import PARTS, ComputeWeight, compute_linear
-from kohakumoss.quant.weights import dequantize
+from kohakumoss.quant.weights import dequantize, unrotated
 from kohakumoss_kernels import registry
 from kohakumoss_kernels.fp8 import dequantize as fp8_dequantize
 from kohakumoss_kernels.fp8.op import dgrad as fp8_dgrad
@@ -121,18 +121,37 @@ class StreamedParamWeight(StreamedWeight):
 
 
 class StreamedQuantWeight(StreamedWeight):
-    """Streamed int8/fp8 base: the ring carries `q` and `scale`, dequantized on use."""
+    """Streamed int8/fp8 base: the ring carries `q` and `scale`, dequantized on use; a
+    ConvRot base (`rotation` > 0) is rotated back in fp32 by the device's
+    `group_hadamard` before the one rounding to the compute dtype."""
+
+    def __init__(self, weight_stream, block, key, shape, rotation: int = 0):
+        super().__init__(weight_stream, block, key, shape)
+        self.rotation = int(rotation)
+        self._weight_now = StreamedQuantWeight._plain
+        if self.rotation:
+            device = weight_stream.device
+            self.rotate = registry.resolve("group_hadamard", device, torch.float32)
+            self._weight_now = StreamedQuantWeight._rotated
 
     def weight_now(self, dtype: torch.dtype) -> Tensor:
+        return self._weight_now(self, dtype)
+
+    def _parts(self) -> tuple[Tensor, Tensor]:
         q = self.weight_stream.slot(self.block, self.key + ":q")
-        scale = self.weight_stream.slot(self.block, self.key + ":scale")
-        return dequantize(q, scale, dtype)
+        return q, self.weight_stream.slot(self.block, self.key + ":scale")
+
+    def _plain(self, dtype: torch.dtype) -> Tensor:
+        return dequantize(*self._parts(), dtype)
+
+    def _rotated(self, dtype: torch.dtype) -> Tensor:
+        w = dequantize(*self._parts(), torch.float32)
+        return self.rotate(w, self.rotation).to(dtype)
 
     def materialize(self) -> Tensor:
         host = self.weight_stream.host[self.block]
-        return dequantize(
-            host[self.key + ":q"], host[self.key + ":scale"], torch.float32
-        )
+        w = dequantize(host[self.key + ":q"], host[self.key + ":scale"], torch.float32)
+        return unrotated(w, self.rotation, torch.float32)
 
 
 class StreamedComputeWeight(StreamedWeight):

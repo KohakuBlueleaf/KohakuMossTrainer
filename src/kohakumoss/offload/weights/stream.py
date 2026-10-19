@@ -31,6 +31,7 @@ from kohakumoss.offload.weights.streaming import (
     read_timing,
 )
 from kohakumoss.quant.compute import ComputeWeight
+from kohakumoss.quant.w4a8 import W4A8Weight
 from kohakumoss.quant.weights import QuantWeight
 from kohakumoss_common.calls import nothing
 
@@ -186,13 +187,18 @@ class WeightStream:
     def _take(self, index: int, block: nn.Module, dtype) -> dict[str, Tensor]:
         out = {}
         for name, lin in self._linears(block):
+            if isinstance(lin.base, W4A8Weight):
+                lin.set_base(lin.base.to_int8())
             if isinstance(lin.base, QuantWeight):
                 if self.trainable:
                     raise ValueError("a quantized base cannot be streamed trainably")
                 for part, t in (("q", lin.base.q), ("scale", lin.base.scale)):
                     out[f"{name}:{part}"] = self._host(t)
                     self.layout.setdefault(f"{name}:{part}", (t.shape, t.dtype))
-                lin.set_base(StreamedQuantWeight(self, index, name, lin.base.shape))
+                base = StreamedQuantWeight(
+                    self, index, name, lin.base.shape, lin.base.rotation
+                )
+                lin.set_base(base)
                 continue
             if isinstance(lin.base, ComputeWeight):
                 if self.trainable:

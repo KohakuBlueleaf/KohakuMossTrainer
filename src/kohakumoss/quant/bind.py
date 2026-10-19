@@ -4,9 +4,11 @@ import torch
 from torch import nn
 
 from kohakumoss.quant.compute import ComputeWeight
+from kohakumoss.quant.embedding import QuantEmbedding
+from kohakumoss.quant.w4a8 import W4A8Weight
 from kohakumoss.quant.weights import QuantWeight
 
-BOUND = (QuantWeight, ComputeWeight)
+BOUND = (QuantWeight, ComputeWeight, W4A8Weight, QuantEmbedding)
 
 
 def rebind_quant(module: nn.Module, device, dtype, autograd: bool = True) -> None:

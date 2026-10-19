@@ -11,7 +11,7 @@ from torch import Tensor, nn
 from kohakumoss.logging.log import get_logger, hl
 from kohakumoss.model.backbone import MossBackbone
 from kohakumoss.model.build import DEFAULT_KEEP_FP32, build_backbone
-from kohakumoss.model.io.keymap import DERIVED, FP16_FIX_KEY
+from kohakumoss.model.io.keymap import DERIVED, FP16_FIX_KEY, FUSED_QKV, strip_prefix
 from kohakumoss.model.io.source import (
     INDEX,
     CheckpointSource,
@@ -22,7 +22,12 @@ from kohakumoss.model.io.source import (
 )
 from kohakumoss.model.numerics.fold import adopt_fold
 from kohakumoss.model.opset import OpSet
-from kohakumoss.quant.comfy_format import refuse_comfy_quant
+from kohakumoss.quant.comfy_format import (
+    ComfyLayer,
+    attach_layers,
+    comfy_layers,
+    stored_format,
+)
 from kohakumoss.quant.stored import attach_stored, read_record, stored_keys
 from kohakumoss.types.arch import MossArchConfig
 from kohakumoss_common.io import read_safetensors_metadata
@@ -35,11 +40,14 @@ __all__ = [
     "INDEX",
     "LoadReport",
     "base_keys",
+    "file_layers",
     "infer_config",
     "load_backbone",
     "load_state_into",
     "read_config",
     "read_fp16_fix",
+    "stored_precision",
+    "stores_fused_qkv",
 ]
 
 
@@ -181,6 +189,39 @@ def load_state_into(
     return report
 
 
+def file_layers(view: ModelKeyView, record: dict | None) -> dict[str, ComfyLayer]:
+    """The ComfyUI quantized layers of a checkpoint view (none in a file whose layers
+    the KohakuMoss fp8 `record` lists)."""
+    if record:
+        return {}
+    return comfy_layers(view.keys(), view.get, view.dtype)
+
+
+def stored_precision(path: str | Path) -> str:
+    """The base precision a DiT checkpoint stores, from its headers and quant records:
+    `compute` (16-bit), the fp8-compute precision of a KohakuMoss fp8 file, or the
+    ComfyUI format (`int8`, `fp8`, `w4a8`; `mixed` for several)."""
+    record = read_record(path)
+    if record:
+        return "mxfp8" if record["recipe"] == "mx" else "fp8_compute"
+    view = ModelKeyView(CheckpointSource(path))
+    return stored_format(file_layers(view, None)) or "compute"
+
+
+def stores_fused_qkv(path: str | Path) -> bool:
+    """The DiT checkpoint stores joint-block q / k / v fused as `layers.N.proj.qkv`
+    (the ComfyUI layout), from its headers."""
+    source = CheckpointSource(path)
+    prefix = strip_prefix(source.keys())
+    return any(FUSED_QKV.match(k[len(prefix) :]) for k in source.keys())
+
+
+def _layer_keys(layers: dict[str, ComfyLayer]) -> tuple[set[str], set[str]]:
+    weights = {f"{p}.weight" for p in layers}
+    rest = {k for layer in layers.values() for k in layer.keys} - weights
+    return weights, rest
+
+
 def load_backbone(
     path: str | Path,
     device: torch.device | str = "cuda",
@@ -194,17 +235,20 @@ def load_backbone(
     """Build on meta, then read, cast and move one tensor at a time (host and device
     peaks are one tensor plus the model), bind ops. An fp16-fix file is recorded as
     folded (savers and adapter exports undo it); `fp16_fix_eps="exact"` uses eps * c^2.
-    A pre-quantized fp8 file attaches its stored bases (no 16-bit copy is built); a
-    ComfyUI quantized file (`comfy_quant` records) is refused.
+    A pre-quantized file (KohakuMoss fp8, ComfyUI int8 / fp8 / W4A8, ConvRot included)
+    attaches its stored bases (no 16-bit copy is built); ComfyUI runtime hints are
+    skipped.
     """
     start = time.perf_counter()
     log.info("loading transformer", path=path, dtype=short(dtype), device=device)
     view = ModelKeyView(CheckpointSource(path))
-    refuse_comfy_quant(view.keys(), view.get, str(path), formats=())
+    record = read_record(path)
+    layers = file_layers(view, record)
     cfg = cfg or infer_config(view, read_config(path))
     model = build_backbone(cfg, device="meta", dtype=dtype, keep_fp32=keep_fp32)
-    record = read_record(path)
     stored, extra = stored_keys(record) if record else (set(), set())
+    weights, rest = _layer_keys(layers)
+    stored, extra = stored | weights, extra | rest
     report = load_state_into(
         model, view, str(path), strict, device, frozenset(stored), frozenset(extra)
     )
@@ -214,6 +258,15 @@ def load_backbone(
             f"{hl(len(stored))} fp8 bases ({hl(record['recipe'])}) from "
             f"{hl(path, 'path')}"
         )
+    if layers:
+        attach_layers(model, layers, view.get, device, dtype)
+        kinds = sorted({layer.layout for layer in layers.values()})
+        log.info(
+            f"{hl(len(layers))} stored bases ({hl(', '.join(kinds))}) from "
+            f"{hl(path, 'path')}"
+        )
+    if view.hints:
+        log.info(f"{hl(view.hints)} ComfyUI runtime hint tensors not used")
     model.rope.to(device)
     model.weight_path = str(path)
     fix = read_fp16_fix(path)
