@@ -14,9 +14,10 @@ Each example writes a complete config for its script from a few options, checks 
 
 Paths:
 
-- weights: `-Weights` / `--weights`, else `KOHAKUMOSS_WEIGHTS` (a pipeline folder with
-  `transformer/`, `text_encoder/`, `vae/`, e.g. `models/MOSS-Image-Base` from the
-  README's download);
+- weights: `-Weights` / `--weights`, else `KOHAKUMOSS_WEIGHTS`: a ComfyUI models folder
+  (`diffusion_models/`, `text_encoders/`, `vae/`, e.g. `ComfyUI/models` from the
+  README's download; the int8 files are the defaults), or an HF pipeline folder with
+  `transformer/`, `text_encoder/`, `vae/` (`models/MOSS-Image-Base`);
 - dataset: `-Dataset` / `--dataset`, else `KOHAKUMOSS_DATASET` (kohya-style folders, or
   `-Source folder` for image + `.txt` pairs in the train example);
 - output: `-Out` / `--out`, default `runs/examples/<script>` under the current directory;
@@ -37,15 +38,15 @@ Each `.ps1` parameter has its meaning in the comment above it; `--help` on a `.s
 the flags with their defaults.
 
 ```powershell
-.\scripts\examples\train.ps1 -Weights models\MOSS-Image-Base -Dataset D:\data\my_set -Steps 30 -SampleEvery 10
-.\scripts\examples\sample.ps1 -Weights models\MOSS-Image-Base -Adapter runs\examples\train\<run>\export\<run>-lycoris.safetensors
-.\scripts\examples\grid.ps1 -Weights models\MOSS-Image-Base -Run <run> -Checkpoints -Prompt "a lighthouse at dusk"
+.\scripts\examples\train.ps1 -Weights ComfyUI\models -Dataset D:\data\my_set -Steps 30 -SampleEvery 10
+.\scripts\examples\sample.ps1 -Weights ComfyUI\models -Adapter runs\examples\train\<run>\export\<run>-lycoris.safetensors
+.\scripts\examples\grid.ps1 -Weights ComfyUI\models -Run <run> -Checkpoints -Prompt "a lighthouse at dusk"
 ```
 
 ```bash
-bash scripts/examples/train.sh --weights models/MOSS-Image-Base --dataset /data/my_set --steps 30 --sample-every 10
-bash scripts/examples/sample.sh --weights models/MOSS-Image-Base --adapter runs/examples/train/<run>/export/<run>-lycoris.safetensors
-bash scripts/examples/grid.sh --weights models/MOSS-Image-Base --run <run> --checkpoints --prompt "a lighthouse at dusk"
+bash scripts/examples/train.sh --weights ComfyUI/models --dataset /data/my_set --steps 30 --sample-every 10
+bash scripts/examples/sample.sh --weights ComfyUI/models --adapter runs/examples/train/<run>/export/<run>-lycoris.safetensors
+bash scripts/examples/grid.sh --weights ComfyUI/models --run <run> --checkpoints --prompt "a lighthouse at dusk"
 ```
 
 Memory: every example defaults to `-Memory auto`, the fastest memory profile whose

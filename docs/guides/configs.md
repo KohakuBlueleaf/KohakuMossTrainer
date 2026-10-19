@@ -17,8 +17,8 @@ The quickest start is a starter config written for your GPU and dataset
 ## Starter configs from flags
 
 ```bash
-kohakumoss-config new train --weights path/to/MOSS-Image-Base --data path/to/dataset
-kohakumoss-config new sample --weights path/to/MOSS-Image-Base --adapter runs/moss/my-lora/export/my-lora-comfy.safetensors
+kohakumoss-config new train --weights ComfyUI/models --data path/to/dataset
+kohakumoss-config new sample --weights ComfyUI/models --adapter runs/moss/my-lora/export/my-lora-comfy.safetensors
 kohakumoss-config list
 kohakumoss-config check configs/user/my-lora.py
 ```
@@ -84,7 +84,8 @@ composition order:
 
 | group | layers | sets |
 | --- | --- | --- |
-| `_base` | `base_lora` (`base_full` = base_lora + algo_full) | weights / data placeholders, objective, schedule, caches, sampling |
+| `_base` | `base_lora` (`base_full` = base_lora + algo_full) | weights (a ComfyUI models folder) / data placeholders, objective, schedule, caches, sampling, exports (SAVE_FORMAT `both`) |
+| `weights` | `comfy`, `hf` | WEIGHTS and the component files: every ComfyUI file named, or the HF pipeline folder ([weights.md](weights.md)) |
 | `algo` | `lora`, `loha`, `lokr`, `oft`, `dora`, `full` | ALGO, DIM, ALPHA, ALGO_KWARGS, DROPOUT, LR; `full`: optimiser, EMA, exports, `ckpt-resident` |
 | `data` | `kohya`, `folder`, `folder_nl`, `jsonl`, `parquet`, `webdataset`, `moss_shard` | the DATASETS entry template with every source argument, CAPTION, ASPECT_RANGE |
 | `vram` | `6g`, `8g`, `12g`, `16g`, `24g`, `auto`, `24g_full` | MEMORY_PROFILE, MAX_TOKENS, TEXT_ENCODE, VAE_ENCODE; `6g`: the offline caches; `6g` / `8g`: SAVE_MINUTES 30; `24g_full`: AdamW, EMA off |
@@ -219,7 +220,8 @@ The sample knobs carry the train script's names and values (`PRECISION`,
   that fits next to the DiT ([sampling-memory.md](../internals/sampling-memory.md)).
 
 The base weights are 9.47 GiB (transformer, bf16), 15.63 GiB (text encoder, bf16) and
-0.23 GiB (VAE).
+0.23 GiB (VAE); the ComfyUI int8 files are 5.04 GiB (DiT file) and 9.08 GiB (text-encoder
+file, of which the vision tower, MTP and LM head are not loaded).
 
 ## Recipes
 

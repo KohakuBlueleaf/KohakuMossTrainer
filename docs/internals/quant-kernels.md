@@ -131,6 +131,156 @@ so it stays in a `torch.compile(fullgraph=True)` graph.
   and compiled dequantize+matmul at the DiT layer shapes, with the path the
   tuner selected for each case.
 
+## Rotation
+
+`kohakumoss_kernels.hadamard` defines the ConvRot rotation of the ComfyUI int8
+checkpoints. H_g is the normalised Kronecker power of H4 = [[1,1,1,-1],[1,1,-1,1],
+[1,-1,1,1],[-1,1,1,1]], for g = 4^j. It is the regular Hadamard comfy-kitchen builds,
+not the Sylvester one. H_g is symmetric and involutory, and its entries are +-2^-j,
+exact in fp16 / bf16.
+
+The op `group_hadamard(x, group)` is x . blockdiag(H_g) over the last dim. It is its
+own inverse and its own adjoint, so its backward is the op itself.
+
+| backend | arch | what runs |
+| --- | --- | --- |
+| eager (`group_hadamard_eager`) | every | fp16 / bf16: a 16-bit matmul with H_g, fp32 accumulation, one rounding; any other dtype: j fp32 4-point butterfly stages (`y_k = sum(x) - 2 x_(3-k)`) and the 2^-j scale |
+| triton | sm70+ (the sm70 / sm75 path too), XPU | one [BR, C] tile per program in fp32 registers, the same butterflies, one rounding; fp16 / bf16 / fp32 |
+| compile | where inductor builds | torch.compile of the eager reference |
+
+There is no TileLang entry. A TileLang version that ran each group as a GEMM against
+H_g measured slower than eager on the RTX 2080 Ti and the RTX 3090 (0.27 vs 0.20 ms
+at [4096, 3072] on the 2080 Ti), since g = 256 makes it compute-bound. The Triton
+butterflies are memory-bound and serve sm70 / sm75 as well.
+
+* **Selection.** Each kernel entry is chosen per shape against the compile path, the
+  same way as the block ops ([tuning.md](tuning.md#kernel-vs-compile)).
+* **Numerics.** Every path computes x . H_g from the 16-bit (or fp32) input with fp32
+  sums and rounds once to the input dtype. The 16-bit inputs times +-2^-j are exact,
+  so the fp32 matmul accumulation and the fp32 butterflies differ only in summation
+  order. The precision tables bear this out: kernel and eager agree to three digits
+  on every mean and median statistic. They differ by up to 1.2x on `abs_max`, and
+  only on the relative statistics of near-zero outputs (`rel_max` of the fp32 tables).
+* **Cost.** The op reads and writes x once. The Triton kernel rotates a [16384, 3072]
+  x in 0.243 ms on the RTX 3090 (about 830 GB/s) and in 0.41 ms on the RTX 2080 Ti
+  (about 490 GB/s).
+
+## Rotated int8 linear
+
+`kohakumoss_kernels.quant.rotated` serves `quant_linear_rotated(x, q, scale, bias, fmt,
+group)`: the ConvRot weight of a ComfyUI file is stored rotated, W R ~ q * scale with
+R = blockdiag(H_g) over K. So:
+
+* forward: `y = quant_linear(x R, q, scale, bias)`;
+* input gradient: `dx = (dy (q * scale)) R`;
+* bias gradient: the fp32 column sum of dy; the base gets no gradient.
+
+The op is a custom op (`kohakumoss::quant_fwd_rot` / `kohakumoss::quant_dgrad_rot`) whose
+autograd saves only `q` and `scale`, so it stays in a `torch.compile(fullgraph=True)`
+graph. `kohakumoss.quant.QuantWeight` binds it once per weight (`fmt`, `group` static).
+
+| backend | what runs |
+| --- | --- |
+| eager | `group_hadamard_eager`, then the dequantize + matmul reference (`quant_linear_rotated_reference`) |
+| triton (sm80+, XPU) | per shape the tuner times `separate` (the Triton rotation, then the plain quant kernel, which picks its own tile or PyTorch path) against the fused tiles: the forward rotates each [BM, g] tile of x in fp32 registers in the prologue, and the dgrad rotates its fp32 accumulator tile in the epilogue |
+| tilelang (sm70+) | the registry's `group_hadamard` for the device (Triton or compiled, chosen per shape), then the TileLang int8 kernels |
+
+* **Numerics.** The fused forward rounds the rotated tile to the activation dtype
+  before the MMA, the same bytes the separate pass writes. The fused dgrad rounds once,
+  after the rotation; the separate dgrad rounds before and after it.
+* **Cost of the separate pass.** One extra read and write of x per forward (of dx per
+  dgrad). The fused forward has no extra pass, but rotates every x tile once per output
+  tile, N / BN times. Measured on the RTX 3090 ([quant-rotate.md](../performance/quant-rotate.md)):
+  * the separate pass costs 1-7% of the int8 GEMM in the forward, and 1-14% of
+    forward + backward (the smallest GEMM, 3072 x 3072 at 4096 tokens, is the 14%);
+  * every fused tile is slower than the separate pass at every DiT shape: about 2x in
+    the forward (the redundant rotations run on the CUDA cores) and 1.2-1.3x in the
+    dgrad.
+
+  The tuner therefore selects `separate` there; the fused tiles stay candidates, timed
+  per card.
+
+### Checks
+
+* `tests/kernels/quant/test_hadamard.py`:
+  * the matrix against an fp64 `torch.kron` build;
+  * the eager reference against fp64 (fp32 butterflies; 16-bit within one rounding)
+    and its gradient;
+  * every GPU backend and the compile path against eager and fp64 (stats rule), fp16 /
+    bf16 / fp32, forward and backward, under fullgraph compile;
+  * negatives: Sylvester H, unnormalised H, non-power-of-4 groups.
+* `tests/kernels/quant/test_quant_rotated.py`:
+  * the eager composition against fp64 (CPU);
+  * every backend, and every Triton config on its own (separate and each fused tile),
+    against the eager composition and fp64, forward / dx / dbias, under fullgraph too;
+  * negatives: no rotation, the rotation on the output side, and the dgrad rotation
+    applied to dy instead of dx.
+* `scripts/bench/kernel/rotate.py`: the rotation alone per backend, the plain int8
+  linear, the rotated linear as selected, and the tuner's separate vs fused timings per
+  DiT shape and token count, with the error against fp64.
+
+### ConvRot bases
+
+`kohakumoss.quant.QuantWeight(q, scale, fmt, rotation)` holds a stored ConvRot weight
+(a ComfyUI `int8_tensorwise` file with `convrot`): `linear` is bound once to
+`quant_linear_rotated(fmt, group=rotation)` (eager when no kernel serves), and
+`weight(dtype)` / `materialize()` give W itself: the fp32 dequantized rows times H_g
+(the eager butterflies), rounded once. Adapters (DoRA norms, OFT, merged exports), the
+dense fallback and the exports therefore all read the unrotated weight.
+
+* **Streamed.** Under weight streaming the ring carries `q` and `scale`;
+  `StreamedQuantWeight` dequantizes the slot in fp32, rotates it with the device's
+  `group_hadamard` (resolved once at install) and rounds once to the compute dtype.
+* **Folds.** A weight fold that scales a stored base's rows (an fp16-fix fold with
+  pre-gate scales) is refused (`fold`); the online fix and the uniform gate fold touch
+  only dense parameters.
+
+### W4A8 weights
+
+`kohakumoss.quant.W4A8Weight` holds a ComfyUI `asym_w4a8_int8` layer: `q` [N, K/2]
+(two 4-bit codes per byte, even column in the low nibble; a 6-bit layout adds a K/4
+plane of the top bits), `s_rel` e4m3 [N, K/16], `s_channel` fp32 [N], a 16-entry
+`codebook` (or the uniform grid code - 8) and an optional per-group `correction`. The
+codes decode exactly onto an int8 grid, `round(level x s_rel)` clamped to +-127, so the
+layer is that int8 grid times `s_channel`, stored rotated (ConvRot 256):
+
+| path | bytes per weight | per call |
+| --- | --- | --- |
+| `to_int8()` (the decode once) | 1 + 4 / K | the rotated int8 linear |
+| packed (`linear`) | 0.5 + 1 / 16 + 4 / K | the decode (compiled on CUDA / XPU, eager on the host), then the rotated int8 linear |
+
+Both give the same int8 values, so the same outputs. A text encoder chooses between them
+by `TEXT_ENCODE["w4a8"]` ([text-encoder.md](text-encoder.md)); a streamed DiT base is
+decoded to int8 before it enters the ring. A layer with a `correction` has no int8 form
+and runs its dense weight. Costs: [quant-rotate.md](../performance/quant-rotate.md#w4a8-decode).
+
+### Embedding
+
+`kohakumoss.quant.QuantEmbedding` is an int8 embedding table stored per-row scaled and
+rotated over the hidden dim (the ComfyUI text encoders' `embed_tokens`). A lookup
+gathers the int8 rows and their scales, dequantizes them in fp32, rotates them back with
+the device's `group_hadamard` and rounds once. Under the text encoder's offload / ring
+placements the table stays on the host and `lookup` moves only the gathered int8 rows
+and scales to the device.
+
+### Stored formats
+
+A checkpoint that stores quantized bases (a KohakuMoss fp8 file, a ComfyUI int8 / fp8 /
+W4A8 file) attaches them at load. The memory plan's `base_precision` then decides
+(`memory.apply.settle_stored`):
+
+| `base_precision` | stored bases |
+| --- | --- |
+| `auto` (every profile's default) | kept as stored |
+| the stored format (e.g. `int8`) | kept; the other linears quantize to it |
+| anything else (`compute` included) | dequantized to dense weights first (one INFO line), then the plan applies |
+| any, with a trainable base | dequantized (`compute` / fp8 compute); `auto` is refused, naming the `compute` escape |
+
+`model.io.load.stored_precision(path)` reads the stored format from the headers and
+quant records (no weight read): the planner's estimate counts its bytes under `auto`
+(`Workload.stored_precision`), and the knob checks refuse a full finetune of a stored
+file under `auto`.
+
 ## fp8 compute
 
 `kohakumoss_kernels.fp8` serves `fp8_linear(x, q, scale, aux, q_t, scale_t, aux_t,

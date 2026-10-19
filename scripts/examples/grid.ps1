@@ -21,7 +21,7 @@ param(
     [ValidateSet("cuda", "xpu")] [string] $Device = "cuda",
     # GPU index within that kind: cuda -> CUDA_VISIBLE_DEVICES (nvidia-smi order), xpu -> ZE_AFFINITY_MASK.
     [int] $Index = 0,
-    # Weights root (HF layout); text encoder, VAE and tokenizer come from here.
+    # Weights: a ComfyUI models folder or an HF weights root; text encoder, VAE and tokenizer come from here.
     [string] $Weights = $env:KOHAKUMOSS_WEIGHTS,
     # Arch preset: base | sft.
     [ValidateSet("base", "sft")] [string] $Variant = "base",
@@ -68,7 +68,7 @@ param(
     # fp16 residual fix when no -Transformer is given: online | fp32_residual | none.
     [ValidateSet("online", "fp32_residual", "none")] [string] $Fp16Fix = "online",
     # DiT base: compute = 16-bit; int8 / fp8 = weight-only; fp8_compute / mxfp8 = fp8 GEMMs (sm89+).
-    [ValidateSet("compute", "int8", "fp8", "fp8_compute", "mxfp8")] [string] $BasePrecision = "compute",
+    [ValidateSet("auto", "compute", "int8", "fp8", "fp8_compute", "mxfp8")] [string] $BasePrecision = "auto",
     # DiT fp8_compute scaling: row | tensor | block.
     [ValidateSet("row", "tensor", "block")] [string] $Fp8Recipe = "row",
     # DiT memory profile: auto = the fastest profile that fits the card's free memory | minimal (2 resident

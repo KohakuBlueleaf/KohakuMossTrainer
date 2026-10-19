@@ -19,7 +19,7 @@ param(
     [ValidateSet("cuda", "xpu")] [string] $Device = "cuda",
     # GPU index within that kind: cuda -> CUDA_VISIBLE_DEVICES (nvidia-smi order), xpu -> ZE_AFFINITY_MASK.
     [int] $Index = 0,
-    # Weights root (HF layout); the text encoder, VAE and tokenizer are loaded from here.
+    # Weights: a ComfyUI models folder or an HF weights root; the text encoder, VAE and tokenizer are loaded from here.
     [string] $Weights = $env:KOHAKUMOSS_WEIGHTS,
     # Arch preset: base | sft (on a root with base\ / sft\ folders, WEIGHTS\<variant>\ is read).
     [ValidateSet("base", "sft")] [string] $Variant = "base",
@@ -53,7 +53,7 @@ param(
     # Free the text encoder after it encoded the prompts.
     [switch] $FreeTextEncoder,
     # DiT base: compute = bf16 / fp16; int8 / fp8 = weight-only; fp8_compute / mxfp8 = fp8 GEMMs (sm89+).
-    [ValidateSet("compute", "int8", "fp8", "fp8_compute", "mxfp8")] [string] $BasePrecision = "compute",
+    [ValidateSet("auto", "compute", "int8", "fp8", "fp8_compute", "mxfp8")] [string] $BasePrecision = "auto",
     # DiT fp8_compute scaling: row | tensor | block.
     [ValidateSet("row", "tensor", "block")] [string] $Fp8Recipe = "row",
     # DiT memory profile: auto = the fastest profile that fits the card's free memory | minimal (2 resident

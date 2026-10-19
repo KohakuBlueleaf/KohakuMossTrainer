@@ -1,25 +1,58 @@
 # Export to ComfyUI
 
-A training run writes its `EXPORT_FORMATS` (default `comfy`; the shipped configs add
-`lycoris`) to `runs/moss/<RUN_NAME>/export/` at the end. `scripts/export/export.py`
-exports any checkpoint of a run (an interrupted one too).
+A training run writes its exports to `runs/moss/<RUN_NAME>/export/` at the end and,
+with `CHECKPOINT_EXPORT=True` (the default), into every checkpoint's `export/` folder;
+`scripts/export/export.py` exports any checkpoint again (an interrupted run's too).
+
+## What a run writes
+
+| knob | values |
+| --- | --- |
+| `SAVE_FORMAT` | `comfy` (default), `hf`, `both`, `none` |
+| `SAVE_MERGED` | `False` (default); `True` adds the merged DiT (adapters only) |
+| `SAVE_FUSED_QKV` | `auto` (default: as the DiT file the run trained on stores q / k / v; the Comfy-Org files are fused), `True`, `False` |
+| `CHECKPOINT_EXPORT` | `True` (default): every checkpoint also holds the exports |
+
+| run | `comfy` | `hf` |
+| --- | --- | --- |
+| adapters | `<run>-comfy.safetensors`: the ComfyUI LyCORIS file (`lora_unet_...` keys, fused q/k/v per `SAVE_FUSED_QKV`) | `<run>-lycoris.safetensors`: the LyCORIS file with diffusers module keys |
+| adapters, `SAVE_MERGED` | + `<run>-merged.safetensors`: one ComfyUI DiT file (bare keys, bf16) | + `<run>-diffusers/`: the HF transformer folder |
+| full finetune | `<run>-merged.safetensors`: one ComfyUI DiT file | `<run>-diffusers/` |
+
+- `both` writes both columns; `none` writes no export (the checkpoints still hold the
+  training state, which `export.py` reads).
+- The build log names the files of one export and their size; with
+  `CHECKPOINT_EXPORT` every checkpoint adds that much (`KEEP_LAST` prunes them with the
+  checkpoint).
+- A merged file from a run on the int8 DiT is the dequantized base plus dW in bf16.
+- A pipeline run's checkpoint export first gives rank 0 every stage's adapters (the
+  same step as the final export).
+- The older `EXPORT_FORMATS` list maps onto these knobs at validation (one INFO line):
+  `comfy` / `lycoris` are the adapter columns, `merged` / `diffusers` the DiT columns
+  (`SAVE_MERGED` on an adapter run), an empty list is `none`.
 
 ## Exporting
 
 ```bash
-# adapter file from a checkpoint
-kogine run scripts/export/export.py --set WEIGHTS=<model dir> \
+# ComfyUI adapter file from a checkpoint (WEIGHTS: the ComfyUI folder or the HF dir)
+kogine run scripts/export/export.py --set WEIGHTS=ComfyUI/models \
     --set ADAPTER=runs/moss/<RUN_NAME>/checkpoints/step_00001000/trainable.safetensors \
     --set OUT=moss_lora.safetensors
-# merged transformer (fused q/k/v like the Comfy-Org repack)
-kogine run scripts/export/export.py --set FORMAT=merged --set FUSED_QKV=True ...
-# adapter file for the fused-q/k/v Comfy-Org repack (see "Fused q/k/v")
-kogine run scripts/export/export.py --set FUSED_QKV=True ...
+# merged transformer (one ComfyUI DiT file)
+kogine run scripts/export/export.py --set FORMAT=merged ...
+# the LyCORIS file
+kogine run scripts/export/export.py --set FORMAT=hf ...
 # merge any adapter files (LyCORIS, ComfyUI, training states) into the base
 kogine run scripts/export/merge.py --config <file with WEIGHTS / ADAPTERS / OUT>
 ```
 
-- A full-finetune checkpoint (`ALGO="full"`) exports as `merged` or `diffusers`.
+- `FORMAT`: `comfy`, `hf` (= `lycoris`), `lycoris`, `merged`, `diffusers`; a
+  full-finetune checkpoint (`ALGO="full"`) exports as `merged` (`comfy`) or `diffusers`
+  (`hf`).
+- `FUSED_QKV` (`auto` default: as `WEIGHTS` stores q / k / v) writes the fused layout of
+  the Comfy-Org files for `comfy` and `merged`.
+- With a ComfyUI folder as `WEIGHTS`, `TRANSFORMER` / `VARIANT` pick the DiT file as in
+  training ([weights.md](weights.md)).
 - `SAVE_DTYPE` (`bf16` default, `fp16`, `fp32`) is the dtype of the written tensors in
   `export.py` and `merge.py`, as in the other export scripts.
 
@@ -89,11 +122,12 @@ Joint-block q/k/v are separate layers in KohakuMoss and are written as separate
   `lora_unet_<path with _>` and `diffusion_model.<path>` to the model's own
   `<path>.weight` keys.
 
-So the default file targets an unfused checkpoint; the fused repack takes the
-`FUSED_QKV=True` file below.
+So an unfused file targets an unfused checkpoint and the fused repack takes a fused
+file. `SAVE_FUSED_QKV` / `FUSED_QKV` `auto` follow the DiT file the run trained on (the
+Comfy-Org files: fused; the HF transformer folder: unfused); `True` / `False` force
+either.
 
-`FUSED_QKV=True` with `FORMAT="comfy"` writes each block's q/k/v as one
-`layers.N.proj.qkv` layer for the fused repack:
+A fused `comfy` file writes each block's q/k/v as one `layers.N.proj.qkv` layer:
 
 | q/k/v layers | written as |
 | --- | --- |

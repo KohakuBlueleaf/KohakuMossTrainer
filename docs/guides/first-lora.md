@@ -20,12 +20,23 @@ write and check the config for you: `scripts\examples\train.ps1` (Windows) or
    [install-windows.md](install-windows.md)) and check the environment:
    `kohakumoss-doctor`. It lists every GPU with its arch, the installed toolchain, which
    kernel backend serves each op, and anything missing with the command that fixes it.
-2. **Download the weights** (~26 GB):
-   `hf download OpenMOSS-Team/MOSS-Image-Base --local-dir models/MOSS-Image-Base`.
+2. **Download the weights** into a ComfyUI models folder (~15 GB; an existing ComfyUI
+   install's `models/` works as is):
+
+   ```bash
+   hf download Comfy-Org/MOSS-Image diffusion_models/moss_image_base_int8_convrot.safetensors \
+       text_encoders/qwen3.5_9b_int8_convrot.safetensors vae/flux2-vae_small.safetensors \
+       --local-dir ComfyUI/models
+   ```
+
+   The run trains on the int8 DiT and text encoder as stored. The HF layout works the
+   same (`hf download OpenMOSS-Team/MOSS-Image-Base --local-dir models/MOSS-Image-Base`,
+   ~26 GB bf16, `--weights models/MOSS-Image-Base`); every file and knob is in
+   [weights.md](weights.md).
 3. **Write a config** for your GPU and data:
 
    ```bash
-   kohakumoss-config new train --weights models/MOSS-Image-Base --data <dataset> --name my-lora
+   kohakumoss-config new train --weights ComfyUI/models --data <dataset> --name my-lora
    ```
 
    It writes `configs/user/my-lora.py` and `configs/user/my-lora_data.py`; set `STEPS`,
@@ -66,8 +77,8 @@ write and check the config for you: `scripts\examples\train.ps1` (Windows) or
    | `log.txt` | every console log line: the plan, kernel decisions, warnings, errors |
    | `metrics.jsonl` | per-step metrics |
    | `samples/step_XXXXXXXX/` | training-time samples |
-   | `checkpoints/step_XXXXXXXX/` | checkpoints |
-   | `export/<RUN_NAME>-comfy.safetensors`, `export/<RUN_NAME>-lycoris.safetensors` | the adapter, written at the end of the run |
+   | `checkpoints/step_XXXXXXXX/` | checkpoints, each with its `export/` (`CHECKPOINT_EXPORT`) |
+   | `export/<RUN_NAME>-comfy.safetensors`, `export/<RUN_NAME>-lycoris.safetensors` | the adapter (`SAVE_FORMAT`: the base config writes `both`), written at the end of the run |
 
    An interrupted run's checkpoints export with `scripts/export/export.py`
    ([export-to-comfy.md](export-to-comfy.md)). The `comfy` file has the key layout of
@@ -77,7 +88,7 @@ write and check the config for you: `scripts\examples\train.ps1` (Windows) or
 7. **Sample** with the exported adapter ([inference.md](inference.md)):
 
    ```bash
-   kohakumoss-config new sample --weights models/MOSS-Image-Base --adapter runs/moss/my-lora/export/my-lora-comfy.safetensors --name my-lora-sample
+   kohakumoss-config new sample --weights ComfyUI/models --adapter runs/moss/my-lora/export/my-lora-comfy.safetensors --name my-lora-sample
    kogine run scripts/sample/sample.py --config configs/user/my-lora-sample.py --set PROMPT="a lighthouse on a rocky coast at sunset"
    ```
 
@@ -145,7 +156,10 @@ images with long captions, lower the area: `--set TARGET_AREA=802816` (896^2) or
 
 ## SFT weights
 
-To train on MOSS-Image-SFT:
+To train on MOSS-Image-SFT from a ComfyUI folder, download
+`diffusion_models/moss_image_sft_int8_convrot.safetensors` next to the base files and set
+`--set VARIANT=sft` (the DiT default follows `VARIANT`; the text encoder and VAE are
+shared). In the HF layout:
 
 1. Download it: `hf download OpenMOSS-Team/MOSS-Image-SFT --local-dir
    models/MOSS-Image-SFT`.

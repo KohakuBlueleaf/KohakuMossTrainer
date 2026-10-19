@@ -1,6 +1,6 @@
 # Example training run: a short LoRA / LoKr run on your dataset, from a generated config.
 #
-#   .\scripts\examples\train.ps1 -Weights models\MOSS-Image-Base -Dataset D:\data\my_set
+#   .\scripts\examples\train.ps1 -Weights ComfyUI\models -Dataset D:\data\my_set
 #   .\scripts\examples\train.ps1 -Algo lokr -Precision fp16 -BasePrecision int8 -Memory minimal
 #   .\scripts\examples\train.ps1 -Steps 30 -SampleEvery 10        # quick run with sample images
 #   .\scripts\examples\train.ps1 -Device xpu -Index 1              # second Intel Arc GPU
@@ -19,7 +19,7 @@ param(
     [ValidateSet("cuda", "xpu")] [string] $Device = "cuda",
     # GPU index within that kind: cuda -> CUDA_VISIBLE_DEVICES (nvidia-smi order), xpu -> ZE_AFFINITY_MASK.
     [int] $Index = 0,
-    # Weights root (HF layout: transformer\, text_encoder\, vae\).
+    # Weights: a ComfyUI models folder (diffusion_models\, text_encoders\, vae\) or an HF folder (transformer\, text_encoder\, vae\).
     [string] $Weights = $env:KOHAKUMOSS_WEIGHTS,
     # The fp16-fix checkpoint, used with -FixFile (single-file transformer with the fold in its metadata).
     [string] $FixCheckpoint = "",
@@ -41,8 +41,8 @@ param(
     [ValidateSet("bf16", "fp16")] [string] $Precision = "bf16",
     # fp16 from the fp16-fix checkpoint instead of the online fix (text encoder / VAE still from -Weights).
     [switch] $FixFile,
-    # DiT base: compute = bf16 / fp16; int8 / fp8 = weight-only; fp8_compute / mxfp8 = fp8 GEMMs (sm89+).
-    [ValidateSet("compute", "int8", "fp8", "fp8_compute", "mxfp8")] [string] $BasePrecision = "compute",
+    # DiT base: auto = what the DiT file stores (the ComfyUI int8 file: int8); compute = bf16 / fp16; int8 / fp8 = weight-only; fp8_compute / mxfp8 = fp8 GEMMs (sm89+).
+    [ValidateSet("auto", "compute", "int8", "fp8", "fp8_compute", "mxfp8")] [string] $BasePrecision = "auto",
     # Memory profile (weights stay at -BasePrecision). Any catalog name, built
     # from its parts in this order (omit a part for its default):
     #   checkpoint: nockpt | ckpt | subckpt
@@ -209,7 +209,7 @@ try {
         "use_config($(PyPath (Join-Path $cfgRoot 'algo\algo_lora.py')))`nDIM = $Dim`nALPHA = float($Dim)"
     }
     $precisionLines = if ($Precision -eq "fp16" -and $FixFile) {
-        "PRECISION = 'fp16'`nFP16_FIX = 'none'`nWEIGHTS = $(PyPath (FullPath $FixCheckpoint))`nTEXT_ENCODER = $(PyPath (Join-Path $Weights 'text_encoder'))`nVAE = $(PyPath (Join-Path $Weights 'vae'))"
+        "PRECISION = 'fp16'`nFP16_FIX = 'none'`nWEIGHTS = $(PyPath $Weights)`nTRANSFORMER = $(PyPath (FullPath $FixCheckpoint))"
     } elseif ($Precision -eq "fp16") {
         "use_config($(PyPath (Join-Path $cfgRoot 'precision\precision_fp16.py')))`nWEIGHTS = $(PyPath $Weights)"
     } else {

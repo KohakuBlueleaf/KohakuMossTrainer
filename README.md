@@ -93,11 +93,12 @@ or bash):
 # 1. check the environment
 kohakumoss-doctor
 
-# 2. weights (~26 GB)
-hf download OpenMOSS-Team/MOSS-Image-Base --local-dir models/MOSS-Image-Base
+# 2. weights into a ComfyUI models folder (~15 GB: the int8 DiT and text encoder, the VAE)
+hf download Comfy-Org/MOSS-Image diffusion_models/moss_image_base_int8_convrot.safetensors \
+    text_encoders/qwen3.5_9b_int8_convrot.safetensors vae/flux2-vae_small.safetensors --local-dir ComfyUI/models
 
 # 3. a config for this GPU and your dataset (kohya-style folders; --source for others)
-kohakumoss-config new train --weights models/MOSS-Image-Base --data path/to/dataset --name my-lora
+kohakumoss-config new train --weights ComfyUI/models --data path/to/dataset --name my-lora
 
 # 4. data: check the plan, then cache text embeddings and latents once
 kogine run scripts/data/inspect_data.py --config configs/user/my-lora_data.py
@@ -108,16 +109,22 @@ kogine run scripts/data/cache_latents.py --config configs/user/my-lora_data.py
 kogine run scripts/train/moss.py --config configs/user/my-lora.py
 
 # 6. sample with the exported adapter
-kohakumoss-config new sample --weights models/MOSS-Image-Base --adapter runs/moss/my-lora/export/my-lora-comfy.safetensors --name my-lora-sample
+kohakumoss-config new sample --weights ComfyUI/models --adapter runs/moss/my-lora/export/my-lora-comfy.safetensors --name my-lora-sample
 kogine run scripts/sample/sample.py --config configs/user/my-lora-sample.py --set PROMPT="a lighthouse on a rocky coast at sunset"
 
-# 7. export any checkpoint again (LyCORIS / ComfyUI / merged / diffusers)
-kogine run scripts/export/export.py --set WEIGHTS=models/MOSS-Image-Base \
+# 7. export any checkpoint again (ComfyUI / LyCORIS / merged / diffusers)
+kogine run scripts/export/export.py --set WEIGHTS=ComfyUI/models \
     --set ADAPTER=runs/moss/my-lora/checkpoints/step_00001000/trainable.safetensors --set OUT=my-lora.safetensors
 ```
 
+The HF layout works the same way: `hf download OpenMOSS-Team/MOSS-Image-Base --local-dir
+models/MOSS-Image-Base` (~26 GB, bf16) and `--weights models/MOSS-Image-Base`; which file
+goes where, and every ComfyUI file: [docs/guides/weights.md](docs/guides/weights.md).
+
 The run writes `runs/moss/<RUN_NAME>/`: `log.txt`, `metrics.jsonl`, samples, checkpoints
-and `export/` (the `comfy` and `lycoris` files). `kohakumoss-config wizard` asks for the
+(each with its `export/`) and `export/` (`SAVE_FORMAT`: the ComfyUI LoRA file by default,
+`hf` the LyCORIS file, `both`; `SAVE_MERGED` adds the merged DiT). The ComfyUI LoRA
+loads with a LoRA loader node on the Comfy-Org files. `kohakumoss-config wizard` asks for the
 GPU, algorithm, data and weights instead of flags; `kohakumoss-config new --from
 lora_24g_bf16 my_run.py` extends a fixed recipe (`configs/moss/recipes/`) with every
 knob listed.
@@ -127,9 +134,9 @@ run it, one PowerShell and one bash file each
 ([scripts/examples/README.md](scripts/examples/README.md)):
 
 ```powershell
-.\scripts\examples\train.ps1 -Weights models\MOSS-Image-Base -Dataset D:\data\my_set -Steps 30 -SampleEvery 10
-.\scripts\examples\sample.ps1 -Weights models\MOSS-Image-Base -Adapter runs\examples\train\<run>\export\<run>-lycoris.safetensors
-.\scripts\examples\grid.ps1 -Weights models\MOSS-Image-Base -Run <run> -Checkpoints -Prompt "a lighthouse at dusk"
+.\scripts\examples\train.ps1 -Weights ComfyUI\models -Dataset D:\data\my_set -Steps 30 -SampleEvery 10
+.\scripts\examples\sample.ps1 -Weights ComfyUI\models -Adapter runs\examples\train\<run>\export\<run>-comfy.safetensors
+.\scripts\examples\grid.ps1 -Weights ComfyUI\models -Run <run> -Checkpoints -Prompt "a lighthouse at dusk"
 ```
 
 The walk-through is [docs/guides/first-lora.md](docs/guides/first-lora.md); sampling is

@@ -21,9 +21,13 @@ State per parameter is about 16 bytes (fp32 master, two Adam moments, gradient),
 | one 24 GB GPU, host masters + weight streaming | `recipes_full_24g_offload.py` |
 | several 24 GB GPUs (Linux), DDP over the same streaming profile | `kohakumoss-config new train --algo full --gpus N` |
 
+A full finetune trains the 16-bit DiT: in a ComfyUI folder it takes
+`diffusion_models/moss_image_<VARIANT>_bf16.safetensors` (the default for `ALGO="full"`),
+in the HF layout the `transformer/` folder.
+
 ```bash
 # a config from the presets for this GPU, or one that extends a recipe
-kohakumoss-config new train --algo full --weights models/MOSS-Image-Base --data <dataset> --name my-ft
+kohakumoss-config new train --algo full --weights ComfyUI/models --data <dataset> --name my-ft
 kohakumoss-config new --from full_24g_offload my_ft.py    # then set WEIGHTS / DATASETS in it
 
 # the data passes printed by the first command, then
@@ -75,10 +79,15 @@ See [quant-kernels.md](../internals/quant-kernels.md#full-finetune).
 
 ## Exports and EMA
 
-| `EXPORT_FORMATS` entry | output |
+| `SAVE_FORMAT` | output |
 | --- | --- |
-| `"merged"` | one bare-key safetensors (the single-file transformer layout of [export-to-comfy.md](export-to-comfy.md)) |
-| `"diffusers"` | the sharded transformer folder |
+| `"comfy"` (default) | `<RUN_NAME>-merged.safetensors`: one bare-key safetensors (the ComfyUI single-file layout of [export-to-comfy.md](export-to-comfy.md); q / k / v fused per `SAVE_FUSED_QKV`) |
+| `"hf"` | `<RUN_NAME>-diffusers/`: the sharded transformer folder |
+| `"both"` / `"none"` | both / neither |
+
+- On a ComfyUI folder the full finetune defaults to the bf16 DiT file; the int8 file
+  trains only under `BASE_PRECISION="compute"` (its dequantized weights,
+  [weights.md](weights.md#dit)).
 
 - With `EMA` enabled the averaged weights are in every checkpoint (`ema.safetensors`);
   with a power EMA, `kohakumoss.training.ema.posthoc` reconstructs any EMA width after

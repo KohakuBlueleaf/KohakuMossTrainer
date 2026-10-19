@@ -25,7 +25,7 @@ options (defaults in brackets; see grid.ps1 for each one's meaning):
   --captions N [1]   --suffix TEXT   --negative TEXT [blurry, distortion, lowres]
   --size HxW [1024x1024]   --steps N [30]   --cfg X [3.0]   --seed N [0]
   --precision bf16|fp16 [bf16]   --fp16-fix online|fp32_residual|none [online]
-  --base-precision compute|int8|fp8|fp8_compute|mxfp8 [compute]   --fp8-recipe row|tensor|block [row]
+  --base-precision auto|compute|int8|fp8|fp8_compute|mxfp8 [auto]   --fp8-recipe row|tensor|block [row]
   --memory auto|PROFILE|"" [auto; "" = whole DiT resident]   --text-memory auto|resident|offload|ring|cpu [auto]
   --text-precision compute|int8|fp8|fp8_compute|mxfp8 [compute]   --free-text-encoder
   --vae-memory auto|resident|offload|ring|cpu [auto]   --vae-dtype auto|bf16|fp16|fp32 [auto]
@@ -59,7 +59,7 @@ device=cuda index=0 weights=${KOHAKUMOSS_WEIGHTS:-} variant=base transformer=""
 adapters=() run="" checkpoints=0 train_out=runs/examples/train multipliers=() adapter_mode=bypass
 prompts=() dataset=${KOHAKUMOSS_DATASET:-} artists=() captions=1 suffix=""
 negative="blurry, distortion, lowres" size=1024x1024 steps=30 cfg=3.0 seed=0
-precision=bf16 fp16_fix=online base_precision=compute fp8_recipe=row memory=auto
+precision=bf16 fp16_fix=online base_precision=auto fp8_recipe=row memory=auto
 text_memory=auto text_precision=compute free_text=0 vae_memory=auto vae_dtype=auto
 batch=4 tune=off layout=prompt-cols font_size=0 out=runs/examples/grid dry_run=0
 
@@ -92,7 +92,7 @@ while [ $# -gt 0 ]; do
     --seed) seed=$2; shift ;;
     --precision) choice precision "$2" bf16 fp16; precision=$2; shift ;;
     --fp16-fix) choice fp16-fix "$2" online fp32_residual none; fp16_fix=$2; shift ;;
-    --base-precision) choice base-precision "$2" compute int8 fp8 fp8_compute mxfp8; base_precision=$2; shift ;;
+    --base-precision) choice base-precision "$2" auto compute int8 fp8 fp8_compute mxfp8; base_precision=$2; shift ;;
     --fp8-recipe) choice fp8-recipe "$2" row tensor block; fp8_recipe=$2; shift ;;
     --memory) memory=$2; shift ;;
     --text-memory) choice text-memory "$2" auto resident offload ring stream cpu; text_memory=$2; shift ;;

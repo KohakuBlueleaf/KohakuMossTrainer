@@ -19,8 +19,8 @@ lines (section 3) caches exactly what that run reads:
 from kohakuengine import use_config
 
 use_config("../user/my-lora.py")   # the train config
-TEXT_ENCODER_KWARGS = {"path": "models/MOSS-Image-Base", "device": "cuda"}
-IMAGE_ENCODER_KWARGS = {"path": "models/MOSS-Image-Base", "device": "cuda"}
+TEXT_ENCODER_KWARGS = {"path": "ComfyUI/models", "device": "cuda"}
+IMAGE_ENCODER_KWARGS = {"path": "ComfyUI/models", "device": "cuda"}
 ```
 
 `configs/data/kohya/kohya_style.py` is a standalone example (set `data_root` and

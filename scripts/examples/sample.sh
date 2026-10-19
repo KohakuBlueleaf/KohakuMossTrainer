@@ -24,7 +24,7 @@ options (defaults in brackets; see sample.ps1 for each one's meaning):
   --text-memory auto|resident|offload|ring|cpu [auto]
   --text-precision compute|int8|fp8|fp8_compute|mxfp8 [compute]   --text-fp8-recipe row|tensor|block [row]
   --free-text-encoder
-  --base-precision compute|int8|fp8|fp8_compute|mxfp8 [compute]   --fp8-recipe row|tensor|block [row]
+  --base-precision auto|compute|int8|fp8|fp8_compute|mxfp8 [auto]   --fp8-recipe row|tensor|block [row]
   --memory auto|PROFILE|"" [auto; "" = whole DiT resident]   --vae-memory auto|resident|offload|ring|cpu [auto]
   --vae-dtype auto|bf16|fp16|fp32 [auto]
   --adapter PATH[:MULT] (repeatable)   --adapter-mode merge|bypass [bypass]
@@ -57,7 +57,7 @@ device=cuda index=0 weights=${KOHAKUMOSS_WEIGHTS:-} variant=base transformer="" 
 prompt="a lighthouse on a rocky coast at sunset" negative="blurry, distortion" size=1024x1024
 steps=50 cfg=3.0 seed=0 count=4 batch=4 prompts_file=""
 precision=bf16 fp16_fix=online text_memory=auto text_precision=compute text_fp8_recipe=row
-free_text=0 base_precision=compute fp8_recipe=row memory=auto vae_memory=auto vae_dtype=auto
+free_text=0 base_precision=auto fp8_recipe=row memory=auto vae_memory=auto vae_dtype=auto
 adapters=() adapter_mode=bypass tune=off tune_only=0 out=runs/examples/sample dry_run=0
 
 while [ $# -gt 0 ]; do
@@ -87,7 +87,7 @@ while [ $# -gt 0 ]; do
     --text-precision) choice text-precision "$2" compute int8 fp8 fp8_compute mxfp8; text_precision=$2; shift ;;
     --text-fp8-recipe) choice text-fp8-recipe "$2" row tensor block; text_fp8_recipe=$2; shift ;;
     --free-text-encoder) free_text=1 ;;
-    --base-precision) choice base-precision "$2" compute int8 fp8 fp8_compute mxfp8; base_precision=$2; shift ;;
+    --base-precision) choice base-precision "$2" auto compute int8 fp8 fp8_compute mxfp8; base_precision=$2; shift ;;
     --fp8-recipe) choice fp8-recipe "$2" row tensor block; fp8_recipe=$2; shift ;;
     --memory) memory=$2; shift ;;
     --vae-memory) choice vae-memory "$2" auto resident offload ring stream cpu; vae_memory=$2; shift ;;

@@ -115,7 +115,7 @@ manual mode, and only `BASE_PRECISION` selects a quantized base:
 
 | knob | plan field | values | default | effect |
 | --- | --- | --- | --- | --- |
-| `BASE_PRECISION` | `base_precision` | `compute`, `fp8`, `int8`, `quant` (fp8 where the arch has fp8 GEMMs, else int8), `fp8_compute`, `mxfp8` | `compute` | storage of the frozen base weights (`compute`: the PRECISION dtype; `fp8` / `int8` weight-only); `fp8_compute` / `mxfp8` run the GEMMs in fp8 on sm89+; see [quant-kernels.md](../internals/quant-kernels.md#fp8-compute) |
+| `BASE_PRECISION` | `base_precision` | `auto`, `compute`, `fp8`, `int8`, `quant` (fp8 where the arch has fp8 GEMMs, else int8), `fp8_compute`, `mxfp8` | `auto` | storage of the frozen base weights (`auto`: what the DiT file stores, a 16-bit file in the PRECISION dtype, a pre-quantized file its own bases; `compute`: the PRECISION dtype, a pre-quantized file dequantized; `fp8` / `int8` weight-only); `fp8_compute` / `mxfp8` run the GEMMs in fp8 on sm89+; see [quant-kernels.md](../internals/quant-kernels.md#stored-formats) |
 | `FP8_RECIPE` | `fp8_recipe` | `row`, `tensor`, `block` | `row` | scale granularity of `fp8_compute` |
 | `FP8_DGRAD` | `fp8_dgrad` | `fp8`, `16bit` | `fp8` | input-gradient GEMM in fp8 (a W^T fp8 copy, 2 bytes per weight in all) or 16-bit (1 byte per weight) |
 

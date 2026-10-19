@@ -13,18 +13,20 @@
 ## CLI
 
 `scripts/sample/sample.py` is a kogine script: every setting is a module-level knob, set
-in a config file or with `--set`. `WEIGHTS` is the pipeline folder the README downloads
-(`models/MOSS-Image-Base`, with `transformer/`, `text_encoder/`, `vae/`):
+in a config file or with `--set`. `WEIGHTS` is the ComfyUI models folder the README
+downloads (`ComfyUI/models`; `TRANSFORMER`, `TEXT_ENCODER`, `VAE` name its files, the
+int8 DiT and text encoder by default) or an HF pipeline folder (`models/MOSS-Image-Base`,
+with `transformer/`, `text_encoder/`, `vae/`); see [weights.md](weights.md):
 
 ```bash
-kogine run scripts/sample/sample.py --set WEIGHTS=models/MOSS-Image-Base \
+kogine run scripts/sample/sample.py --set WEIGHTS=ComfyUI/models \
     --set PROMPT="a cat" --set ADAPTERS=my_lora.safetensors:0.8 --set OUT=out/samples
 ```
 
 A config file holds the same knobs:
 
 ```python
-WEIGHTS = "models/MOSS-Image-Base"
+WEIGHTS = "ComfyUI/models"
 PROMPTS = ["a cat", "a dog"]
 SIZES = [(1024, 1024), (832, 1216)]  # (H, W) or "HxW" per prompt; the last repeats
 SEEDS = [0, 1]  # missing seeds are SEED_BASE + index
@@ -101,7 +103,7 @@ import torch
 from kohakumoss.inference import MossPipeline
 
 pipe = MossPipeline.from_pretrained(
-    "models/MOSS-Image-Base",    # one pipeline dir, or a root with base/ (and sft/)
+    "ComfyUI/models",            # a ComfyUI models folder, a pipeline dir, or a root with base/ (and sft/)
     dtype=torch.bfloat16,
     adapters=[("my_lora.safetensors", 0.8)],
     adapter_mode="merge",        # or "bypass"
@@ -139,8 +141,13 @@ The settings below are `from_pretrained` / `generate` arguments; the knob names 
 
 ### Weights root
 
-`path` is one pipeline folder, or a root with `base/` (and `sft/`) subfolders. `variant`
-(`VARIANT`, `"base"` default or `"sft"`) is the arch preset:
+`path` is a ComfyUI models folder: `transformer`, `text_encoder_file`, `vae_file`
+(`TRANSFORMER`, `TEXT_ENCODER`, `VAE`) name its files, each "" for its default
+(`moss_image_<variant>_int8_convrot`, `qwen3.5_9b_int8_convrot`, `flux2-vae_small`, each
+falling back to the next file that exists; [weights.md](weights.md#comfyui-layout)).
+
+Otherwise `path` is one pipeline folder, or a root with `base/` (and `sft/`)
+subfolders. `variant` (`VARIANT`, `"base"` default or `"sft"`) is the arch preset:
 
 - Each component comes from `path/variant` when that folder holds it, else from
   `path/base` (logged). An SFT folder that carries only the transformer takes the base's
@@ -226,10 +233,14 @@ On sm89+, `BASE_PRECISION = "fp8_compute"` (with `FP8_RECIPE` `"row"` / `"tensor
 1 byte each, plus their scales) and runs their GEMMs in fp8, the activations quantized
 per call. `BASE_PRECISION` int8 / fp8 are the weight-only formats.
 
+- `BASE_PRECISION = "auto"` (default) runs what the DiT file stores: the ComfyUI int8
+  file its int8 ConvRot bases (resident with no profile), a 16-bit file in 16 bits;
+  `"compute"` dequantizes an int8 file ([weights.md](weights.md#dit)).
 - A quantized `BASE_PRECISION` places the DiT under the `speed` profile unless
   `MEMORY_PROFILE` names one (`memory_overrides={"base_precision": ..., "fp8_recipe":
   ...}` in Python).
-- The text encoder takes the same formats (`TEXT_ENCODE["precision"]`).
+- The text encoder takes the same formats (`TEXT_ENCODE["precision"]`, `auto` by
+  default: a ComfyUI int8 / W4A8 file keeps its stored layers).
 
 RTX 5090, 1024^2, 20 steps of 2 prompts with CFG (`scripts/probe/fp8_inference.py`):
 
@@ -318,7 +329,7 @@ kogine run scripts/sample/compare_grid.py --config my_grid.py
 ```
 
 ```python
-WEIGHTS = "models/MOSS-Image-Base"
+WEIGHTS = "ComfyUI/models"
 CHECKPOINTS = [
     "runs/quality/quality-lora8/checkpoints/step_00000100/trainable.safetensors",
     "runs/quality/quality-lora8/checkpoints/step_00000200/trainable.safetensors",

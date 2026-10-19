@@ -19,7 +19,8 @@ One knob set (`kohakumoss.types.plans.TextEncoderPlan`) serves:
 | --- | --- | --- |
 | `memory` | `resident`, `offload`, `ring` (`stream` is accepted as the same value), `cpu`, `auto` | placement ([offload.md](offload.md#text-encoder)); the dataclass default is `resident` (`kohakumoss.types.plans`), and training and sampling resolve an unset `memory` to `auto` |
 | `free_after_use` | `False`, `True` | drop the model after its first pass |
-| `precision` | `compute`, `int8`, `fp8`, `fp8_compute`, `mxfp8` | weight storage and GEMMs ([Quantization](#quantization)) |
+| `precision` | `auto`, `compute`, `int8`, `fp8`, `fp8_compute`, `mxfp8`, `w4a8` | weight storage and GEMMs ([Quantization](#quantization)); `auto` is what the weights store ([ComfyUI files](#comfyui-files)), `w4a8` a ComfyUI W4A8 file only |
+| `w4a8` | `auto`, `int8`, `packed` | a W4A8 file's decode ([ComfyUI files](#comfyui-files)) |
 | `quant_group` | `0` (per output channel), or any multiple of 16 (e.g. `64`, `128`) | weight-only scale groups of input columns; `int8` / `fp8` only |
 | `fp8_recipe` | `row`, `tensor`, `block` | `fp8_compute` scaling |
 | `stored` | `""`, a file | a pre-quantized text encoder ([below](#pre-quantized-text-encoder)) |
@@ -164,8 +165,35 @@ TEXT_ENCODE = {"precision": "fp8_compute", "stored": "<file>"}
 - The encoder is built from the text-encoder dir's config without initialising or
   reading the dense weights. The stored bases are attached as `QuantLinear`, and the
   remaining tensors load from the file, so nothing is quantized at load.
-- The file's precision must equal the plan's, and `quant_group` must be 0.
+- The file's precision must equal the plan's (or the plan's be `auto`), and
+  `quant_group` must be 0.
 - The tokenizer and config still come from the weights root.
+
+### ComfyUI files
+
+A ComfyUI text-encoder file (`text_encoders/qwen3.5_9b_*`, [weights.md](../guides/weights.md#text-encoder))
+loads through `kohakumoss.encoders.text.comfy_load.load_comfy_text`: the text model is
+built from the packaged config without initialising its weights, `model.language_model.*`
+loads onto it, the tokenizer is the packaged one.
+
+- `precision="auto"` resolves to the file's format, read from its headers and quant
+  records (`text_file_format`): `compute` for the bf16 file, `int8` (int8 ConvRot
+  linears) or `w4a8`. Its quantized linears attach as `QuantLinear` over the stored
+  base, its int8 embedding as `QuantEmbedding`; nothing is quantized at load. On the
+  host (memory `cpu`) `auto` is `compute`.
+- Any other precision dequantizes the stored layers into the dense model (one INFO
+  line) and quantizes from there.
+- `w4a8` on a W4A8 file: `int8` decodes every layer once at load (on the compute device,
+  the result where the layer lives), `packed` keeps the 4-bit codes and decodes per call
+  (the compiled decode on CUDA / XPU), `auto` (`default_w4a8`) takes `int8` when the
+  decoded encoder fits resident next to the step's reserve on the device and `packed`
+  otherwise; then `memory="auto"` chooses the placement on the chosen form's sizes.
+- `encoder_spec` (the text cache key) appends the stored layout, e.g.
+  `bf16/int8/g0/src:int8-convrot256`; the offline cache factory computes the same spec
+  from the headers.
+- The kernel prewarm's weightless twin mirrors the loaded quantized modules (their
+  shapes, formats and rotations), so it records the rotated int8 calls a live encode
+  makes.
 
 ## Reporting
 
