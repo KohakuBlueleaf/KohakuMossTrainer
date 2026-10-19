@@ -149,9 +149,10 @@ falling back to the next file that exists; [weights.md](weights.md#comfyui-layou
 Otherwise `path` is one pipeline folder, or a root with `base/` (and `sft/`)
 subfolders. `variant` (`VARIANT`, `"base"` default or `"sft"`) is the arch preset:
 
-- Each component comes from `path/variant` when that folder holds it, else from
-  `path/base` (logged). An SFT folder that carries only the transformer takes the base's
-  text encoder and VAE.
+- Each component comes from `path/variant` when that folder holds its weights (a
+  component folder with safetensors files), else from `path/base` (logged). An SFT
+  folder that carries only the transformer weights (its `text_encoder/` and `vae/` with
+  configs and no weights) takes the base's text encoder and VAE.
 - Without a `path/variant` folder, `path` itself is the pipeline folder.
 - A root that has no folder for the requested variant (e.g. `sft` on a root with only
   `base/`) is an error.

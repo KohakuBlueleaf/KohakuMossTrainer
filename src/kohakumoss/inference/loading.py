@@ -89,20 +89,25 @@ def _plan_dict(plan) -> dict:
     return asdict(plan) if isinstance(plan, TextEncoderPlan) else dict(plan)
 
 
+def _ships(root: Path, name: str) -> bool:
+    return any((root / name).glob("*.safetensors"))
+
+
 def component_root(path: Path, variant: str | None, name: str) -> Path:
-    """The folder holding component `name`: `path/<variant>` (a weights root with base/
-    sft/); `path/base` when that variant folder does not ship `name` (logged); `path`
-    itself (one pipeline dir) when there is no variant folder. FileNotFoundError when
-    none holds it. See docs/guides/inference.md."""
+    """The folder holding component `name` (a `name/` with safetensors files):
+    `path/<variant>` (a weights root with base/ sft/); `path/base` when that variant
+    folder does not ship `name`'s weights (logged); `path` itself (one pipeline dir)
+    when there is no variant folder. FileNotFoundError when none holds it. See
+    docs/guides/inference.md."""
     own = path / variant if variant else None
     if own is not None and own.is_dir():
         for root in (own, path / "base"):
-            if (root / name).is_dir():
+            if _ships(root, name):
                 if root != own:
-                    log.info(f"{name}/ from {root} ({own} does not ship one)")
+                    log.info(f"{name}/ from {root} ({own} does not ship its weights)")
                 return root
-        raise FileNotFoundError(f"no {name}/ in {own} or {path / 'base'}")
-    if (path / name).is_dir():
+        raise FileNotFoundError(f"no {name}/ weights in {own} or {path / 'base'}")
+    if _ships(path, name):
         return path
     where = f"no VARIANT folder {own}/ and " if own is not None else ""
     raise FileNotFoundError(f"{where}no {name}/ under {path}")
