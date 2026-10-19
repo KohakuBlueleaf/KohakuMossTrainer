@@ -104,11 +104,24 @@ def train_layers(root: Path, c: TrainChoice) -> list[Path]:
     layers = [presets.layer(root, "moss", group, name) for group, name in picks]
     layers = [root / BASES[TRAIN], *layers]
     parallel = presets.parallel_layer(c.gpus, full)
-    if parallel == "fsdp" and not fsdp_fits(root, layers, c):
+    if parallel == "fsdp" and not (peer_linked(c.gpus) and fsdp_fits(root, layers, c)):
         parallel = "ddp"
     if parallel is not None:
         layers.append(presets.layer(root, "moss", "parallel", parallel))
     return layers
+
+
+def peer_linked(gpus: int, cuda=torch.cuda) -> bool:
+    """Every pair of the first `gpus` CUDA devices has peer access (NVLink / P2P); False
+    when this machine has fewer CUDA devices. See docs/guides/full-finetune.md."""
+    if not cuda.is_available() or cuda.device_count() < gpus:
+        return False
+    return all(
+        cuda.can_device_access_peer(i, j)
+        for i in range(gpus)
+        for j in range(gpus)
+        if i != j
+    )
 
 
 def fsdp_fits(root: Path, layers: list[Path], c: TrainChoice) -> bool:

@@ -139,7 +139,9 @@ def _fsdp_on_8_ranks(k: dict) -> None:
     assert k["PARALLEL"] == "fsdp" and k["DEVICES"] == tuple(range(8)), k["PARALLEL"]
 
 
-def test_full_ft_picks_fsdp_only_where_its_shards_fit(tmp_path):
+def test_full_ft_picks_fsdp_only_where_its_shards_fit(tmp_path, monkeypatch):
+    assert _full_ft(tmp_path / "pcie", "8", "32")["PARALLEL"] == "ddp"
+    monkeypatch.setattr(starter, "peer_linked", lambda gpus: True)
     _fsdp_on_8_ranks(_full_ft(tmp_path / "a", "8", "32"))
     k = _full_ft(tmp_path / "b", "2", "24")
     swap = load_knobs(presets.layer(ROOT, "moss", "vram", "24g_full"))

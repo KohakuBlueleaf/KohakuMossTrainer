@@ -59,11 +59,13 @@ With `--gpus N` the starter picks:
 
 | condition | engine |
 | --- | --- |
-| the per-rank FSDP2 footprint (the `fsdp` layer's resident profile, every parameter, gradient and optimizer state sharded over N ranks; the memory estimate) fits the card within `--vram-tolerance` | FSDP2 |
+| every pair of the N cards has peer access (NVLink / P2P) on the machine that runs `kohakumoss-config`, and the per-rank FSDP2 footprint (the `fsdp` layer's resident profile, every parameter, gradient and optimizer state sharded over N ranks; the memory estimate) fits the card within `--vram-tolerance` | FSDP2 |
 | otherwise | DDP: the full VRAM layer's swap profile (`ckpt-ring4-actoff-optstream-gradoff`) runs unchanged on every rank, the ranks sharing one host copy of the masters ([multi-gpu.md](multi-gpu.md#shared-host-masters)) |
 | `--vram auto` | DDP |
 
-So 4x 32 GB gets FSDP2 and 2x 24 GB gets DDP. Two RTX 3090 under DDP with that profile
+So 4x 32 GB V100 on NVLink gets FSDP2, and cards on plain PCIe get DDP: on 4x RTX 5090
+(PCIe, no P2P) a full finetune runs 15.3k tok/s under DDP against 8.3k under FSDP2
+([training-5090.md](../performance/training-5090.md)). Two RTX 3090 under DDP with that profile
 measured 0.356 samples/s (scaling efficiency 0.79), an nvidia-smi peak of 17.3 GiB per
 card and 63 GiB of host RAM in all.
 
