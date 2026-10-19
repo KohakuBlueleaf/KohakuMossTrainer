@@ -310,8 +310,11 @@ def weight_counts(ref, c: float, s: tuple) -> dict:
     summed and per tensor family."""
     params = dict(ref.named_parameters())
     fam = defaultdict(lambda: {"n": 0, "flushed": 0, "subnormal": 0, "inf": 0})
-    for name in _row_scales(ref, _scales(ref, c), "gate", s):
+    # the scaled rows, from a fold at c != 1 (at c = 1 every multiplier is 1)
+    for name, mult in _row_scales(ref, _scales(ref, 0.5), "gate", s).items():
         t = params[name].detach()
+        if isinstance(mult, torch.Tensor):
+            t = t[mult.to(t.device) != 1]
         h = t.to(torch.float16)
         parts = name.split(".")
         match parts[0]:
