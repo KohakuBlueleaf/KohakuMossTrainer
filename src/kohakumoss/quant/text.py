@@ -75,6 +75,32 @@ def _make(linear, precision, group, compute_dtype, recipe, work_device, values):
     return QuantLinear(linear, precision, compute_dtype, recipe, work_device, values)
 
 
+def linear_fate(
+    module: nn.Module, precision: str, group: int, min_features: int = 256
+) -> str | None:
+    """What `quantize_text_linears` does with `module`: "quantize", "skip" (a plain
+    linear fp8 compute cannot take) or None (left as it is)."""
+    if type(module) is not nn.Linear:
+        return None
+    if min(module.in_features, module.out_features) < min_features:
+        return None
+    if group and module.in_features % group:
+        return None
+    if not accepts(precision, module.out_features, module.in_features):
+        return "skip"
+    return "quantize"
+
+
+def quantizes(
+    module: nn.Module, precision: str, group: int, min_features: int = 256
+) -> bool:
+    """Whether `quantize_text_linears` would replace any linear inside `module`."""
+    return any(
+        linear_fate(m, precision, group, min_features) == "quantize"
+        for m in module.modules()
+    )
+
+
 @torch.no_grad()
 def quantize_text_linears(
     module: nn.Module,
@@ -85,25 +111,26 @@ def quantize_text_linears(
     recipe: str = "row",
     work_device: torch.device | str | None = None,
     source: SourceWeights | None = None,
+    quiet: bool = False,
 ) -> dict[str, int]:
     """Replace every plain nn.Linear with min(in, out) >= `min_features` in place
     (quantizing on `work_device`, from each weight's stored values in `source`, by
     weight name under `module`, where `source_weight` takes them, the tally logged
-    once); returns the layer count, dense / stored bytes, the layers fp8 compute could
-    not take (`skipped`), those quantized from stored values (`from_source`) and the
-    layers per `source_weight` kind (`sources`)."""
+    once unless `quiet`); each dense linear is freed as it is replaced. Returns the
+    layer count, dense / stored bytes, the layers fp8 compute could not take
+    (`skipped`), those quantized from stored values (`from_source`) and the layers per
+    `source_weight` kind (`sources`)."""
     report = {"layers": 0, "dense_bytes": 0, "quant_bytes": 0, "skipped": 0}
     sources: dict[str, int] = {}
-    for path, parent in list(module.named_modules()):
-        for name, child in list(parent.named_children()):
-            if type(child) is not nn.Linear:
-                continue
-            if min(child.in_features, child.out_features) < min_features:
-                continue
-            if group and child.in_features % group:
-                continue
-            if not accepts(precision, child.out_features, child.in_features):
+    parents = [(p, m) for p, m in module.named_modules() if type(m) is not nn.Linear]
+    for path, parent in parents:
+        names = [n for n, c in parent.named_children() if type(c) is nn.Linear]
+        for name in names:
+            child = getattr(parent, name)
+            fate = linear_fate(child, precision, group, min_features)
+            if fate == "skip":
                 report["skipped"] += 1
+            if fate != "quantize":
                 continue
             weight = f"{path}.{name}.weight" if path else f"{name}.weight"
             values, kind = source_weight(
@@ -117,8 +144,9 @@ def quantize_text_linears(
             report["dense_bytes"] += child.weight.nbytes
             report["quant_bytes"] += sum(t.nbytes for t in new.buffers())
             setattr(parent, name, new)
+            del child, values, new
     report["from_source"] = sources.get(STORED, 0)
     report["sources"] = sources
-    if source is not None:
+    if source is not None and not quiet:
         log_sources(f"text encoder {precision}", sources)
     return report
