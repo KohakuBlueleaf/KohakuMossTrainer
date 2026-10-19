@@ -3,7 +3,7 @@ encoder and the VAE, each placed for the device; `component_root` finds their fo
 """
 
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
@@ -13,11 +13,11 @@ import torch
 from kohakumoss import adapters as adapter_api
 from kohakumoss.encoders import FluxVae, QwenTextEncoder
 from kohakumoss.encoders.text import text_plan as make_text_plan
-from kohakumoss.encoders.text.encoder import default_auto_memory
+from kohakumoss.encoders.text.encoder import default_auto_memory, default_w4a8
 from kohakumoss.encoders.vae import resolve_vae_dtype
 from kohakumoss.inference.placement_report import REFERENCE_TOKENS
 from kohakumoss.logging.log import get_logger, hl, log_object, timed
-from kohakumoss.memory.apply import apply_inference_plan
+from kohakumoss.memory.apply import apply_inference_plan, settle_stored
 from kohakumoss.memory.estimate import Workload, estimate_inference
 from kohakumoss.memory.profiles import ORDER
 from kohakumoss.memory.profiles import resolve as resolve_memory
@@ -27,8 +27,10 @@ from kohakumoss.model.numerics import apply_fp16_fix, output_row_scales
 from kohakumoss.model.opset import OpSet
 from kohakumoss.offload.accel import device_budget
 from kohakumoss.offload.encoders.vae import place_vae
+from kohakumoss.quant.densify import stored_precision_of
 from kohakumoss.types.arch import MossArchConfig
 from kohakumoss.types.plans import MemoryPlan, TextEncoderPlan
+from kohakumoss.weights import DIT, TEXT, VAE, component_path, is_comfy_folder
 from kohakumoss_common.units import GIB
 from kohakumoss_kernels.dtypes import short
 
@@ -44,12 +46,18 @@ def auto_profile(
     overrides: dict | None,
     budget: int,
     tokens: int = REFERENCE_TOKENS,
+    stored: str = "compute",
 ) -> str:
     """MEMORY_PROFILE 'auto' for sampling: the fastest profile (ORDER) whose inference
-    estimate of one `tokens`-token forward of `arch` at `compute_bytes` per element fits
-    `budget` bytes; ValueError listing each estimate when none fits."""
+    estimate of one `tokens`-token forward of `arch` at `compute_bytes` per element
+    (the DiT file's `stored` precision under base precision auto) fits `budget` bytes;
+    ValueError listing each estimate when none fits."""
     work = Workload(
-        arch=arch, img_tokens=tokens, txt_tokens=0, compute_bytes=compute_bytes
+        arch=arch,
+        img_tokens=tokens,
+        txt_tokens=0,
+        compute_bytes=compute_bytes,
+        stored_precision=stored,
     )
     rows = []
     for name in ORDER:
@@ -100,6 +108,32 @@ def component_root(path: Path, variant: str | None, name: str) -> Path:
     raise FileNotFoundError(f"{where}no {name}/ under {path}")
 
 
+def component_paths(
+    path: Path,
+    variant: str | None,
+    transformer: str = "",
+    text_encoder: str = "",
+    vae: str = "",
+) -> tuple[Path, Callable[[], Path], Callable[[], Path]]:
+    """(DiT path, text-encoder path, VAE path) of a weights `path`: a ComfyUI models
+    folder (`weights.component_path`: each knob a file name there, a path, or "" for
+    the default), else the HF layout (`component_root`; a set knob is a path). The
+    encoder paths are resolved when called (a run may load neither)."""
+    if is_comfy_folder(path):
+        dit = component_path(path, DIT, transformer, variant or "base")
+        return (
+            dit,
+            partial(component_path, path, TEXT, text_encoder, variant or "base"),
+            partial(component_path, path, VAE, vae, variant or "base"),
+        )
+
+    def hf(name: str, choice: str) -> Path:
+        return Path(choice) if choice else component_root(path, variant, name)
+
+    dit = Path(transformer) if transformer else component_root(path, variant, DIT)
+    return dit, partial(hf, TEXT, text_encoder), partial(hf, VAE, vae)
+
+
 def load_transformer(
     dit: str | Path,
     dtype: torch.dtype,
@@ -109,10 +143,14 @@ def load_transformer(
     fp16_fix: str = "none",
     fp16_fix_kwargs: dict | None = None,
     kernels: dict[str, str] | None = None,
+    base_precision: str = "auto",
 ):
     """Backbone + adapters (merged before a weight fix, bypassed after it) + fp16 fix,
     ops bound last; adapter deltas always carry the row scales of a fold already in
-    the weights (an fp16-fix file). Returns (backbone, adapter stacks)."""
+    the weights (an fp16-fix file). A pre-quantized DiT file keeps its stored bases
+    under `base_precision` auto / their own format and is dequantized for any other
+    (`settle_stored`) before the adapters attach. Returns (backbone, adapter
+    stacks)."""
     fix_kw = dict(fp16_fix_kwargs or {})
     backbone, _ = load_backbone(
         dit,
@@ -122,6 +160,7 @@ def load_transformer(
         fp16_fix_eps=fix_kw.get("eps", "stock"),
     )
     backbone.eval().requires_grad_(False)
+    settle_stored(backbone, base_precision, trainable_base=False)
     stacks = []
     if adapter_mode == "merge":
         loaded = output_row_scales(backbone)
@@ -174,6 +213,7 @@ def load_dit(
     (a `memory` profile) loaded on the host, placed by the inference MemoryPlan, then
     the adapters attached to the placed layers; 'auto' sizes for a `tokens`-token
     forward."""
+    precision = (memory_overrides or {}).get("base_precision", "auto")
     if not memory:
         backbone, stacks = load_transformer(
             dit,
@@ -184,6 +224,7 @@ def load_dit(
             fp16_fix,
             fp16_fix_kwargs,
             kernels,
+            precision,
         )
         loaded = LoadedDit(backbone, stacks)
     else:
@@ -192,9 +233,15 @@ def load_dit(
         )
         if memory == AUTO:
             budget = device_budget(device)
-            cb = next(backbone.parameters()).element_size()
+            cb = backbone.final_norm_video.weight.element_size()
             memory = auto_profile(
-                backbone.cfg, cb, device, memory_overrides, budget, tokens
+                backbone.cfg,
+                cb,
+                device,
+                memory_overrides,
+                budget,
+                tokens,
+                stored_precision_of(backbone),
             )
             log.info(f"MEMORY_PROFILE 'auto' -> {hl(memory)}")
         plan = resolve_memory(memory, memory_overrides, device, inference=True)
@@ -230,13 +277,19 @@ def load_text_encoder(
     if te_device.type == "cpu":
         spec = replace(spec, memory="cpu")
     choose = partial(default_auto_memory, plan=spec, reserve=reserve)
+    w4a8 = partial(default_w4a8, plan=spec, reserve=reserve)
     what = (
         f"text encoder weights -> host RAM, then placed (memory "
         f"{spec.memory}, compute on {te_device})"
     )
     with timed(log, what) as done:
         te = QwenTextEncoder.from_pretrained(
-            root, te_device, spec, output_device=device, auto_memory=choose
+            root,
+            te_device,
+            spec,
+            output_device=device,
+            auto_memory=choose,
+            auto_w4a8=w4a8,
         )
         done["memory"] = te.plan.memory
     return te

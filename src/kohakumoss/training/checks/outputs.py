@@ -3,18 +3,49 @@
 import os
 from pathlib import Path
 
-EXPORTS = ("comfy", "lycoris", "merged", "diffusers")
+from kohakumoss.memory.apply import stored_base_problems
+from kohakumoss.training.exports import EXPORT_FORMATS, export_problems
+from kohakumoss.training.weights import KNOBS, component, stored_dit_precision
+from kohakumoss.weights import COMPONENTS, DIT, TEXT, VAE, is_comfy_folder
+
+EXPORTS = EXPORT_FORMATS
+
+
+def weights_problems(k: dict) -> list[str]:
+    """WEIGHTS and the component knobs: each component the run reads exists (a ComfyUI
+    folder names the files it tried), and a full finetune does not train a
+    pre-quantized DiT file under BASE_PRECISION auto."""
+    weights = k["WEIGHTS"]
+    if not weights or not os.path.exists(weights):
+        return [f"WEIGHTS={weights!r} does not exist"] if weights else []
+    p = []
+    comfy = is_comfy_folder(weights)
+    sampling = k["SAMPLE_EVERY"] > 0
+    reads = {
+        DIT: True,
+        TEXT: k["TEXT_CACHE"] != "offline" or sampling,
+        VAE: k["LATENT_CACHE"] != "offline" or sampling,
+    }
+    for which in COMPONENTS:
+        if not reads[which]:
+            continue
+        try:
+            path = component(k, which)
+        except FileNotFoundError as err:
+            p.append(f"{KNOBS[which]}: {err}")
+            continue
+        named = k.get(KNOBS[which]) or comfy or which == DIT
+        if named and not Path(path).exists():
+            p.append(f"{KNOBS[which]}: {path} does not exist")
+    stored = stored_dit_precision(k)
+    p += stored_base_problems(stored, k.get("BASE_PRECISION"), k["ALGO"] == "full")
+    return p
 
 
 def io_problems(k: dict) -> list[str]:
-    """EXPORT_FORMATS, SAMPLE / VALIDATION inputs, checkpoint cadence, RESUME and
-    WEIGHTS paths."""
-    p = []
-    bad = [f for f in k["EXPORT_FORMATS"] if f not in EXPORTS]
-    if bad:
-        p.append(f"EXPORT_FORMATS has unknown formats {bad}; valid {EXPORTS}")
-    if k["ALGO"] == "full" and set(k["EXPORT_FORMATS"]) & {"comfy", "lycoris"}:
-        p.append("full finetune exports 'merged' / 'diffusers', not adapter formats")
+    """Exports, SAMPLE / VALIDATION inputs, checkpoint cadence, RESUME and the weights
+    paths."""
+    p = export_problems(k)
     if k["SAMPLE_EVERY"] > 0 and not k["SAMPLE_PROMPTS"]:
         p.append("SAMPLE_EVERY > 0 needs SAMPLE_PROMPTS")
     if k["VALIDATE_EVERY"] > 0 and not k["VALIDATION"].get("datasets"):
@@ -24,7 +55,4 @@ def io_problems(k: dict) -> list[str]:
     resume = k["RESUME"]
     if resume not in ("", "latest") and not Path(resume).exists():
         p.append(f"RESUME={resume!r} does not exist")
-    weights = k["WEIGHTS"]
-    if weights and not os.path.exists(weights):
-        p.append(f"WEIGHTS={weights!r} does not exist")
-    return p
+    return p + weights_problems(k)

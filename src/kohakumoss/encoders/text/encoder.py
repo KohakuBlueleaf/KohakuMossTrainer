@@ -12,6 +12,12 @@ from transformers import AutoModel, AutoTokenizer
 from transformers.utils import logging as hf_logging
 
 from kohakumoss.encoders.specs import text_spec
+from kohakumoss.encoders.text.comfy_files import is_comfy_text_file, packaged_tokenizer
+from kohakumoss.encoders.text.comfy_load import (
+    comfy_text_source,
+    load_comfy_text,
+    text_file_format,
+)
 from kohakumoss.encoders.text.forward import (
     KernelForward,
     TextOps,
@@ -23,6 +29,7 @@ from kohakumoss.encoders.text.plan import (
     DTYPES,
     check_plan,
     resolve_dtype,
+    resolve_precision,
     text_plan,
 )
 from kohakumoss.encoders.text.tokens import (
@@ -33,16 +40,22 @@ from kohakumoss.encoders.text.tokens import (
     tokenizer_dir,
 )
 from kohakumoss.logging.log import bar as log_bar
+from kohakumoss.logging.log import get_logger, hl
 from kohakumoss.offload.accel import device_budget
-from kohakumoss.offload.encoders.text import apply_to_text_encoder
+from kohakumoss.offload.encoders.text import apply_to_text_encoder, w4a8_extra_bytes
 from kohakumoss.offload.encoders.text_memory import choose_text_memory, text_sizes
+from kohakumoss.quant.convert import QuantLinear
 from kohakumoss.quant.source import SourceWeights, text_source
 from kohakumoss.quant.stored_text import load_stored_text, read_text_record
+from kohakumoss.quant.text import GroupQuantLinear
 from kohakumoss.types.plans import TextEncoderPlan
+from kohakumoss.weights import TEXT, comfy_file, is_comfy_folder
 from kohakumoss_common.calls import nothing
+from kohakumoss_kernels.dtypes import short
 from kohakumoss_kernels.hardware.current import synchronize
 
 ENCODER_ID = "qwen3.5-9b"
+log = get_logger(__name__)
 
 
 @contextmanager
@@ -87,6 +100,69 @@ def _stored(model_dir: Path, plan: TextEncoderPlan):
     return load_stored_text(model_dir, plan.stored, DTYPES[plan.dtype])
 
 
+def text_source_of(path: str | Path) -> Path:
+    """The text-encoder weights `path` names: a ComfyUI folder's default text-encoder
+    file, else `path` (a ComfyUI file, a pipeline root or a model dir)."""
+    if not str(path):
+        return Path(path)
+    path = Path(path)
+    return comfy_file(path, TEXT) if is_comfy_folder(path) else path
+
+
+def stored_text_format(path: str | Path, plan: TextEncoderPlan) -> tuple[str, str]:
+    """(precision, layout) the text-encoder weights at `path` store (headers only): a
+    ComfyUI file's (`text_file_format`), a plan's `stored` file's record precision, else
+    `compute`."""
+    path = text_source_of(path)
+    if is_comfy_text_file(path):
+        return text_file_format(path)
+    if plan.stored:
+        record = read_text_record(plan.stored)
+        if record is not None:
+            return record["precision"], ""
+    return "compute", ""
+
+
+def resolve_text_plan(
+    path: str | Path, plan: TextEncoderPlan, device: torch.device | str
+) -> tuple[TextEncoderPlan, str, str]:
+    """(plan with dtype and precision resolved for `device`, the stored precision,
+    the stored layout) of the text encoder at `path`."""
+    stored, layout = stored_text_format(path, plan)
+    plan = resolve_precision(plan, stored, device)
+    return resolve_dtype(plan, device), stored, layout
+
+
+def default_w4a8(
+    text, device: torch.device, plan: TextEncoderPlan, reserve: int = 0
+) -> str:
+    """`w4a8="auto"`: `int8` (decode once) when the int8-decoded encoder fits resident
+    next to `reserve` bytes on `device` (the host: always), else `packed`."""
+    if device.type == "cpu":
+        return "int8"
+    extra = w4a8_extra_bytes(text)
+    sizes = text_sizes(text, plan.stream_resident, extra)
+    budget = int(device_budget(device))
+    tokens = plan.max_tokens or 16384
+    choice, _ = choose_text_memory(sizes, budget, reserve, tokens, tokens)
+    return "int8" if choice == "resident" else "packed"
+
+
+def flops_per_token(text) -> int:
+    """2 x the multiply-adds per token: every dense parameter outside the embedding,
+    plus every quantized linear's [N, K]."""
+    dense = sum(
+        p.numel() for n, p in text.named_parameters() if "embed_tokens" not in n
+    )
+    quant = 0
+    for m in text.modules():
+        if isinstance(m, QuantLinear):
+            quant += m.in_features * m.out_features
+        elif isinstance(m, GroupQuantLinear):
+            quant += m.q.numel()
+    return 2 * (dense + quant)
+
+
 def _released(*args):
     raise RuntimeError(
         "the text encoder was freed after its first pass (free_after_use)"
@@ -120,9 +196,13 @@ class QwenTextEncoder:
         output_device: torch.device | str | None = None,
         auto_memory: Callable | None = None,
         source: SourceWeights | None = None,
+        layout: str = "",
+        auto_w4a8: Callable | None = None,
     ):
         plan = text_plan(plan)
         compute = torch.device("cpu") if plan.memory == "cpu" else torch.device(device)
+        if plan.precision == "auto":
+            plan = resolve_precision(plan, "compute", compute)
         self.plan = check_plan(plan, device=compute)
         if hasattr(model, "visual"):
             del model.visual
@@ -132,13 +212,15 @@ class QwenTextEncoder:
         self.max_length = max_length
         self.device = compute
         self.output_device = torch.device(output_device or device)
-        self.dtype = next(text.parameters()).dtype
+        self.dtype = text.norm.weight.dtype
         choose = auto_memory or partial(default_auto_memory, plan=plan)
+        w4a8 = auto_w4a8 or partial(default_w4a8, plan=plan)
         self.placement, self.quant, plan = apply_to_text_encoder(
-            text, plan, compute, self.dtype, choose, source
+            text, plan, compute, self.dtype, choose, source, w4a8
         )
         self.plan = plan
-        self.encoder_spec = text_spec(plan, self.dtype)
+        self.layout = layout
+        self.encoder_spec = text_spec(plan, self.dtype, layout)
         self.pad_id = getattr(tokenizer, "pad_token_id", None) or 0
         self.padded = plan.layout == "padded"
         self.batch = 1 if plan.layout == "single" else plan.batch
@@ -152,9 +234,7 @@ class QwenTextEncoder:
             self.op_names = {}
         self._empty: Tensor | None = None
         self.stats = {"passes": 0, "prompts": 0, "tokens": 0, "seconds": 0.0}
-        self.flops_per_token = 2 * sum(
-            p.numel() for n, p in text.named_parameters() if "embed_tokens" not in n
-        ) + 2 * sum(b.numel() for n, b in text.named_buffers() if n.endswith(".q"))
+        self.flops_per_token = flops_per_token(text)
         self.before_pass = self.after_pass = nothing
         self.progress = False
         self._run = QwenTextEncoder._encode
@@ -173,28 +253,56 @@ class QwenTextEncoder:
         max_length: int = MAX_LENGTH,
         output_device: torch.device | str | None = None,
         auto_memory: Callable | None = None,
+        auto_w4a8: Callable | None = None,
     ) -> "QwenTextEncoder":
-        """`path` is a pipeline root (text_encoder/ + tokenizer/) or a model dir (its own
-        tokenizer files, else a sibling tokenizer/). Loaded on the host in the plan's
-        dtype, quantized from the checkpoint's stored values, then placed;
-        `auto_memory(text_model, device) -> memory mode` resolves `memory="auto"`
-        (default: the fastest placement that fits the free memory)."""
-        path = Path(path)
+        """`path` is a pipeline root (text_encoder/ + tokenizer/), a model dir (its own
+        tokenizer files, else a sibling tokenizer/), a ComfyUI text-encoder file (the
+        packaged config and tokenizer) or a ComfyUI models folder (its default text
+        encoder file). Loaded on the host in the plan's dtype at the plan's precision
+        (`auto`: the stored one; a pre-quantized file's bases kept, or dequantized for
+        another precision; quantized from the checkpoint's stored values), then
+        placed; `auto_memory(text_model, device) -> memory mode` resolves
+        `memory="auto"` (default: the fastest placement that fits the free memory),
+        `auto_w4a8(text_model, device)` a W4A8 file's `w4a8="auto"`."""
+        path = text_source_of(path)
         plan = text_plan(plan)
         on = torch.device("cpu") if plan.memory == "cpu" else torch.device(device)
-        plan = check_plan(resolve_dtype(plan, on), device=on)
-        model_dir = _subdir(path, "text_encoder")
-        tok = AutoTokenizer.from_pretrained(str(tokenizer_dir(model_dir)))
-        with hf_bars_off():
-            model = (
-                _stored(model_dir, plan)
-                if plan.stored
-                else AutoModel.from_pretrained(str(model_dir), dtype=DTYPES[plan.dtype])
-            )
-        quantized = plan.precision != "compute" and not plan.stored
-        source = text_source(model_dir) if quantized else None
+        plan, stored, layout = resolve_text_plan(path, plan, on)
+        plan = check_plan(plan, device=on)
+        dtype = DTYPES[plan.dtype]
+        if is_comfy_text_file(path):
+            tok = packaged_tokenizer()
+            keep = plan.precision == stored and stored != "compute"
+            with hf_bars_off():
+                model = load_comfy_text(path, dtype, keep)
+            if stored != "compute" and not keep:
+                log.info(
+                    f"text encoder precision {hl(plan.precision)}: the {hl(stored)} "
+                    f"layers of {hl(path, 'path')} dequantized to {short(dtype)}"
+                )
+            source = comfy_text_source(path) if plan.precision != "compute" else None
+        else:
+            model_dir = _subdir(path, "text_encoder")
+            tok = AutoTokenizer.from_pretrained(str(tokenizer_dir(model_dir)))
+            with hf_bars_off():
+                model = (
+                    _stored(model_dir, plan)
+                    if plan.stored
+                    else AutoModel.from_pretrained(str(model_dir), dtype=dtype)
+                )
+            quantized = plan.precision != "compute" and not plan.stored
+            source = text_source(model_dir) if quantized else None
         return cls(
-            model, tok, device, plan, max_length, output_device, auto_memory, source
+            model,
+            tok,
+            device,
+            plan,
+            max_length,
+            output_device,
+            auto_memory,
+            source=source,
+            layout=layout,
+            auto_w4a8=auto_w4a8,
         )
 
     def format(self, prompt: str) -> str:

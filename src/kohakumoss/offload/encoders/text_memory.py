@@ -26,12 +26,13 @@ class TextSizes:
     elem: int
 
 
-def text_sizes(model: nn.Module, slots: int = 2) -> TextSizes:
+def text_sizes(model: nn.Module, slots: int = 2, extra_layers: int = 0) -> TextSizes:
     """Sizes of a (possibly quantized) Qwen3.5 text model; `ring` is the layer ring of
-    `slots` slots per layer signature."""
+    `slots` slots per layer signature; `extra_layers` bytes are added to the decoder
+    layers (spread evenly over the ring's signatures: a decode the model has not run
+    yet)."""
     cfg = model.config
     layers = list(model.layers)
-    emb = model.embed_tokens.weight
     sigs: dict[tuple, int] = {}
     total_layers = 0
     for layer in layers:
@@ -39,17 +40,18 @@ def text_sizes(model: nn.Module, slots: int = 2) -> TextSizes:
         sig = tuple((n, tuple(t.shape), t.dtype) for n, t in ts.items())
         sigs[sig] = tensor_bytes(ts.values())
         total_layers += sigs[sig]
+    per_layer = extra_layers / max(len(layers), 1)
     return TextSizes(
-        total=module_bytes(model),
-        embedding=emb.nbytes,
-        layers=total_layers,
-        ring=max(slots, 2) * sum(sigs.values()),
+        total=module_bytes(model) + extra_layers,
+        embedding=module_bytes(model.embed_tokens),
+        layers=total_layers + extra_layers,
+        ring=int(max(slots, 2) * (sum(sigs.values()) + per_layer * len(sigs))),
         hidden=cfg.hidden_size,
         intermediate=cfg.intermediate_size,
         value_heads=cfg.linear_num_value_heads,
         head_k=cfg.linear_key_head_dim,
         head_v=cfg.linear_value_head_dim,
-        elem=emb.element_size(),
+        elem=model.norm.weight.element_size(),
     )
 
 

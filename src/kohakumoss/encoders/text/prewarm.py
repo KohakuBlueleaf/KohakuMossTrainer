@@ -5,6 +5,9 @@ so live encodes bind every tuned choice from the tables. See
 docs/internals/tuning.md#text-encoder-buckets.
 """
 
+import copy
+from types import MethodType
+
 import torch
 from torch import nn
 
@@ -12,7 +15,9 @@ from kohakumoss.encoders.text.forward import KernelForward, make_pack
 from kohakumoss.model.build import materialize
 from kohakumoss.offload.encoders.text import TextPlacement
 from kohakumoss.quant.bind import rebind_quant
-from kohakumoss.quant.text import quantize_text_linears
+from kohakumoss.quant.convert import QuantLinear
+from kohakumoss.quant.embedding import QuantEmbedding
+from kohakumoss.quant.text import GroupQuantLinear
 from kohakumoss_kernels.recording import recording
 from kohakumoss_kernels.tuning.buckets import (
     LENGTH_FLOOR,
@@ -28,6 +33,7 @@ from kohakumoss_kernels.tuning.replay import OpReport, Target, replay
 
 RECORD_ROWS = (37, 24)
 RECORD_TOKEN = 1
+QUANTIZED_MODULES = (QuantLinear, GroupQuantLinear, QuantEmbedding)
 
 
 def longest_row(te, max_text_tokens: int, data_tokens: int = 0) -> int:
@@ -137,18 +143,49 @@ def text_targets(
     return targets
 
 
+def meta_copy(module: nn.Module) -> nn.Module:
+    """A copy of `module` whose every tensor is an empty meta tensor of the same shape
+    and dtype; bound kernels and other callables are shared, not copied (the twin is
+    re-bound by `rebind_quant`)."""
+    memo = {}
+    for m in module.modules():
+        for t in m._parameters.values():
+            if t is not None:
+                memo[id(t)] = nn.Parameter(torch.empty_like(t, device="meta"), False)
+        for t in m._buffers.values():
+            if t is not None:
+                memo[id(t)] = torch.empty_like(t, device="meta")
+        for value in vars(m).values():
+            shared = callable(value) and not isinstance(value, MethodType)
+            if shared and not isinstance(value, (nn.Module, torch.Tensor)):
+                memo[id(value)] = value
+    return copy.deepcopy(module, memo)
+
+
+def mirror_quantized(twin: nn.Module, model: nn.Module) -> int:
+    """Put a meta copy of every quantized module of `model` (QuantLinear,
+    GroupQuantLinear, QuantEmbedding: quantized at load or stored in the file) at the
+    same path of `twin`; returns how many."""
+    count = 0
+    for path, m in model.named_modules():
+        if not isinstance(m, QUANTIZED_MODULES):
+            continue
+        parent_path, _, name = path.rpartition(".")
+        parent = twin.get_submodule(parent_path) if parent_path else twin
+        setattr(parent, name, meta_copy(m))
+        count += 1
+    return count
+
+
 def text_shapes(te) -> nn.Module:
     """A weightless twin of `te`'s text model: its class built on the meta device,
-    the plan's quantized linears, every tensor in the dtype of `te`'s tensor of the
-    same name as a stride-0 view on `te.device`, quantized GEMMs bound there."""
+    `te`'s quantized modules mirrored (`mirror_quantized`), every tensor in the dtype
+    of `te`'s tensor of the same name as a stride-0 view on `te.device`, quantized
+    GEMMs bound there."""
     with torch.device("meta"):
         twin = type(te.model)(te.model.config)
     twin.eval().requires_grad_(False)
-    plan = te.plan
-    if plan.precision != "compute":
-        quantize_text_linears(
-            twin, plan.precision, plan.quant_group, te.dtype, recipe=plan.fp8_recipe
-        )
+    mirror_quantized(twin, te.model)
     like = {**dict(te.model.named_parameters()), **dict(te.model.named_buffers())}
     materialize(twin, te.device, like)
     rebind_quant(twin, te.device, te.dtype, autograd=False)

@@ -70,6 +70,8 @@ def test_sample_knobs_map_to_the_memory_plan():
     memory, overrides = knobs.memory_of(k)
     assert memory == "speed"
     assert overrides == {"base_precision": "mxfp8", "fp8_recipe": "row"}
-    assert knobs.memory_of({**k, "BASE_PRECISION": "compute"}) == (None, {})
+    assert knobs.memory_of({**k, "BASE_PRECISION": "auto"}) == (None, {})
+    compute = knobs.memory_of({**k, "BASE_PRECISION": "compute"})
+    assert compute == (None, {"base_precision": "compute"})
     k2 = {**k, "MEMORY_PROFILE": "low", "MEMORY_OVERRIDES": {"fp8_recipe": "block"}}
     assert knobs.memory_of(k2) == ("low", {"base_precision": "mxfp8", "fp8_recipe": "block"})  # fmt: skip

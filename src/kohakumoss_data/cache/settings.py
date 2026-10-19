@@ -81,19 +81,21 @@ def record(cfg: DataConfig, kind: str) -> None:
 
 SPEC_FIELDS = {"latents": "latent_encoder_spec", "text": "text_encoder_spec"}
 SAFE = re.compile(r"[\w%+=:./-]*", re.ASCII)
+SRC = "src:"
 
 
 def spec_knobs(cfg: DataConfig, kind: str) -> dict:
     """The encoder knobs that give `cfg`'s encoder spec in the cache pass of `kind` (the
     pass records the spec of the encoder it builds from them): VAE_DTYPE for latents,
     TEXT_ENCODE's dtype / precision / quant_group / fp8_recipe for text (the inverse of
-    kohakumoss.encoders.specs.text_spec); empty for no spec."""
+    kohakumoss.encoders.specs.text_spec; a stored-layout part `src:...` names the
+    weights file, not a knob); empty for no spec."""
     spec = getattr(cfg, SPEC_FIELDS[kind])
     if not spec:
         return {}
     if kind == "latents":
         return {"VAE_DTYPE": spec}
-    dtype, precision, *rest = spec.split("/")
+    dtype, precision, *rest = [p for p in spec.split("/") if not p.startswith(SRC)]
     fields = {"dtype": dtype, "precision": precision}
     if rest and rest[0].startswith("g") and rest[0][1:].isdigit():
         fields["quant_group"] = int(rest[0][1:])

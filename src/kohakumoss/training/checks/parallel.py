@@ -6,10 +6,12 @@ trace windows for every layout (`parallel_problems`), and the per-layout limits 
 import sys
 
 from kohakumoss.adapters.build.config import config_from_knobs
+from kohakumoss.memory.estimate import base_precision
 from kohakumoss.offload.accel import default_type
 from kohakumoss.parallel.launch import default_backend
 from kohakumoss.parallel.pipeline.distributed import schedule_problems
 from kohakumoss.parallel.pipeline.split import SPLITS
+from kohakumoss.training.weights import stored_dit_precision
 from kohakumoss.types.plans import PrecisionConfig
 from kohakumoss_data import DataConfig, pipeline_problems
 
@@ -155,10 +157,11 @@ def _in_backward_steps(k: dict, plan) -> list[str]:
 
 def _resident(k: dict, plan) -> list[str]:
     kind, p = k["PARALLEL"], []
+    precision = base_precision(plan, stored_dit_precision(k))
     for field, value, ok in (
         ("stream", plan.stream, "off"),
         ("optim_state", plan.optim_state, "gpu"),
-        ("base_precision", plan.base_precision, "compute"),
+        ("base_precision", precision, "compute"),
         ("act_offload", plan.act_offload, False),
     ):
         if value != ok:

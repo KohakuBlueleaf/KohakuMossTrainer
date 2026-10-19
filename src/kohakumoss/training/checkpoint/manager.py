@@ -39,7 +39,9 @@ def _barrier() -> None:
 class CheckpointManager:
     """Owns `<output>/checkpoints/step_XXXXXXXX/` directories; called on every rank.
     `before_save` runs on every rank before each save (e.g. flushing the online cache
-    writer); `devices` are this rank's devices whose CUDA RNG state is kept."""
+    writer), `after_save(step, path)` on every rank after it (path: the checkpoint
+    directory on rank 0, None elsewhere; e.g. the checkpoint exports); `devices` are
+    this rank's devices whose CUDA RNG state is kept."""
 
     def __init__(
         self,
@@ -56,6 +58,7 @@ class CheckpointManager:
         self.keep_last = keep_last
         self._snap = CheckpointManager._snapshot if snapshot_ema else nothing
         self.before_save = before_save
+        self.after_save = nothing
         self.rank = rank
         self.devices = tuple(devices)
         self.last_saved = -1
@@ -80,6 +83,7 @@ class CheckpointManager:
         path = self._save(self, step, parts)
         _barrier()
         self.last_saved = step
+        self.after_save(step, path)
         return path
 
     def _write(self, step: int, parts: dict) -> Path:

@@ -68,6 +68,12 @@ from kohakumoss.training.build.pipelines import release_nonlocal
 from kohakumoss.training.callbacks.evaluate import FixedSigma
 from kohakumoss.training.context import RunContext
 from kohakumoss.training.drivers import Parts
+from kohakumoss.training.exports import (
+    export_bytes,
+    export_files,
+    fused_qkv,
+    log_export_plan,
+)
 from kohakumoss.training.knobs import check, default_device_type, is_full, run_name
 from kohakumoss.training.layouts import Layout, layout_of
 from kohakumoss.training.memory.optimizers import close_memory
@@ -75,6 +81,7 @@ from kohakumoss.training.state import TrainState
 from kohakumoss.training.step import LayoutTransform
 from kohakumoss.tuning.prewarm import prewarm_devices, release_workspaces, tunes
 from kohakumoss.types.plans import ParallelPlan
+from kohakumoss_common.calls import nothing
 from kohakumoss_data import DataConfig, build_loader
 from kohakumoss_kernels import compile_setup
 from kohakumoss_kernels.dist import dist_rank, initialized
@@ -244,6 +251,8 @@ def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
     log_object(log, "training memory plan", built.plan)
     for message, fields in placement_lines(k, built, device):
         log.info(message, **fields)
+    files = export_files(k, fused_qkv(k))
+    log_export_plan(k, files, export_bytes(files, built.trainable, built.backbone))
     release_cache(device)
     device_use.log(log, "after build")
     warm = _prewarm(k, built, prec, device, loader.dataset, device_use)
@@ -302,6 +311,7 @@ def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
     rng_devices = stage_devices if layout.stage_rng else warm
     ckpt = build_checkpoints(k, output_dir, ema, is_main, writer, rank, rng_devices)
     parts = _parts(ctx, (ema, bundle, step, loader), names)
+    ckpt.after_save = checkpoint_exports(k, layout, built, parts, is_main)
     rank_cbs = _rank_callbacks(ctx, [hooks.timing, *sources], share, traced)
     runner = build_callbacks(
         ctx,
@@ -403,20 +413,41 @@ def _parts(ctx: RunContext, live: tuple, names) -> Parts:
     return ctx.layout.parts(ctx, (ctx.built.trainable, *live), names, extra)
 
 
-def _export(
-    k: dict, layout: Layout, built, parts, state, output_dir: str, is_main: bool
+def export_into(
+    k: dict, layout: Layout, built, parts, step: int, root: Path, is_main: bool
 ) -> None:
-    """Every EXPORT_FORMATS output of the trained state (rank 0 writes; every rank
-    takes part in the stage merge and the FSDP2 unshard)."""
+    """Every export file of the trained state at `step` under `root` (rank 0 writes;
+    every rank takes part in the stage merge and the FSDP2 unshard)."""
     parts.before_export()
     with layout.full_weights(built.backbone):
         if is_main:
-            meta = {
-                "kohakumoss_step": str(state.step),
-                "kohakumoss_algo": str(k["ALGO"]),
-            }
-            for path in export(k, built, output_dir, meta):
+            meta = {"kohakumoss_step": str(step), "kohakumoss_algo": str(k["ALGO"])}
+            for path in export(k, built, root, meta):
                 log.info(f"exported {path}")
+
+
+def _export(
+    k: dict, layout: Layout, built, parts, state, output_dir: str, is_main: bool
+) -> None:
+    """The run's final exports under `<output>/export/` (none with SAVE_FORMAT
+    'none')."""
+    if k["SAVE_FORMAT"] == "none":
+        return
+    root = Path(output_dir) / "export"
+    export_into(k, layout, built, parts, state.step, root, is_main)
+
+
+def checkpoint_exports(k: dict, layout: Layout, built, parts, is_main: bool):
+    """`after_save(step, path)` of the CheckpointManager: the exports into
+    `<checkpoint>/export/` (CHECKPOINT_EXPORT; every rank calls it, rank 0 writes)."""
+    if not k["CHECKPOINT_EXPORT"] or k["SAVE_FORMAT"] == "none":
+        return nothing
+
+    def after_save(step: int, path: Path | None) -> None:
+        root = (path or Path()) / "export"
+        export_into(k, layout, built, parts, step, root, is_main)
+
+    return after_save
 
 
 def close_quietly(writer) -> None:

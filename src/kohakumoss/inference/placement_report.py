@@ -7,6 +7,7 @@ from kohakumoss.inference import peaks
 from kohakumoss.logging.log import hl
 from kohakumoss.offload.encoders.report import gib_text, split_bytes
 from kohakumoss.offload.weights.layers import module_bytes
+from kohakumoss.quant.densify import stored_precision_of
 from kohakumoss_common.units import GIB
 from kohakumoss_data.resolution.geometry import LATENT_FACTOR
 from kohakumoss_kernels.dtypes import NAME_OF
@@ -42,7 +43,10 @@ def dit_line(backbone, path, device, plan) -> tuple[str, dict]:
     """The transformer: resident on the device, or streamed from the host."""
     on, host = split_bytes(backbone, device)
     dtype = NAME_OF.get(next(backbone.parameters()).dtype, "mixed")
-    base = "" if plan.base_precision == "compute" else f", base {plan.base_precision}"
+    precision = plan.base_precision
+    if precision == "auto":
+        precision = stored_precision_of(backbone)
+    base = "" if precision == "compute" else f", base {precision}"
     head = f"transformer: {hl(path, 'path')} -> "
     fields = {"gpu_gib": round(on / GIB, 2), "host_gib": round(host / GIB, 2)}
     if host == 0:

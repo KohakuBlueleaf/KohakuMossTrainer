@@ -5,7 +5,7 @@ steps after backward). Composed after configs/moss/_base/base_lora.py; see
 docs/guides/configs.md and docs/concepts/profiles.md."""
 
 ALGO = "full"
-EXPORT_FORMATS = ("merged",)
+SAVE_FORMAT = "comfy"
 OPTIMIZER = "muon"
 LR = 5e-5
 WD_RULES = "moss"

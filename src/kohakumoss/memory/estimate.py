@@ -24,7 +24,9 @@ PRECISION_BYTES = {
     "int8": 1,
     "fp8_compute": 1,
     "mxfp8": 1 + 1 / 32,
+    "w4a8": 0.5 + 1 / 16,
 }
+QUANTIZED = ("fp8", "int8", "w4a8", *FP8_COMPUTE)
 HOST_STATES = ("stream", "cpu")
 CONTEXT_BYTES = int(0.88 * GIB)  # device memory outside the torch allocator
 WORKSPACE_BYTES = int(0.25 * GIB)
@@ -40,7 +42,9 @@ class Workload:
     accumulates unsharded gradients across micro-batches); `ema_decays`: fp32 EMA
     averages kept of every trainable parameter (on its device; `swap` block masters
     and their averages live on the host); `master_bytes`: a full finetune's trainable
-    device parameter (fp32 master, the compute dtype under adamw16)."""
+    device parameter (fp32 master, the compute dtype under adamw16);
+    `stored_precision`: the base precision the checkpoint stores (what a plan's
+    `auto` keeps; `model.io.load.stored_precision`)."""
 
     arch: MossArchConfig
     img_tokens: int
@@ -55,10 +59,16 @@ class Workload:
     ema_decays: int = 0
     optim_state_bytes: int = 8
     master_bytes: int = 4
+    stored_precision: str = "compute"
 
     @property
     def tokens(self) -> int:
         return self.img_tokens + self.txt_tokens
+
+
+def base_precision(plan: MemoryPlan, stored: str = "compute") -> str:
+    """The base precision a plan runs: the checkpoint's `stored` one under `auto`."""
+    return stored if plan.base_precision == "auto" else plan.base_precision
 
 
 def fragmentation(plan: MemoryPlan) -> float:
@@ -180,13 +190,19 @@ def recompute_window(arch: MossArchConfig, mode: str) -> int:
 
 
 def weight_bytes(
-    plan: MemoryPlan, compute_bytes: int, training: bool, full_ft: bool = False
+    plan: MemoryPlan,
+    compute_bytes: int,
+    training: bool,
+    full_ft: bool = False,
+    stored: str = "compute",
 ) -> float:
-    """Stored bytes per base parameter: the compute dtype, a quantized format, plus the
-    W^T copy of an fp8 input gradient in training; a trainable fp8-compute weight keeps
-    its 16-bit copy next to the fp8 ones."""
-    wb = PRECISION_BYTES.get(plan.base_precision) or compute_bytes
-    fp8 = plan.base_precision in FP8_COMPUTE
+    """Stored bytes per base parameter: the compute dtype, a quantized format (the
+    checkpoint's `stored` one under `auto`), plus the W^T copy of an fp8 input gradient
+    in training; a trainable fp8-compute weight keeps its 16-bit copy next to the fp8
+    ones."""
+    precision = base_precision(plan, stored)
+    wb = PRECISION_BYTES.get(precision) or compute_bytes
+    fp8 = precision in FP8_COMPUTE
     copies = 2 if training and fp8 and plan.fp8_dgrad == "fp8" else 1
     return wb * copies + (compute_bytes if fp8 and full_ft else 0)
 
@@ -195,11 +211,12 @@ def _transients(est: Estimate, work: Workload, plan: MemoryPlan) -> None:
     """Per-call buffers of a quantized base: a dequantized layer (weight-only, and the
     fp8 path's 16-bit fallback) and the fp8 activation copy."""
     arch, cb = work.arch, work.compute_bytes
-    if plan.base_precision not in ("fp8", "int8", *FP8_COMPUTE):
+    precision = base_precision(plan, work.stored_precision)
+    if precision not in QUANTIZED:
         return
     largest = 2 * arch.ffn_dim * arch.dim
     est.parts["dequant"] = (block_params(arch) + 2 * largest) * cb
-    if plan.base_precision in FP8_COMPUTE:
+    if precision in FP8_COMPUTE:
         est.parts["fp8_act"] = work.tokens * 2 * arch.ffn_dim
 
 
@@ -210,7 +227,7 @@ def estimate_inference(work: Workload, plan: MemoryPlan) -> Estimate:
     est = Estimate(fragmentation=fragmentation(plan))
     est.parts["context"] = CONTEXT_BYTES
     est.parts["workspace"] = WORKSPACE_BYTES
-    wb = weight_bytes(plan, cb, training=False)
+    wb = weight_bytes(plan, cb, training=False, stored=work.stored_precision)
     blocks = arch.depth * block_params(arch)
     rest = total_params(arch) - blocks
     ring_params = min(max(plan.stream_resident, 2), arch.depth) * block_params(arch)
@@ -231,7 +248,9 @@ def estimate(work: Workload, plan: MemoryPlan) -> Estimate:
     est.parts["context"] = CONTEXT_BYTES
     est.parts["workspace"] = WORKSPACE_BYTES
 
-    wb = weight_bytes(plan, cb, training=True, full_ft=work.full_ft)
+    wb = weight_bytes(
+        plan, cb, training=True, full_ft=work.full_ft, stored=work.stored_precision
+    )
     # full FT: device parameters are the masters (+ the fp8 copies of fp8 compute)
     pb = work.master_bytes + wb - cb if work.full_ft else wb
     blocks = arch.depth * block_params(arch)

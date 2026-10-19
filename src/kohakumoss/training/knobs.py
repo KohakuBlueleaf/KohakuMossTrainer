@@ -27,6 +27,7 @@ from kohakumoss.training.checks.parallel import (
     dist_backend,
     parallel_problems,
 )
+from kohakumoss.training.exports import with_export_formats
 from kohakumoss.training.layouts import LAYOUTS
 from kohakumoss.training.optim.optimizers.factory import OPTIMIZERS
 from kohakumoss.training.optim.optimizers.kwargs import optimizer_problems
@@ -52,7 +53,7 @@ __all__ = [
 ]
 
 KNOWN = frozenset(
-    """WEIGHTS VARIANT ARCH_OVERRIDES TEXT_ENCODER TEXT_DEVICE TEXT_ENCODE VAE
+    """WEIGHTS VARIANT ARCH_OVERRIDES TRANSFORMER TEXT_ENCODER TEXT_DEVICE TEXT_ENCODE VAE
     VAE_ENCODE VAE_DTYPE TRAIN_TEXT_REFINER DATASETS
     RESOLUTION_MODE TARGET_AREA SIZE_STEP ASPECT_RANGE UPSCALE MAX_TOKENS BATCH_SIZE
     CAPTION TEXT_DROP LATENT_CACHE TEXT_CACHE CACHE_DTYPE CACHE_DIR CAPTION_VARIANTS FLIP
@@ -68,7 +69,8 @@ KNOWN = frozenset(
     MICROBATCHES KERNELS TUNE RETUNE_STEPS COMPILE DRIVER STEPS GRAD_ACC OUTPUT_DIR RUN_NAME LOGGER
     LOG_EVERY METRICS_EVERY PROGRESS SAMPLE_PROMPTS SAMPLE_EVERY SAMPLE_STEPS SAMPLE_CFG SAMPLE_SHIFT
     SAMPLE_SKIP_LAYERS SAMPLE_SIZE SAMPLE_SEEDS VALIDATE_EVERY VALIDATION SAVE_EVERY
-    SAVE_MINUTES KEEP_LAST RESUME EXPORT_FORMATS WEIGHTING OPTIMIZER_KWARGS
+    SAVE_MINUTES KEEP_LAST RESUME EXPORT_FORMATS SAVE_FORMAT SAVE_MERGED SAVE_FUSED_QKV
+    CHECKPOINT_EXPORT WEIGHTING OPTIMIZER_KWARGS
     SAMPLE_NEGATIVE PROJECT LORAPLUS_RATIO BATCHING OVERLONG MAX_SAMPLES TOKEN_BUDGET
     CROP PLANNER_KWARGS LATENT_ENCODER_ID LATENT_DRAW
     TEXT_ENCODER_ID BACKGROUND RESAMPLE TEXT_CHARS_PER_TOKEN TEXT_OVERHEAD_TOKENS
@@ -351,9 +353,9 @@ def _memory_problems(k: dict) -> list[str]:
 
 
 def check(g: dict) -> dict:
-    """Knobs from globals (PRECISION resolved); raises one SystemExit listing every
-    problem."""
-    k = with_precision(collect(g))
+    """Knobs from globals (PRECISION resolved, a set EXPORT_FORMATS mapped onto
+    SAVE_FORMAT / SAVE_MERGED); raises one SystemExit listing every problem."""
+    k = with_export_formats(with_precision(collect(g)))
     problems = validate(k)
     if problems:
         raise SystemExit("invalid configuration:\n  - " + "\n  - ".join(problems))

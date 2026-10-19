@@ -14,7 +14,7 @@ docs/guides/datasets.md.
 """
 
 data_root = "path/to/kohya_dataset"
-WEIGHTS = "models/MOSS-Image-Base"
+WEIGHTS = "ComfyUI/models"
 
 DATASETS = [
     {

@@ -3,6 +3,8 @@
 import os
 
 from kohakumoss.model.io.load import read_fp16_fix
+from kohakumoss.training.weights import component
+from kohakumoss.weights import DIT
 
 REAL_VARIANTS = ("base", "sft")
 
@@ -10,6 +12,16 @@ REAL_VARIANTS = ("base", "sft")
 def carries_fp16_fix(weights: str) -> bool:
     """True when WEIGHTS is a single file with an fp16-fix fold in its metadata."""
     return bool(weights) and read_fp16_fix(weights) is not None
+
+
+def dit_file(k: dict) -> str:
+    """The run's DiT weights path ("" when a ComfyUI folder holds none)."""
+    if not k["WEIGHTS"]:
+        return ""
+    try:
+        return str(component(k, DIT))
+    except FileNotFoundError:
+        return ""
 
 
 def objective_problems(k: dict) -> list[str]:
@@ -25,7 +37,7 @@ def objective_problems(k: dict) -> list[str]:
         k["PRECISION"] == "fp16"
         and k["VARIANT"] in REAL_VARIANTS
         and k["FP16_FIX"] == "none"
-        and not carries_fp16_fix(k["WEIGHTS"])
+        and not carries_fp16_fix(dit_file(k))
     ):
         p.append(
             f"PRECISION='fp16' on VARIANT={k['VARIANT']!r} needs FP16_FIX ('online' "

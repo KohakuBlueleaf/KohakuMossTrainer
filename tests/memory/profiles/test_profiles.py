@@ -36,7 +36,7 @@ def test_quant_resolves_per_arch_and_overrides_apply():
 
 @pytest.mark.parametrize("name", list(PROFILES))
 def test_no_profile_sets_a_precision(name):
-    assert resolve(name, device="cpu").base_precision == "compute"
+    assert resolve(name, device="cpu").base_precision == "auto"
 
 
 def test_invalid_combinations_listed_together():
@@ -65,7 +65,7 @@ def test_unknown_override_rejected():
 
 def test_full_ft_maps_ring_to_swap_and_keeps_dense_base():
     plan = resolve("minimal", device="cpu", trainable_base=True)
-    assert plan.stream == "swap" and plan.base_precision == "compute"
+    assert plan.stream == "swap" and plan.base_precision == "auto"
 
 
 def test_inference_drops_activation_knobs_and_allows_streaming():

@@ -1,7 +1,6 @@
 """Model-side build: backbone, fold, memory plan, trainable set, encoders, export."""
 
 import contextlib
-import os
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -12,10 +11,13 @@ from kohakumoss.adapters.build.apply import apply as apply_adapters
 from kohakumoss.adapters.build.config import config_from_knobs
 from kohakumoss.encoders.specs import cache_specs
 from kohakumoss.encoders.text import QwenTextEncoder, text_plan
-from kohakumoss.encoders.text.encoder import default_auto_memory
+from kohakumoss.encoders.text.encoder import (
+    default_auto_memory,
+    default_w4a8,
+    resolve_text_plan,
+)
 from kohakumoss.encoders.text.plan import DTYPES as TEXT_DTYPES
 from kohakumoss.encoders.text.plan import MEMORY_ALIASES as TEXT_MEMORY_ALIASES
-from kohakumoss.encoders.text.plan import resolve_dtype
 from kohakumoss.encoders.vae import FluxVae, resolve_vae_dtype
 from kohakumoss.logging.log import get_logger, hl
 from kohakumoss.memory.apply import apply_to_backbone
@@ -24,7 +26,6 @@ from kohakumoss.memory.planner import NothingFits, auto_plan
 from kohakumoss.memory.profiles import ORDER, catalog_name
 from kohakumoss.memory.profiles import resolve as resolve_profile
 from kohakumoss.model import load_backbone, resolve_config
-from kohakumoss.model.numerics import output_row_scales
 from kohakumoss.model.numerics.fp16fix import apply_fp16_fix
 from kohakumoss.model.opset import OpSet
 from kohakumoss.offload.accel import module as accel_module
@@ -36,6 +37,7 @@ from kohakumoss.parallel.launch import dist_rank, gate_name, rank0_value
 from kohakumoss.precision import apply_param_dtypes
 from kohakumoss.training.build.text_estimate import pass_tokens, planned_text_sizes
 from kohakumoss.training.ema.averagers import decay_count
+from kohakumoss.training.exports import export_files, fused_qkv, write_exports
 from kohakumoss.training.full import FullTrainable
 from kohakumoss.training.knobs import (
     is_full,
@@ -45,7 +47,9 @@ from kohakumoss.training.knobs import (
 )
 from kohakumoss.training.optim.groups import last_block_qk_norm
 from kohakumoss.training.optim.optimizers.factory import STATE_BYTES
+from kohakumoss.training.weights import component, stored_dit_precision
 from kohakumoss.types.plans import PrecisionConfig
+from kohakumoss.weights import DIT, TEXT, VAE
 from kohakumoss_kernels.hardware.current import rng_kept
 
 log = get_logger(__name__)
@@ -63,10 +67,10 @@ class Built:
 
 
 def build_backbone(k: dict, device: torch.device, prec: PrecisionConfig):
-    """The backbone loaded from WEIGHTS."""
+    """The backbone loaded from WEIGHTS (TRANSFORMER: the ComfyUI folder's file)."""
     cfg = resolve_config(k["VARIANT"], k["ARCH_OVERRIDES"] or None)
     model, _ = load_backbone(
-        k["WEIGHTS"],
+        component(k, DIT),
         device=device,
         dtype=prec.compute,
         keep_fp32=prec.keep_fp32,
@@ -105,6 +109,7 @@ def workload(
         ema_decays=decay_count(k["EMA"]),
         optim_state_bytes=STATE_BYTES.get(k["OPTIMIZER"], STATE_BYTES["adamw"]),
         master_bytes=compute_bytes if k["OPTIMIZER"] == "adamw16" else 4,
+        stored_precision=stored_dit_precision(k),
     )
 
 
@@ -118,7 +123,7 @@ def auto_text(k: dict, device: torch.device):
     """The `auto` planner's text-encoder term: (TextSizes from its config, tokens per
     pass / call, the placement rule per candidate plan), or None when text is not
     encoded online on `device`."""
-    path = _component_path(k, "TEXT_ENCODER", "text_encoder")
+    path = _component_path(k, TEXT)
     if k["TEXT_CACHE"] == "offline" or not path or not Path(path).exists():
         return None
     plan, te_device = training_text_plan(k, device)
@@ -259,8 +264,13 @@ def build_model(
     return Built(backbone, trainable, plan, engines, vae, text, embeds)
 
 
-def _component_path(k: dict, knob: str, sub: str) -> str:
-    return k[knob] or os.path.join(k["WEIGHTS"], sub)
+def _component_path(k: dict, which: str) -> str:
+    """The path of component `which` ("" when a ComfyUI folder holds none: the knob
+    checks report that)."""
+    try:
+        return str(component(k, which))
+    except FileNotFoundError:
+        return ""
 
 
 def placement_lines(k: dict, built: Built, device) -> list[tuple[str, dict]]:
@@ -269,8 +279,8 @@ def placement_lines(k: dict, built: Built, device) -> list[tuple[str, dict]]:
     te, vae = encoder_lines(
         built.text_encoder,
         built.vae,
-        _component_path(k, "TEXT_ENCODER", "text_encoder"),
-        _component_path(k, "VAE", "vae"),
+        _component_path(k, TEXT),
+        _component_path(k, VAE),
         device,
     )
     if te is None:
@@ -287,7 +297,11 @@ def step_reserve(k: dict, plan) -> int:
     MAX_TOKENS): what an `auto` text-encoder placement must leave free."""
     cfg = resolve_config(k["VARIANT"], k["ARCH_OVERRIDES"] or None)
     work = Workload(
-        cfg, img_tokens=int(k["MAX_TOKENS"]), txt_tokens=0, full_ft=is_full(k)
+        cfg,
+        img_tokens=int(k["MAX_TOKENS"]),
+        txt_tokens=0,
+        full_ft=is_full(k),
+        stored_precision=stored_dit_precision(k),
     )
     est = estimate(work, plan)
     return max(est.total - est.parts.get("weights", 0), 0)
@@ -349,9 +363,9 @@ def data_knobs(k: dict, device: torch.device) -> dict:
     dtype, precision and quantization layout)."""
     plan, te_device = training_text_plan(k, device)
     on = torch.device("cpu") if plan.memory == "cpu" else te_device
-    plan = resolve_dtype(plan, on)
+    plan, _, layout = resolve_text_plan(_component_path(k, TEXT), plan, on)
     vae_dtype = resolve_vae_dtype(k.get("VAE_DTYPE", "auto"), device)
-    return {**k, **cache_specs(vae_dtype, plan, TEXT_DTYPES[plan.dtype])}
+    return {**k, **cache_specs(vae_dtype, plan, TEXT_DTYPES[plan.dtype], layout)}
 
 
 def sample_texts(k: dict) -> list[str]:
@@ -372,8 +386,8 @@ def build_encoders(
     sampling = k["SAMPLE_EVERY"] > 0
     need_vae = k["LATENT_CACHE"] != "offline" or sampling
     vae = text = embeds = None
-    vae_path = _component_path(k, "VAE", "vae")
-    text_path = _component_path(k, "TEXT_ENCODER", "text_encoder")
+    vae_path = _component_path(k, VAE)
+    text_path = _component_path(k, TEXT)
     if need_vae and vae_path:
         vae_dtype = resolve_vae_dtype(k.get("VAE_DTYPE", "auto"), device)
         vae = place_vae(
@@ -394,8 +408,14 @@ def build_encoders(
             plan = replace(plan, free_after_use=True)
         hold = device if plan.ahead_device == "device" else torch.device("cpu")
         choose = partial(default_auto_memory, plan=plan, reserve=reserve)
+        w4a8 = partial(default_w4a8, plan=plan, reserve=reserve)
         text = QwenTextEncoder.from_pretrained(
-            text_path, te_device, plan, output_device=hold, auto_memory=choose
+            text_path,
+            te_device,
+            plan,
+            output_device=hold,
+            auto_memory=choose,
+            auto_w4a8=w4a8,
         )
         rule = encoder_rule(k, "text", mem_plan)
         log.info(f"text encoder placement: {hl(text.plan.memory)} ({rule})")
@@ -406,18 +426,9 @@ def build_encoders(
     return vae, text, embeds
 
 
-def export(k: dict, built: Built, output_dir: str, metadata: dict) -> list[Path]:
-    """Every EXPORT_FORMATS output under `<output>/export/`."""
-    root = Path(output_dir) / "export"
-    root.mkdir(parents=True, exist_ok=True)
-    name = run_name(k)
-    out = []
-    order = ("lycoris", "comfy", "merged", "diffusers")
-    for fmt in sorted(k["EXPORT_FORMATS"], key=order.index):
-        suffix = "" if fmt == "diffusers" else ".safetensors"
-        path = root / f"{name}-{fmt}{suffix}"
-        built.trainable.export(
-            str(path), fmt, metadata, row_scales=output_row_scales(built.backbone)
-        )
-        out.append(path)
-    return out
+def export(k: dict, built: Built, root: Path, metadata: dict) -> list[Path]:
+    """Every export file of the knobs (`training.exports.export_files`) under `root`."""
+    files = export_files(k, fused_qkv(k))
+    return write_exports(
+        files, built.trainable, built.backbone, root, run_name(k), metadata
+    )

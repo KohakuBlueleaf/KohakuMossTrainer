@@ -51,7 +51,12 @@ class AdapterSet(Protocol):
     def load_state_dict(self, state: dict[str, Tensor]) -> None: ...
 
     def export(
-        self, path: str, fmt: str, metadata: dict[str, str], row_scales=None
+        self,
+        path: str,
+        fmt: str,
+        metadata: dict[str, str],
+        row_scales=None,
+        fused_qkv: bool = False,
     ) -> None: ...
 
     def begin_step(self, sigma: Tensor, seq: SeqInfo, step: int) -> None: ...

@@ -15,14 +15,14 @@ class _Spy:
     def __init__(self):
         self.paths = []
 
-    def export(self, path, fmt, metadata, row_scales=None):
+    def export(self, path, fmt, metadata, row_scales=None, fused_qkv=False):
         self.paths.append(path)
 
 
 def _names(k, tmp_path) -> list[str]:
     spy = _Spy()
     built = SimpleNamespace(backbone=SimpleNamespace(fold_scales=None), trainable=spy)
-    export(k, built, str(tmp_path), {})
+    export(k, built, tmp_path, {})
     return [p.rsplit("\\", 1)[-1].rsplit("/", 1)[-1] for p in spy.paths]
 
 
@@ -31,7 +31,13 @@ def _prefixed(names: list[str], prefix: str) -> None:
 
 
 def test_empty_run_name_is_one_default(tmp_path):
-    k = {"RUN_NAME": "", "EXPORT_FORMATS": ("comfy", "lycoris")}
+    k = {
+        "RUN_NAME": "",
+        "ALGO": "lora",
+        "SAVE_FORMAT": "both",
+        "SAVE_MERGED": False,
+        "SAVE_FUSED_QKV": False,
+    }
     names = _names(k, tmp_path)
     _prefixed(names, run_name(k))
     assert run_name(k) == "run"

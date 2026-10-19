@@ -10,6 +10,6 @@ use_config("../algo/algo_full.py")
 OPTIMIZER = "adamw"
 LR = 1e-5
 EMA = 0.0
-EXPORT_FORMATS = ()
+SAVE_FORMAT = "none"
 MEMORY_PROFILE = "ckpt-resident"
 SCHEDULE = {"mode": "constant", "warmup": 1, "end": -1}

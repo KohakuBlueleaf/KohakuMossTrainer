@@ -14,7 +14,9 @@ from kohakumoss_kernels.hardware.arch import arch_of
 
 MEMORY = ("resident", "offload", "ring", "cpu", "auto")
 MEMORY_ALIASES = {"stream": "ring"}
-PRECISION = ("compute", "int8", "fp8", *COMPUTE)
+PRECISION = ("auto", "compute", "int8", "fp8", *COMPUTE, "w4a8")
+STORED_ONLY = ("w4a8",)
+W4A8 = ("auto", "int8", "packed")
 LAYOUT = ("single", "padded", "packed")
 FORWARD = ("kernels", "hf")
 DTYPES = {name: BY_NAME[name] for name in ("bf16", "fp16")}
@@ -40,6 +42,24 @@ def text_plan(
         )
     plan = replace(base, **values)
     return replace(plan, memory=MEMORY_ALIASES.get(plan.memory, plan.memory))
+
+
+def resolve_precision(
+    plan: TextEncoderPlan, stored: str, device: torch.device | str
+) -> TextEncoderPlan:
+    """`precision="auto"`: the format the weights store (`stored`: `compute` for a
+    16-bit checkpoint), `compute` when the encoder runs on the host (memory 'cpu');
+    ValueError for a stored-only precision (`w4a8`) the weights do not store."""
+    if plan.precision in STORED_ONLY and stored != plan.precision:
+        raise ValueError(
+            f"text-encoder precision {plan.precision!r} is a stored format; these "
+            f"weights store {stored!r}: use 'auto' or a precision KohakuMoss quantizes "
+            "to"
+        )
+    if plan.precision != "auto":
+        return plan
+    on_host = plan.memory == "cpu" or torch.device(device).type == "cpu"
+    return replace(plan, precision="compute" if on_host else stored)
 
 
 def resolve_dtype(plan: TextEncoderPlan, device: torch.device | str) -> TextEncoderPlan:
@@ -70,6 +90,7 @@ def plan_problems(
         ("forward", plan.forward, FORWARD),
         ("dtype", plan.dtype, (*DTYPES, "auto")),
         ("ahead_device", plan.ahead_device, AHEAD_DEVICE),
+        ("w4a8", plan.w4a8, W4A8),
     ):
         if value not in opts:
             p.append(f"text-encoder {name}={value!r} not in {opts}")
@@ -91,16 +112,16 @@ def plan_problems(
         p.append("text-encoder quant_group is 0 (per channel) or a multiple of 16")
     if plan.stored and (plan.precision == "compute" or plan.quant_group):
         p.append(
-            "text-encoder stored (a pre-quantized file) needs precision int8 / fp8 / "
-            "fp8_compute / mxfp8 (the file's) and quant_group 0"
+            "text-encoder stored (a pre-quantized file) needs precision auto / int8 / "
+            "fp8 / fp8_compute / mxfp8 (the file's) and quant_group 0"
         )
     if plan.stored and not Path(plan.stored).is_file():
         p.append(f"text-encoder stored file {plan.stored} does not exist")
     bad_ops = sorted(set(plan.kernels) - set(kernel_ops.TEXT) - {"rms_norm"})
     if bad_ops:
         p.append(f"text-encoder kernels has unknown ops {bad_ops}")
-    if plan.memory == "cpu" and plan.precision != "compute":
-        p.append("text-encoder memory='cpu' runs precision 'compute'")
+    if plan.memory == "cpu" and plan.precision not in ("compute", "auto"):
+        p.append("text-encoder memory='cpu' runs precision 'compute' (or 'auto')")
     if plan.precision in COMPUTE and plan.memory != "cpu" and device is not None:
         kind = torch.device(device).type
         if kind != "cuda":

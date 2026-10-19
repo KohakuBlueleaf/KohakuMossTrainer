@@ -66,15 +66,22 @@ class FullTrainable:
             p.copy_(state[name])
 
     def export(
-        self, path: str, fmt: str, metadata: dict[str, str], row_scales=None
+        self,
+        path: str,
+        fmt: str,
+        metadata: dict[str, str],
+        row_scales=None,
+        fused_qkv: bool = False,
     ) -> None:
-        """`merged`: bare-key single safetensors of the base weights, fold undone;
-        `diffusers`: the transformer folder (`row_scales` is for adapter formats and
-        unused here)."""
+        """`merged`: bare-key single safetensors of the base weights, fold undone
+        (`fused_qkv`: joint q/k/v as one `proj.qkv`, the ComfyUI layout); `diffusers`:
+        the transformer folder (`row_scales` is for adapter formats and unused here)."""
         if fmt == "diffusers":
             save_diffusers(self.model, path)
             return
-        save_single(self.model, path, dtype=self.dtype, metadata=metadata)
+        save_single(
+            self.model, path, dtype=self.dtype, fused_qkv=fused_qkv, metadata=metadata
+        )
 
     def begin_step(self, sigma: Tensor, seq, step: int) -> None:
         return None

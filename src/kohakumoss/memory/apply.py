@@ -8,6 +8,7 @@ from functools import partial
 import torch
 from torch import nn
 
+from kohakumoss.logging.log import get_logger, hl
 from kohakumoss.memory.runners import build_runner
 from kohakumoss.model.io.quant_source import backbone_source
 from kohakumoss.offload.activation import ActivationOffload
@@ -20,10 +21,12 @@ from kohakumoss.quant.bind import rebind_quant, work_device
 from kohakumoss.quant.compute import COMPUTE as FP8_COMPUTE
 from kohakumoss.quant.compute import ComputeWeight
 from kohakumoss.quant.convert import attach_compute, default_filter, quantize_model
+from kohakumoss.quant.densify import densify_bases, stored_formats
 from kohakumoss.types.plans import MemoryPlan
 from kohakumoss_kernels.dist import dist_rank, grouped
 
 QUANT = ("fp8", "int8", "fp8_compute", "mxfp8")
+log = get_logger(__name__)
 
 
 @dataclass
@@ -122,6 +125,40 @@ def _node_share(trainable: bool, n_blocks: int, device, plan: MemoryPlan) -> dic
     }
 
 
+def stored_base_problems(
+    stored: str, precision: str | None, trainable_base: bool
+) -> list[str]:
+    """Why a checkpoint storing `stored` bases cannot run base precision `precision`
+    (None / `auto`: the stored format): a full finetune trains dense weights, so `auto`
+    on a pre-quantized file is refused naming the `compute` escape."""
+    if stored == "compute" or not trainable_base or precision not in (None, "auto"):
+        return []
+    return [
+        f"the DiT checkpoint stores {stored} bases and a full finetune trains dense "
+        "weights: set BASE_PRECISION='compute' to train its dequantized weights, or "
+        "use the 16-bit file"
+    ]
+
+
+def settle_stored(backbone: nn.Module, precision: str, trainable_base: bool) -> None:
+    """Dequantize the attached stored bases unless `precision` keeps them (`auto` or
+    their own format, frozen); ValueError for `auto` with a trainable base."""
+    formats = stored_formats(backbone)
+    if not formats:
+        return
+    stored = formats.pop() if len(formats) == 1 else "mixed"
+    problems = stored_base_problems(stored, precision, trainable_base)
+    if problems:
+        raise ValueError(problems[0])
+    if not trainable_base and precision in ("auto", stored):
+        return
+    count = densify_bases(backbone)
+    log.info(
+        f"base_precision {hl(precision)}: {hl(count)} stored {hl(stored)} bases "
+        "dequantized to dense weights (W = dequant(q) with any rotation undone)"
+    )
+
+
 @torch.no_grad()
 def quantize_base(
     backbone: nn.Module,
@@ -136,8 +173,12 @@ def quantize_base(
     """The frozen base's quantized storage under `plan.base_precision` (quantized on
     `work` from the checkpoint's stored values where they apply, `backbone_source`;
     the meta device builds the layout only), with the fp8 input-gradient copy when
-    training takes it; the quantization report, None when nothing is quantized."""
+    training takes it; the quantization report, None when nothing is quantized. Bases
+    a pre-quantized checkpoint attached stay under `auto` and their own format, and are
+    dequantized first for any other precision (`compute` included) and for a
+    trainable base, which `auto` refuses (`stored_base_problems`)."""
     report = None
+    settle_stored(backbone, plan.base_precision, trainable_base)
     if plan.base_precision in QUANT and not trainable_base:
         source, scales = backbone_source(backbone)
         report = quantize_model(

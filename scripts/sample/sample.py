@@ -41,11 +41,11 @@ from kohakumoss_kernels import compile_setup
 log = get_logger("scripts.sample")
 
 # ===================== MODEL =====================
-WEIGHTS = ""  # weights root (base/, sft/) or one pipeline dir
-VARIANT = (
-    "base"  # "base" | "sft": the arch preset; WEIGHTS/<VARIANT> is read when it exists
-)
-TRANSFORMER = ""  # DiT override (file / dir, e.g. an fp16-fix checkpoint); "" = WEIGHTS
+WEIGHTS = ""  # ComfyUI models folder (diffusion_models/, text_encoders/, vae/) | HF weights root (base/, sft/) | one pipeline dir
+VARIANT = "base"  # "base" | "sft": the arch preset; WEIGHTS/<VARIANT> is read when it exists (ComfyUI: the DiT file moss_image_<VARIANT>_*)
+TRANSFORMER = ""  # DiT override (file / dir, e.g. an fp16-fix checkpoint; ComfyUI folder: a file name under diffusion_models/); "" = WEIGHTS (ComfyUI: the int8 ConvRot file, else bf16)
+TEXT_ENCODER = ""  # "" = WEIGHTS' text encoder (ComfyUI: qwen3.5_9b_int8_convrot, else _bf16, else _w4a8_gptq) | a file name under text_encoders/ | a path
+VAE = ""  # "" = WEIGHTS' VAE (ComfyUI: flux2-vae_small, else flux2-vae) | a file name under vae/ | a path
 ADAPTERS = []  # [(path, multiplier), ...] or "path[:multiplier]" strings
 ADAPTER_MODE = "merge"  # "merge" | "bypass"
 PRECISION = "bf16"  # compute dtype: "bf16" | "fp16" | "fp32" | "auto" (bf16 where supported, else fp16)
@@ -58,7 +58,7 @@ DEVICE = "cuda"
 TEXT_DEVICE = ""  # text encoder device, e.g. "cpu"; "" = DEVICE
 TEXT_ENCODE = {}  # TextEncoderPlan fields, as in training:
 #   "memory": "auto" (default) | "resident" | "offload" | "ring" | "cpu"; "dtype": "auto" | "bf16" | "fp16"
-#   "precision": "compute" | "int8" | "fp8" | "fp8_compute" | "mxfp8"; "quant_group", "fp8_recipe", "layout", "stored", ...
+#   "precision": "auto" (what the weights store) | "compute" | "int8" | "fp8" | "fp8_compute" | "mxfp8"; "w4a8": "auto" | "int8" | "packed"; "quant_group", "fp8_recipe", "layout", "stored", ...
 #   "free_after_use": True drops the text encoder after its first pass
 VAE_ENCODE = (
     {}
@@ -70,9 +70,7 @@ MEMORY_OVERRIDES = {}  # MemoryPlan fields
 STREAM = None  # "off" (resident) | "ring" (block weights streamed through device slots)  [off]
 STREAM_RESIDENT = None  # device block slots when streaming (>= 2)  [0]
 PINNED = None  # pinned host memory for the streamed weights  [True]
-BASE_PRECISION = (
-    "compute"  # DiT base: "compute" | "int8" | "fp8" | "fp8_compute" | "mxfp8"
-)
+BASE_PRECISION = "auto"  # DiT base: "auto" (what the DiT file stores) | "compute" (16-bit; a quantized file dequantized) | "int8" | "fp8" | "fp8_compute" | "mxfp8"
 FP8_RECIPE = "row"  # fp8_compute scaling: "tensor" | "row" | "block"
 
 # ===================== PROMPTS =====================
@@ -134,6 +132,8 @@ def main() -> None:
         k["WEIGHTS"],
         variant=k["VARIANT"],
         transformer=k["TRANSFORMER"] or None,
+        text_encoder_file=k["TEXT_ENCODER"],
+        vae_file=k["VAE"],
         dtype=knobs.compute_dtype(k["PRECISION"], k["DEVICE"]),
         device=k["DEVICE"],
         adapters=[knobs.parse_adapter(a) for a in k["ADAPTERS"]],

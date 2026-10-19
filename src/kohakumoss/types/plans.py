@@ -27,9 +27,12 @@ class PrecisionConfig:
 @dataclass(frozen=True)
 class MemoryPlan:
     """Concrete memory/speed knobs a profile resolves to; every field is overridable.
-    `base_precision` fp8_compute / mxfp8 run the frozen base's GEMMs in fp8
-    (`fp8_recipe` tensor | row | block for fp8_compute); `fp8_dgrad` fp8 stores a W^T
-    copy for an fp8 input-gradient GEMM, 16bit dequantizes the forward copy.
+    `base_precision` auto keeps the checkpoint's stored format (16-bit: compute; a
+    pre-quantized file: its bases); compute is 16-bit (a pre-quantized file
+    dequantized); int8 / fp8 weight-only; fp8_compute / mxfp8 run the frozen base's
+    GEMMs in fp8 (`fp8_recipe` tensor | row | block for fp8_compute); `fp8_dgrad` fp8
+    stores a W^T copy for an fp8 input-gradient GEMM, 16bit dequantizes the forward
+    copy.
     `act_offload_inflight`: blocks whose activation-offload copies may be queued before
     the host waits for the oldest block's."""
 
@@ -38,7 +41,7 @@ class MemoryPlan:
     checkpoint: str = "block"
     act_offload: bool = False
     act_offload_inflight: int = 2
-    base_precision: str = "compute"
+    base_precision: str = "auto"
     fp8_recipe: str = "row"
     fp8_dgrad: str = "fp8"
     stream: str = "off"
@@ -57,13 +60,16 @@ class TextEncoderPlan:
     memory: resident | offload (whole model to the device per pass) | ring (a layer
     ring of `stream_resident` slots, prefetching; "stream" is its alias) | cpu (runs on
     the host) | auto (resolved by the memory planner); `free_after_use` drops the model
-    after its first pass. precision: compute | int8 | fp8 (weight-only, per output
-    channel or per `quant_group` input columns) | fp8_compute (fp8 GEMMs, `fp8_recipe`
-    tensor | row |
-    block scaling, sm89+) | mxfp8 (MX block-scaled GEMMs, sm89+); fp8 compute weights
-    are quantized once, activations per call. `dtype` bf16 | fp16 | auto (bf16, or
-    fp16 where the device has no bf16). `batch` prompts / `max_tokens` tokens per
-    kernel call, `layout`
+    after its first pass. precision: auto (the format the weights store: compute for a
+    16-bit checkpoint, a pre-quantized file's own; compute on the host) | compute |
+    int8 | fp8 (weight-only, per output channel or per `quant_group` input columns) |
+    fp8_compute (fp8 GEMMs, `fp8_recipe` tensor | row | block scaling, sm89+) | mxfp8
+    (MX block-scaled GEMMs, sm89+) | w4a8 (stored only: a ComfyUI W4A8 file); fp8
+    compute weights are quantized once, activations per call. `w4a8` decodes a W4A8
+    file's codes: int8 (once, 1 byte per weight) | packed (per call) | auto (int8 when
+    the decoded encoder fits resident next to the DiT step). `dtype` bf16 | fp16 |
+    auto (bf16, or fp16 where the device has no bf16). `batch` prompts / `max_tokens`
+    tokens per kernel call, `layout`
     single | padded | packed, `forward` kernels (kohakumoss_kernels ops) | hf (the
     transformers modules' own forward; single / padded only). `ahead` host batches
     encoded per pass by the online text cache, held on `ahead_device` host | device.
@@ -73,7 +79,8 @@ class TextEncoderPlan:
 
     memory: str = "resident"
     free_after_use: bool = False
-    precision: str = "compute"
+    precision: str = "auto"
+    w4a8: str = "auto"
     quant_group: int = 0
     fp8_recipe: str = "row"
     stored: str = ""

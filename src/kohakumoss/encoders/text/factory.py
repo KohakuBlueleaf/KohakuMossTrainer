@@ -5,8 +5,8 @@ from pathlib import Path
 import torch
 
 from kohakumoss.encoders.specs import text_spec
-from kohakumoss.encoders.text.encoder import QwenTextEncoder
-from kohakumoss.encoders.text.plan import DTYPES, resolve_dtype, text_plan
+from kohakumoss.encoders.text.encoder import QwenTextEncoder, resolve_text_plan
+from kohakumoss.encoders.text.plan import DTYPES, text_plan
 from kohakumoss.types.plans import TextEncoderPlan
 from kohakumoss_kernels.dtypes import NAME_OF
 
@@ -30,11 +30,11 @@ def text_encoder_spec(
     max_length: int = 4096,
 ) -> str:
     """The `encoder_spec` `text_encoder(...)` gives for the same arguments, without
-    loading the weights."""
+    loading the weights (their headers only)."""
     spec = factory_plan(dtype, plan)
     on = torch.device("cpu") if spec.memory == "cpu" else torch.device(device)
-    spec = resolve_dtype(spec, on)
-    return text_spec(spec, DTYPES[spec.dtype])
+    spec, _, layout = resolve_text_plan(path, spec, on)
+    return text_spec(spec, DTYPES[spec.dtype], layout)
 
 
 def text_encoder(

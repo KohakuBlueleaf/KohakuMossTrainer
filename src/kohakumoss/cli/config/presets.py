@@ -11,7 +11,7 @@ import re
 from pathlib import Path
 
 LAYER_GROUPS = {
-    "moss": ("algo", "data", "vram", "precision", "parallel"),
+    "moss": ("algo", "data", "vram", "precision", "parallel", "weights"),
     "sample": ("precision",),
 }
 VRAM_RE = re.compile(r"(\d+)g(_full)?")

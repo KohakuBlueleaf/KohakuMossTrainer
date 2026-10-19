@@ -37,7 +37,7 @@ WIDTH = 88
 
 @dataclass
 class TrainChoice:
-    weights: str  # model dir with transformer/, text_encoder/, vae/
+    weights: str  # ComfyUI models folder or HF model dir
     data: str  # dataset root (or file, per source)
     source: str = "kohya"  # data layer name
     algo: str = "lora"  # algo layer name

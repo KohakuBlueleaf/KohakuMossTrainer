@@ -28,11 +28,11 @@ GRID_CHOICES = ("VARIANT", "PRECISION", "MEMORY_PROFILE", "BASE_PRECISION", "FP1
 GRID_CHOICES += ("ADAPTER_MODE", "CFG_MODE", "TUNE")
 
 # ===================== MODEL =====================
-WEIGHTS = ""  # weights root (base/, sft/) or one pipeline dir
-VARIANT = (
-    "base"  # "base" | "sft": the arch preset; WEIGHTS/<VARIANT> is read when it exists
-)
-TRANSFORMER = ""  # DiT override (file / dir); "" = WEIGHTS
+WEIGHTS = ""  # ComfyUI models folder | HF weights root (base/, sft/) | one pipeline dir
+VARIANT = "base"  # "base" | "sft": the arch preset; WEIGHTS/<VARIANT> is read when it exists (ComfyUI: the DiT file)
+TRANSFORMER = ""  # DiT override (file / dir; ComfyUI folder: a file name); "" = WEIGHTS
+TEXT_ENCODER = ""  # text encoder as in sample.py ("" = WEIGHTS' own)
+VAE = ""  # VAE as in sample.py ("" = WEIGHTS' own)
 CHECKPOINTS = (
     []
 )  # adapter files, one grid line each after the base: path or (path, multiplier)
@@ -54,9 +54,7 @@ VAE_ENCODE = {}  # VaePlan fields as in sample.py
 VAE_DTYPE = "auto"  # "auto" (bf16, fp16 on fp16-only GPUs) | "bf16" | "fp16" | "fp32"
 MEMORY_PROFILE = ""  # DiT memory profile: "" (resident) | a catalog profile | "speed" | "balanced" | "low" | "minimal" | "manual" | "auto" (the fastest that fits)
 MEMORY_OVERRIDES = {}  # MemoryPlan fields
-BASE_PRECISION = (
-    "compute"  # DiT base: "compute" | "int8" | "fp8" | "fp8_compute" | "mxfp8"
-)
+BASE_PRECISION = "auto"  # DiT base: "auto" (what the file stores) | "compute" | "int8" | "fp8" | "fp8_compute" | "mxfp8"
 FP8_RECIPE = "row"  # fp8_compute scaling: "tensor" | "row" | "block"
 # MEMORY_PROFILE="manual": the DiT placement, as in sample.py (None = the default).
 STREAM = None  # "off" (resident) | "ring" (block weights streamed through device slots)
@@ -130,6 +128,7 @@ def problems(k: dict) -> list[str]:
     p += choice_problems(k, {n: knobs.CHOICES[n] for n in GRID_CHOICES})
     if k["GRID_LAYOUT"] not in LAYOUTS:
         p.append(f"GRID_LAYOUT={k['GRID_LAYOUT']!r} not in {tuple(LAYOUTS)}")
+    p += knobs.component_problems(k)
     return p + knobs.size_problems(k) + knobs.encoder_problems(k)
 
 
@@ -144,6 +143,8 @@ def main() -> None:
         k["WEIGHTS"],
         variant=k["VARIANT"],
         transformer=k["TRANSFORMER"] or None,
+        text_encoder_file=k["TEXT_ENCODER"],
+        vae_file=k["VAE"],
         dtype=knobs.compute_dtype(k["PRECISION"], k["DEVICE"]),
         device=k["DEVICE"],
         text_device=k["TEXT_DEVICE"] or None,

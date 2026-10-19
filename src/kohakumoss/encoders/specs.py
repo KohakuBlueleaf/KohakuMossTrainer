@@ -26,23 +26,31 @@ def vae_spec(dtype: torch.dtype) -> str:
     return dtype_name(dtype)
 
 
-def text_spec(plan: TextEncoderPlan, dtype: torch.dtype) -> str:
+def text_spec(plan: TextEncoderPlan, dtype: torch.dtype, layout: str = "") -> str:
     """`<dtype>/<precision>`, plus `g<quant_group>` for a weight-only int8 / fp8 base or
-    the kernel recipe for fp8 compute; any torch dtype has a name."""
-    parts = [dtype_name(dtype), plan.precision]
+    the kernel recipe for fp8 compute, plus `src:<layout>` when the weights were
+    stored quantized (a ComfyUI file's layout, e.g. `int8-convrot256`); any torch
+    dtype has a name; an unresolved `auto` precision names the 16-bit checkpoint's
+    `compute` (a stored file's callers resolve it first)."""
+    precision = "compute" if plan.precision == "auto" else plan.precision
+    parts = [dtype_name(dtype), precision]
     if plan.precision in WEIGHT_ONLY:
         parts.append(f"g{plan.quant_group}")
     elif plan.precision in COMPUTE:
         parts.append(recipe_of(plan.precision, plan.fp8_recipe))
+    if layout:
+        parts.append(f"src:{layout}")
     return "/".join(parts)
 
 
-def cache_specs(vae_dtype: torch.dtype, plan: TextEncoderPlan, text_dtype) -> dict:
+def cache_specs(
+    vae_dtype: torch.dtype, plan: TextEncoderPlan, text_dtype, layout: str = ""
+) -> dict:
     """The data knobs naming both specs (`LATENT_ENCODER_SPEC`, `TEXT_ENCODER_SPEC`), to
     merge into the knobs `DataConfig.from_knobs` reads."""
     return {
         "LATENT_ENCODER_SPEC": vae_spec(vae_dtype),
-        "TEXT_ENCODER_SPEC": text_spec(plan, text_dtype),
+        "TEXT_ENCODER_SPEC": text_spec(plan, text_dtype, layout),
     }
 
 

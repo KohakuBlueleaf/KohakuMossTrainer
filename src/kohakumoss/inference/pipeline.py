@@ -19,7 +19,7 @@ from kohakumoss.inference import peaks
 from kohakumoss.inference import placement_report as report
 from kohakumoss.inference.components import Components
 from kohakumoss.inference.loading import (
-    component_root,
+    component_paths,
     load_dit,
     load_text_encoder,
     load_vae,
@@ -181,10 +181,15 @@ class MossPipeline:
         memory_overrides: dict | None = None,
         reserve_gib: float | None = None,
         forward_tokens: int | None = None,
+        text_encoder_file: str = "",
+        vae_file: str = "",
     ) -> "MossPipeline":
-        """`path`: weights root (base/ sft/ subdirs, `variant` picks one) or one pipeline
+        """`path`: a ComfyUI models folder (one file per component: `transformer`,
+        `text_encoder_file`, `vae_file` name them, "" the defaults, `variant` picks the
+        DiT), a weights root (base/ sft/ subdirs, `variant` picks one) or one pipeline
         dir. `transformer` overrides the DiT weights (single file, HF dir, our
-        checkpoint or an fp16-fix file). `fp16_fix`: none | online | fp32_residual (+
+        checkpoint or an fp16-fix file), `text_encoder_file` / `vae_file` the text
+        encoder and VAE. `fp16_fix`: none | online | fp32_residual (+
         kwargs); an fp16-fix file carries its fold. `text_plan` (TextEncoderPlan or its
         fields, `free_after_use` included) places the text encoder, `vae_plan` (VaePlan
         fields) the VAE; an unset `memory` of either is 'auto': the fastest placement
@@ -200,10 +205,8 @@ class MossPipeline:
         is also tuned on its first use and stored; no prewarm)."""
         apply_tune(tune)
         path = Path(path)
-        dit = (
-            Path(transformer)
-            if transformer
-            else component_root(path, variant, "transformer")
+        dit, te_path, vae_path = component_paths(
+            path, variant, transformer or "", text_encoder_file, vae_file
         )
         sources = {"transformer": str(dit)}
         tokens = forward_tokens or report.REFERENCE_TOKENS
@@ -226,11 +229,11 @@ class MossPipeline:
             reserve = int(reserve_gib * GIB)
         te = decoder = None
         if text_encoder:
-            te_root = component_root(path, variant, "text_encoder")
+            te_root = te_path()
             sources["text_encoder"] = str(te_root)
             te = load_text_encoder(te_root, device, text_device, text_plan, reserve)
         if vae:
-            vae_root = component_root(path, variant, "vae")
+            vae_root = vae_path()
             sources["vae"] = str(vae_root)
             decoder = load_vae(vae_root, vae_dtype, device, vae_plan, reserve)
         pipe = cls(

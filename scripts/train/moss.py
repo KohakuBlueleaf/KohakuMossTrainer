@@ -11,15 +11,17 @@ from kohakumoss.training.entry import run
 from kohakumoss_common.knobs import prompt_list
 
 # ===================== MODEL =====================
-WEIGHTS = ""  # HF dir (transformer/ + text_encoder/ + vae/) | single .safetensors
-VARIANT = "base"  # "base" | "sft"
+WEIGHTS = ""  # ComfyUI models folder (diffusion_models/ + text_encoders/ + vae/) | HF dir (transformer/ + text_encoder/ + vae/) | single DiT .safetensors (docs/guides/weights.md)
+VARIANT = "base"  # "base" | "sft" (also picks the ComfyUI DiT file)
 ARCH_OVERRIDES = {}  # MossArchConfig field overrides
-TEXT_ENCODER = ""  # "" = <WEIGHTS>/text_encoder; path to Qwen3.5 dir
+TRANSFORMER = ""  # DiT: "" = WEIGHTS (ComfyUI folder: moss_image_<VARIANT>_int8_convrot, else _bf16; full FT: _bf16 first) | a file name under diffusion_models/ | a path
+TEXT_ENCODER = ""  # "" = <WEIGHTS>/text_encoder (ComfyUI folder: qwen3.5_9b_int8_convrot, else _bf16, else _w4a8_gptq) | a file name under text_encoders/ | a path (Qwen3.5 dir or ComfyUI file)
 TEXT_DEVICE = ""  # GPU the text encoder runs on ("" = the training device); "cpu" only with TEXT_CACHE="offline"
 TEXT_ENCODE = {}  # TextEncoderPlan fields (docs/internals/text-encoder.md):
 #   "memory": "auto" (default: fastest that fits next to the DiT step) | "resident" | "offload" (whole TE in per pass) | "ring" (layer ring; "stream" is accepted too)
 #   "stream_resident": 2 (ring slots per layer kind), "pinned": True
-#   "precision": "compute" | "int8" | "fp8" (weight-only) | "fp8_compute" | "mxfp8" (fp8 GEMMs, sm89+); "quant_group": 0 (per channel) | 64 | 128
+#   "precision": "auto" (default: what the weights store; a ComfyUI int8 / W4A8 file keeps its bases) | "compute" | "int8" | "fp8" (weight-only) | "fp8_compute" | "mxfp8" (fp8 GEMMs, sm89+); "quant_group": 0 (per channel) | 64 | 128
+#   "w4a8": "auto" (int8 decode when it fits resident next to the DiT step, else packed) | "int8" (decoded once) | "packed" (decoded per call): a ComfyUI W4A8 file
 #   "stored": "" | a pre-quantized text-encoder file of that precision (scripts/export/text_quant.py; its stored bases attach at load)
 #   "fp8_recipe": "row" | "tensor" | "block" (fp8_compute scaling)
 #   "dtype": "auto" (bf16 where supported, else fp16) | "bf16" | "fp16"; "batch": 32 prompts / "max_tokens": 16384 tokens per kernel call
@@ -27,7 +29,7 @@ TEXT_ENCODE = {}  # TextEncoderPlan fields (docs/internals/text-encoder.md):
 #   "ahead": 1 (TEXT_CACHE "online" / "off": host batches encoded per TE pass); "ahead_device": "host" | "device" (where results wait)
 #   "kernels": {} (op -> backend, e.g. {"gated_delta_rule_varlen": "triton"})
 # Sample prompts are encoded once at build; with TEXT_CACHE="offline" the TE is freed after that.
-VAE = ""  # "" = <WEIGHTS>/vae
+VAE = ""  # "" = <WEIGHTS>/vae (ComfyUI folder: flux2-vae_small, else flux2-vae) | a file name under vae/ | a path
 VAE_ENCODE = {}  # VaePlan fields (docs/internals/offload.md#vae):
 #   "memory": "resident" (default) | "offload" (VAE in per pass) | "ring" (block rings; "stream" is accepted too) | "auto" | "cpu" (LATENT_CACHE="offline" only)
 #   "batch": 1 (same-size images per encode call), "ahead": 1 (LATENT_CACHE "online" / "off": host batches encoded per VAE pass), "tile": False (tiled / sliced encode and decode)
@@ -148,7 +150,7 @@ GRAD_OFFLOAD = (
 )
 FUSED_STEP = None  # optimiser step per parameter inside backward  [False]
 # Base precision, independent of the memory profile:
-BASE_PRECISION = None  # frozen base: "compute" | "int8" | "fp8" | "fp8_compute" | "mxfp8" | "quant" (fp8 on sm89+, else int8)  [compute]
+BASE_PRECISION = None  # frozen base: "auto" (what the DiT file stores: an int8 ConvRot file trains on its int8 bases) | "compute" (16-bit; a quantized file dequantized, the full-FT escape) | "int8" | "fp8" | "fp8_compute" | "mxfp8" | "quant" (fp8 on sm89+, else int8)  [auto]
 FP8_RECIPE = None  # fp8_compute scaling: "tensor" | "row" | "block"  [row]
 FP8_DGRAD = (
     None  # fp8 bases: "fp8" (W^T copy, fp8 input-gradient GEMM) | "16bit"  [fp8]
@@ -225,7 +227,11 @@ SAVE_MINUTES = (
 )
 KEEP_LAST = 3
 RESUME = ""  # checkpoint dir | "latest"
-EXPORT_FORMATS = ("comfy",)  # "comfy" | "lycoris" | "merged" | "diffusers"
+SAVE_FORMAT = "comfy"  # exports: "comfy" (ComfyUI LyCORIS file; full FT: one ComfyUI DiT file) | "hf" (LyCORIS file with diffusers keys; full FT: the diffusers folder) | "both" | "none"
+SAVE_MERGED = False  # adapters: also the merged DiT in SAVE_FORMAT (ComfyUI single file / diffusers folder)
+SAVE_FUSED_QKV = "auto"  # comfy files: joint q/k/v as one proj.qkv: "auto" (as the DiT file stores them; the Comfy-Org files are fused) | True | False
+CHECKPOINT_EXPORT = True  # also write the exports into every checkpoint's export/ (their size is logged at build)
+EXPORT_FORMATS = None  # None | the older spelling: ("comfy" | "lycoris" | "merged" | "diffusers", ...) -> SAVE_FORMAT / SAVE_MERGED
 
 
 def main():

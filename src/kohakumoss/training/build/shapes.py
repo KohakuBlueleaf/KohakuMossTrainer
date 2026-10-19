@@ -1,7 +1,8 @@
 """The weightless twin of the run's backbone that the kernel prewarm records from: the
-run's module structure, base storage kinds (int8 / fp8 / fp8_compute / mxfp8 bases, fp8
-compute caches), parameter dtypes and grad flags, every tensor a stride-0 view of one
-zero on the device. See docs/internals/tuning.md#prewarm."""
+run's module structure, base storage kinds (int8 / fp8 / fp8_compute / mxfp8 bases, the
+stored bases of a pre-quantized checkpoint with their rotation, fp8 compute caches),
+parameter dtypes and grad flags, every tensor a stride-0 view of one zero on the
+device. See docs/internals/tuning.md#prewarm."""
 
 from functools import partial
 
@@ -15,12 +16,18 @@ from kohakumoss.model.build import build_shapes, weightless
 from kohakumoss.model.linear import MossLinear
 from kohakumoss.quant.bind import rebind_quant
 from kohakumoss.quant.compute import PARTS, ComputeCache
+from kohakumoss.quant.densify import mirror_stored
 from kohakumoss.training.knobs import is_full
 from kohakumoss_common.weak import weak_call
 
 
-def _storage(model, plan, compute: torch.dtype, full: bool, keep_fp32) -> None:
-    """The run's base storage swaps (training), on the meta device."""
+def _storage(
+    model, plan, compute: torch.dtype, full: bool, keep_fp32, real=None
+) -> None:
+    """The run's base storage swaps (training), on the meta device: the stored bases
+    `real` loaded from its checkpoint (`mirror_stored`), then the plan's."""
+    if real is not None:
+        mirror_stored(model, real)
     quantize_base(model, plan, compute, True, full, keep_fp32)
     trainable_compute(model, plan, compute, True, full, keep_fp32)
 
@@ -71,7 +78,12 @@ def run_shapes(k: dict, prec, plan, device: torch.device, real=None) -> nn.Modul
     if real is not None:
         like = {**dict(real.named_parameters()), **dict(real.named_buffers())}
     storage = partial(
-        _storage, plan=plan, compute=prec.compute, full=full, keep_fp32=prec.keep_fp32
+        _storage,
+        plan=plan,
+        compute=prec.compute,
+        full=full,
+        keep_fp32=prec.keep_fp32,
+        real=real,
     )
     twin = build_shapes(
         cfg,
