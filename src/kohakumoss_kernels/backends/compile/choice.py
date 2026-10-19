@@ -192,6 +192,8 @@ class KernelOrCompile:
         return fn
 
     def __call__(self, *args):
+        if torch.compiler.is_compiling():
+            return self.impls[self.pinned or "kernel"](*args)
         qk = _call_key(args)
         fn = self.bound.get(qk)
         if fn is None:

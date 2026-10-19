@@ -1,5 +1,6 @@
 """Kernel-vs-compile binding on CPU: a bound compile path calls its pattern's runner (no
-pattern built per call), a call under torch.compile tracing binds nothing, the compile
+pattern built per call), a call under torch.compile tracing binds nothing and builds no
+per-call key (pinned or not), the compile
 call pattern carries the device, and a retune whose inputs do not fit in memory keeps
 the kernel instead of raising."""
 
@@ -71,27 +72,46 @@ def test_negative_generic_compiled_op(fresh, monkeypatch):
     )
 
 
+def _untraceable(args):
+    raise AssertionError(
+        "a traced call built the per-call key (torch.get_num_threads breaks a "
+        "fullgraph trace)"
+    )
+
+
 def check_traced_binds_nothing(op, monkeypatch) -> None:
     with monkeypatch.context() as patch:
         patch.setattr(choice.torch.compiler, "is_compiling", lambda: True)
+        patch.setattr(choice, "_call_key", _untraceable)
         op(torch.randn(16, 8))
     assert not op.bound, "a traced call bound the kernel for eager calls"
 
 
-def test_traced_call_binds_nothing(fresh, monkeypatch):
-    check_traced_binds_nothing(_op(), monkeypatch)
+@pytest.mark.parametrize("pinned", (None, "kernel", "compile"))
+def test_traced_call_binds_nothing(fresh, monkeypatch, pinned):
+    op = _op()
+    if pinned is not None:
+        op.bind(pinned)
+    check_traced_binds_nothing(op, monkeypatch)
 
 
 class _StoringWhenTraced(choice.KernelOrCompile):
-    def _lookup(self, args, qk):
-        fn = super()._lookup(args, qk)
-        self.bound[qk] = fn
-        return fn
+    def __call__(self, *args):
+        fn = self.impls["kernel"]
+        self.bound[("traced",)] = fn
+        return fn(*args)
 
 
-def test_negative_traced_call_binds(fresh, monkeypatch):
-    op = _StoringWhenTraced("test", "situ_glu", ffn.situ_glu, choice.shape_key)
-    must_fail(lambda: check_traced_binds_nothing(op, monkeypatch), "traced binding")
+class _KeyedWhenTraced(choice.KernelOrCompile):
+    def __call__(self, *args):
+        qk = choice._call_key(args)
+        return (self.bound.get(qk) or self._lookup(args, qk))(*args)
+
+
+@pytest.mark.parametrize("broken", (_StoringWhenTraced, _KeyedWhenTraced))
+def test_negative_traced_call_binds(fresh, monkeypatch, broken):
+    op = broken("test", "situ_glu", ffn.situ_glu, choice.shape_key)
+    must_fail(lambda: check_traced_binds_nothing(op, monkeypatch), broken.__name__)
 
 
 def check_pattern_has_device(pattern) -> None:

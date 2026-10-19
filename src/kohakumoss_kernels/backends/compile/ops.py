@@ -11,7 +11,7 @@ from torch import Tensor
 
 from kohakumoss_common.log import get_logger
 from kohakumoss_kernels import compile_setup
-from kohakumoss_kernels.backends.eager import ffn, loss, norm, rope, textenc
+from kohakumoss_kernels.backends.eager import ffn, hadamard, loss, norm, rope, textenc
 from kohakumoss_kernels.errors import unavailable
 
 log = get_logger(__name__)
@@ -46,6 +46,7 @@ EAGER: dict[str, Callable] = {
     "linear_qk_rope": _linear_qk_rope,
     "causal_conv_varlen": textenc.causal_conv_varlen,
     "rms_norm_gated": textenc.rms_norm_gated,
+    "group_hadamard": hadamard.group_hadamard,
 }
 COMPILED = tuple(EAGER)
 

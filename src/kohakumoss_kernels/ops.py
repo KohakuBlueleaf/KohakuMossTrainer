@@ -22,6 +22,13 @@ eager reference):
     linear_situ(y, w_up_gate, bias) -> situ_glu(y W^T + b)
     linear_gated_residual(a, w, bias, x, gate, seg, r) -> gated_residual(x, a W^T + b, ...)
 
+Rotation and the rotated quantized linear (ConvRot weights; H_g the normalised regular
+Hadamard of `kohakumoss_kernels.hadamard`, R = blockdiag(H_g) over the last dim):
+
+    group_hadamard(x[..., K], group: int) -> x R [..., K]   (self-adjoint, involutory)
+    quant_linear_rotated(x[N,K], q[M,K], scale[M], bias[M] | None, fmt, group: int)
+        -> quant_linear(x R, q, scale, bias, fmt); dx = (dy (q * scale)) R
+
 Text-encoder ops (Qwen3.5 Gated DeltaNet + causal GQA attention; forward only):
 
     causal_conv_varlen(x[N,C], weight[C,W], cu_seqlens[B+1] int32)
@@ -50,11 +57,21 @@ RESIDUAL = ("gated_residual",)
 LOSS = ("token_mse",)
 FUSED = ("linear_qk_rope", "linear_situ", "linear_gated_residual")
 OPTIM = ("adamw_step", "adamw8bit_step", "adamw_step_multi")
-QUANT = ("quant_linear", "fp8_linear", "fp8_linear_infer", "fp8_linear_train")
+QUANT = (
+    "quant_linear",
+    "quant_linear_rotated",
+    "fp8_linear",
+    "fp8_linear_infer",
+    "fp8_linear_train",
+)
+ROTATION = ("group_hadamard",)
 TEXT = (
     "causal_conv_varlen",
     "gated_delta_rule_varlen",
     "rms_norm_gated",
     "attention_varlen_causal",
 )
-ALL = NORM + ROPE + ATTENTION + FFN + RESIDUAL + LOSS + FUSED + OPTIM + QUANT + TEXT
+ALL = (
+    NORM + ROPE + ATTENTION + FFN + RESIDUAL + LOSS + FUSED + OPTIM + QUANT + ROTATION
+    + TEXT
+)  # fmt: skip
