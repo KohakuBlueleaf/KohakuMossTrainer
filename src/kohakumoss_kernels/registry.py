@@ -3,6 +3,7 @@ to a `Bound` op that falls back along the arch's backend priority. See
 docs/internals/kernel-dev.md#registry.
 """
 
+import gc
 import importlib
 import threading
 import weakref
@@ -126,16 +127,17 @@ class Bound:
         self.rebind()
 
     def rebind(self) -> None:
-        """Bind the call path for the current recording state and `guard`."""
+        """Bind the call path (a class function) for the current recording state and
+        `guard`."""
         if RECORDS:
-            self._call = self._record
+            self._call = Bound._record
         elif self._guard:
-            self._call = self._guarded
+            self._call = Bound._guarded
         else:
-            self._call = self._plain
+            self._call = Bound._plain
 
     def __call__(self, *args, **kwargs):
-        return self._call(*args, **kwargs)
+        return self._call(self, *args, **kwargs)
 
     def _plain(self, *args, **kwargs):
         try:
@@ -431,7 +433,8 @@ def load_backends() -> None:
     """Once per process, on the first kernel build: apply the compile settings
     (`compile_setup`: cache key tag, never-quiesced compile pool) and import every
     backend package (each sets up the host toolchain); a failed import
-    marks that backend unavailable. See docs/internals/kernel-dev.md#lazy-backends."""
+    marks that backend unavailable; then one cyclic gc pass, so no import-time cycle
+    holds the caller's frames. See docs/internals/kernel-dev.md#lazy-backends."""
     if _LOADED:
         return
     with _LOAD_LOCK:
@@ -445,6 +448,7 @@ def load_backends() -> None:
                     importlib.import_module(f"kohakumoss_kernels.backends.{name}")
                 except ImportError as err:
                     mark_unavailable(name, str(err))
+            gc.collect()
         finally:
             _LOADING.clear()
         _LOADED.append(True)

@@ -13,7 +13,7 @@ LyCORIS algorithm:
 | field | meaning |
 | --- | --- |
 | `name`, `module`, `algos` | kind name, LyCORIS module class, `ALGO` names -> LyCORIS `network_module` |
-| `diff_weight(t)` | dW at multiplier 1 (fp32, before DoRA); `Target.unit_fn` binds it |
+| `diff_weight(t)` | dW at multiplier 1 (fp32, before DoRA); `Target.unit_fn()` calls it |
 | `diff_weight_at(t, m)` | the (dW, db) builder at `m` when it is not `diff_weight * m` (OFT / BOFT rotations), or None |
 | `kernel_diff_weight(t, ops)` | W -> dW at multiplier 1 from the layer's kernel ops, or None |
 | `kernel_merged_weight(t, ops)` | W -> W + dW at multiplier 1 with the add inside the op (`base=`), or None |

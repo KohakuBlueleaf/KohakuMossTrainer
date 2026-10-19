@@ -23,6 +23,7 @@ from kohakumoss.training.optim.bundle.nonfinite import param_names
 from kohakumoss.training.optim.optimizers.factory import master_groups
 from kohakumoss.types.plans import MemoryPlan, PrecisionConfig
 from kohakumoss_common.calls import identity
+from kohakumoss_common.weak import weak_method
 
 ADAMW_BY_STATE = {
     "gpu": "adamw",
@@ -325,9 +326,9 @@ def _wire_fused(
     """The step in backward: device parameters through gradient offload or FusedStep
     (DDP-reduced first), GPU-stepped swap blocks through StreamedAdamW."""
     ddp = w.ddp
-    step = bundle.step_param
+    step = weak_method(bundle.step_param)
     if ddp is not None:
-        step = ddp.reduced(device_params, bundle.step_param)
+        step = ddp.reduced(device_params, step)
     if grads is not None:
         bundle.attach(
             grads if ddp is None else _OffloadThrough(grads, step), finishes=True

@@ -42,7 +42,7 @@ def _eager(t: Target, ctx: BindCtx):
         return eager.eager_merged(t.base_fn, t.lyco.shape, t.delta_at(ctx.m), lin)
     if t.record.module_forward is not None:
         return t.record.module_forward(t, ctx)
-    return eager.module_bypass(t.linear, t.lyco, ctx.m)
+    return eager.module_bypass(t.layer, t.lyco, ctx.m)
 
 
 def _dora_kernel(t: Target, ctx: BindCtx, mix, lin):
@@ -71,7 +71,7 @@ def _dora(t: Target, ctx: BindCtx):
     detach = ctx.detach and ctx.training
     if t.stored:
         fn = _stored_dora(t)
-        return partial(fn, t.linear, t.base_fn, t.unit_fn, t.lyco, ctx.m, detach)
+        return partial(fn, t.layer, t.base_fn, t.unit_fn, t.lyco, ctx.m, detach)
     mix, lin = compose.mix_of(ctx.m), compose.lin_of(t)
     if ctx.use_ops and not detach:
         fn = _dora_kernel(t, ctx, mix, lin)
@@ -128,7 +128,7 @@ def bind_target(
         fn = fn or _eager(t, ctx)
     t.autotuned = ops.autotuned
     if rec.own_forward is None and module_p > 0 and training:
-        fn = eager.module_dropout(t.linear, t.draws, fn)
+        fn = eager.module_dropout(t.layer, t.draws, fn)
     return fn
 
 

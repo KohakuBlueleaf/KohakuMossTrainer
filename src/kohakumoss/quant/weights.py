@@ -50,7 +50,7 @@ class QuantWeight(nn.Module):
         self.register_buffer("q", q)
         self.register_buffer("scale", scale.float())
         self.shape = q.shape
-        self.linear = self._dequant_linear
+        self._linear = _dequant_linear
 
     @classmethod
     def from_weight(cls, w: Tensor, fmt: str) -> "QuantWeight":
@@ -72,15 +72,20 @@ class QuantWeight(nn.Module):
         try:
             kernel = registry.resolve("quant_linear", device, dtype, fmt=self.fmt)
         except (registry.NoImplementationError, KeyError):
-            self.linear = self._dequant_linear
+            self._linear = _dequant_linear
             return
-        self.linear = partial(_kernel_linear, kernel, self)
+        self._linear = partial(_kernel_linear, kernel)
 
-    def _dequant_linear(self, x: Tensor, bias: Tensor | None) -> Tensor:
-        return quant_linear_eager(x, self.q, self.scale, bias, self.fmt)
+    def linear(self, x: Tensor, bias: Tensor | None) -> Tensor:
+        """x W^T (+ bias) through the bound implementation."""
+        return self._linear(self, x, bias)
 
     def nbytes(self) -> int:
         return self.q.nbytes + self.scale.numel() * 4
+
+
+def _dequant_linear(qw: QuantWeight, x: Tensor, bias: Tensor | None) -> Tensor:
+    return quant_linear_eager(x, qw.q, qw.scale, bias, qw.fmt)
 
 
 def _kernel_linear(kernel, qw: QuantWeight, x: Tensor, bias: Tensor | None) -> Tensor:

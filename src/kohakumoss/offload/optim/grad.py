@@ -13,6 +13,7 @@ from torch import Tensor, nn
 
 from kohakumoss.offload.accel import DONE, module, streamed
 from kohakumoss.offload.optim.host_acc import HostAccumulator
+from kohakumoss_common.weak import weak_call
 
 
 @dataclass
@@ -87,19 +88,22 @@ class GradOffload:
             lane = _Lane(host)
             if side:
                 stream = self._stream(p.device)
-                offload = partial(self._offload_device, lane, stream, id(p))
+                offload = partial(
+                    GradOffload._offload_device, lane=lane, stream=stream, key=id(p)
+                )
                 ring = self.rings.get(p.device)
                 if ring is None:
                     ring = _Ring(p.device, largest[p.device])
                     self.rings[p.device] = ring
-                finish = partial(self._finish_device, lane, ring)
+                finish = partial(GradOffload._finish_device, lane=lane, ring=ring)
             else:
-                offload = partial(self._offload_host, lane)
-                finish = partial(self._finish, lane)
+                offload = partial(GradOffload._offload_host, lane=lane)
+                finish = partial(GradOffload._finish, lane=lane)
             self.host[p] = host
             self.lanes[id(p)] = lane
             self.finishes[id(p)] = finish
-            hook = partial(self._hook, {"offload": offload, "finish": finish})
+            bodies = {"offload": offload, "finish": finish}
+            hook = weak_call(GradOffload._hook, self, bodies)
             self.handles.append(p.register_post_accumulate_grad_hook(hook))
 
     def _stream(self, device: torch.device):
@@ -115,7 +119,7 @@ class GradOffload:
         self._mode = "finish" if last and final is not None else "offload"
 
     def _hook(self, bodies: dict, p: Tensor) -> None:
-        bodies[self._mode](p)
+        bodies[self._mode](self, p=p)
 
     @torch.no_grad()
     def _offload_host(self, lane: _Lane, p: Tensor) -> None:
@@ -180,7 +184,7 @@ class GradOffload:
         for p in self.params:
             if self.lanes[id(p)].filled:
                 p.grad = torch.zeros_like(p)
-                self.finishes[id(p)](p)
+                self.finishes[id(p)](self, p=p)
 
     def finish(self) -> None:
         """`finish_unhooked`, then the compute stream waits for every in-backward update

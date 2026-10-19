@@ -49,7 +49,7 @@ class MossBackbone(nn.Module):
         self.stream = StreamConfig()
         self.fp16_fix = "none"
         self.weight_path: str | None = None
-        self._default = self.bind_forward()
+        self._default = self._plan_forward()
 
     def init_weights(self, std: float = 0.02) -> None:
         """Random init (normal weights, zero biases)."""
@@ -85,9 +85,9 @@ class MossBackbone(nn.Module):
     def _plan(
         self, skip_layers: frozenset, segment_skip: frozenset = frozenset()
     ) -> tuple[Callable, ...]:
-        """One step `(x, ctx, run) -> x` per block, resolved once: run it; (skipped)
-        apply only the fold's stream rescale r (dropped when r == 1); (segment-skipped)
-        run it and keep its output only on the tokens `run` marks."""
+        """One step `(model, x, ctx, run) -> x` per block, resolved once: run it;
+        (skipped) apply only the fold's stream rescale r (dropped when r == 1);
+        (segment-skipped) run it and keep its output only on the tokens `run` marks."""
         steps = []
         for i in range(len(self.layers)):
             r = self.residual_scale[i]
@@ -96,17 +96,21 @@ class MossBackbone(nn.Module):
                     steps.append(partial(_rescale, r))
             elif i in segment_skip:
                 kept = _same if r == 1.0 else partial(_rescale, r)
-                steps.append(partial(self._run_selected, i, kept))
+                steps.append(partial(_run_selected, i, kept))
             else:
-                steps.append(partial(self._run_block, i))
+                steps.append(partial(_run_block, i))
         return tuple(steps)
 
-    def _run_block(self, index: int, x: Tensor, ctx: BlockCtx, run) -> Tensor:
-        return self.runner.run(index, self.layers[index], x, ctx)
-
-    def _run_selected(self, index: int, kept, x: Tensor, ctx: BlockCtx, run) -> Tensor:
-        out = self.runner.run(index, self.layers[index], x, ctx)
-        return torch.where(run, out, kept(x, ctx, run))
+    def _plan_forward(
+        self, skip_layers=(), segment_skip_layers=()
+    ) -> Callable[..., Tensor]:
+        """`bind_forward`'s plan as `(model, img, text, sigma, seq[, mask]) -> v`,
+        holding no reference to this model."""
+        skip = frozenset(skip_layers)
+        if segment_skip_layers:
+            segment = frozenset(segment_skip_layers) - skip
+            return partial(_forward_masked, self._plan(skip, segment))
+        return partial(_forward_plan, self._plan(skip))
 
     def bind_forward(
         self, skip_layers=(), segment_skip_layers=()
@@ -117,15 +121,11 @@ class MossBackbone(nn.Module):
         `segment_skip_layers` skip blocks only for the samples flagged by a bool [B]
         mask: `(img, text, sigma, seq, mask) -> v` (packed CFG); a flagged sample's
         stream takes the skip's value, whatever the block computed on it."""
-        skip = frozenset(skip_layers)
-        if segment_skip_layers:
-            segment = frozenset(segment_skip_layers) - skip
-            return partial(self._forward_masked, self._plan(skip, segment))
-        return partial(self._forward_plan, self._plan(skip))
+        return partial(self._plan_forward(skip_layers, segment_skip_layers), self)
 
     def set_residual_scale(self, scales: tuple[float, ...]) -> None:
         self.residual_scale = tuple(scales)
-        self._default = self.bind_forward()
+        self._default = self._plan_forward()
 
     def conditioning_linears(self) -> tuple[MossLinear, ...]:
         """The KEEP_FP32 linears of the per-sample conditioning."""
@@ -171,35 +171,48 @@ class MossBackbone(nn.Module):
 
     def _trunk(self, plan, x: Tensor, ctx: BlockCtx, run) -> Tensor:
         for step in plan:
-            x = step(x, ctx, run)
+            x = step(self, x, ctx, run)
         return x
-
-    def _forward_plan(self, plan, img, text, sigma, seq) -> Tensor:
-        mod, head = self.conditioning(sigma)
-        x = self.embed(img, text, seq)
-        ctx = BlockCtx(seq, mod, self.rope.bands, self.residual_scale)
-        x = self._trunk(plan, x, ctx, None)
-        return self.head(x, head, seq)
-
-    def _forward_masked(self, plan, img, text, sigma, seq, mask) -> Tensor:
-        mod, head = self.conditioning(sigma)
-        x = self.embed(img, text, seq)
-        ctx = BlockCtx(seq, mod, self.rope.bands, self.residual_scale)
-        x = self._trunk(plan, x, ctx, runs_on(mask, seq))
-        return self.head(x, head, seq)
 
     def forward(self, img: Tensor, text: Tensor, sigma: Tensor, seq: SeqInfo) -> Tensor:
         """img [N_img, C], text [N_txt, text_dim], sigma f32 [B] in [0, 1] -> v [N_img, C].
 
         Every block runs; `bind_forward` gives skipping variants."""
-        return self._default(img, text, sigma, seq)
+        return self._default(self, img, text, sigma, seq)
 
 
-def _rescale(r: float, x: Tensor, ctx, run) -> Tensor:
+def _forward_plan(plan, model: MossBackbone, img, text, sigma, seq) -> Tensor:
+    mod, head = model.conditioning(sigma)
+    x = model.embed(img, text, seq)
+    ctx = BlockCtx(seq, mod, model.rope.bands, model.residual_scale)
+    x = model._trunk(plan, x, ctx, None)
+    return model.head(x, head, seq)
+
+
+def _forward_masked(plan, model: MossBackbone, img, text, sigma, seq, mask) -> Tensor:
+    mod, head = model.conditioning(sigma)
+    x = model.embed(img, text, seq)
+    ctx = BlockCtx(seq, mod, model.rope.bands, model.residual_scale)
+    x = model._trunk(plan, x, ctx, runs_on(mask, seq))
+    return model.head(x, head, seq)
+
+
+def _run_block(
+    index: int, model: MossBackbone, x: Tensor, ctx: BlockCtx, run
+) -> Tensor:
+    return model.runner.run(index, model.layers[index], x, ctx)
+
+
+def _run_selected(index: int, kept, model, x: Tensor, ctx: BlockCtx, run) -> Tensor:
+    out = model.runner.run(index, model.layers[index], x, ctx)
+    return torch.where(run, out, kept(model, x, ctx, run))
+
+
+def _rescale(r: float, model, x: Tensor, ctx, run) -> Tensor:
     return x * r
 
 
-def _same(x: Tensor, ctx, run) -> Tensor:
+def _same(model, x: Tensor, ctx, run) -> Tensor:
     return x
 
 

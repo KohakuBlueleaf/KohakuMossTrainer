@@ -28,7 +28,7 @@ def check_save_gates(monkeypatch, tmp_path, barrier) -> None:
     monkeypatch.setattr(manager, "capture_rng", lambda *a: {})
     monkeypatch.setattr(manager, "save_rng", lambda *a: None)
     ckpt = manager.CheckpointManager(tmp_path, keep_last=1)
-    monkeypatch.setattr(ckpt, "_save", lambda step, parts: None)
+    monkeypatch.setattr(ckpt, "_save", lambda mgr, step, parts: None)
     ckpt.save(5, {"step_rng": None})
     assert met == ["checkpoint"] * 3, met
 

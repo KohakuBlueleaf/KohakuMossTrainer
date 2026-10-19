@@ -122,8 +122,8 @@ def _dylora_forward(t, ctx):
     """Training: the step's drawn rank prefix; eval: every block, whatever a step
     draws (both as bypass products, no dW)."""
     if ctx.training:
-        return eager.dylora_train(t.linear, t.lyco, ctx.m, ctx.draws)
-    return eager.dylora_train(t.linear, t.lyco, ctx.m, Draws(t.lyco.lora_dim))
+        return eager.dylora_train(t.layer, t.lyco, ctx.m, ctx.draws)
+    return eager.dylora_train(t.layer, t.lyco, ctx.m, Draws(t.lyco.lora_dim))
 
 
 LOCON = register(

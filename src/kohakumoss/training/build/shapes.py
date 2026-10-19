@@ -16,6 +16,7 @@ from kohakumoss.model.linear import MossLinear
 from kohakumoss.quant.bind import rebind_quant
 from kohakumoss.quant.compute import PARTS, ComputeCache
 from kohakumoss.training.knobs import is_full
+from kohakumoss_common.weak import weak_call
 
 
 def _storage(model, plan, compute: torch.dtype, full: bool, keep_fp32) -> None:
@@ -36,8 +37,8 @@ def _place_caches(model: nn.Module, device, compute: torch.dtype) -> None:
             cache.bind(compute, device)
 
 
-def _grad_out(forward, zero: Tensor, x: Tensor) -> Tensor:
-    return forward(x) + zero
+def _grad_out(linear: MossLinear, zero: Tensor, x: Tensor) -> Tensor:
+    return linear._impl(linear, x) + zero
 
 
 def mirror(twin: nn.Module, real: nn.Module, device) -> None:
@@ -54,7 +55,7 @@ def mirror(twin: nn.Module, real: nn.Module, device) -> None:
         if isinstance(eps, float) and hasattr(m, "eps"):
             m.eps = eps
         if isinstance(m, MossLinear) and CHILD in src._modules:
-            m.forward = partial(_grad_out, m.forward, zero)
+            m.forward = weak_call(_grad_out, m, zero)
     twin.fp16_fix = real.fp16_fix
     twin.set_residual_scale(real.residual_scale)
     twin.set_stream_config(real.stream)

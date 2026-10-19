@@ -75,8 +75,9 @@ adamw_host = _fused_adamw if FUSED_CPU else _manual_adamw
 
 @dataclass
 class _Lane:
-    """Per-parameter host buffers and the bound copy / step functions for its device;
-    the gradient's host copy is allocated on its first D2H (`pin`: pinned)."""
+    """Per-parameter host buffers and the copy / step functions selected for its device
+    (each called with the lane); the gradient's host copy is allocated on its first
+    D2H (`pin`: pinned)."""
 
     grad_host: Tensor | None
     shadow: Tensor
@@ -156,16 +157,14 @@ class CPUAdamW(Optimizer):
                     module(p.device).Stream(p.device),
                 )
             d2h, h2d = self._streams[p.device]
-            lane.d2h = partial(_d2h_device, lane=lane, stream=d2h)
-            lane.h2d = partial(_h2d_device, lane=lane, stream=h2d)
+            lane.d2h = partial(_d2h_device, stream=d2h)
+            lane.h2d = partial(_h2d_device, stream=h2d)
             lane.found = torch.zeros((), dtype=torch.float32, pin_memory=pin)
-            lane.step = partial(self._step_async, lane=lane, d2h=d2h, h2d=h2d)
+            lane.step = partial(CPUAdamW._step_async, d2h=d2h, h2d=h2d)
             if self._worker is None:
                 self._worker = HostWorker("kohakumoss-cpu-adamw")
         else:
-            lane.d2h = partial(_d2h_host, lane=lane)
-            lane.h2d = partial(_h2d_host, lane=lane)
-            lane.step = partial(self._step_now, lane=lane)
+            lane.d2h, lane.h2d, lane.step = _d2h_host, _h2d_host, CPUAdamW._step_now
         lane.ready = _has_grad
         self._lanes[id(p)] = lane
 
@@ -184,14 +183,14 @@ class CPUAdamW(Optimizer):
 
     def _update(self, p: Tensor, lane: _Lane, ev) -> None:
         self._compute(p, lane, ev, self._scratch["main"])
-        lane.h2d(p)
+        lane.h2d(p, lane)
         self.stats["bytes_h2d"] += p.nbytes
 
     def _fetch(self, p: Tensor, lane: _Lane):
-        """`lane.d2h(p)`, counting the copied gradient bytes."""
+        """`lane.d2h(p, lane)`, counting the copied gradient bytes."""
         if lane.d2h is not _already_on_host:
             self.stats["bytes_d2h"] += p.nbytes
-        return lane.d2h(p)
+        return lane.d2h(p, lane)
 
     def _compute(self, p: Tensor, lane: _Lane, ev, scratch: _Scratch) -> None:
         """The host AdamW update of p (after its gradient copy `ev`) into the shadow;
@@ -234,7 +233,8 @@ class CPUAdamW(Optimizer):
         """Update one parameter (its grad must be set; it may be dropped on return);
         skipped when `found_inf` (a 0-d tensor) is nonzero. Device parameters update on
         a host worker: `finish()` before the parameter is read again."""
-        self._lanes[id(p)].step(p, found_inf)
+        lane = self._lanes[id(p)]
+        lane.step(self, p, found_inf, lane)
 
     def _step_now(self, p: Tensor, found_inf: Tensor | None, lane: _Lane) -> None:
         ev = self._fetch(p, lane)
@@ -323,7 +323,7 @@ def _filled(sum_lane, p: Tensor) -> bool:
     return sum_lane.filled
 
 
-def _already_on_host(p: Tensor):
+def _already_on_host(p: Tensor, lane: _Lane):
     return DONE
 
 

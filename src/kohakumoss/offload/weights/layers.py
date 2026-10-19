@@ -103,7 +103,8 @@ class LayerStreamer:
 
     `open()` allocates the slots (implicitly on the first entry), `close()` orders the
     compute stream after the last H2D copy, points every layer back at its host copy
-    and drops the slots; `h2d_bytes` counts every host-to-device byte copied."""
+    and drops the slots; `h2d_bytes` counts every host-to-device byte copied. The
+    streamer holds the layers' tensors, not the layers (their hooks hold it)."""
 
     def __init__(
         self,
@@ -113,7 +114,7 @@ class LayerStreamer:
         pinned: bool = True,
         hooks: bool = True,
     ):
-        self.layers = list(layers)
+        layers = list(layers)
         self.device = with_index(device)
         self.streamed = streamed(self.device)
         self.dm = module(self.device)
@@ -122,7 +123,7 @@ class LayerStreamer:
         self.pool_of: list[_Pool] = []
         self.layer_bytes: list[int] = []
         pools: dict[tuple, _Pool] = {}
-        for layer in self.layers:
+        for layer in layers:
             params = module_tensors(layer)
             hosts = []
             for t in params.values():
@@ -143,27 +144,27 @@ class LayerStreamer:
         if self.streamed:
             self.stream = self.dm.Stream(self.device)
             self._copy, self._wait, self._free = (
-                self._copy_device,
-                self._wait_device,
-                self._free_device,
+                LayerStreamer._copy_device,
+                LayerStreamer._wait_device,
+                LayerStreamer._free_device,
             )
         else:
             self._copy, self._wait, self._free = (
-                self._copy_host,
+                LayerStreamer._copy_host,
                 nothing,
                 nothing,
             )
-        n = len(self.layers)
+        n = len(layers)
         self.ahead = [
-            partial(self._prefetch, i + 1) if i + 1 < n else nothing for i in range(n)
+            partial(LayerStreamer._prefetch, i=i + 1) if i + 1 < n else nothing
+            for i in range(n)
         ]
         self.handles = []
         if hooks:
-            for i, layer in enumerate(self.layers):
-                self.handles.append(
-                    layer.register_forward_pre_hook(partial(self._pre, i))
-                )
-                self.handles.append(layer.register_forward_hook(partial(self._post, i)))
+            for i, layer in enumerate(layers):
+                pre, post = partial(self._pre, i), partial(self._post, i)
+                self.handles.append(layer.register_forward_pre_hook(pre))
+                self.handles.append(layer.register_forward_hook(post))
 
     def slot_bytes(self) -> int:
         """Device bytes the open ring holds."""
@@ -197,7 +198,7 @@ class LayerStreamer:
             self.slot_of.pop(old, None)
         pool.held[slot] = i
         self.slot_of[i] = slot
-        self._copy(pool, slot, self.host[i])
+        self._copy(self, pool, slot, self.host[i])
         self.h2d_bytes += self.layer_bytes[i]
         return slot
 
@@ -230,15 +231,15 @@ class LayerStreamer:
         if slot is None:
             slot = self._load(i)
         pool = self.pool_of[i]
-        self._wait(pool, slot)
+        self._wait(self, pool, slot)
         for t, s in zip(self.targets[i], pool.slots[slot]):
             t.data = s
-        self.ahead[i]()
+        self.ahead[i](self)
 
     def leave(self, i: int) -> None:
         """Layer i's slot is released to the ring; its tensors point at the host copy."""
         pool = self.pool_of[i]
-        self._free(pool, self.slot_of[i])
+        self._free(self, pool, self.slot_of[i])
         for t, h in zip(self.targets[i], self.host[i]):
             t.data = h
 

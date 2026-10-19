@@ -82,9 +82,9 @@ class ThreadedPipeline:
         self._rest = tuple(stages[1:])
         match schedule:
             case "gpipe":
-                self._step = self._gpipe
+                self._step = ThreadedPipeline._gpipe
             case "async":
-                self._step = self._async
+                self._step = ThreadedPipeline._async
             case _:
                 raise ValueError(f"threaded schedule {schedule!r} not in gpipe|async")
 
@@ -111,7 +111,7 @@ class ThreadedPipeline:
         `states[k]` is micro-batch k's adapter step state (None: nothing to install).
         """
         states = list(states) if states is not None else [None] * len(microbatches)
-        return self._step(microbatches, loss_fn, states)
+        return self._step(self, microbatches, loss_fn, states)
 
     def _gpipe(self, microbatches, loss_fn, states) -> Tensor:
         losses = []

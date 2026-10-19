@@ -81,7 +81,7 @@ def _boft_at(t, multiplier: float):
 
 
 def _oft_bypass(t, ctx):
-    return ctx.ops.oft(t.linear, t.lyco) if ctx.m == 1.0 else None
+    return ctx.ops.oft(t.layer, t.lyco) if ctx.m == 1.0 else None
 
 
 def _oft_merge(t, ctx):
@@ -97,7 +97,7 @@ def _oft_eager(t, ctx):
     if ctx.m == 1.0 or t.stored:
         return eager.module_rotation(t.lyco, ctx.m)
     dense = compose.dense_of(t.linear)
-    return eager.delta_bypass(t.linear, t.lyco.shape, t.delta_at(ctx.m), dense)
+    return eager.delta_bypass(t.layer, t.lyco.shape, t.delta_at(ctx.m), dense)
 
 
 def _boft_eager(t, ctx):
@@ -105,7 +105,7 @@ def _boft_eager(t, ctx):
 
 
 def _boft_bypass(t, ctx):
-    return ctx.ops.boft(t.linear, t.lyco, ctx.m)
+    return ctx.ops.boft(t.layer, t.lyco, ctx.m)
 
 
 def _boft_merge(t, ctx):

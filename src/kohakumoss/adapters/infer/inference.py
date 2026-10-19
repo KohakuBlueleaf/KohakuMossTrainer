@@ -1,6 +1,7 @@
 """Inference-time adapters: load files of any supported format, bypass or merge, undo exactly."""
 
 import json
+import weakref
 from functools import partial
 
 import torch
@@ -11,7 +12,13 @@ from kohakumoss.adapters.bind.compose import dense_of
 from kohakumoss.adapters.build.apply import apply, compute_device
 from kohakumoss.adapters.build.config import inference_config
 from kohakumoss.adapters.build.network import lora_name_of
-from kohakumoss.adapters.build.target import Target, base_kind, is_stored
+from kohakumoss.adapters.build.target import (
+    Target,
+    base_forward,
+    base_kind,
+    is_stored,
+    weak_org,
+)
 from kohakumoss.adapters.export.convert import row_norm
 from kohakumoss.adapters.export.fused import split_qkv
 from kohakumoss.adapters.infer import stored
@@ -163,9 +170,11 @@ class AdapterStack:
         param.data.copy_(merged.to(param.dtype))
 
     def _chain(self, linear: nn.Module, make) -> None:
+        """`make(prev)` as the layer's forward: `prev` its current one, or its class
+        forward over a weak reference."""
         if id(linear) not in self.forwards:
             self.forwards[id(linear)] = (linear, vars(linear).get("forward"))
-        prev = vars(linear).get("forward") or type(linear).forward.__get__(linear)
+        prev = vars(linear).get("forward") or partial(base_forward, weakref.ref(linear))
         vars(linear)["forward"] = make(prev)
 
     @torch.no_grad()
@@ -366,6 +375,7 @@ class AdapterStack:
             lyco = make_module(lyco_type, params, name, linear)
         if lyco is None:
             raise KeyError(f"{path}: {lyco_type.__name__} cannot load from a file")
+        weak_org(lyco, linear)
         if dora_scale is not None:
             lyco.wd = True
             lyco.wd_on_out = dora_scale.shape[0] == lyco.shape[0]

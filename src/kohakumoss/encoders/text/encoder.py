@@ -93,6 +93,13 @@ def _released(*args):
     )
 
 
+def _first_pass(run: Callable, fn: Callable[[], None], encoder, prompts) -> list:
+    """`before_first`'s pass: put `run` back, run `fn()`, then `run` the prompts."""
+    encoder._run = run
+    fn()
+    return run(encoder, prompts)
+
+
 class QwenTextEncoder:
     """Frozen Qwen3.5 encoder placed by `plan` (memory mode, precision, batching,
     layout); embeddings land on `output_device` (default `device`). The empty-prompt
@@ -150,7 +157,7 @@ class QwenTextEncoder:
         ) + 2 * sum(b.numel() for n, b in text.named_buffers() if n.endswith(".q"))
         self.before_pass = self.after_pass = nothing
         self.progress = False
-        self._run = self._encode
+        self._run = QwenTextEncoder._encode
 
     def set_timeline(self, timeline) -> None:
         """Mark `step` (the work since the last pass) before and `te` after each pass."""
@@ -261,18 +268,11 @@ class QwenTextEncoder:
     def before_first(self, fn: Callable[[], None]) -> None:
         """Run `fn()` once, right before the next pass (the kernel prewarm of a run
         that encodes online)."""
-        run = self._run
-
-        def first(prompts: Sequence[str]) -> list[Tensor]:
-            self._run = run
-            fn()
-            return run(prompts)
-
-        self._run = first
+        self._run = partial(_first_pass, self._run, fn)
 
     def encode(self, prompts: Sequence[str]) -> list[Tensor]:
         """EncodeText: one [L_i, text_dim] tensor per prompt (unpadded)."""
-        return self._run(prompts)
+        return self._run(self, prompts)
 
     def __call__(self, prompts: Sequence[str]) -> list[Tensor]:
         return self.encode(prompts)
@@ -280,7 +280,7 @@ class QwenTextEncoder:
     def empty(self) -> Tensor:
         """Embedding of the empty prompt (CFG negative / text dropout)."""
         if self._empty is None:
-            self._run([])
+            self._run(self, [])
         return self._empty
 
     def footprint(self) -> dict[str, int]:

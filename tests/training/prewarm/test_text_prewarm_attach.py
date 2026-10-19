@@ -28,7 +28,7 @@ CPU = torch.device("cpu")
 def _encoder(log: list) -> QwenTextEncoder:
     """An encoder shell whose pass only logs (no model)."""
     te = object.__new__(QwenTextEncoder)
-    te._run = lambda prompts: log.append(("pass", tuple(prompts))) or []
+    te._run = lambda enc, prompts: log.append(("pass", tuple(prompts))) or []
     return te
 
 
@@ -45,8 +45,8 @@ def check_once_before(attach) -> None:
 def _after_each(te, fn):
     run = te._run
 
-    def each(prompts):
-        out = run(prompts)
+    def each(enc, prompts):
+        out = run(enc, prompts)
         fn()
         return out
 

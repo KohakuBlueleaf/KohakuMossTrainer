@@ -100,7 +100,12 @@ class MossTimestep:
                 table = tuple((int(st), dict(kw)) for st, kw in schedule)
         self.starts = [st for st, _ in table]
         self.stages = [_stage(steps, uniform_mix, **kw) for _, kw in table]
-        self.sample = self._staged if len(self.stages) > 1 else self._single
+        many = len(self.stages) > 1
+        self._sample = MossTimestep._staged if many else MossTimestep._single
+
+    def sample(self, batch: int, generator: torch.Generator, step: int) -> Tensor:
+        """sigma [batch] float32 on CPU from the stage active at `step`."""
+        return self._sample(self, batch, generator, step)
 
     def stage_at(self, step: int) -> _Stage:
         return self.stages[bisect.bisect_right(self.starts, step) - 1]

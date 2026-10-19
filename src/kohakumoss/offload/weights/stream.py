@@ -44,6 +44,11 @@ __all__ = [
 ]
 
 
+def steps_block(owners: list[int] | None, rank: int, index: int) -> bool:
+    """Rank `rank` steps block `index` under `owners` (every block when None)."""
+    return owners is None or owners[index] == rank
+
+
 class WeightStream:
     """Ring-buffer weight streaming over a sequence of identically shaped blocks. A
     frozen ring keeps its first `slots - 2` blocks on the device once loaded and
@@ -55,7 +60,9 @@ class WeightStream:
 
     The stream owns the host copies (`host`, `params`, `layout`) and its parts: `ring`
     (SlotRing), `copier` (H2DCopier), `timer` (SpanTimer), `grads` (GradSink) and
-    `reducer` (BlockReducer); `stats` counts loads, bytes and host syncs over all."""
+    `reducer` (BlockReducer); `stats` counts loads, bytes and host syncs over all.
+    `optimizer` is a weak reference to the in-backward block optimiser (StreamedAdamW),
+    None without one."""
 
     def __init__(
         self,
@@ -103,7 +110,8 @@ class WeightStream:
             self.host, self.layout, self.device, slots, keep, self.copier, self.stats
         )
         self.grads = GradSink(self.params, self.n, dev, self.pinned, self.stats)
-        self.reducer = BlockReducer(self.grads, dev, trainable, self.mine, self.stats)
+        mine = partial(steps_block, owners, rank)
+        self.reducer = BlockReducer(self.grads, dev, trainable, mine, self.stats)
         # the streamed weights' per-linear calls go straight to the parts
         self.slot, self.ensure = self.ring.slot, self.ring.ensure
         self.prefetch, self.release = self.ring.prefetch, self.ring.release
@@ -163,7 +171,7 @@ class WeightStream:
 
     def mine(self, index: int) -> bool:
         """This rank steps block `index` (every block without owners)."""
-        return self.owners is None or self.owners[index] == self.rank
+        return steps_block(self.owners, self.rank, index)
 
     def _shared_pair(self, w: Tensor, work: torch.dtype) -> tuple[Tensor, Tensor]:
         """(streaming copy, fp32 master) views of the shared region, filled by rank 0."""

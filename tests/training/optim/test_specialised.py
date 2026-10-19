@@ -26,8 +26,8 @@ DEV = torch.device("cpu")
 def test_losses_samplers_ema_bind_once():
     assert HuberLoss(None).reduce is _plain_sum
     assert L1Loss(None, masked=True).reduce is _masked_sum
-    assert MossTimestep().sample.__func__ is MossTimestep._single
-    assert MossTimestep(schedule="tech_report").sample.__func__ is MossTimestep._staged
+    assert MossTimestep()._sample is MossTimestep._single
+    assert MossTimestep(schedule="tech_report")._sample is MossTimestep._staged
     assert LogitNormalTimestep(shift=1.0).shift is identity
     assert LogitNormalTimestep(shift=3.0).shift is not identity
     p = torch.nn.Parameter(torch.zeros(2))
@@ -59,7 +59,7 @@ def test_bundle_scaler_and_writer_selection(tmp_path):
         1.0,
         fused_step=True,
     )
-    assert fused.factor == fused._clipped
+    assert fused.factor is type(fused)._clipped
     unclipped = build_bundle(
         groups, DEV, "adamw", hyper, sched, 10, build_precision("fp16", ()), 0.0
     )

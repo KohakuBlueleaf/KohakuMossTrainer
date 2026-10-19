@@ -53,7 +53,7 @@ class ComputeWeight(nn.Module):
         for name in PARTS:
             self.register_buffer(name, parts.get(name))
         self.shape = self.q.shape
-        self.linear = self._unbound
+        self._linear = ComputeWeight._unbound
 
     @classmethod
     def from_weight(cls, w: Tensor, recipe: str, dgrad: bool = False):
@@ -108,7 +108,11 @@ class ComputeWeight(nn.Module):
         device = self.q.device if device is None else torch.device(device)
         name = "fp8_linear" if autograd else "fp8_linear_infer"
         op = registry.resolve(name, device, dtype, backend, recipe=self.recipe)
-        self.linear = partial(compute_linear, op, self)
+        self._linear = partial(compute_linear, op)
+
+    def linear(self, x: Tensor, bias: Tensor | None) -> Tensor:
+        """x W^T (+ bias) through the bound `fp8_linear` op."""
+        return self._linear(self, x, bias)
 
     def _unbound(self, x: Tensor, bias: Tensor | None) -> Tensor:
         self.bind(x.dtype, x.device)

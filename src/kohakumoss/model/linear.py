@@ -26,7 +26,7 @@ class MossLinear(nn.Linear):
         super().__init__(in_features, out_features, bias, device=device, dtype=dtype)
         self.base: BaseWeight | None = None
         self.compute = None
-        self._impl = self._dense if bias else self._dense_nobias
+        self._impl = MossLinear._dense if bias else MossLinear._dense_nobias
 
     def reset_parameters(self) -> None:
         """No-op: the model builder initialises or loads weights."""
@@ -62,20 +62,21 @@ class MossLinear(nn.Linear):
         self.rebind()
 
     def rebind(self) -> None:
-        """Re-select the forward after a structural change (bias, base, fp8 compute)."""
+        """Re-select the forward after a structural change (bias, base, fp8 compute):
+        `_impl` is the class function, called as `self._impl(self, x)`."""
         match (self.base is not None, self.compute is not None, self.bias is not None):
             case (True, _, True):
-                self._impl = self._stored
+                self._impl = MossLinear._stored
             case (True, _, False):
-                self._impl = self._stored_nobias
+                self._impl = MossLinear._stored_nobias
             case (False, True, True):
-                self._impl = self._fp8
+                self._impl = MossLinear._fp8
             case (False, True, False):
-                self._impl = self._fp8_nobias
+                self._impl = MossLinear._fp8_nobias
             case (False, False, True):
-                self._impl = self._dense
+                self._impl = MossLinear._dense
             case (False, False, False):
-                self._impl = self._dense_nobias
+                self._impl = MossLinear._dense_nobias
 
     def _dense(self, x: Tensor) -> Tensor:
         return F.linear(x, self.weight.to(x.dtype), self.bias.to(x.dtype))
@@ -96,7 +97,7 @@ class MossLinear(nn.Linear):
         return self.compute.linear(x, self.weight, None)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self._impl(x)
+        return self._impl(self, x)
 
     def __delattr__(self, name: str) -> None:
         if name == "weight" and "weight" in self._parameters:

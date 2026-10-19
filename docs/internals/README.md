@@ -13,6 +13,7 @@ does on the device. Start from the [concepts](../concepts/README.md) and
 | memory | [offload.md](offload.md) | activation offload, weight streaming, gradient offload, CPU optimiser, text-encoder placement |
 | | [sampling-memory.md](sampling-memory.md) | what a generate call holds on the device per phase (text encode, sampling, decode), and the placement that keeps sampling at or below training |
 | | [checkpoints.md](checkpoints.md) | streaming checkpoint writes, memory and disk cost |
+| | [reference-cycles.md](reference-cycles.md) | no reference cycle through a tensor holder: class-function slots, weak hooks and callbacks |
 | text encoder | [text-encoder.md](text-encoder.md) | text-encoder ops and kernels, batched / packed encode, TextEncoderPlan, encode-ahead, quantization |
 | adapters | [adapter-kinds.md](adapter-kinds.md) | the per-algorithm adapter records |
 | | [adapter-binding.md](adapter-binding.md) | bound adapter forwards, kernel ops, autotuned ops, forward wrappers |

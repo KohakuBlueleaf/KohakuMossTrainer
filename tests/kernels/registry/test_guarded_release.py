@@ -78,7 +78,7 @@ def test_backward_releases_the_forward_state(square, monkeypatch):
 
 
 def _path(op) -> str:
-    return op._call.__func__.__name__
+    return op._call.__name__
 
 
 def check_path_fixed_in_step(op) -> None:

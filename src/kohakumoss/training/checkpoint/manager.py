@@ -54,12 +54,12 @@ class CheckpointManager:
         self.root = Path(output_dir) / "checkpoints"
         self.snap_root = Path(output_dir) / "ema_snapshots"
         self.keep_last = keep_last
-        self.snapshot = self._snapshot if snapshot_ema else nothing
+        self._snap = CheckpointManager._snapshot if snapshot_ema else nothing
         self.before_save = before_save
         self.rank = rank
         self.devices = tuple(devices)
         self.last_saved = -1
-        self._save = self._write if is_main else nothing
+        self._save = CheckpointManager._write if is_main else nothing
         self._clear = self._clear_partial if is_main else nothing
 
     def saved(self, step: int) -> bool:
@@ -77,7 +77,7 @@ class CheckpointManager:
         if "optim_rank" in parts:
             save_optim_rank(partial, self.rank, parts["optim_rank"])
         _barrier()
-        path = self._save(step, parts)
+        path = self._save(self, step, parts)
         _barrier()
         self.last_saved = step
         return path
@@ -97,7 +97,7 @@ class CheckpointManager:
         if final.exists():
             shutil.rmtree(final)
         partial.rename(final)
-        self.snapshot(step, parts["ema"], parts.get("ema_gammas", {}))
+        self._snap(self, step, parts["ema"], parts.get("ema_gammas", {}))
         self.prune()
         return final
 

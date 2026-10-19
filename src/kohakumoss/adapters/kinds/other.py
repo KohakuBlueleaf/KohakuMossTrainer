@@ -23,7 +23,7 @@ def _glora_kernel_unit(t, ops):
 
 
 def _glora_eager(t, ctx):
-    return eager.glora_bypass(t.linear, t.lyco, ctx.m)
+    return eager.glora_bypass(t.layer, t.lyco, ctx.m)
 
 
 def _ia3_unit(t):
@@ -36,7 +36,7 @@ def _ia3_bypass(t, ctx):
     if scale is None:
         return None
     wrap = forwards.scaled_input if t.lyco.train_input else forwards.scaled_output
-    return wrap(t.linear, scale)
+    return wrap(t.layer, scale)
 
 
 def _ia3_merge(t, ctx):
@@ -45,7 +45,7 @@ def _ia3_merge(t, ctx):
 
 def _ia3_eager(t, ctx):
     fn = eager.ia3_in if t.lyco.train_input else eager.ia3_out
-    return fn(t.linear, t.lyco, ctx.m)
+    return fn(t.layer, t.lyco, ctx.m)
 
 
 GLORA = register(

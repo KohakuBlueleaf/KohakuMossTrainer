@@ -1,12 +1,15 @@
 """GPU AdamW for streamed (`swap`) blocks, stepped per block inside backward of the
 last micro-batch; states streamed or on the device. See docs/internals/offload.md."""
 
+import weakref
+
 import torch
 from torch import Tensor
 
 from kohakumoss.offload.optim.gpu_adamw import fused_adamw, make_groups
 from kohakumoss.offload.weights.stream import WeightStream
 from kohakumoss_common.calls import nothing
+from kohakumoss_common.weak import weak_method
 
 STATE_SLOTS = 3
 
@@ -137,15 +140,21 @@ class StreamedAdamW:
             self.free = [self.dm.Event() for _ in range(self.n_slots)]
             for ev in self.free:
                 ev.record(cur)
-        self._load = self._load_device if device_states else self._load_streamed
-        self._apply = self._apply_device if device_states else self._apply_streamed
-        ws.optimizer = self
+        if device_states:
+            self._load = StreamedAdamW._load_device
+            self._apply = StreamedAdamW._apply_device
+        else:
+            self._load = StreamedAdamW._load_streamed
+            self._apply = StreamedAdamW._apply_streamed
+        self._stepping = (weak_method(self._on_grad), weak_method(self._prefetch))
+        ws.optimizer = weakref.ref(self)
 
     def start(self, last: bool) -> None:
         """Last micro-batch: step blocks in backward; else accumulate grads on host."""
         if last:
-            self.weight_stream.on_grad = self._on_grad
-            self.weight_stream.on_block_backward = self._prefetch
+            on_grad, on_block_backward = self._stepping
+            self.weight_stream.on_grad = on_grad
+            self.weight_stream.on_block_backward = on_block_backward
         else:
             self.weight_stream.on_grad = self.weight_stream.accumulate
             self.weight_stream.on_block_backward = nothing
@@ -156,7 +165,7 @@ class StreamedAdamW:
         filled = self.weight_stream.grad_filled
         self.has_acc[index] = {name: filled.get((i, name), False) for i, name in keys}
         self.pending[index] = {}
-        self._load(index)
+        self._load(self, index)
 
     def _take_slot(self, index: int) -> int:
         """The next ring slot for block `index`; raises while a block loaded into it
@@ -238,7 +247,7 @@ class StreamedAdamW:
             found = self.transform(g)
             weight = self.weight_slots[slot][name]
             step = self.steps[key]
-            outs.append(self._apply(key, slot, g, step, group, found, weight))
+            outs.append(self._apply(self, key, slot, g, step, group, found, weight))
         return outs
 
     @torch.no_grad()

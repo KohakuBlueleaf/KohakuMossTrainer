@@ -10,7 +10,7 @@ import torch
 
 from kohakumoss.diffusion.sampling.sample import layout
 from kohakumoss.inference.knobs import DEPTH, skip_problems
-from kohakumoss.model.backbone import MossBackbone, runs_on
+from kohakumoss.model.backbone import _run_selected, runs_on
 from kohakumoss.types.seqinfo import build_seqinfo
 from kohakumoss_kernels.backends.eager.attention import _BOUNDS
 from tests._util.negative import must_fail
@@ -52,7 +52,7 @@ def _flagged_keep_the_skip(out, x, seq, r: float) -> None:
     assert torch.equal(out[~second], x[~second] + 1.0)
 
 
-def _rescaled(x, ctx, run):
+def _rescaled(model, x, ctx, run):
     return x * 0.5
 
 
@@ -60,7 +60,7 @@ def test_segment_skip_keeps_the_skip_on_flagged_samples():
     seq, x, mask, owner = _setup()
     run = runs_on(mask, seq)
     assert run.shape == (seq.n_joint, 1) and int(run.sum()) == 7
-    out = MossBackbone._run_selected(owner, 0, _rescaled, x, None, run)
+    out = _run_selected(0, _rescaled, owner, x, None, run)
     _flagged_keep_the_skip(out, x, seq, 0.5)
     must_fail(
         lambda: _flagged_keep_the_skip(zero_gates(owner, x, run, 0.5), x, seq, 0.5),

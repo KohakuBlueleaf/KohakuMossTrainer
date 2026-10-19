@@ -15,7 +15,8 @@ class H2DCopier:
     side stream after the slot's `free` event (and block `host_ready`, its master
     write-back) and records the slot's `ready` event; pinned host copies go directly,
     pageable ones through two alternating pinned staging sets. On the host it is a
-    plain copy. `copy`, `wait(slot)` and `mark_free(slot)` are bound at construction."""
+    plain copy. The bodies of `copy`, `wait(slot)` and `mark_free(slot)` are selected
+    at construction."""
 
     def __init__(
         self,
@@ -38,14 +39,30 @@ class H2DCopier:
         self.staged: list = [None, None]
         self.stage_next = 0
         if not side:
-            self.copy, self.wait, self.mark_free = self.copy_host, nothing, nothing
+            self._copy, self._wait, self._mark_free = (
+                H2DCopier.copy_host,
+                nothing,
+                nothing,
+            )
             return
         self.h2d = dm.Stream(device)
         events = SlotEvents(dm, device, slots)
         self.ready, self.free = events.ready, events.free
         self.host_ready = recorded(dm, device, blocks)
-        self.copy = self.copy_pinned if host_pinned else self.copy_staged
-        self.wait, self.mark_free = self._wait_ready, self._record_free
+        self._copy = H2DCopier.copy_pinned if host_pinned else H2DCopier.copy_staged
+        self._wait, self._mark_free = H2DCopier._wait_ready, H2DCopier._record_free
+
+    def copy(self, src: dict, dst: dict, slot: int, index: int) -> None:
+        """Block `index`'s host tensors `src` -> ring slot `slot` (`dst`)."""
+        self._copy(self, src, dst, slot, index)
+
+    def wait(self, slot: int) -> None:
+        """The compute stream waits for slot `slot`'s copy."""
+        self._wait(self, slot)
+
+    def mark_free(self, slot: int) -> None:
+        """The compute stream is done reading slot `slot`."""
+        self._mark_free(self, slot)
 
     def copy_host(self, src: dict, dst: dict, slot: int, index: int) -> None:
         for k, t in src.items():

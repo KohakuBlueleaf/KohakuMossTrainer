@@ -183,9 +183,9 @@ class HostStateAdamW(_GroupsMixin):
                 self.written[id(p)] = self.dm.Event()
                 self.written[id(p)].record(cur)
             self.no_inf = torch.zeros((), dtype=torch.float32, device=self.device)
-            self._update = self._update_device
+            self._update = HostStateAdamW._update_device
         else:
-            self._update = self._update_host
+            self._update = HostStateAdamW._update_host
 
     def _update_host(self, p: Tensor, ahead: Tensor | None, found_inf) -> None:
         master, m, v = self.host[id(p)]
@@ -263,13 +263,13 @@ class HostStateAdamW(_GroupsMixin):
         if self.last is not None:
             self.after[id(self.last)] = p
         self.last = p
-        self._update(p, self.after.get(id(p)), found_inf)
+        self._update(self, p, self.after.get(id(p)), found_inf)
 
     @torch.no_grad()
     def step(self) -> None:
         live = [p for p in self.params if p.grad is not None]
         for p, ahead in zip(live, live[1:] + [None]):
-            self._update(p, ahead, None)
+            self._update(self, p, ahead, None)
         self.finish()
 
     def synchronize(self) -> None:

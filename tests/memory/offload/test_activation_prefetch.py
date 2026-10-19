@@ -20,7 +20,7 @@ def _miss_only(self: ActivationOffload, pk: Packet) -> torch.Tensor:
     if pk.device_copy is None:
         self.pending.setdefault(pk.block, []).append(pk)
         self._fetch(pk.block)
-        self._prefetch(pk.block - 1)
+        self._prefetch(self, pk.block - 1)
     self.dm.current_stream(self.device).wait_event(pk.h2d)
     pk.users -= 1
     return pk.device_copy

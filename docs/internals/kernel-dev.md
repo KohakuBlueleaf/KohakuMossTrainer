@@ -278,11 +278,18 @@ once per process:
 2. it imports the eager, compile, Triton and TileLang backend packages; the Triton and
    TileLang packages set up the host toolchain on import (`ensure_toolchain()`:
    `vcvars64` and `PATH` / `CXX` on Windows, the Intel Triton UTF-8 sources), the
-   compile backend at its first CPU probe.
+   compile backend at its first CPU probe;
+3. it runs one cyclic gc pass. The compile backend imports `torch._dynamo`, and that
+   import leaves a reference cycle through the importing stack (`torch.fx.wrap` keeps
+   its own frame, whose `f_back` chain reaches every caller frame): without the pass,
+   the frame of the call that built the first kernels, `load_backbone` with the model
+   among its locals, outlives it until the collector runs. See
+   [reference-cycles.md](reference-cycles.md).
 
 `CompiledOp` also applies the settings before its first compile.
-`tests/kernels/registry/test_lazy_backends.py` checks it in a fresh process (negative:
-backends loaded at import).
+`tests/kernels/registry/test_lazy_backends.py` checks it in a fresh process (negatives:
+backends loaded at import; the gc pass left out, which keeps an object held by the
+first build's caller alive with automatic gc off).
 
 ## Current device
 

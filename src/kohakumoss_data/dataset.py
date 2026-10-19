@@ -199,32 +199,37 @@ class MossDataset:
             raise ValueError(f"token_budget must be one of {TOKEN_BUDGETS}")
         if cfg.token_budget == "exact" and cfg.text_cache != "offline":
             raise ValueError("token_budget='exact' needs text_cache='offline'")
-        self.text_len = {
-            ("estimate", "off"): self._text_len_columns,
-            ("estimate", "online"): self._text_len_columns,
-            ("estimate", "offline"): self._text_len_columns,
-            ("render", "off"): self._text_len_estimate,
-            ("render", "online"): self._text_len_estimate,
-            ("render", "offline"): self._text_len_cached,
-            ("exact", "offline"): self._text_len_exact,
+        cls = type(self)
+        self._text_len = {
+            ("estimate", "off"): cls._text_len_columns,
+            ("estimate", "online"): cls._text_len_columns,
+            ("estimate", "offline"): cls._text_len_columns,
+            ("render", "off"): cls._text_len_estimate,
+            ("render", "online"): cls._text_len_estimate,
+            ("render", "offline"): cls._text_len_cached,
+            ("exact", "offline"): cls._text_len_exact,
         }[(cfg.token_budget, cfg.text_cache)]
         self._drop = (
             partial(draw_drop, cfg.seed, cfg.text_drop) if cfg.text_drop else never_drop
         )
         self._fill_latents = {
-            "off": self._latents_decode,
-            "offline": self._latents_offline,
-            "online": self._latents_online,
+            "off": cls._latents_decode,
+            "offline": cls._latents_offline,
+            "online": cls._latents_online,
         }[cfg.latent_cache]
         self._fill_text = {
-            "off": self._text_prompts,
-            "offline": self._text_offline,
-            "online": self._text_online,
+            "off": cls._text_prompts,
+            "offline": cls._text_offline,
+            "online": cls._text_online,
         }[cfg.text_cache]
         latent_online = cfg.latent_cache == "online"
         text_online = cfg.text_cache == "online"
-        self._put_latents = self._write_latents if latent_online else nothing
-        self._put_text = self._write_text if text_online else nothing
+        self._put_latents = cls._write_latents if latent_online else nothing
+        self._put_text = cls._write_text if text_online else nothing
+
+    def text_len(self, row_id: int, variant: int) -> int:
+        """Text tokens of caption `variant` of row `row_id` under the token budget."""
+        return self._text_len(self, row_id, variant)
 
     def _planner(self):
         cfg = self.cfg
@@ -339,8 +344,8 @@ class MossDataset:
             rank=rank,
             text_limit=[it.text_limit for it in items],
         )
-        self._fill_latents(batch, items)
-        self._fill_text(batch, captions)
+        self._fill_latents(self, batch, items)
+        self._fill_text(self, batch, captions)
         return batch
 
     @staticmethod
@@ -427,6 +432,6 @@ class MossDataset:
         `latents` is packed [N_img, C] in batch order; `text` is one tensor per sample;
         a cache that is not online ignores its argument."""
         if latents is not None:
-            self._put_latents(batch, latents)
+            self._put_latents(self, batch, latents)
         if text is not None:
-            self._put_text(batch, text)
+            self._put_text(self, batch, text)

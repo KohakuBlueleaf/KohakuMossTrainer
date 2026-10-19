@@ -233,7 +233,8 @@ def _warned_bypass(caplog, build) -> None:
 def test_merge_on_a_stored_base_runs_bypass(caplog):
     w, b, lin, x = problem("int8")
     _warned_bypass(caplog, lambda: adapted(lin, "lora", mode="merge"))
-    assert adapted(problem("int8")[2], "lora", mode="merge").targets[0].stored
+    merged = adapted(problem("int8")[2], "lora", mode="merge")
+    assert merged.targets[0].stored
     must_fail(
         lambda: _warned_bypass(
             caplog, lambda: adapted(dense_linear(w, b), "lora", "merge")

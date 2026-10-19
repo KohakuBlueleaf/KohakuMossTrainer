@@ -19,13 +19,14 @@ def _lin_nobias(x: Tensor, w: Tensor) -> Tensor:
 
 
 def lin_of(t) -> Callable[[Tensor, Tensor], Tensor]:
-    """(x, W) -> F.linear in x's dtype, with or without the layer's bias."""
-    linear = t.linear
-    if linear.bias is None:
+    """(x, W) -> F.linear in x's dtype, with or without the layer's bias (read per
+    call through the target's weak reference)."""
+    if t.linear.bias is None:
         return _lin_nobias
+    layer = t.layer
 
     def biased(x: Tensor, w: Tensor) -> Tensor:
-        return F.linear(x, w.to(x.dtype), linear.bias.to(x.dtype))
+        return F.linear(x, w.to(x.dtype), layer().bias.to(x.dtype))
 
     return biased
 
@@ -67,10 +68,10 @@ def plus_base(t, diff: Callable | None, with_base: Callable | None = None):
     if diff is None:
         return None
     if has_scalar_param(t.lyco):
-        return forwards.plus_base_scalar(t.linear, t.lyco, diff)
+        return forwards.plus_base_scalar(t.layer, t.lyco, diff)
     if with_base is not None:
-        return forwards.with_base(t.linear, with_base)
-    return forwards.plus_base(t.linear, diff)
+        return forwards.with_base(t.layer, with_base)
+    return forwards.plus_base(t.layer, diff)
 
 
 def merged(t, unit: Callable | None, m: float, merge: Callable | None = None):

@@ -73,10 +73,10 @@ class QuantLinear(nn.Module):
         self.qweight = make_base(w.to(work_device or dev), fmt, recipe).to(dev)
         self.qweight.bind(compute_dtype)
         self.bias = None
-        self._impl = self._no_bias
+        self._impl = QuantLinear._no_bias
         if linear.bias is not None:
             self.bias = nn.Parameter(linear.bias.detach(), requires_grad=False)
-            self._impl = self._with_bias
+            self._impl = QuantLinear._with_bias
 
     @classmethod
     def from_base(
@@ -94,10 +94,10 @@ class QuantLinear(nn.Module):
         self.qweight = base
         self.qweight.bind(compute_dtype)
         self.bias = None
-        self._impl = self._no_bias
+        self._impl = QuantLinear._no_bias
         if bias is not None:
             self.bias = nn.Parameter(bias, requires_grad=False)
-            self._impl = self._with_bias
+            self._impl = QuantLinear._with_bias
         return self
 
     def _no_bias(self, x):
@@ -107,7 +107,7 @@ class QuantLinear(nn.Module):
         return self.qweight.linear(x, self.bias.to(x.dtype))
 
     def forward(self, x):
-        return self._impl(x)
+        return self._impl(self, x)
 
 
 @torch.no_grad()

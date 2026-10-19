@@ -5,6 +5,7 @@ metrics report what the allocator returned. See
 docs/internals/offload.md#between-step-release."""
 
 import time
+from functools import partial
 
 import torch
 
@@ -61,6 +62,10 @@ class StepRelease:
         return out
 
 
+def _take_from(source: StepRelease, stats) -> tuple[int, float]:
+    return source.take()
+
+
 class CacheReleaseStats:
     """Every step: the bytes returned to the driver at that step, reserved before minus
     reserved after: the `source` release's (a StepRelease), else the drop of the
@@ -76,7 +81,9 @@ class CacheReleaseStats:
         self.device = torch.device(device)
         self.rows = max(int(rows), 1)
         self.mark = reserved(self.device)
-        self.take = self._drop if source is None else source.take
+        self._take = (
+            CacheReleaseStats._drop if source is None else partial(_take_from, source)
+        )
         self.first = True
         self._clear()
 
@@ -89,7 +96,7 @@ class CacheReleaseStats:
         return freed, 0.0
 
     def on_step_end(self, state, out) -> None:
-        freed, secs = self.take()
+        freed, secs = self._take(self)
         self.count += freed > 0
         self.secs += secs
         self.steps += 1

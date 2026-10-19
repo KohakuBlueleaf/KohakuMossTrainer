@@ -1,6 +1,8 @@
 """Forward wrappers a layer's kernel ops plug into, built once per bind as closures:
-x -> the adapted layer's output. The base forward is `linear._impl`, read per call (a
-bias change re-binds it). See docs/internals/adapter-binding.md#forward-wrappers."""
+x -> the adapted layer's output. `layer` is a weak reference to the layer, read per
+call; the base forward is its `_impl` (a bias change re-binds it). See
+docs/internals/adapter-binding.md#forward-wrappers and
+docs/internals/reference-cycles.md#adapters."""
 
 from collections.abc import Callable
 
@@ -10,70 +12,77 @@ from torch import Tensor
 F32 = torch.float32
 
 
-def plus_base(linear, diff: Callable) -> Callable:
+def plus_base(layer, diff: Callable) -> Callable:
     """x -> base(x) + diff(x)."""
 
     def forward(x: Tensor) -> Tensor:
-        return linear._impl(x) + diff(x)
+        lin = layer()
+        return lin._impl(lin, x) + diff(x)
 
     return forward
 
 
-def plus_base_scalar(linear, lyco, diff: Callable) -> Callable:
+def plus_base_scalar(layer, lyco, diff: Callable) -> Callable:
     """x -> base(x) + diff(x) * the module's trainable scalar."""
 
     def forward(x: Tensor) -> Tensor:
-        return linear._impl(x) + diff(x) * lyco.scalar.to(x.dtype)
+        lin = layer()
+        return lin._impl(lin, x) + diff(x) * lyco.scalar.to(x.dtype)
 
     return forward
 
 
-def with_base(linear, op: Callable) -> Callable:
+def with_base(layer, op: Callable) -> Callable:
     """x -> op((x, base(x))) on (tokens, channels) views: base + dy, the add inside
     the op."""
 
     def forward(x: Tensor) -> Tensor:
-        y = linear._impl(x)
+        lin = layer()
+        y = lin._impl(lin, x)
         out = op((x.reshape(-1, x.shape[-1]), y.reshape(-1, y.shape[-1])))
         return out.reshape(y.shape)
 
     return forward
 
 
-def rotated(linear, rotate: Callable) -> Callable:
+def rotated(layer, rotate: Callable) -> Callable:
     """x -> rotate(y), y = base(x): the rotated base output, y + dy inside the op."""
 
     def forward(x: Tensor) -> Tensor:
-        y = linear._impl(x)
+        lin = layer()
+        y = lin._impl(lin, x)
         return rotate(y).to(y.dtype)
 
     return forward
 
 
-def plus_rotation(linear, delta: Callable) -> Callable:
+def plus_rotation(layer, delta: Callable) -> Callable:
     """x -> y + delta(y), y = base(x): a rotation whose dy is a function of y."""
 
     def forward(x: Tensor) -> Tensor:
-        y = linear._impl(x)
+        lin = layer()
+        y = lin._impl(lin, x)
         return y + delta(y).to(y.dtype)
 
     return forward
 
 
-def scaled_output(linear, scale: Callable) -> Callable:
+def scaled_output(layer, scale: Callable) -> Callable:
     """x -> scale(base(x)): a channel scale of the base output."""
 
     def forward(x: Tensor) -> Tensor:
-        return scale(linear._impl(x))
+        lin = layer()
+        return scale(lin._impl(lin, x))
 
     return forward
 
 
-def scaled_input(linear, scale: Callable) -> Callable:
+def scaled_input(layer, scale: Callable) -> Callable:
     """x -> base(scale(x)): a channel scale of the input."""
 
     def forward(x: Tensor) -> Tensor:
-        return linear._impl(scale(x))
+        lin = layer()
+        return lin._impl(lin, scale(x))
 
     return forward
 

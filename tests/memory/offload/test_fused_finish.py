@@ -39,22 +39,22 @@ def _bundle(name, params):
 def _slow_side_stream(opt):
     update = opt._update
 
-    def slow(p, ahead, found):
-        with torch.cuda.stream(opt.opt):
+    def slow(owner, p, ahead, found):
+        with torch.cuda.stream(owner.opt):
             torch.cuda._sleep(SLEEP)
-        update(p, ahead, found)
+        update(owner, p, ahead, found)
 
     opt._update = slow
 
 
 def _slow_current_stream(bundle):
-    update = bundle.update
+    update = bundle._update
 
-    def slow(p, found):
+    def slow(owner, p, found):
         torch.cuda._sleep(SLEEP)
-        update(p, found)
+        update(owner, p, found)
 
-    bundle.update = slow
+    bundle._update = slow
 
 
 def _host_state(finish: bool):

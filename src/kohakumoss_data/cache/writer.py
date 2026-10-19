@@ -45,10 +45,10 @@ class CacheWriter:
                 dataset.latents.store.path,
                 dataset.latents.storage,
             )
-            self._take_latents = self._latent_jobs
+            self._take_latents = CacheWriter._latent_jobs
         if dataset.texts.mode == "online":
             self._paths["text"] = (dataset.texts.store.path, dataset.texts.storage)
-            self._take_text = self._text_jobs
+            self._take_text = CacheWriter._text_jobs
         self.rank = rank
         self._streams: dict = {}
         self._queue: queue.Queue = queue.Queue(maxsize=max_pending)
@@ -63,7 +63,8 @@ class CacheWriter:
 
     def __call__(self, hb: HostBatch, latents, text, text_len) -> None:
         self.raise_error()
-        jobs = self._take_latents(hb, latents) + self._take_text(hb, text, text_len)
+        latent_jobs = self._take_latents(self, hb, latents)
+        jobs = latent_jobs + self._take_text(self, hb, text, text_len)
         if jobs:
             self._queue.put(self._to_host(jobs))
 

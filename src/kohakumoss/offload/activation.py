@@ -136,12 +136,12 @@ class ActivationOffload:
         if self.streamed:
             self.d2h_stream = self.dm.Stream(self.device)
             self.h2d_stream = self.dm.Stream(self.device)
-            self._store = self._store_device
-            self._load = self._load_device
-            self._prefetch = self._fetch if prefetch else nothing
+            self._store = ActivationOffload._store_device
+            self._load = ActivationOffload._load_device
+            self._prefetch = ActivationOffload._fetch if prefetch else nothing
         else:
-            self._store = self._store_host
-            self._load = self._load_host
+            self._store = ActivationOffload._store_host
+            self._load = ActivationOffload._load_host
 
     def exclude(self, tensors: Iterable[Tensor]) -> None:
         """Never offload these tensors' storages (parameters, weight slots)."""
@@ -193,7 +193,7 @@ class ActivationOffload:
             return hit[1]
         self.stats["packed"] += 1
         self.stats["packed_bytes"] += t.nbytes
-        pk = self._store(t)
+        pk = self._store(self, t)
         self.seen[key] = (weakref.ref(t), pk)
         self.pending.setdefault(self.current, []).append(pk)
         return pk
@@ -205,7 +205,7 @@ class ActivationOffload:
             return pk
         if isinstance(pk, Recast):
             return _recast(pk)
-        return self._load(pk)
+        return self._load(self, pk)
 
     def _store_host(self, t: Tensor) -> Packet:
         return Packet(t.detach().clone(), self.current)
@@ -291,7 +291,7 @@ class ActivationOffload:
                 )
             self.pending.setdefault(pk.block, []).append(pk)
             self._fetch(pk.block)
-        self._prefetch(pk.block - 1)
+        self._prefetch(self, pk.block - 1)
         self.dm.current_stream(self.device).wait_event(pk.h2d)
         pk.users -= 1
         return pk.device_copy

@@ -102,6 +102,10 @@ def decay_to_one(groups: list[dict], optimizer: Optimizer) -> Callable[[], None]
     return apply
 
 
+def _given(grads: Callable[[], list[Tensor]], bundle) -> list[Tensor]:
+    return grads()
+
+
 def close_optimizers(*opts) -> None:
     """Stop the host worker threads of the optimisers among `opts` that run them."""
     for opt in opts:
@@ -140,8 +144,10 @@ class Bundle:
         self.params = [p for g in groups for p in g["params"]]
         self.names = param_names(groups)
         self.nonfinite_grads: list[dict] = []
-        self._report = self._device_report if grads is None else self._host_report
-        self._grads = grads or self._device_grads
+        if grads is None:
+            self._report, self._grads = Bundle._device_report, Bundle._device_grads
+        else:
+            self._report, self._grads = Bundle._host_report, partial(_given, grads)
         self._grad_names = grad_names
         self.clip = make_clipper(
             grad_clip, len({p.device for p in self.params}) > 1 or grads is not None
@@ -189,7 +195,7 @@ class Bundle:
 
     def step(self) -> bool:
         self.before()
-        grads = self._grads()
+        grads = self._grads(self)
         self.scaler.unscale_(grads)
         norm = self.grad_norm(grads).to(self.device)
         local = (~torch.isfinite(norm)).to(torch.int32).reshape(1)
@@ -208,7 +214,7 @@ class Bundle:
         else:
             self.skipped += 1
             self.nonfinite += 1
-            self.nonfinite_grads = self._report(grads)
+            self.nonfinite_grads = self._report(self, grads)
             self.last_nonfinite_params = nonfinite_count(grads)
         self.after()
         self.schedule.step()

@@ -147,7 +147,7 @@ def test_release_stats_on_accelerators_only(fake):
     (cb,) = release_callbacks("cuda", 1, "none")
     assert isinstance(cb, CacheReleaseStats)
     release, stats = release_callbacks("cuda", 1, "empty_cache")
-    assert stats.take == release.take, "the stats do not read the bound release"
+    assert stats._take.args == (release,), "the stats do not read the bound release"
 
 
 def check_default(default) -> None:

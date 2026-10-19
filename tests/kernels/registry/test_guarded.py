@@ -98,7 +98,7 @@ def test_negative_unchecked_inputs(square, monkeypatch):
 
 
 def _path(op) -> str:
-    return op._call.__func__.__name__
+    return op._call.__name__
 
 
 def check_paths(op) -> None:

@@ -261,13 +261,13 @@ class PipelineImages:
     def __init__(self, pipe, autocast=contextlib.nullcontext):
         self.pipe = pipe
         self.autocast = autocast
-        self.run = self._first
+        self._run = PipelineImages._first
 
     def __call__(self, **settings) -> list:
-        return self.run(**settings)
+        return self._run(self, **settings)
 
     def _first(self, **settings) -> list:
-        self.run = self._later
+        self._run = PipelineImages._later
         with tuning_window() as close:
             user = settings.get("step_callback")
             settings["step_callback"] = partial(_closing, close, user)

@@ -15,8 +15,8 @@ class GradSink:
     """One fp32 host gradient sum per trainable (block, key): a step's first gradient
     of a key replaces its sum, later ones add (`filled` marks the sums holding this
     step's gradients); on a device the D2H and the add run on a host worker thread
-    (`HostAccumulator`), so backward does not wait. `accumulate(key, grad)`, `drain()`
-    and `land_block(index, keys)` are bound at construction."""
+    (`HostAccumulator`), so backward does not wait. The bodies of `accumulate(key,
+    grad)`, `drain()` and `land_block(index, keys)` are selected at construction."""
 
     def __init__(
         self,
@@ -39,19 +39,27 @@ class GradSink:
             self.block_keys[key[0]].append(key)
         self.acc = None
         if not side:
-            self.accumulate, self.drain, self.land_block = (
-                self._accumulate_host,
+            self._accumulate, self.drain, self._land_block = (
+                GradSink._accumulate_host,
                 nothing,
                 nothing,
             )
             return
         self.acc = HostAccumulator(pinned, stats=stats)
         self.d2h = dm.Stream(device)
-        self.accumulate, self.drain, self.land_block = (
-            self._accumulate_device,
+        self._accumulate, self.drain, self._land_block = (
+            GradSink._accumulate_device,
             self.acc.drain,
-            self._land_block_device,
+            GradSink._land_block_device,
         )
+
+    def accumulate(self, key: tuple[int, str], grad: Tensor) -> None:
+        """Add `grad` to the host sum of `key` (replace it for the step's first)."""
+        self._accumulate(self, key, grad)
+
+    def land_block(self, index: int, keys) -> None:
+        """Every queued gradient of one block's `keys` has landed in `host_grad`."""
+        self._land_block(self, index, keys)
 
     def buffer(self, key: tuple[int, str]) -> Tensor:
         """The host sum of `key`, allocated on first use."""

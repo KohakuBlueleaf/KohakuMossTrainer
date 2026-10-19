@@ -13,7 +13,7 @@ class FusedStep:
     """Post-accumulate-grad hooks that transform the gradient and call `step_param(p)`.
 
     `scaled=True` expects `start(..., inv_scale)` every step; `clip > 0` clips per
-    parameter.
+    parameter. It holds no parameter (their hooks hold it).
     """
 
     def __init__(
@@ -23,31 +23,31 @@ class FusedStep:
         clip: float = 0.0,
         scaled: bool = False,
     ):
-        self.params = [p for p in params if p.requires_grad]
+        params = [p for p in params if p.requires_grad]
         self.step_param = step_param
         self.clip = clip
         self.inv_scale: Tensor | None = None
         self.found_inf: Tensor | None = None
         transforms = []
         if scaled:
-            transforms.append(self._unscale)
+            transforms.append(FusedStep._unscale)
         if clip > 0:
-            transforms.append(self._clip)
+            transforms.append(FusedStep._clip)
         self._transforms = tuple(transforms)
         self._active = nothing
         self.handles = [
-            p.register_post_accumulate_grad_hook(self._hook) for p in self.params
+            p.register_post_accumulate_grad_hook(self._hook) for p in params
         ]
 
     def start(self, last_microbatch: bool, inv_scale: Tensor | None = None) -> None:
         """Step on this backward (the last micro-batch of the step) or only accumulate."""
-        self._active = self._step if last_microbatch else nothing
+        self._active = FusedStep._step if last_microbatch else nothing
         self.inv_scale = inv_scale
         if inv_scale is not None:
             self.found_inf = torch.zeros((), device=inv_scale.device)
 
     def _hook(self, p: Tensor) -> None:
-        self._active(p)
+        self._active(self, p)
 
     def _unscale(self, g: Tensor) -> None:
         g.mul_(self.inv_scale.to(g.device))
@@ -64,7 +64,7 @@ class FusedStep:
     def _step(self, p: Tensor) -> None:
         g = p.grad
         for transform in self._transforms:
-            transform(g)
+            transform(self, g)
         self.step_param(p)
         p.grad = None
 

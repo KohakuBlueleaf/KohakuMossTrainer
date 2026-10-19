@@ -117,11 +117,29 @@ def add_bias(linear: nn.Module, value: Tensor) -> None:
     linear.bias.data.copy_(value.to(linear.bias))
 
 
-def _train_and_rebind(aset, t: Target, mode: bool = True):
-    """Module.train for a LyCORIS module whose bound forward depends on the mode."""
-    nn.Module.train(t.lyco, mode)
-    aset.bind_one(t)
-    return t.lyco
+def _bind_one(t: Target, config: AdapterConfig, backend: str, multiplier: float):
+    """Install `t`'s bound forward for these settings and its module's mode."""
+    t.linear.forward = bind_target(
+        t,
+        config.mode,
+        backend,
+        multiplier,
+        config.dora_detach,
+        config.module_dropout,
+        autotune=config.backend == "auto",
+        fuse_base_add=config.fuse_base_add,
+        dynamic=config.compile_dynamic,
+    )
+
+
+def _train_and_rebind(settings: tuple, t: Target, mode: bool = True):
+    """Module.train for an adapted layer whose bound forward depends on the mode: the
+    layer and its LyCORIS module change mode, then the forward is re-bound under
+    `settings` (`_bind_one`'s config, backend, multiplier)."""
+    linear = t.linear
+    nn.Module.train(linear, mode)
+    _bind_one(t, *settings)
+    return linear
 
 
 class LycoAdapterSet:
@@ -147,31 +165,21 @@ class LycoAdapterSet:
 
     def bind(self) -> None:
         """Install every layer's forward for the current multiplier and training state;
-        layers whose forward depends on train()/eval() re-bind through a hook."""
+        layers whose forward depends on train()/eval() re-bind through a hook on the
+        layer (holding the settings and the target, not this set)."""
         config = self.config
+        settings = (config, self.backend, self.multiplier)
         for t in self.targets:
-            self.bind_one(t)
+            _bind_one(t, *settings)
             if training_dependent(t, config.module_dropout, config.dora_detach):
-                vars(t.lyco)["train"] = partial(_train_and_rebind, self, t)
+                vars(t.linear)["train"] = partial(_train_and_rebind, settings, t)
         for n in self.norms:
             for _, d in n.deltas():
                 d.multiplier = self.multiplier
         rebind_owner(self.model)
 
     def bind_one(self, t: Target) -> None:
-        config = self.config
-        fn = bind_target(
-            t,
-            config.mode,
-            self.backend,
-            self.multiplier,
-            config.dora_detach,
-            config.module_dropout,
-            autotune=config.backend == "auto",
-            fuse_base_add=config.fuse_base_add,
-            dynamic=config.compile_dynamic,
-        )
-        t.linear.forward = fn
+        _bind_one(t, self.config, self.backend, self.multiplier)
 
     def set_multiplier(self, multiplier: float) -> None:
         self.multiplier = float(multiplier)
@@ -485,6 +493,6 @@ class LycoAdapterSet:
     @staticmethod
     def _detach(t: Target) -> None:
         vars(t.linear).pop("forward", None)
-        vars(t.lyco).pop("train", None)
+        vars(t.linear).pop("train", None)
         if CHILD in t.linear._modules:
             del t.linear._modules[CHILD]

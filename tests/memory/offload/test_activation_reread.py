@@ -44,7 +44,7 @@ class _Device:
 def _engine(monkeypatch) -> ActivationOffload:
     off = ActivationOffload("cpu", min_bytes=0)
     off.dm, off.h2d_stream, off.d2h_stream = _Device(), _Stream(), _Stream()
-    off._load, off._prefetch = off._load_device, nothing
+    off._load, off._prefetch = ActivationOffload._load_device, nothing
     monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, stream: None)
     return off
 

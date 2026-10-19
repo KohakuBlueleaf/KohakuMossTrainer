@@ -19,10 +19,15 @@ from kohakumoss.training.optim.optimizers.skip import (
     restore_host,
 )
 from kohakumoss_common.calls import identity, nothing
+from kohakumoss_common.weak import weak_method
 
 
-def _unclipped(inv: Tensor) -> Tensor:
+def _unclipped(bundle, inv: Tensor) -> Tensor:
     return inv
+
+
+def _shared_update(step_param: Callable, bundle, param: Tensor, found: Tensor) -> None:
+    step_param(param, found)
 
 
 def next_clip(max_norm: float, norm: Tensor, prev: Tensor) -> Tensor:
@@ -127,7 +132,7 @@ class FusedStepBundle:
         self.scaler = scaler
         self.reduce = step_reducer(reduce_loss, agree, reduce_step)
         self.max_norm = clip
-        self.factor = self._clipped if clip > 0 else _unclipped
+        self.factor = FusedStepBundle._clipped if clip > 0 else _unclipped
         self.hooks = None
         self.blocks = None
         self._start = _no_start
@@ -145,7 +150,7 @@ class FusedStepBundle:
         if shared is not None:
             self.lr_source = shared
             self.schedule = schedule_factory(shared)
-            self.update = shared.step_param
+            self._update = partial(_shared_update, shared.step_param)
             self.opts = {}
             if hasattr(shared, "finish"):
                 self.finishers.append(shared.finish)
@@ -164,7 +169,7 @@ class FusedStepBundle:
                     one["params"] = [p]
                     opt = build_one([one])
                     self.opts[id(p)] = (opt, gi, _step_runner(opt), post)
-            self.update = self._own_update
+            self._update = FusedStepBundle._own_update
         self.device = device if device is not None else self.params[0].device
         self._clip = torch.ones(1, dtype=torch.float32, device=self.device)
         self._reset()
@@ -181,7 +186,9 @@ class FusedStepBundle:
         a FusedStep."""
         self.hooks = hooks
         self._start = (
-            partial(_start_offload, hooks, self.step_param) if finishes else hooks.start
+            partial(_start_offload, hooks, weak_method(self.step_param))
+            if finishes
+            else hooks.start
         )
         if hasattr(hooks, "finish"):
             self.finishers.insert(0, hooks.finish)
@@ -190,7 +197,7 @@ class FusedStepBundle:
         """A per-block in-backward optimiser (StreamedAdamW) sharing the transform; its
         groups follow the schedule (lr scaled like group 0)."""
         self.blocks = blocks
-        blocks.transform = self._block_transform
+        blocks.transform = weak_method(self._block_transform)
         self.finishers.append(blocks.finish)
         self._start = partial(_start_blocks, blocks, self._start)
         self._block_lr = [(g, float(g["lr"])) for g in blocks.param_groups]
@@ -249,7 +256,8 @@ class FusedStepBundle:
         inv = self._inv.to(g.device)
         sq_acc += (norm * inv).square().reshape(()).to(sq_acc.device)
         found = torch.zeros(1, dtype=torch.float32, device=g.device)
-        torch._amp_foreach_non_finite_check_and_unscale_([g], found, self.factor(inv))
+        factor = self.factor(self, inv)
+        torch._amp_foreach_non_finite_check_and_unscale_([g], found, factor)
         bad_acc += found.to(torch.int32).to(bad_acc.device)
         return found.reshape(())
 
@@ -273,7 +281,7 @@ class FusedStepBundle:
     def step_param(self, param: torch.nn.Parameter) -> None:
         """Called by the engine's post-accumulate-grad hook (grad is present)."""
         found = self.transform(param.grad)
-        self.update(param, found)
+        self._update(self, param, found)
         self._flags.append((self.name_of[id(param)], found))
         param.grad = None
 

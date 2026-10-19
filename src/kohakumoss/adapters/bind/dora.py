@@ -68,26 +68,30 @@ def _out(y: Tensor, wx: Tensor, s: Tensor, lyco, m: float, x) -> Tensor:
     return y + m * ((s - 1) * wx + s * dy)
 
 
-def bypass_out(linear, base_fn, unit_fn, lyco, m: float, detach: bool, x):
+def bypass_out(layer, base_fn, unit_fn, lyco, m: float, detach: bool, x):
     """Output-axis DoRA without a merged weight on a bias-less layer: y = (1 - m) Wx +
-    m s (Wx + dWx) with s = mag / ||W + dW||_row, Wx from the base's own forward."""
+    m s (Wx + dWx) with s = mag / ||W + dW||_row, Wx from the base's own forward;
+    `layer` is a weak reference to the layer."""
     s = magnitude_ratio(base_fn, unit_fn, lyco, 1, detach)
-    y = linear._impl(x)
+    lin = layer()
+    y = lin._impl(lin, x)
     return _out(y, y, s, lyco, m, x)
 
 
-def bypass_out_biased(linear, base_fn, unit_fn, lyco, m: float, detach: bool, x):
+def bypass_out_biased(layer, base_fn, unit_fn, lyco, m: float, detach: bool, x):
     """`bypass_out` on a layer with a bias b: y = b + (1 - m) Wx + m s (Wx + dWx)."""
     s = magnitude_ratio(base_fn, unit_fn, lyco, 1, detach)
-    y = linear._impl(x)
-    return _out(y, y - linear.bias.to(y.dtype), s, lyco, m, x)
+    lin = layer()
+    y = lin._impl(lin, x)
+    return _out(y, y - lin.bias.to(y.dtype), s, lyco, m, x)
 
 
-def bypass_in(linear, base_fn, unit_fn, lyco, m: float, detach: bool, x):
+def bypass_in(layer, base_fn, unit_fn, lyco, m: float, detach: bool, x):
     """Input-axis DoRA without a merged weight: W'x = (W + dW)(c x) with
     c = mag / ||W + dW||_col, both products through the base forward and the bypass."""
     c = magnitude_ratio(base_fn, unit_fn, lyco, 0, detach)
     xc = x * c.to(device=x.device, dtype=x.dtype)
-    y = linear._impl(x)
-    yc = linear._impl(xc) + lyco.bypass_forward_diff(xc, 1.0).to(y.dtype)
+    lin = layer()
+    y = lin._impl(lin, x)
+    yc = lin._impl(lin, xc) + lyco.bypass_forward_diff(xc, 1.0).to(y.dtype)
     return y + m * (yc - y)

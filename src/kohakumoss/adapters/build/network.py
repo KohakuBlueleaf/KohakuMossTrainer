@@ -18,7 +18,7 @@ from torch import nn
 
 from kohakumoss.adapters.build.config import AdapterConfig
 from kohakumoss.adapters.build.presets import resolve_preset
-from kohakumoss.adapters.build.target import NormTarget, Target
+from kohakumoss.adapters.build.target import NormTarget, Target, weak_org
 from kohakumoss.adapters.train import norms
 from kohakumoss.adapters.train.tlora import AXES, axis_of
 
@@ -111,12 +111,14 @@ def build_targets(
         warn_on_unmatched=True,
         **kwargs,
     )
+    loras, net.loras = net.loras, []
     paths = _paths(model)
     targets = []
-    for lyco in net.loras:
+    for lyco in loras:
         linear = lyco.org_module[0]
         if "forward" in vars(linear):
             raise RuntimeError(f"{paths[id(linear)]} already carries an adapter")
+        weak_org(lyco, linear)
         deferred.restore(lyco, linear)
         targets.append(_target(paths[id(linear)], lyco, linear))
     trained = build_norms(model, norm_patterns, config) if config.train_norms else []

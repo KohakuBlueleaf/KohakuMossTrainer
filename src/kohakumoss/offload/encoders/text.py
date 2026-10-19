@@ -11,6 +11,7 @@ docs/internals/offload.md.
 
 from collections.abc import Callable, Sequence
 from dataclasses import replace
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -146,12 +147,9 @@ class RingPlacement(TextPlacement):
         self.streamer = LayerStreamer(
             self.layers, self.device, slots=self.slots, pinned=self.pinned
         )
-        self.enter = [
-            lambda i=i: self.streamer.enter(i) for i in range(len(self.layers))
-        ]
-        self.leave = [
-            lambda i=i: self.streamer.leave(i) for i in range(len(self.layers))
-        ]
+        n = len(self.layers)
+        self.enter = [partial(self.streamer.enter, i) for i in range(n)]
+        self.leave = [partial(self.streamer.leave, i) for i in range(n)]
 
     def embed(self, ids: Tensor) -> Tensor:
         return F.embedding(ids.to("cpu"), self.embedding.weight).to(self.device)

@@ -69,21 +69,22 @@ class KernelOps:
     def lokr_with_base(self, lyco, scale):
         return self._with_base(ops.lokr_bypass_with_base, lyco, scale)
 
-    def oft(self, linear, lyco):
-        """The whole OFT forward: the rotated base output."""
+    def oft(self, layer, lyco):
+        """The whole OFT forward: the rotated base output (`layer` a weak reference
+        to the layer)."""
         if self.fuse_base_add:
             rotate = on_tokens(self.bind(ops.oft_rotate(lyco)))
-            return None if rotate is None else forwards.rotated(linear, rotate)
+            return None if rotate is None else forwards.rotated(layer, rotate)
         delta = on_tokens(self.bind(ops.oft_bypass(lyco)))
-        return None if delta is None else forwards.plus_rotation(linear, delta)
+        return None if delta is None else forwards.plus_rotation(layer, delta)
 
-    def boft(self, linear, lyco, m):
+    def boft(self, layer, lyco, m):
         """The whole BOFT forward at multiplier `m`: the rotated base output."""
         if self.fuse_base_add:
             rotate = on_tokens(self.bind(ops.boft_rotate(lyco, m)))
-            return None if rotate is None else forwards.rotated(linear, rotate)
+            return None if rotate is None else forwards.rotated(layer, rotate)
         delta = on_tokens(self.bind(ops.boft_bypass(lyco, m)))
-        return None if delta is None else forwards.plus_rotation(linear, delta)
+        return None if delta is None else forwards.plus_rotation(layer, delta)
 
     def ia3_scale(self, lyco, m):
         return on_tokens(self.bind(ops.ia3_bypass_scale(lyco, m)))

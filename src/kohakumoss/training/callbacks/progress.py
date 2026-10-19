@@ -15,7 +15,7 @@ from kohakumoss_common.units import GIB
 POSTFIX = ("loss", "lr", "grad_norm", "s/it", "samples/s", "tokens/s", "vram")
 
 
-def _no_vram() -> str:
+def _no_vram(bar) -> str:
     return "-"
 
 
@@ -46,7 +46,7 @@ class ProgressBar:
         self.device = torch.device(device)
         self.timeline = timeline if timeline is not None else NoTimeline()
         self.device_use = device_use if device_use is not None else NoDeviceUse()
-        self.vram = _no_vram if timeline is None else self._vram
+        self._vram_of = _no_vram if timeline is None else ProgressBar._vram
         self.enabled = enabled
         self.beta = beta
         self.clock = clock
@@ -98,7 +98,7 @@ class ProgressBar:
             "s/it": f"{dt:.2f}",
             "samples/s": f"{(state.samples - s0) / dt:.1f}",
             "tokens/s": f"{(state.tokens - n0) / dt:.0f}",
-            "vram": self.vram(),
+            "vram": self._vram_of(self),
         }
         self.mark = (now, state.samples, state.tokens)
         self.bar.set_postfix(post, refresh=False)

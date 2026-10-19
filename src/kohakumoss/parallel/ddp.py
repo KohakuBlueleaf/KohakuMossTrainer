@@ -17,6 +17,7 @@ from kohakumoss.offload.accel import module, streamed
 from kohakumoss.parallel.telemetry.timing import build_clock
 from kohakumoss_common.runs import runs_within
 from kohakumoss_common.units import MIB
+from kohakumoss_common.weak import weak_call, weak_method
 
 WIDE_AHEAD = 2  # reduce-dtype bucket copies in flight before the oldest one lands
 
@@ -83,7 +84,7 @@ class _Bucket:
                 p.grad = view
 
 
-def _skip(bucket: _Bucket, p: Tensor) -> None:
+def _skip(reducer, bucket: _Bucket, p: Tensor) -> None:
     return None
 
 
@@ -129,15 +130,15 @@ class GradReducer:
         self.next = 0
         self.widened: list[_Bucket] = []
         self.handles = [
-            p.register_post_accumulate_grad_hook(partial(self._hook, bucket))
-            for bucket in self.buckets
+            p.register_post_accumulate_grad_hook(weak_call(GradReducer._hook, self, i))
+            for i, bucket in enumerate(self.buckets)
             for p in bucket.params
         ]
 
     def start(self, last_microbatch: bool) -> None:
         """Reduce during this backward (last micro-batch) or only accumulate; the
         step's first call attaches the bucket buffers as the gradients."""
-        self._active = self._count if last_microbatch else _skip
+        self._active = GradReducer._count if last_microbatch else _skip
         for b in self.buckets:
             if b.params[0].grad is None:
                 b.attach()
@@ -148,8 +149,8 @@ class GradReducer:
         if last_microbatch:
             self.clock.begin()
 
-    def _hook(self, bucket: _Bucket, p: Tensor) -> None:
-        self._active(bucket, p)
+    def _hook(self, index: int, p: Tensor) -> None:
+        self._active(self, self.buckets[index], p)
 
     def _count(self, bucket: _Bucket, p: Tensor) -> None:
         bucket.pending -= 1
@@ -332,7 +333,7 @@ class AsyncReducer:
         """Track `params` in static buckets; returns the hook body `(p) -> None`
         handing `p.grad` to the reduction, `then(p)` running once it is summed (in
         `reduce_dtype`, default fp32; None: the parameters' dtype), as a gradient of
-        the parameter's dtype."""
+        the parameter's dtype. The hook body holds this reducer weakly."""
         params = [p for p in params if p.requires_grad]
         items = [(p.nbytes, p.dtype) for p in params]
         for idx in plan_buckets(items, self.bucket_bytes):
@@ -342,7 +343,7 @@ class AsyncReducer:
                 slab.add_key(id(p), p.shape, partial(_deliver, p, then))
                 self.slab_of[id(p)] = slab
             self.slabs.append(slab)
-        return self.add_param
+        return weak_method(self.add_param)
 
     def watch(self, stream) -> None:
         """A stream whose reductions the compute stream waits for at `finish`."""
