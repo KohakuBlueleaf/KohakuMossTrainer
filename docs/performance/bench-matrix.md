@@ -196,6 +196,10 @@ The report is `ncu.ncu-rep`, imported as `ncu.csv` and summarized into `ncu.json
 A failed ncu process (sudo, an unsupported metric) is `profile-failed`: queued for
 review, the queue goes on.
 
+The achieved TFLOP/s of each GEMM / flash kernel against its clock-derived peak, and
+how the tensor-pipe % relates to it per arch, are in
+[gemm-efficiency.md](gemm-efficiency.md) (`measure/tflops.py`, `measure/ceiling.py`).
+
 ## Coverage
 
 The coverage runs exercise what the matrix does not: the other LyCORIS algorithms
