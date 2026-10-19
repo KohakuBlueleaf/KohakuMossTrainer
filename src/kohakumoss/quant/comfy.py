@@ -3,23 +3,28 @@
 Recognised per-layer key sets (`<n>` is a module path):
   `<n>.weight` float8_e4m3fn + `<n>.scale_weight` (scalar or per-row)
   `<n>.weight` float8_e4m3fn / int8 + `<n>.weight_scale` (scalar or per-row)
+A `<n>.comfy_quant` record (uint8 JSON) naming a rotated (`convrot`) or another format
+is refused (`comfy_format.refuse_comfy_quant`).
 """
 
 import torch
 from torch import Tensor, nn
 
 from kohakumoss.model.linear import MossLinear
+from kohakumoss.quant.comfy_format import RECORD, refuse_comfy_quant
 from kohakumoss.quant.weights import QuantWeight
 
 SCALE_KEYS = ("scale_weight", "weight_scale")
 QUANT_DTYPES = {torch.float8_e4m3fn: "fp8", torch.int8: "int8"}
-IGNORED = ("scale_input", "input_scale", "comfy_quant")
+IGNORED = ("scale_input", "input_scale", RECORD)
 
 
 def split_quantized(
     state: dict[str, Tensor],
 ) -> tuple[dict[str, QuantWeight], dict[str, Tensor]]:
-    """({module path: QuantWeight}, remaining dense state dict)."""
+    """({module path: QuantWeight}, remaining dense state dict); ValueError for a
+    rotated or unknown `comfy_quant` layer (`refuse_comfy_quant`)."""
+    refuse_comfy_quant(state, state.__getitem__, "state dict")
     quant: dict[str, QuantWeight] = {}
     dense = dict(state)
     for key, t in state.items():

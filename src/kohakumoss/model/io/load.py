@@ -22,6 +22,7 @@ from kohakumoss.model.io.source import (
 )
 from kohakumoss.model.numerics.fold import adopt_fold
 from kohakumoss.model.opset import OpSet
+from kohakumoss.quant.comfy_format import refuse_comfy_quant
 from kohakumoss.quant.stored import attach_stored, read_record, stored_keys
 from kohakumoss.types.arch import MossArchConfig
 from kohakumoss_common.io import read_safetensors_metadata
@@ -193,11 +194,13 @@ def load_backbone(
     """Build on meta, then read, cast and move one tensor at a time (host and device
     peaks are one tensor plus the model), bind ops. An fp16-fix file is recorded as
     folded (savers and adapter exports undo it); `fp16_fix_eps="exact"` uses eps * c^2.
-    A pre-quantized fp8 file attaches its stored bases (no 16-bit copy is built).
+    A pre-quantized fp8 file attaches its stored bases (no 16-bit copy is built); a
+    ComfyUI quantized file (`comfy_quant` records) is refused.
     """
     start = time.perf_counter()
     log.info("loading transformer", path=path, dtype=short(dtype), device=device)
     view = ModelKeyView(CheckpointSource(path))
+    refuse_comfy_quant(view.keys(), view.get, str(path), formats=())
     cfg = cfg or infer_config(view, read_config(path))
     model = build_backbone(cfg, device="meta", dtype=dtype, keep_fp32=keep_fp32)
     record = read_record(path)
