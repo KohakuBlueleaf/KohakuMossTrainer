@@ -48,6 +48,7 @@ class MossBackbone(nn.Module):
         self.runner: BlockRunner = PlainRunner()
         self.stream = StreamConfig()
         self.fp16_fix = "none"
+        self.weight_path: str | None = None
         self._default = self.bind_forward()
 
     def init_weights(self, std: float = 0.02) -> None:

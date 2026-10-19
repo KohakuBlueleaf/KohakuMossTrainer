@@ -4,10 +4,12 @@ import json
 from pathlib import Path
 from typing import Protocol
 
+import torch
 from safetensors import safe_open
 from torch import Tensor
 
 from kohakumoss.model.io.keymap import FUSED_QKV, strip_prefix
+from kohakumoss_kernels.dtypes import SAFETENSORS as SAFETENSORS_DTYPES
 
 INDEX = "diffusion_pytorch_model.safetensors.index.json"
 
@@ -73,6 +75,9 @@ class CheckpointSource:
     def shape(self, key: str) -> tuple[int, ...]:
         return tuple(self._where[key].get_slice(key).get_shape())
 
+    def dtype(self, key: str) -> torch.dtype | None:
+        return SAFETENSORS_DTYPES.get(self._where[key].get_slice(key).get_dtype())
+
     def get(self, key: str) -> Tensor:
         return self._where[key].get_tensor(key)
 
@@ -104,6 +109,9 @@ class ModelKeyView:
         src, part = self.map[key]
         s = self.source.shape(src)
         return s if part is None else (s[0] // 3, *s[1:])
+
+    def dtype(self, key: str) -> torch.dtype | None:
+        return self.source.dtype(self.map[key][0])
 
     def get(self, key: str) -> Tensor:
         src, part = self.map[key]

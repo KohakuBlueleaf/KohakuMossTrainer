@@ -1,7 +1,8 @@
 """Write a pre-quantized fp8 / MXFP8 MOSS-Image transformer: every fp8-compute linear as
-e4m3 `<n>.weight` + `<n>.weight_scale`, the rest as SAVE_DTYPE, the recipe in the file
-metadata. `load_backbone` (and TRANSFORMER=<file> in the sample and train scripts)
-attaches the stored bases without building a 16-bit copy.
+e4m3 `<n>.weight` (quantized from the checkpoint's stored values) + `<n>.weight_scale`,
+the rest as SAVE_DTYPE, the recipe in the file metadata. `load_backbone` (and
+TRANSFORMER=<file> in the sample and train scripts) attaches the stored bases without
+building a 16-bit copy.
 
     kogine run scripts/export/fp8_quant.py --set WEIGHTS=<root>/base \
         --set PRECISION=mxfp8 --set OUT=moss_image_base_mxfp8.safetensors
@@ -18,6 +19,7 @@ from kohakumoss.logging.log import get_logger, setup
 from kohakumoss.model import load_backbone
 from kohakumoss.model.build import DEFAULT_KEEP_FP32
 from kohakumoss.model.io.load import base_keys
+from kohakumoss.model.io.quant_source import backbone_source
 from kohakumoss.quant.convert import default_filter, quantize_model
 from kohakumoss.quant.stored import FP8_KEY, quantized_state
 from kohakumoss_common.knobs import check_script
@@ -45,8 +47,16 @@ def main() -> None:
     dtype = DTYPES[SAVE_DTYPE]
     model, load = load_backbone(WEIGHTS, device="cpu", dtype=dtype)
     accept = default_filter(DEFAULT_KEEP_FP32, MIN_FEATURES)
+    source, scales = backbone_source(model)
     report = quantize_model(
-        model, PRECISION, accept, dtype, FP8_RECIPE, work_device=torch.device(DEVICE)
+        model,
+        PRECISION,
+        accept,
+        dtype,
+        FP8_RECIPE,
+        work_device=torch.device(DEVICE),
+        source=source,
+        scales=scales,
     )
     state, meta = quantized_state(model, base_keys(model.cfg), dtype)
     meta["source"] = Path(WEIGHTS).name

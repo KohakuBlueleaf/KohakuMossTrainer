@@ -14,6 +14,13 @@ from kohakumoss.quant.compute import (
     eligible,
     recipe_of,
 )
+from kohakumoss.quant.source import (
+    STORED,
+    SourceWeights,
+    log_sources,
+    source_weight,
+    tally,
+)
 from kohakumoss.quant.weights import QuantWeight
 
 
@@ -46,7 +53,9 @@ def default_filter(
 
 
 class QuantLinear(nn.Module):
-    """Inference replacement of a plain nn.Linear by a quantized weight (+ bias)."""
+    """Inference replacement of a plain nn.Linear by a quantized weight (+ bias),
+    quantized from `values` when given (its stored values, `source_weight`), else from
+    the linear's weight."""
 
     def __init__(
         self,
@@ -55,12 +64,13 @@ class QuantLinear(nn.Module):
         compute_dtype: torch.dtype,
         recipe: str = "row",
         work_device: torch.device | str | None = None,
+        values: torch.Tensor | None = None,
     ):
         super().__init__()
         self.in_features, self.out_features = linear.in_features, linear.out_features
         dev = linear.weight.device
-        w = linear.weight.detach().to(work_device or dev)
-        self.qweight = make_base(w, fmt, recipe).to(dev)
+        w = linear.weight.detach() if values is None else values
+        self.qweight = make_base(w.to(work_device or dev), fmt, recipe).to(dev)
         self.qweight.bind(compute_dtype)
         self.bias = None
         self._impl = self._no_bias
@@ -154,13 +164,21 @@ def quantize_model(
     recipe: str = "row",
     dgrad: bool = False,
     work_device: torch.device | str | None = None,
+    source: SourceWeights | None = None,
+    scales: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, int]:
     """Replace accepted MossLinear bases with QuantWeight (int8 / fp8) or ComputeWeight
     (fp8_compute / mxfp8; `recipe`, `dgrad` copy), quantizing on `work_device`
-    (default: where the weight is); returns counts and bytes (`skipped`: accepted
-    layers whose shape fp8 compute cannot take)."""
+    (default: where the weight is) from each weight's stored values in `source` (times
+    its fold rows in `scales`, by module path) where `source_weight` takes them, the
+    tally logged once; returns counts and bytes (`skipped`: accepted layers whose shape
+    fp8 compute cannot take, `from_source`: layers quantized from stored values,
+    `sources`: layers per `source_weight` kind)."""
     accept = accept or default_filter(())
     report = {"layers": 0, "dense_bytes": 0, "quant_bytes": 0, "skipped": 0}
+    report["from_source"] = 0
+    sources: dict[str, int] = {}
+    scales = scales or {}
     for name, lin in list(model.named_modules()):
         if not isinstance(lin, MossLinear) or lin.base is not None:
             continue
@@ -170,7 +188,11 @@ def quantize_model(
             report["skipped"] += 1
             continue
         w = lin.weight.detach()
-        qw = make_base(w.to(work_device or w.device), fmt, recipe, dgrad).to(w.device)
+        values, kind = source_weight(
+            w, source, f"{name}.weight", scales.get(name), work_device or w.device
+        )
+        tally(sources, kind)
+        qw = make_base(values, fmt, recipe, dgrad).to(w.device)
         report["layers"] += 1
         report["dense_bytes"] += w.nbytes
         report["quant_bytes"] += qw.nbytes()
@@ -179,4 +201,8 @@ def quantize_model(
         )
         lin.set_base(qw)
         qw.bind(compute_dtype or w.dtype)
+    report["from_source"] = sources.get(STORED, 0)
+    report["sources"] = sources
+    if source is not None:
+        log_sources(f"base {fmt}", sources)
     return report

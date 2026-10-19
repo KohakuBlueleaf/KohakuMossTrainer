@@ -121,6 +121,13 @@ Under `ring` / `offload` one pass moves the weights once for `ahead` batches.
 Linears with fewer than 256 input or output features stay dense, as do fp8-compute
 linears whose sizes are not multiples of 128.
 
+Each linear is quantized from the text-encoder checkpoint's stored values (its
+safetensors tensor, matched by its weight name's unique key suffix), not from the
+plan-dtype copy the encoder loaded ([quant-kernels.md](quant-kernels.md#source)): the
+dense model loads in the plan's dtype as before, and the codes are those of the bf16
+checkpoint whatever the dtype, so an fp16 encoder (sm75) quantizes like a bf16 one. The
+quantization report counts these layers in `from_source`.
+
 Qwen3.5-9B on an RTX 5090 (`scripts/probe/fp8_inference.py`, 5 short prompts),
 embeddings against the host fp64 encode:
 
@@ -141,9 +148,10 @@ in bf16.
 `fp8` weight-only per channel, `fp8_compute` with `FP8_RECIPE`, `mxfp8`) to one
 safetensors file:
 
-- `<n>.weight` holds the codes, `<n>.weight_scale` the recipe's scale, `<n>.bias` the
-  bias;
-- every other tensor is in `SAVE_DTYPE`;
+- `<n>.weight` holds the codes (quantized from the checkpoint's stored values, so they
+  equal quantize-at-load at any `SAVE_DTYPE` and any compute dtype),
+  `<n>.weight_scale` the recipe's scale, `<n>.bias` the bias;
+- every other tensor is in `SAVE_DTYPE` (`bf16` keeps the checkpoint's values);
 - the metadata key `kohakumoss_text_quant` records the precision, recipe and layer list
   (`kohakumoss/quant/stored_text.py`).
 

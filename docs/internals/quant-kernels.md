@@ -26,6 +26,43 @@ The GEMMs that serve a frozen base weight stored below 16 bits. Two families:
 On Ada (sm89) `fp8_compute` with the `row` recipe is the fast format; `mxfp8` there
 keeps its weight bytes and costs compute time ([measured](#measured-rtx-5090-sm120-bf16-activations)).
 
+## Source
+
+Every quantizer (`quantize_model` for the DiT base, `quantize_text_linears` for the
+text encoder, and the two export scripts `fp8_quant.py` / `text_quant.py`) quantizes a
+weight from the checkpoint's stored values, not from its live copy
+(`kohakumoss.quant.source.source_weight`):
+
+- The stored values are read one tensor at a time (safetensors headers first) and
+  multiplied in fp32 by the output-row multiplier of any fold applied since the load
+  (`kohakumoss.model.io.quant_source.fold_since_load`: the online fp16 fix, against the
+  fold an fp16-fix file already carries).
+- They replace the live weight only when they round to it exactly
+  (`(stored * fold).to(live.dtype) == live`). Otherwise the live weight is quantized: a
+  delta merged into it, a different checkpoint, a model not loaded from a file.
+- A weight stored in the live dtype with no fold since the load is not read again (the
+  live copy is already its stored values).
+- The lookup runs once per weight, when the model is quantized (load / memory plan /
+  export), never per step. Each quantizer logs one INFO line per model:
+  `base fp8: quantized <n> linears: from the stored values <n>` (the DiT) or
+  `text encoder fp8: ...`, with the live-weight counts by reason (stored in its dtype,
+  no stored values, not the stored values' cast); the report carries the same counts
+  (`from_source`, `sources`).
+
+So the codes and scales depend on the checkpoint, never on the compute dtype: a bf16
+checkpoint quantizes the same at fp16 compute (sm75, fp16 training) as at bf16, and a
+pre-quantized file holds the codes of quantize-at-load. The fp16 cast changes the bf16
+values below fp16's smallest normal (6.1e-5); quantizing that cast instead moves about
+1e-5 of the fp8 codes by one step (MOSS-Image `layers.0.proj.q`: 94 of 9.4M codes in
+`fp8` / `fp8_compute` row, 45 in block, 227 in `mxfp8`; Qwen3.5 `layers.0.mlp.down_proj`:
+1392 of 50M in `fp8`); `int8` codes do not move. Cost: when the stored dtype differs
+from the compute dtype (or a fold was applied since the load), one more read of each
+quantized weight from the checkpoint and one fp32 copy of it on the quantizing device.
+
+An fp16-fix file stores its weights in its own `SAVE_DTYPE`. Written at `fp16`, its
+stored values are the fp16 cast of the bf16 weights (folded), and a quantized base
+built from it holds the codes of that cast; written at `bf16` it keeps the bf16 values.
+
 ## Weight-only
 
 `kohakumoss_kernels.quant` serves `quant_linear(x, q, scale, bias, fmt)`, the
@@ -205,7 +242,8 @@ KohakUwULLM trains its full models in MXFP8, and so does a full finetune here:
 ### Pre-quantized checkpoints
 
 `scripts/export/fp8_quant.py` writes a transformer whose fp8-compute linears are stored
-as `<n>.weight` (e4m3 q) + `<n>.weight_scale` (the recipe's scale), every other tensor
+as `<n>.weight` (e4m3 q, quantized from the checkpoint's stored values: [source](#source))
++ `<n>.weight_scale` (the recipe's scale), every other tensor
 16-bit, the recipe and layer list in the safetensors metadata (`kohakumoss_fp8`).
 
 - `load_backbone` attaches those bases directly; no 16-bit copy is built. The file is

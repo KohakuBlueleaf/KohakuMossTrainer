@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from kohakumoss.memory.runners import build_runner
+from kohakumoss.model.io.quant_source import backbone_source
 from kohakumoss.offload.activation import ActivationOffload
 from kohakumoss.offload.optim.fused_step import FusedStep
 from kohakumoss.offload.optim.grad import GradOffload
@@ -133,11 +134,12 @@ def quantize_base(
     work: torch.device | str | None = None,
 ) -> dict | None:
     """The frozen base's quantized storage under `plan.base_precision` (quantized on
-    `work`; the meta device builds the layout only), with the fp8 input-gradient
-    copy when training takes it; the quantization report, None when nothing is
-    quantized."""
+    `work` from the checkpoint's stored values where they apply, `backbone_source`;
+    the meta device builds the layout only), with the fp8 input-gradient copy when
+    training takes it; the quantization report, None when nothing is quantized."""
     report = None
     if plan.base_precision in QUANT and not trainable_base:
+        source, scales = backbone_source(backbone)
         report = quantize_model(
             backbone,
             plan.base_precision,
@@ -146,6 +148,8 @@ def quantize_base(
             recipe=plan.fp8_recipe,
             dgrad=training and plan.fp8_dgrad == "fp8",
             work_device=work,
+            source=source,
+            scales=scales,
         )
     if training and plan.fp8_dgrad == "fp8":
         for m in backbone.modules():

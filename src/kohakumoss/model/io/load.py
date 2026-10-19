@@ -212,6 +212,7 @@ def load_backbone(
             f"{hl(path, 'path')}"
         )
     model.rope.to(device)
+    model.weight_path = str(path)
     fix = read_fp16_fix(path)
     if fix is not None:
         adopt_fold(model, fix["c"], (fix["s_attn"], fix["s_ffn"]), fp16_fix_eps)

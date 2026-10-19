@@ -36,6 +36,7 @@ from kohakumoss.logging.log import bar as log_bar
 from kohakumoss.offload.accel import device_budget
 from kohakumoss.offload.encoders.text import apply_to_text_encoder
 from kohakumoss.offload.encoders.text_memory import choose_text_memory, text_sizes
+from kohakumoss.quant.source import SourceWeights, text_source
 from kohakumoss.quant.stored_text import load_stored_text, read_text_record
 from kohakumoss.types.plans import TextEncoderPlan
 from kohakumoss_common.calls import nothing
@@ -111,6 +112,7 @@ class QwenTextEncoder:
         max_length: int = MAX_LENGTH,
         output_device: torch.device | str | None = None,
         auto_memory: Callable | None = None,
+        source: SourceWeights | None = None,
     ):
         plan = text_plan(plan)
         compute = torch.device("cpu") if plan.memory == "cpu" else torch.device(device)
@@ -126,7 +128,7 @@ class QwenTextEncoder:
         self.dtype = next(text.parameters()).dtype
         choose = auto_memory or partial(default_auto_memory, plan=plan)
         self.placement, self.quant, plan = apply_to_text_encoder(
-            text, plan, compute, self.dtype, choose
+            text, plan, compute, self.dtype, choose, source
         )
         self.plan = plan
         self.encoder_spec = text_spec(plan, self.dtype)
@@ -167,8 +169,9 @@ class QwenTextEncoder:
     ) -> "QwenTextEncoder":
         """`path` is a pipeline root (text_encoder/ + tokenizer/) or a model dir (its own
         tokenizer files, else a sibling tokenizer/). Loaded on the host in the plan's
-        dtype, then placed; `auto_memory(text_model, device) -> memory mode` resolves
-        `memory="auto"` (default: the fastest placement that fits the free memory)."""
+        dtype, quantized from the checkpoint's stored values, then placed;
+        `auto_memory(text_model, device) -> memory mode` resolves `memory="auto"`
+        (default: the fastest placement that fits the free memory)."""
         path = Path(path)
         plan = text_plan(plan)
         on = torch.device("cpu") if plan.memory == "cpu" else torch.device(device)
@@ -181,7 +184,11 @@ class QwenTextEncoder:
                 if plan.stored
                 else AutoModel.from_pretrained(str(model_dir), dtype=DTYPES[plan.dtype])
             )
-        return cls(model, tok, device, plan, max_length, output_device, auto_memory)
+        quantized = plan.precision != "compute" and not plan.stored
+        source = text_source(model_dir) if quantized else None
+        return cls(
+            model, tok, device, plan, max_length, output_device, auto_memory, source
+        )
 
     def format(self, prompt: str) -> str:
         """The exact training-time chat template (thinking enabled, no system prompt)."""

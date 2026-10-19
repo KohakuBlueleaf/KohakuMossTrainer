@@ -1,5 +1,6 @@
-"""Names of the torch dtypes the kernels take: knob names (`BY_NAME` / `NAME_OF`) and
-torch's own name without the module prefix (`short`), as problem keys spell it."""
+"""Names of the torch dtypes the kernels take: knob names (`BY_NAME` / `NAME_OF`),
+safetensors header names (`SAFETENSORS`) and torch's own name without the module prefix
+(`short`), as problem keys spell it."""
 
 import torch
 
@@ -9,6 +10,11 @@ BY_NAME: dict[str, torch.dtype] = {
     "fp32": torch.float32,
 }
 NAME_OF: dict[torch.dtype, str] = {dtype: name for name, dtype in BY_NAME.items()}
+SAFETENSORS: dict[str, torch.dtype] = {
+    "BF16": torch.bfloat16,
+    "F16": torch.float16,
+    "F32": torch.float32,
+}
 
 
 def short(dtype: torch.dtype) -> str:

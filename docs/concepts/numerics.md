@@ -74,6 +74,12 @@ the safetensors metadata (`kohakumoss_fp16_fix`).
   `EPS_CHECK = True` measures the difference on the real weights.
 - **KohakuMoss** reads the metadata: the model is recorded as folded (savers and adapter
   exports undo it), and `fp16_fix_eps="exact"` switches to the exact eps.
+- **Quantized bases** built from the file quantize its stored values
+  ([quant-kernels.md](../internals/quant-kernels.md#source)). Written at
+  `SAVE_DTYPE="fp16"` (the shipped file), those are the fp16 cast of the folded bf16
+  weights, so an `int8` / `fp8` / `fp8_compute` / `mxfp8` base from it holds the codes of
+  that cast; only a file written at `SAVE_DTYPE="bf16"` keeps the bf16 values (the fold
+  scales are powers of two, exact in bf16).
 
 ### Adapters and gradients
 

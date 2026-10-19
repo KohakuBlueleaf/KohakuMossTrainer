@@ -1,8 +1,9 @@
 """Write a pre-quantized MOSS-Image text encoder: every quantized linear as
-`<n>.weight` (codes) + `<n>.weight_scale` (+ `<n>.bias`), the rest as SAVE_DTYPE, the
-precision / recipe / layers in the file metadata. Training and inference load it with
-the text-encoder plan field `stored` (TEXT_ENCODE), so the encoder is not
-quantized at every load; the config and tokenizer stay in WEIGHTS.
+`<n>.weight` (codes, quantized from the checkpoint's stored values, so they equal
+quantize-at-load at any compute dtype) + `<n>.weight_scale` (+ `<n>.bias`), the rest
+as SAVE_DTYPE, the precision / recipe / layers in the file metadata. Training and
+inference load it with the text-encoder plan field `stored` (TEXT_ENCODE), so the
+encoder is not quantized at every load; the config and tokenizer stay in WEIGHTS.
 
     kogine run scripts/export/text_quant.py --set WEIGHTS=<root>/base \
         --set PRECISION=fp8_compute --set OUT=moss_text_encoder_fp8.safetensors
@@ -17,6 +18,7 @@ from safetensors.torch import save_file
 from transformers import AutoModel
 
 from kohakumoss.logging.log import get_logger, setup
+from kohakumoss.quant.source import text_source
 from kohakumoss.quant.stored_text import TEXT_QUANT_KEY, quantized_text_state, text_of
 from kohakumoss.quant.text import quantize_text_linears
 from kohakumoss_common.knobs import check_script
@@ -54,6 +56,7 @@ def main() -> None:
         MIN_FEATURES,
         FP8_RECIPE,
         work_device=torch.device(DEVICE),
+        source=text_source(model_dir),
     )
     state, meta = quantized_text_state(text, PRECISION, dtype)
     meta["source"] = model_dir.name

@@ -27,6 +27,7 @@ from kohakumoss.offload.weights.layers import (
     tensor_ids,
 )
 from kohakumoss.quant.bind import rebind_quant, work_device
+from kohakumoss.quant.source import SourceWeights
 from kohakumoss.quant.text import quantize_text_linears
 from kohakumoss.types.plans import TextEncoderPlan
 from kohakumoss_common.calls import nothing
@@ -191,11 +192,13 @@ def apply_to_text_encoder(
     device: torch.device | str,
     compute_dtype: torch.dtype,
     choose: Callable[[nn.Module, torch.device], str] | None = None,
+    source: SourceWeights | None = None,
 ) -> tuple[TextPlacement, dict, TextEncoderPlan]:
     """Quantize a frozen text model's linears under `plan.precision` (per channel or
-    per `quant_group`), resolve `memory="auto"` with `choose(model, device)` on the
-    quantized sizes, place it (resident / offload / ring / cpu) and bind the quantized
-    GEMMs to the compute device. Returns (placement, quantization report, plan)."""
+    per `quant_group`; from the checkpoint's stored values in `source` where they
+    apply), resolve `memory="auto"` with `choose(model, device)` on the quantized
+    sizes, place it (resident / offload / ring / cpu) and bind the quantized GEMMs to
+    the compute device. Returns (placement, quantization report, plan)."""
     report = {"stored": plan.stored} if plan.stored else {}
     if plan.precision != "compute" and not plan.stored:
         report = quantize_text_linears(
@@ -205,6 +208,7 @@ def apply_to_text_encoder(
             compute_dtype,
             recipe=plan.fp8_recipe,
             work_device=work_device(device),
+            source=source,
         )
     if plan.memory == "auto":
         plan = replace(plan, memory=choose(text_model, torch.device(device)))
