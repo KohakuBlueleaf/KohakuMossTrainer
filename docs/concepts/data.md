@@ -373,6 +373,15 @@ sample-major and row-major over each sample's latent grid.
 | `index` / `rank` | the plan coordinates |
 | `layout` | the consumer's packed-sequence layout, built in the loader worker by a transform when the text lengths are final (None otherwise) |
 
+`HostBatch.pin()` (the DataLoader pin hook) pins every tensor field, the tensors of the
+list fields (`img_keep`) and the `layout` through its own `pin_memory()` (the trainer's
+SeqInfo has one). A worker hands every tensor over in shared memory, and the main
+process holds one open file per shared storage for as long as that storage lives. A
+field left unpinned keeps its file open while the batch is held, and the trainer holds a
+whole GRAD_ACC group of batches before its first forward. With the SeqInfo unpinned,
+that is ~16 open files per batch, and GRAD_ACC=64 passed Linux's default limit of 1024
+open files. Pinned, a held batch keeps no file open.
+
 ## Loader
 
 `Loader` wraps a `DataLoader(batch_size=None)` over a `BatchStream`: worker `w` of `W`

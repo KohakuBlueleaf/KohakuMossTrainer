@@ -49,6 +49,17 @@ class SeqInfo:
     def n_joint(self) -> int:
         return self.n_img + self.n_txt
 
+    def pin_memory(self) -> "SeqInfo":
+        """Every host tensor (and attention plan boundary) in pinned memory, in place;
+        returns self (the HostBatch pin hook)."""
+        for name, value in self.__dict__.items():
+            match value:
+                case Tensor() if value.device.type == "cpu" and not value.is_pinned():
+                    setattr(self, name, value.pin_memory())
+                case AttnPlan() if not value.cu_seqlens.is_pinned():
+                    value.cu_seqlens = value.cu_seqlens.pin_memory()
+        return self
+
     def to(self, device: torch.device | str, non_blocking: bool = True) -> "SeqInfo":
         """Copy every tensor to `device` (host tensors go as one pinned buffer per dtype,
         one copy each; the fields become views); host-side ints and tuples are kept."""

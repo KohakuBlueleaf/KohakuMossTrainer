@@ -57,6 +57,13 @@ class BatchPlan:
     token_budget: int = 0
 
 
+def _pinned(value):
+    """`value` in pinned memory when it is a tensor, else as is."""
+    if isinstance(value, Tensor) and not value.is_pinned():
+        return value.pin_memory()
+    return value
+
+
 @dataclass
 class HostBatch:
     """Packed batch on the host (pinned when a GPU consumes it); image tokens are
@@ -82,10 +89,16 @@ class HostBatch:
     layout: object | None = None
 
     def pin(self) -> "HostBatch":
-        """Pin every tensor field in place; returns self."""
+        """Pin every tensor field, every tensor of a list field and the `layout` (its
+        `pin_memory()`) in place; returns self. See docs/concepts/data.md#hostbatch."""
         for name, value in self.__dict__.items():
-            if isinstance(value, Tensor) and not value.is_pinned():
-                setattr(self, name, value.pin_memory())
+            match value:
+                case Tensor():
+                    setattr(self, name, _pinned(value))
+                case list():
+                    setattr(self, name, [_pinned(v) for v in value])
+                case _ if hasattr(value, "pin_memory"):
+                    setattr(self, name, value.pin_memory())
         return self
 
     def pin_memory(self) -> "HostBatch":
