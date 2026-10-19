@@ -82,6 +82,11 @@ reduce-scattered:
 | `"step"` (default) | on the last micro-batch only (`set_requires_gradient_sync`); one per step | the unsharded gradients of the whole model (4 B per parameter for fp32 masters; the memory estimate counts them) |
 | `"micro"` | after every micro-batch; `GRAD_ACC` per step | sharded gradients only |
 
+`FSDP_RESHARD` sets when a block's gathered parameters are freed: `"forward"` (default,
+ZeRO-3) after its forward, gathered again in backward; `"backward"` (ZeRO-2) after its
+backward, one gather per micro-batch with every block held unsharded at the start of
+backward (the memory estimate counts them).
+
 ## Data parallel (`ddp`)
 
 `GradReducer` groups the trainable parameters (reverse order, same dtype and device)

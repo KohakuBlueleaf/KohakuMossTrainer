@@ -164,11 +164,31 @@ def fsdp_accumulate(backbone, reduce: str) -> Callable:
     raise ValueError(f"FSDP_REDUCE={reduce!r} not in ('step', 'micro')")
 
 
-def fsdp_hooks(backbone, world: int, reduce: str = "step") -> ParallelHooks:
+def reshard_after_forward(reshard: str) -> bool:
+    """FSDP_RESHARD: 'forward' frees each block's gathered parameters after its forward
+    and gathers them again in backward (ZeRO-3); 'backward' holds them from the forward
+    gather through backward (ZeRO-2: one gather per micro-batch)."""
+    match reshard:
+        case "forward":
+            return True
+        case "backward":
+            return False
+    raise ValueError(f"FSDP_RESHARD={reshard!r} not in ('forward', 'backward')")
+
+
+def fsdp_hooks(
+    backbone, world: int, reduce: str = "step", reshard: str = "forward"
+) -> ParallelHooks:
     """Shard each conditioning linear, text-refiner and joint block, then the backbone
     (parameters in their own dtype, FSDP2 SUM of fp32 gradients); gradient sync per
-    FSDP_REDUCE (`fsdp_accumulate`)."""
-    shard(backbone, block_units(backbone), conditioning_units(backbone))
+    FSDP_REDUCE (`fsdp_accumulate`), block resharding per FSDP_RESHARD
+    (`reshard_after_forward`)."""
+    shard(
+        backbone,
+        block_units(backbone),
+        conditioning_units(backbone),
+        reshard_after_forward=reshard_after_forward(reshard),
+    )
     return ParallelHooks(
         reduce=all_reduce_sum,
         world_factor=1,

@@ -39,7 +39,9 @@ ACT_FACTOR = {"fused": 1.0, "eager": 3.6}
 class Workload:
     """What one rank runs per micro-step. `sharded`: parameters sharded over `world`
     ranks (FSDP2); `sharded_grads`: their gradients sharded too (False while FSDP2
-    accumulates unsharded gradients across micro-batches); `ema_decays`: fp32 EMA
+    accumulates unsharded gradients across micro-batches); `gathered`: every sharded
+    block also held unsharded from its forward through backward (FSDP_RESHARD=
+    'backward', ZeRO-2); `ema_decays`: fp32 EMA
     averages kept of every trainable parameter (on its device; `swap` block masters
     and their averages live on the host); `master_bytes`: a full finetune's trainable
     device parameter (fp32 master, the compute dtype under adamw16);
@@ -55,6 +57,7 @@ class Workload:
     world: int = 1
     sharded: bool = False
     sharded_grads: bool = True
+    gathered: bool = False
     act_factor: float = ACT_FACTOR["fused"]
     ema_decays: int = 0
     optim_state_bytes: int = 8
@@ -261,6 +264,8 @@ def estimate(work: Workload, plan: MemoryPlan) -> Estimate:
         est.parts["weights"] = int(rest * pb + ring_params * wb)
     else:
         est.parts["weights"] = int((rest + blocks) * pb) // shard
+        if work.sharded and work.gathered:
+            est.parts["gathered"] = int(blocks * pb)
 
     grad_offload = plan.grad_offload
     if work.full_ft:

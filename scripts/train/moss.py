@@ -168,6 +168,7 @@ PIPELINE_SCHEDULE = "1f1b"  # "gpipe" | "1f1b" | "interleaved-1f1b" | "looped-bf
 PIPELINE_SPLIT = "measured"  # stage split: "measured" | "flops" | "even" | layers per stage, e.g. (11, 10, 11, 10)
 MICROBATCHES = 4
 FSDP_REDUCE = "step"  # fsdp with GRAD_ACC > 1: "step" (one reduce-scatter per step; unsharded gradients held over the micro-batches) | "micro" (reduce-scatter every micro-batch; sharded gradients only)
+FSDP_RESHARD = "forward"  # fsdp block parameters: "forward" (ZeRO-3: freed after each block's forward, gathered again in backward) | "backward" (ZeRO-2: held unsharded from the forward gather through backward; one gather per micro-batch)
 DDP_BACKEND = "kohakumoss"  # ddp: "kohakumoss" (the project's reducers, every memory plan) | "torch" (stock torch DDP, the A / B baseline; plans that keep gradients on the device until the step)
 DDP_REDUCE_DTYPE = (
     "fp32"  # ddp gradient sums: "fp32" | "param" (each parameter's own dtype)

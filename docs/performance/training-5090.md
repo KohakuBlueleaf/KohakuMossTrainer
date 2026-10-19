@@ -87,8 +87,10 @@ over four. Scaling is against 4x the one-GPU `partial:0.2` row (6385).
 | pipeline `1f1b`, 32 micro-batches, `CHECKPOINT="none"` | 4608 | 19500 | 4875 | 6.49 | 111-122 | 25.7 / 27.7 | | 0.76 |
 | pipeline `interleaved-1f1b`, 32 micro-batches, `CHECKPOINT="none"` | 4608 | out of memory | | | | | | |
 | pipeline `zbv`, 16 micro-batches, `CHECKPOINT="none"` | 4608 | out of memory | | | | | | |
-| FSDP2 (parameters, gradients and states sharded), `CHECKPOINT="none"` | 4608 | 5627 | 1407 | 2.76 | 34 | 23.7 / 26.5 | 27.0 | 0.22 |
-| FSDP2, `partial:0.4` | 9216 | 11426 | 2857 | 2.81 | 102 | 28.4 / 31.4 | 32.0 | 0.45 |
+| FSDP2 ZeRO-3 (`FSDP_RESHARD="forward"`), `CHECKPOINT="none"` | 4608 | 5627 | 1407 | 2.76 | 34 | 23.7 / 26.5 | 27.0 | 0.22 |
+| FSDP2 ZeRO-3, `partial:0.4` | 9216 | 11426 | 2857 | 2.81 | 102 | 28.4 / 31.4 | 32.0 | 0.45 |
+| FSDP2 ZeRO-2 (`FSDP_RESHARD="backward"`), `partial:0.35` | 4608 | 8360 | 2090 | 1.84 | 75 | 26.2 / 28.6 | 29.3 | 0.33 |
+| FSDP2 ZeRO-2, `partial:0.7` | 9216 | 13070 | 3268 | 2.45 | 117 | 26.8 / 29.8 | 29.8 | 0.51 |
 
 - The gradient all-reduce (284 MB per step) waits 11-12 ms per step (median).
 - The median DDP step is 3 % longer than the one-GPU step; the rest of the scaling loss is
@@ -98,6 +100,9 @@ over four. Scaling is against 4x the one-GPU `partial:0.2` row (6385).
   without recompute, but it all-gathers each block's 16-bit weights in forward and again
   in backward through host memory (no peer-to-peer). Its micro-batch takes 2.8 s at 4608
   and at 9216 tokens alike, so its step time is the gather.
+- ZeRO-2 gathers once per micro-batch (1.84 s at 4608 tokens against ZeRO-3's 2.76 s)
+  but holds the whole gathered base through backward, so it needs more checkpointing
+  than DDP (`partial:0.35` at 4608 tokens) and still loses to it.
 - The pipeline needs no checkpointing (stage 0 peaks at 25.7 GiB, stage 3 at 9.7 GiB)
   but pads every micro-batch to the static 4608-token shape (about 4000 real tokens) and
   idles in the 3-of-35 bubble; its global batch is 32 samples per step against DDP's 4.
@@ -133,14 +138,17 @@ backward. Rows marked "lanes" ran next to three other full-finetune jobs on the 
 | --- | --- | --- | --- | --- | --- | --- |
 | **DDP, `ckpt-ring8-actoff-optstream`, 36864 per rank** (recipe) | **15271** | 9.25 | 3.92 | 184 | 18.6 / 24.0 | 0.93 |
 | pipeline `1f1b`, `ckpt-resident`, 16 x 9216 | 10.3k | 12.54 | 2.70 | 123 | 28.3 / 30.4 | |
-| FSDP2, `ckpt-resident`, 18432 per rank | 8306 | 7.83 | 2.23 | 99 | 27.6 / 31.4 | |
-| FSDP2, manual `partial:0.88`, 9216 per rank | 4180 | 7.71 | 1.12 | 50 | 26.1 / 31.4 | |
+| FSDP2 ZeRO-3, `ckpt-resident`, 18432 per rank | 8306 | 7.83 | 2.23 | 99 | 27.6 / 31.4 | |
+| FSDP2 ZeRO-3, manual `partial:0.88`, 9216 per rank | 4180 | 7.71 | 1.12 | 50 | 26.1 / 31.4 | |
+| FSDP2 ZeRO-2, `ckpt-resident`, 9216 per rank | out of memory in step 1 | | | | | |
 | pipeline `interleaved-1f1b`, `ckpt-resident`, 32 x 4608 | out of memory in step 2 | | | | | |
 
 - DDP waits 6 ms per step for its reduction (median); the four ranks used 71 GiB of host
   RAM in all.
 - FSDP2 gathers the fp32 masters for every micro-batch: its step takes 7.7-7.8 s at 9216
   and 18432 tokens per rank alike, so a lower checkpoint share buys nothing, and 18432
-  tokens already fill the card.
-- A checkpoint of an FSDP2 or pipeline full finetune gathers the state one tensor at a
-  time through host memory.
+  tokens already fill the card. ZeRO-2 holds the gathered fp32 masters (18.9 GiB) next
+  to the shards and does not fit.
+- A full-finetune checkpoint (55 GB) of the FSDP2 and pipeline runs gathers through
+  host memory without raising VRAM above the step peak; it takes 2.5 min under FSDP2
+  (18432 per rank) and 11.5 min under the pipeline (`1f1b`, 16 x 9216).

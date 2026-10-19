@@ -77,7 +77,10 @@ def _ddp_hooks(ctx: RunContext) -> ParallelHooks:
 
 
 def _fsdp_hooks(ctx: RunContext) -> ParallelHooks:
-    return fsdp_hooks(ctx.built.backbone, ctx.world, ctx.k["FSDP_REDUCE"])
+    k = ctx.k
+    return fsdp_hooks(
+        ctx.built.backbone, ctx.world, k["FSDP_REDUCE"], k["FSDP_RESHARD"]
+    )
 
 
 def _pipeline_hooks(ctx: RunContext) -> ParallelHooks:

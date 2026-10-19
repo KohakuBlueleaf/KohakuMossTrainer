@@ -106,6 +106,7 @@ def workload(
         world=world,
         sharded=k["PARALLEL"] == "fsdp",
         sharded_grads=fsdp_grads_sharded(k),
+        gathered=k["FSDP_RESHARD"] == "backward",
         ema_decays=decay_count(k["EMA"]),
         optim_state_bytes=STATE_BYTES.get(k["OPTIMIZER"], STATE_BYTES["adamw"]),
         master_bytes=compute_bytes if k["OPTIMIZER"] == "adamw16" else 4,
