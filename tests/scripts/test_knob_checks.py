@@ -82,4 +82,4 @@ def test_check_script_names_the_replacement(tmp_path):
     renamed = {"DTYPE": "renamed to SAVE_DTYPE"}
     with pytest.raises(SystemExit, match="unknown knob DTYPE: renamed to SAVE_DTYPE"):
         check_script({**g, "DTYPE": "fp16"}, renamed)
-    check_script({**g, "WEIGHTS": "w"}, accept={"WEIGHTS"})
+    check_script({**g, "WEIGHTS": None}, accept={"WEIGHTS"})

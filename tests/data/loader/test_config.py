@@ -1,10 +1,18 @@
-"""DataConfig knob mapping, cache-dir resolution and build-problem listing."""
+"""DataConfig knob mapping, cache-dir resolution, field types and build-problem listing."""
 
 import os
 
 import pytest
 
-from kohakumoss_data import DataConfig, MossDataset, data_problems, resolved_cache_dir
+from kohakumoss_data import (
+    DataConfig,
+    MossDataset,
+    config,
+    data_problems,
+    resolved_cache_dir,
+    type_problems,
+)
+from kohakumoss_data.scripting import data_config
 from tests._util.negative import must_fail
 from tests.data import fixtures
 
@@ -81,3 +89,58 @@ def test_data_problems():
     )
     shifted.resolution_mode = "shifted_square"
     assert any("centre crop" in p for p in data_problems(shifted))
+
+
+GOOD = dict(datasets=[{"source": "synthetic"}], latent_cache="off", text_cache="off")
+TYPED = (
+    ("text_drop", 0),
+    ("data_wait", 600),
+    ("aspect_range", [0.5, 2]),
+    ("background", (0, 0, 0)),
+    ("background", "black"),
+    ("data_rescan", "never"),
+    ("data_rescan", True),
+)
+MISTYPED = (
+    ("target_area", "262144"),
+    ("max_tokens", 8.0),
+    ("seed", True),
+    ("flip", 1),
+    ("aspect_range", (1.0,)),
+    ("aspect_range", (1.0, "2")),
+    ("background", 5),
+    ("data_rescan", 3),
+    ("datasets", [["x"]]),
+    ("caption", "tags"),
+)
+
+
+def check_typed(cfg) -> None:
+    assert type_problems(cfg) == [], type_problems(cfg)
+
+
+def check_reported(field: str, cfg) -> None:
+    found = type_problems(cfg)
+    assert len(found) == 1 and found[0].startswith(f"{field.upper()}="), found
+    assert data_problems(cfg) == found, data_problems(cfg)
+
+
+def test_type_problems(monkeypatch):
+    for field, value in TYPED:
+        check_typed(DataConfig(**{**GOOD, field: value}))
+    for field, value in MISTYPED:
+        bad = DataConfig(**{**GOOD, field: value})
+        check_reported(field, bad)
+        must_fail(lambda b=bad: check_typed(b), f"{field}={value!r}")
+    area = DataConfig(**{**GOOD, "target_area": "262144"})
+    assert type_problems(area) == ["TARGET_AREA='262144' is not int"]
+    monkeypatch.setattr(config, "mismatches", lambda cfg: [])
+    must_fail(lambda: check_reported("target_area", area), "no type check")
+
+
+def test_data_config_exits_on_a_type_problem():
+    knobs = {"DATASETS": [{"source": "synthetic"}], "LATENT_CACHE": "off"}
+    knobs["TEXT_CACHE"] = "off"
+    assert data_config({**knobs, "TARGET_AREA": 262144}).target_area == 262144
+    with pytest.raises(SystemExit, match="TARGET_AREA='262144' is not int"):
+        data_config({**knobs, "TARGET_AREA": "262144"})

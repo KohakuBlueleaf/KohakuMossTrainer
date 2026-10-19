@@ -292,3 +292,32 @@ checks each one through that script's knob checks:
 
 A layer is checked on top of its script's base (`base_lora` / `base_sample`), or on the
 base it names in a private `_BASE = "<path>"` (kogine ignores names starting with `_`).
+
+## Knob types
+
+kogine coerces a `--set` value against the default (or annotation) of a knob the script
+binds. The data scripts and the loader bench also take every knob of their owner
+scripts, `scripts/train/moss.py` and the data scripts' folder
+(`check_script(globals(), owners=...)` in `kohakumoss_common.knobs`): a string value of
+such a knob is coerced the same way against the first owner that binds it, so
+`kogine run scripts/data/cache_text.py --set TARGET_AREA=262144` gives the int 262144,
+as it does for the train script. An owner is read only when a string value of one of
+its knobs arrives, once per check, from its source
+(`kohakumoss_common.script_schema.static_schema`): the defaults and annotations built
+from literals, arithmetic, builtin types and earlier such knobs, which is a parse of the
+file and imports nothing. A knob whose default or annotation needs anything else
+(`SAMPLE_PROMPTS`, annotated with kogine's `FormatArg`), or an owner whose module-level
+code runs more than imports, definitions, plain assignments and the `__main__` guard,
+is read with `kohakuengine.introspect_schema` instead: that imports the owner module
+(its `main()` does not run; `scripts/train/moss.py` imports the trainer) and puts its
+folder on `sys.path`. `tests/scripts/test_knob_coercion.py` checks that the two reads
+agree on every owner knob. A coercion that fails keeps the string, with kogine's
+warning; a string knob that no owner binds with a default or an annotation is a knob
+error.
+
+Values from a config file keep their Python type. `kohakumoss_data.type_problems`
+checks every data knob against its `DataConfig` annotation
+(`kohakumoss_common.typecheck`): int, float (an int is a float), bool, str, tuples and
+lists (item by item), dicts, Optional and unions. `data_problems` reports a wrong type
+on its own, and the data scripts exit on one before the dataset is built, e.g.
+`TARGET_AREA='262144' is not int`.

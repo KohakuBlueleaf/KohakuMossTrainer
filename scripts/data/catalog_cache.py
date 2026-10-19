@@ -11,8 +11,7 @@ the cache (each file has one writer).
 import json
 import os
 
-from kohakumoss.training.knobs import KNOWN as TRAIN_KNOBS
-from kohakumoss_common.knobs import check_script, siblings
+from kohakumoss_common.knobs import check_script
 from kohakumoss_common.log import get_logger, setup
 from kohakumoss_data.catalog.vault import CatalogVault
 from kohakumoss_data.config import catalog_cache_dir
@@ -41,7 +40,7 @@ def _show(path: str) -> dict:
 
 def main() -> None:
     setup()
-    check_script(globals(), accept=TRAIN_KNOBS | siblings(__file__))
+    check_script(globals(), owners=("../train/moss.py", "."))
     cfg = data_config(globals())
     cache_dir = catalog_cache_dir(cfg)
     if not cache_dir:

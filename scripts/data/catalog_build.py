@@ -9,8 +9,7 @@ and `import_to` (directory: copy the images into the native moss_shard format).
 import json
 import os
 
-from kohakumoss.training.knobs import KNOWN as TRAIN_KNOBS
-from kohakumoss_common.knobs import check_script, siblings
+from kohakumoss_common.knobs import check_script
 from kohakumoss_common.log import get_logger, setup
 from kohakumoss_data.dataset import build_source
 from kohakumoss_data.importer import import_source
@@ -25,7 +24,7 @@ DATASETS = []  # same entries as the train script
 
 def main() -> None:
     setup()
-    check_script(globals(), accept=TRAIN_KNOBS | siblings(__file__))
+    check_script(globals(), owners=("../train/moss.py", "."))
     for entry in DATASETS:
         source = build_source(entry)
         if entry.get("import_to"):

@@ -10,13 +10,10 @@ import json
 import os
 import time
 
-from kohakumoss.training.knobs import KNOWN as TRAIN_KNOBS
-from kohakumoss_common.knobs import check_script, siblings
+from kohakumoss_common.knobs import check_script
 from kohakumoss_data.dataset import MossDataset
 from kohakumoss_data.loader.stateless import Loader
 from kohakumoss_data.scripting import data_config
-
-DATA_SCRIPTS = os.path.join(os.path.dirname(__file__), "..", "..", "data")
 
 # ===================== DATA =====================
 DATASETS = []  # [{"source": ..., "path": ...}] (the data config's)
@@ -61,7 +58,7 @@ def run(dataset, workers: int) -> dict:
 
 
 def main() -> None:
-    check_script(globals(), accept=TRAIN_KNOBS | siblings(DATA_SCRIPTS))
+    check_script(globals(), owners=("../../train/moss.py", "../../data"))
     cfg = data_config(globals(), num_workers=0)
     dataset = MossDataset(cfg)
     os.makedirs(OUT_DIR, exist_ok=True)

@@ -7,6 +7,7 @@ from kohakumoss_data.config import (
     data_problems,
     pipeline_problems,
     resolved_cache_dir,
+    type_problems,
 )
 from kohakumoss_data.dataset import MossDataset
 from kohakumoss_data.loader import Loader
@@ -51,4 +52,5 @@ __all__ = [
     "resolved_cache_dir",
     "resolution",
     "sources",
+    "type_problems",
 ]

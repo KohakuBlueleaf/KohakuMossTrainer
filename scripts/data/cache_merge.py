@@ -8,8 +8,7 @@ Run with no training job writing the cache (the shards' writers must have exited
 
 import os
 
-from kohakumoss.training.knobs import KNOWN as TRAIN_KNOBS
-from kohakumoss_common.knobs import check_script, siblings
+from kohakumoss_common.knobs import check_script
 from kohakumoss_common.log import get_logger, setup
 from kohakumoss_data.cache.store import merge_shards, shard_paths
 from kohakumoss_data.config import resolved_cache_dir
@@ -26,7 +25,7 @@ TEXT_CACHE = "online"
 
 def main() -> None:
     setup()
-    check_script(globals(), accept=TRAIN_KNOBS | siblings(__file__))
+    check_script(globals(), owners=("../train/moss.py", "."))
     cache_dir = resolved_cache_dir(data_config(globals()))
     if not cache_dir:
         raise SystemExit("no cache dir: set CACHE_DIR or a dataset `path`")

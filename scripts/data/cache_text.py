@@ -23,8 +23,7 @@ import sys
 from tqdm.auto import tqdm
 
 from kohakumoss.encoders.specs import text_encoder_kwargs
-from kohakumoss.training.knobs import KNOWN as TRAIN_KNOBS
-from kohakumoss_common.knobs import check_script, siblings
+from kohakumoss_common.knobs import check_script
 from kohakumoss_common.log import get_logger, setup
 from kohakumoss_data.cache.build import build_text
 from kohakumoss_data.dataset import MossDataset
@@ -52,7 +51,7 @@ ENCODE_BATCH = 512
 
 def main() -> None:
     setup()
-    check_script(globals(), accept=TRAIN_KNOBS | siblings(__file__))
+    check_script(globals(), owners=("../train/moss.py", "."))
     encode = build_encoder(TEXT_ENCODER, text_encoder_kwargs(globals()))
     spec = getattr(encode, "encoder_spec", "")
     cfg = data_config(

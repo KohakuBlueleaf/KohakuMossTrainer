@@ -3,6 +3,7 @@
 import os
 from dataclasses import dataclass, field
 
+from kohakumoss_common.typecheck import describe, mismatches
 from kohakumoss_data.cache.store import STORAGE
 from kohakumoss_data.cache.tensor_cache import MODES
 from kohakumoss_data.loader.decode import BACKGROUNDS, RESAMPLE
@@ -49,7 +50,7 @@ class DataConfig:
     text_encoder_spec: str = ""
     latent_factor: int = LATENT_FACTOR
     flip: bool = False
-    background: str = "white"
+    background: str | tuple[int, int, int] = "white"
     resample: str = "lanczos"
     text_chars_per_token: float = 3.5
     text_overhead_tokens: int = 12
@@ -104,10 +105,22 @@ def _default_cache_dir(cfg: DataConfig) -> str:
     return os.path.join(root, "cache")
 
 
+def type_problems(cfg: DataConfig) -> list[str]:
+    """One line per field whose value does not have its annotated type
+    (`kohakumoss_common.typecheck.matches`: a float field takes an int)."""
+    return [
+        f"{name.upper()}={value!r} is not {describe(annotation)}"
+        for name, value, annotation in mismatches(cfg)
+    ]
+
+
 def data_problems(cfg: DataConfig) -> list[str]:
     """Every knob combination that would make `MossDataset(cfg)` (or its first batch)
-    fail; empty when the config builds."""
-    problems = []
+    fail; empty when the config builds. A field of the wrong type is reported alone
+    (`type_problems`), ahead of the checks that read its value."""
+    problems = type_problems(cfg)
+    if problems:
+        return problems
     for name, value, allowed in (
         ("RESOLUTION_MODE", cfg.resolution_mode, PLANNERS.names()),
         ("BATCHING", cfg.batching, sorted(BATCHINGS)),

@@ -1,13 +1,18 @@
 """Script-knob checks every kogine script shares: collection from globals, unknown names
 with their replacement (a rename table, dict-knob fields) or a did-you-mean hint,
 choice tables, one SystemExit for every problem; `check_script` is the unknown-knob
-check of a script whose knobs are the names it binds itself."""
+check of a script whose knobs are the names it binds itself and its owner scripts bind,
+with the owner-typed coercion of those foreign knobs. See docs/guides/configs.md."""
 
 import ast
 import difflib
 import json
 import os
 from collections.abc import Iterable
+
+from kohakuengine import ScriptSchema, coerce_globals, introspect_schema
+
+from kohakumoss_common.script_schema import static_schema
 
 
 def collect(g: dict) -> dict:
@@ -120,24 +125,80 @@ def declared(path: str) -> set[str]:
     return names
 
 
-def siblings(path: str) -> set[str]:
-    """`declared` over every .py file in the directory `path` (or the directory of the
-    file `path`): a script family that shares one config."""
-    path = os.path.abspath(path)
-    folder = path if os.path.isdir(path) else os.path.dirname(path)
-    files = sorted(f for f in os.listdir(folder) if f.endswith(".py"))
-    return set().union(*(declared(os.path.join(folder, f)) for f in files))
+def _py_files(folder: str) -> list[str]:
+    return [
+        os.path.join(folder, f) for f in sorted(os.listdir(folder)) if f.endswith(".py")
+    ]
+
+
+def owner_files(script: str, owners: Iterable[str]) -> list[str]:
+    """`owners` as script files, in order: each path is relative to the directory of
+    `script` (or absolute), and a directory stands for its .py files (sorted): a script
+    family that shares one config names its own directory."""
+    base = os.path.dirname(os.path.abspath(script))
+    files = []
+    for owner in owners:
+        path = os.path.normpath(os.path.join(base, owner))
+        files += _py_files(path) if os.path.isdir(path) else [path]
+    return files
+
+
+def owner_schema(path: str, names: set[str]) -> ScriptSchema:
+    """The schema of the owner script `path` for `names`: read from its source
+    (`static_schema`) when the source types or excludes every one of them, else
+    `kohakuengine.introspect_schema` (imports the file; its `main()` does not run)."""
+    found = static_schema(path)
+    if found is None or names & found[1]:
+        return introspect_schema(path)
+    return found[0]
+
+
+def owned_values(
+    k: dict, foreign: set[str], binds: dict[str, set[str]]
+) -> tuple[dict, list[str]]:
+    """(coerced values, problems) of the string knobs of `k` named in `foreign`: each is
+    coerced as kogine coerces a `--set` value, against the schema (`owner_schema`, once
+    per owner file per call) of the first owner file of `binds` (path -> its `declared`
+    names) that binds it. A name no owner binds with a default or an annotation keeps
+    its value and gives a problem."""
+    pending = {n: v for n, v in k.items() if n in foreign and isinstance(v, str)}
+    by_owner: dict[str, dict] = {}
+    for name, value in pending.items():
+        owner = next((path for path, names in binds.items() if name in names), "")
+        by_owner.setdefault(owner, {})[name] = value
+    coerced, untyped = {}, set(by_owner.pop("", {}))
+    for path, values in by_owner.items():
+        schema = owner_schema(path, set(values))
+        typed = {n: v for n, v in values.items() if n in schema.declared}
+        coerced |= coerce_globals(
+            typed, schema.defaults, annotations=schema.annotations
+        )
+        untyped |= set(values) - set(typed)
+    problems = [
+        f"{n}={pending[n]!r}: no owner script binds a default or an annotation that "
+        "types it"
+        for n in sorted(untyped)
+    ]
+    return coerced, problems
 
 
 def check_script(
     g: dict,
     renamed: dict[str, str] | None = None,
     accept: Iterable[str] = (),
+    owners: Iterable[str] = (),
 ) -> dict:
     """The knobs of a kogine script (`g` its globals after the config), after one
-    SystemExit listing every knob outside the names the script binds and `accept`
-    (with `renamed`'s replacement or a did-you-mean hint)."""
+    SystemExit listing every knob outside the names the script, `accept` and its
+    `owners` (`owner_files`) bind (with `renamed`'s replacement or a did-you-mean hint)
+    and every `owned_values` problem. The string values of the knobs it takes from
+    `accept` / `owners` are coerced by `owned_values` and written into `g`."""
+    script = g["__file__"]
     k = collect(g)
-    known = declared(g["__file__"]) | set(accept)
-    exit_on(unknown_problems(k, known, renamed))
-    return k
+    binds = {path: declared(path) for path in owner_files(script, owners)}
+    own = declared(script)
+    foreign = (set(accept) | set().union(*binds.values())) - own
+    coerced, problems = owned_values(k, foreign, binds)
+    exit_on(unknown_problems(k, own | foreign, renamed) + problems)
+    g.update(coerced)
+    return {**k, **coerced}

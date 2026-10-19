@@ -5,8 +5,7 @@ kogine run scripts/data/inspect_data.py --config configs/data/kohya/kohya_style.
 
 import json
 
-from kohakumoss.training.knobs import KNOWN as TRAIN_KNOBS
-from kohakumoss_common.knobs import check_script, siblings
+from kohakumoss_common.knobs import check_script
 from kohakumoss_common.log import get_logger, setup
 from kohakumoss_data.dataset import MossDataset
 from kohakumoss_data.scripting import data_config
@@ -33,7 +32,7 @@ SHOW_CAPTIONS = 3
 
 def main() -> None:
     setup()
-    check_script(globals(), accept=TRAIN_KNOBS | siblings(__file__))
+    check_script(globals(), owners=("../train/moss.py", "."))
     cfg = data_config(globals(), latent_cache="off", text_cache="off")
     dataset = MossDataset(cfg)
     budget = None if cfg.batching == "count" else cfg.max_tokens
