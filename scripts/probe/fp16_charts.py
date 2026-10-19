@@ -53,6 +53,7 @@ def style() -> None:
             "grid.alpha": 0.25,
             "legend.frameon": False,
             "font.size": 11,
+            "figure.constrained_layout.use": True,
         }
     )
 
@@ -102,11 +103,28 @@ def stream_chart(variant: str, study: dict, out: Path) -> list[str]:
     )
     a.semilogy(
         x,
+        study["plain"]["fp16_per_block"]["stream"],
+        "d-",
+        ms=3,
+        color=COLORS["o"],
+        label="official, plain fp16 run",
+    )
+    a.semilogy(
+        x,
         row["per_block"]["stream"],
         "^-",
         ms=3,
         color=COLORS["fixed"],
         label=f"fp16-fixed (c = 1/{round(1 / c)}), fp16 run",
+    )
+    peak = int(np.argmax(pb["stream"]))
+    a.annotate(
+        f"block {peak}: {pb['stream'][peak]:,.0f} = {pb['stream'][peak] / FP16_MAX:.0%} of fp16 max",
+        (peak, pb["stream"][peak]),
+        xytext=(max(peak - 22, 0), pb["stream"][peak] / 6),
+        color=COLORS["orig"],
+        fontsize=9,
+        arrowprops={"arrowstyle": "->", "color": COLORS["orig"]},
     )
     fp16_line(a)
     a.set_ylabel("max |x|, joint residual stream")
@@ -114,7 +132,7 @@ def stream_chart(variant: str, study: dict, out: Path) -> list[str]:
         f"MOSS-Image-{variant.upper() if variant == 'sft' else variant.title()}: residual stream per block"
     )
     a.grid(True, which="both")
-    a.legend(loc="lower right", fontsize=9)
+    a.legend(loc="center right", fontsize=9)
     for site in ("o", "ffn_down", "ffn_up_gate", "logit"):
         if site in pb:
             b.semilogy(
@@ -130,8 +148,11 @@ def stream_chart(variant: str, study: dict, out: Path) -> list[str]:
 
 def plain_chart(variant: str, study: dict, out: Path) -> list[str]:
     """Plain fp16 on the official weights: share of non-finite outputs per resolution x
-    sigma (over the prompts) and the first block whose output is non-finite."""
-    rows = study["plain"]["fp16_forward_rows"]
+    sigma (over the prompts), headroom 65504 / max |stream| per block (official fp16,
+    official bf16, fp16-fixed), and the first block whose output is non-finite when any
+    forward overflowed."""
+    plain = study["plain"]
+    rows = plain["fp16_forward_rows"]
     res = [tuple(r) for r in study["resolutions"]]
     sig = study["sigmas"]
     grid = np.zeros((len(res), len(sig)))
@@ -142,14 +163,22 @@ def plain_chart(variant: str, study: dict, out: Path) -> list[str]:
             ]
             grid[i, j] = sum(cell) / max(len(cell), 1)
     first = [q["first_bad_block"] for q in rows if q["first_bad_block"] is not None]
-    fig, (a, b) = plt.subplots(
-        1, 2, figsize=(12, 3.8), gridspec_kw={"width_ratios": [1.3, 1]}
+    c = study["probe"]["chosen_c"]
+    fixed = next(r for r in study["sweep"] if r["c"] == c)["per_block"]["stream"]
+    ratios = [1.3, 1.6] + ([1] if first else [])
+    fig, axes = plt.subplots(
+        1,
+        len(ratios),
+        figsize=(6 * len(ratios), 3.8),
+        gridspec_kw={"width_ratios": ratios},
     )
+    a, h = axes[0], axes[1]
     im = a.imshow(grid, vmin=0, vmax=1, cmap="magma", aspect="auto")
     a.set_xticks(range(len(sig)), [str(s) for s in sig])
-    a.set_yticks(range(len(res)), [f"{h}x{w}" for h, w in res])
+    a.set_yticks(range(len(res)), [f"{rh}x{rw}" for rh, rw in res])
     a.set_xlabel("sigma")
-    a.set_title("plain fp16: share of non-finite outputs")
+    a.set_ylabel("resolution")
+    a.set_title(f"plain fp16: non-finite in {len(first)} of {len(rows)} forwards")
     for i in range(len(res)):
         for j in range(len(sig)):
             a.text(
@@ -162,12 +191,25 @@ def plain_chart(variant: str, study: dict, out: Path) -> list[str]:
                 fontsize=8,
             )
     fig.colorbar(im, ax=a, fraction=0.04)
+    x = np.arange(len(fixed))
+    for vals, mark, color, name in (
+        (plain["fp16_per_block"]["stream"], "d-", COLORS["o"], "official, fp16"),
+        (plain["bf16_per_block"]["stream"], "s-", COLORS["sampled"], "official, bf16"),
+        (fixed, "^-", COLORS["fixed"], f"fp16-fixed (c = 1/{round(1 / c)}), fp16"),
+    ):
+        h.semilogy(x, [FP16_MAX / v for v in vals], mark, ms=3, color=color, label=name)
+    h.axhline(1.0, color="#d62828", ls="--", lw=1.2)
+    h.set_xlabel("joint block")
+    h.set_ylabel("headroom = 65504 / max |stream|")
+    h.set_title("margin to the fp16 limit per block")
+    h.grid(True, which="both")
+    h.legend(fontsize=8)
     if first:
-        b.hist(first, bins=np.arange(-0.5, 42.5, 1), color=COLORS["orig"])
-    b.set_xlabel("first joint block with a non-finite output")
-    b.set_ylabel("forwards")
-    b.set_title(f"{len(first)} of {len(rows)} forwards overflow")
-    b.grid(True)
+        b = axes[2]
+        b.hist(first, bins=np.arange(-0.5, len(fixed) + 0.5, 1), color=COLORS["orig"])
+        b.set_xlabel("first joint block with a non-finite output")
+        b.set_ylabel("forwards")
+        b.grid(True)
     return save(fig, out, f"{variant}_plain_fp16")
 
 
@@ -198,6 +240,11 @@ def sweep_chart(variant: str, study: dict, out: Path) -> list[str]:
     b = axes[1]
     b.semilogy(xs, [r["headroom"] for r in sweep], "o-", color=COLORS["folded"])
     b.axhline(1.0, color="#d62828", ls="--", lw=1)
+    goal = FP16_MAX / study["target"]
+    b.axhline(goal, color=COLORS["folded"], ls=":", lw=1)
+    b.text(
+        min(xs), goal * 1.15, f"target {goal:.0f}x", color=COLORS["folded"], fontsize=9
+    )
     b.set_ylabel("headroom = 65504 / fp16 stream max")
     d = axes[2]
     tot = [r["weights"]["total"] for r in sweep]
@@ -224,7 +271,7 @@ def sweep_chart(variant: str, study: dict, out: Path) -> list[str]:
         label="stock-eps rel. error (fp32)",
     )
     d.set_ylabel("fraction / relative error")
-    d.legend(fontsize=8)
+    d.legend(loc="lower left", fontsize=8)
     for ax in axes:
         ax.axvline(chosen, color=INK, ls="--", lw=1)
         ax.set_xticks(xs, labels)
@@ -283,14 +330,14 @@ def gallery(variant: str, quality: dict, runs: Path, out: Path) -> list[dict]:
                 key = f"p{p}_s{s}"
                 lf = lpips_of(quality, rt, "fix_fp16", key)
                 lb = lpips_of(quality, rt, "bf16", key)
-                tf = "fp16-fixed" + (f"  LPIPS {lf:.3f}" if lf is not None else "")
-                tb = "official bf16" + (f"  LPIPS {lb:.3f}" if lb is not None else "")
+                tf = "fp16-fixed" + (f"  LPIPS* {lf:.3f}" if lf is not None else "")
+                tb = "official bf16" + (f"  LPIPS* {lb:.3f}" if lb is not None else "")
                 dest = out / "images" / "gallery" / f"{variant}_{rt}_{key}.webp"
                 ok = triptych(
                     [
                         (d / f"fix_fp16_{key}.png", tf),
                         (d / f"bf16_{key}.png", tb),
-                        (d / f"fp32_{key}.png", "fp32 reference"),
+                        (d / f"fp32_{key}.png", "fp32 reference (* = LPIPS to it)"),
                     ],
                     dest,
                 )
@@ -308,13 +355,21 @@ def gallery(variant: str, quality: dict, runs: Path, out: Path) -> list[dict]:
             key = f"p0_s{quality['seeds'][0]}"
             if not (d / f"bf16_lora{i}_{key}.png").is_file():
                 break
+            pair = quality.get(rt, {}).get("lora", {}).get(f"lora{i}", {})
+            pair = {
+                r["key"]: r["lpips"]
+                for r in pair.get("fix_vs_bf16", {}).get("rows", [])
+            }
             for p in range(len(quality["prompts"])):
                 key = f"p{p}_s{quality['seeds'][0]}"
                 dest = out / "images" / "gallery" / f"{variant}_{rt}_lora{i}_{key}.webp"
+                tl = "fp16-fixed + LoRA"
+                if key in pair:
+                    tl += f"  LPIPS* {pair[key]:.3f}"
                 if triptych(
                     [
-                        (d / f"fix_fp16_lora{i}_{key}.png", "fp16-fixed + LoRA"),
-                        (d / f"bf16_lora{i}_{key}.png", "official bf16 + LoRA"),
+                        (d / f"fix_fp16_lora{i}_{key}.png", tl),
+                        (d / f"bf16_lora{i}_{key}.png", "official bf16 + LoRA (*)"),
                         (d / f"bf16_{key}.png", "official bf16, no LoRA"),
                     ],
                     dest,
@@ -370,6 +425,139 @@ def sweep_strip(variant: str, study: dict, runs: Path, out: Path) -> list[str]:
     return made
 
 
+def md_table(head: list[str], rows: list[list]) -> list[str]:
+    """Markdown table lines."""
+    lines = ["| " + " | ".join(head) + " |", "|" + " --- |" * len(head)]
+    lines += ["| " + " | ".join(str(v) for v in r) + " |" for r in rows]
+    return lines + [""]
+
+
+def mean(xs: list[float]) -> float:
+    return sum(xs) / len(xs)
+
+
+def score_row(name: str, v: dict) -> list:
+    """[name, images, mean LPIPS, mean PSNR] of one fp16_quality.py score entry."""
+    return [name, len(v["rows"]), f"{v['mean_lpips']:.4f}", f"{v['mean_psnr']:.2f}"]
+
+
+def tables(variant: str, study: dict, quality: dict) -> str:
+    """The card's tables (markdown): stream maxima, c sweep, quality per runtime,
+    adapters, whole-pipeline fp16, file checks."""
+    probe, plain = study["probe"], study["plain"]
+    c = probe["chosen_c"]
+    out = [f"# {variant}: fp16-fix tables", "", "## Max |x| per site", ""]
+    sites = list(probe["summary_max"])
+    out += md_table(
+        ["run"] + sites,
+        [
+            [name] + [f"{src[s]:,.1f}" if s in src else "" for s in sites]
+            for name, src in (
+                ("official, probe grid (fp32)", probe["summary_max"]),
+                ("official, sampling (fp32)", probe["sampled_summary_max"]),
+                ("official, plain fp16", plain["fp16_summary_max"]),
+                ("official, bf16", plain["bf16_summary_max"]),
+                (f"folded c = 1/{round(1 / c)} (fp32)", probe["folded_summary_max"]),
+            )
+        ],
+    )
+    n_rows = len(plain["fp16_forward_rows"])
+    bad = {
+        k: sum(r["nonfinite"] for r in plain[f"{k}_forward_rows"])
+        for k in ("fp16", "bf16")
+    }
+    out += [
+        f"Non-finite forwards on the official weights: fp16 {bad['fp16']} / {n_rows},"
+        f" bf16 {bad['bf16']} / {n_rows}.",
+        "",
+        "## c sweep",
+        "",
+    ]
+    rows = []
+    for r in study["sweep"]:
+        t = r["weights"]["total"]
+        eps = max(q["stock_rel"] for q in study["eps"][str(r["c"])])
+        rows.append(
+            [
+                f"1/{round(1 / r['c'])}" + (" (chosen)" if r["c"] == c else ""),
+                f"{r['fp16_stream_max']:,.0f}",
+                f"{r['headroom']:.1f}",
+                f"{r['nonfinite_forwards']} / {r['forwards']}",
+                f"{r['mean_lpips']:.4f}",
+                f"{r['mean_psnr']:.2f}",
+                f"{r['mean_latent_cos']:.4f}",
+                f"{(t['flushed'] + t['subnormal']) / t['n']:.2%}",
+                f"{r['stream']['subnormal_frac']:.2e}",
+                f"{eps:.1e}",
+            ]
+        )
+    n = len(study["sweep"][0]["vs_fp32"])
+    bf = plain["bf16_vs_fp32"][:n]
+    rows.append(
+        ["official bf16", "", "", "", f"{mean([q['lpips'] for q in bf]):.4f}"]
+        + [f"{mean([q['psnr'] for q in bf]):.2f}"]
+        + [f"{mean([q['latent_cos'] for q in bf]):.4f}", "", "", ""]
+    )
+    out += md_table(
+        [
+            "c",
+            "fp16 stream max",
+            "headroom",
+            "non-finite",
+            f"LPIPS vs fp32 ({n} img)",
+            "PSNR",
+            "latent cos",
+            "scaled weights subnormal / 0",
+            "stream subnormal",
+            "stock-eps rel err",
+        ],
+        rows,
+    )
+    for rt in ("kohakumoss", "diffusers", "comfyui"):
+        q = quality.get(rt)
+        if not q:
+            continue
+        out += [f"## Quality, {rt} (vs fp32; fix vs bf16 last)", ""]
+        rows = [score_row(name, v) for name, v in q["vs_fp32"].items()]
+        rows.append(score_row("fix_fp16 vs bf16", q["fix_vs_bf16"]))
+        rows += [
+            score_row(f"{i} {k}", v[k])
+            for i, v in q.get("lora", {}).items()
+            for k in ("fix_vs_bf16", "effect_vs_bf16")
+        ]
+        out += md_table(["config", "n", "LPIPS", "PSNR"], rows)
+    te, vae = study["text_encoder"]["cos"], study["vae"]
+    wf = study["whole_fp16"]["vs_fp32"]
+    out += ["## Whole pipeline in fp16", ""]
+    out += md_table(
+        ["part", "metric", "bf16", "fp16"],
+        [
+            [
+                "text encoder",
+                "cos vs fp32 (min / mean)",
+                f"{min(te['bf16_vs_fp32']):.6f} / {mean(te['bf16_vs_fp32']):.6f}",
+                f"{min(te['fp16_vs_fp32']):.6f} / {mean(te['fp16_vs_fp32']):.6f}",
+            ],
+            [
+                "VAE decode",
+                "PSNR vs fp32 (mean dB)",
+                f"{mean([q['psnr_vs_fp32'] for q in vae['bf16']]):.2f}",
+                f"{mean([q['psnr_vs_fp32'] for q in vae['fp16']]):.2f}",
+            ],
+            [
+                "TE + fixed DiT + VAE",
+                f"LPIPS / PSNR vs fp32 ({len(wf)} img)",
+                "",
+                f"{mean([q['lpips'] for q in wf]):.4f} / {mean([q['psnr'] for q in wf]):.2f}",
+            ],
+        ],
+    )
+    files = quality.get("files")
+    if files:
+        out += ["## Files", "", "```", json.dumps(files, indent=1), "```", ""]
+    return "\n".join(out)
+
+
 def main() -> None:
     check_script(globals())
     if not RUNS or not OUT:
@@ -399,6 +587,8 @@ def main() -> None:
         rep = out / "reports" / f"{variant}_fp16_fix.json"
         rep.parent.mkdir(parents=True, exist_ok=True)
         rep.write_text(json.dumps(merged, indent=1), encoding="utf-8")
+        tab = out / "reports" / f"{variant}_tables.md"
+        tab.write_text(tables(variant, study, quality), encoding="utf-8")
         print(f"{variant}: {sum(len(v) for v in assets.values())} assets, {rep}")
 
 
