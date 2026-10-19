@@ -1,4 +1,4 @@
-"""Metric sinks (rank 0 only): console + metrics.jsonl, KohakuBoard, wandb. A fresh run
+"""Metric sinks (rank 0 only): console + metrics.jsonl, wandb. A fresh run
 moves an earlier attempt's files aside (`fresh_run`); a resumed run keeps the rows up
 to its step and appends (`resume_at`)."""
 
@@ -9,20 +9,13 @@ from pathlib import Path
 from kohakumoss.logging.log import get_logger
 
 METRICS = "metrics.jsonl"
-RUN_FILES = (METRICS, "log.txt", "board")
+RUN_FILES = (METRICS, "log.txt")
 log = get_logger(__name__)
 
 try:
     import wandb
 except ImportError:
     wandb = None
-try:
-    from kohakuboard.client import Board, Media
-    from kohakuboard.logger import init_logger_settings as board_log_settings
-except ImportError:
-    Board = None
-    Media = None
-    board_log_settings = None
 
 
 def free_name(path: Path) -> Path:
@@ -48,8 +41,8 @@ def rotate(path: Path | str) -> Path | None:
 
 
 def fresh_run(output_dir: str | Path) -> list[Path]:
-    """A run that does not resume: an earlier attempt's metrics.jsonl, log.txt and
-    board directory in `output_dir` move aside (WARNING each); the moved paths."""
+    """A run that does not resume: an earlier attempt's metrics.jsonl and log.txt in
+    `output_dir` move aside (WARNING each); the moved paths."""
     moved = []
     for name in RUN_FILES:
         dst = rotate(Path(output_dir) / name)
@@ -119,38 +112,6 @@ class ConsoleLogger:
 
     def close(self) -> None:
         self.file.close()
-
-
-class BoardLogger(ConsoleLogger):
-    """KohakuBoard run under `<output>/board`, plus the console/jsonl sink. The console
-    shows what it shows under LOGGER='console': KohakuBoard's own log lines go to
-    `<output>/board/kohakuboard.log` only, and it captures no stdout / stderr."""
-
-    def __init__(self, output_dir: str, name: str, project: str, config: dict):
-        super().__init__(output_dir)
-        if Board is None:
-            raise SystemExit("LOGGER='board' needs the `kohakuboard` package installed")
-        base = Path(output_dir) / "board"
-        board_log_settings(log_file=base / "kohakuboard.log", file_only=True)
-        self.board = Board(
-            name=name,
-            project=project,
-            base_dir=str(base),
-            config=config,
-            capture_output=False,
-        )
-
-    def log(self, metrics: dict, step: int) -> None:
-        super().log(metrics, step)
-        self.board.step()
-        self.board.log(**{f"train/{k}": v for k, v in metrics.items()})
-
-    def log_images(self, key: str, images: list, step: int) -> None:
-        self.board.log(**{key: Media(images)})
-
-    def close(self) -> None:
-        super().close()
-        self.board.finish()
 
 
 class WandbLogger(ConsoleLogger):

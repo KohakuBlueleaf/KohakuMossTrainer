@@ -28,7 +28,7 @@ Training knobs:
 | knob | default | what it sets |
 | --- | --- | --- |
 | `LOG_EVERY` | 10 | the console step line (bar off only); the default `METRICS_EVERY` |
-| `METRICS_EVERY` | None (= `LOG_EVERY`) | metric rows to the sinks (`metrics.jsonl`, KohakuBoard, wandb) and the throughput, VRAM and encoder-share monitors that fill them; 1 = every step |
+| `METRICS_EVERY` | None (= `LOG_EVERY`) | metric rows to the sinks (`metrics.jsonl`, wandb) and the throughput, VRAM and encoder-share monitors that fill them; 1 = every step |
 | `PROGRESS` | True | the bar |
 | `LOGGER` | `console` | the sink next to `metrics.jsonl` ([Sinks](#sinks)) |
 
@@ -73,19 +73,16 @@ other.
 | `LOGGER` | sink |
 | --- | --- |
 | `console` | no other sink; the console shows the bar or the step line |
-| `board` | KohakuBoard under `<output>/board` |
 | `wandb` | a wandb run in wandb's own default mode (`WANDB_MODE` when set, else online), writing under the run directory; `WANDB_MODE=offline` keeps it local (and `wandb sync` it afterwards) |
 
 Under every logger the console shows exactly what it shows with `LOGGER="console"`:
-wandb runs silent and captures no console output, and KohakuBoard writes its own log
-lines to `<output>/board/kohakuboard.log` and captures no stdout / stderr.
+wandb runs silent and captures no console output.
 
 ### Fresh and resumed runs
 
 - A run that does not resume (`RESUME=""`, or `"latest"` with no checkpoint yet) into an
-  existing `<output>` first moves an earlier attempt's `metrics.jsonl`, `log.txt` and
-  `board/` aside to the first free `metrics.<n>.jsonl`, `log.<n>.txt`, `board.<n>`, with
-  a WARNING line each (`fresh run: an earlier metrics.jsonl in <output> moved to
+  existing `<output>` first moves an earlier attempt's `metrics.jsonl` and `log.txt`
+  aside to the first free `metrics.<n>.jsonl`, `log.<n>.txt`, with a WARNING line each (`fresh run: an earlier metrics.jsonl in <output> moved to
   <output>/metrics.1.jsonl`).
 - A resumed run appends to them. Rows of `metrics.jsonl` past the resumed step (an
   attempt that went on after that checkpoint) move to `metrics.<n>.jsonl` first

@@ -166,7 +166,7 @@ shared drive):
 | `quant` | `bitsandbytes` | `OPTIMIZER="adamw8bit"` (bitsandbytes 8-bit AdamW) |
 | `optim` | `prodigyopt`, `schedulefree` | `OPTIMIZER="prodigy"` / `"schedule_free"` |
 | `parquet` | `pyarrow` | the `parquet` dataset source |
-| `board` / `wandb` | `kohakuboard` / `wandb` | `LOGGER="board"` / `"wandb"` |
+| `wandb` | `wandb` | `LOGGER="wandb"` |
 | `dev` | pytest, ruff, black, lpips + `bench` | tests and lint (the script tests import every script) |
 | `bench` | matplotlib, pandas | benches, the fp16-fix charts |
 | `baselines` | flash-linear-attention, causal-conv1d | comparison benches only |
@@ -178,9 +178,7 @@ package.
 
 ## Prebuilt wheels
 
-- `kohakuvault` (a dependency) and `kohakuboard` (extra `board`) install from wheels: a
-  binary-only resolve (`uv pip compile --only-binary :all:`) for win_amd64 and
-  manylinux_2_28 x86_64 on CPython 3.10 - 3.13 finds `kohakuvault 0.9.0` (with its
-  dependency numpy) and `kohakuboard 0.0.1`, the newest releases.
-- `click-completion`, a dependency of `kohakuboard`, installs from its pure-Python source
-  distribution.
+- `kohakuvault` (a dependency) installs from wheels: a binary-only resolve
+  (`uv pip compile --only-binary :all:`) for win_amd64 and manylinux_2_28 x86_64 on
+  CPython 3.10 - 3.13 finds `kohakuvault 0.9.0` (with its dependency numpy), the newest
+  release.

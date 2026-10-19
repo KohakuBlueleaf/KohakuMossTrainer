@@ -107,9 +107,9 @@ param(
     [int] $Seed = 0,
     # Full log line (and logger sinks) every N steps; between them the progress bar shows loss / lr / speed / VRAM.
     [int] $LogEvery = 10,
-    # Metrics sink: console | board (KohakuBoard) | wandb (needs `wandb login` once).
-    [ValidateSet("console", "board", "wandb")] [string] $Logger = "console",
-    # Project name for board / wandb.
+    # Metrics sink: console | wandb (needs `wandb login` once).
+    [ValidateSet("console", "wandb")] [string] $Logger = "console",
+    # Project name for wandb.
     [string] $Project = "kohakumoss",
     # Output root (relative paths are under the current directory).
     [string] $Out = "runs\examples\train",

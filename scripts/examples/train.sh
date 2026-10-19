@@ -32,7 +32,7 @@ options (defaults in brackets; see train.ps1 for each one's meaning):
   --cache off|online|offline [off]   --cache-dir DIR
   --sample-every N [0]   --sample-prompt TEXT   --save-every N [0]
   --tune table|off [table]   --tune-only   --kernel OP=BACKEND (repeatable)
-  --seed N [0]   --log-every N [10]   --logger console|board|wandb [console]   --project NAME
+  --seed N [0]   --log-every N [10]   --logger console|wandb [console]   --project NAME
   --out DIR [runs/examples/train]   --dry-run
 EOF
 }
@@ -114,7 +114,7 @@ while [ $# -gt 0 ]; do
     --kernel) kernels+=("$2"); shift ;;
     --seed) seed=$2; shift ;;
     --log-every) log_every=$2; shift ;;
-    --logger) choice logger "$2" console board wandb; logger=$2; shift ;;
+    --logger) choice logger "$2" console wandb; logger=$2; shift ;;
     --project) project=$2; shift ;;
     --out) out=$2; shift ;;
     --dry-run) dry_run=1 ;;

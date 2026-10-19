@@ -179,7 +179,7 @@ Local machine notes live in `CLAUDE.local.md`, plans in `plans/`, live state in 
 ## Development Setup
 
 ```bash
-uv pip install -e ".[cuda,dev]"    # or ".[xpu,dev]"; extras: kernels, lightning, quant, parquet, board, wandb, bench, baselines
+uv pip install -e ".[cuda,dev]"    # or ".[xpu,dev]"; extras: kernels, lightning, quant, parquet, wandb, bench, baselines
 uv pip install -e scripts/bench/matrix    # the bench matrix dev package (kohakumoss-bench), not in the wheel
 kogine run scripts/train/moss.py --config configs/moss/recipes/recipes_lora_24g_bf16.py
 ```

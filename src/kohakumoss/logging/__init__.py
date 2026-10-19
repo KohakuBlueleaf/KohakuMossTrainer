@@ -1,19 +1,12 @@
 """Logging sinks, selected through LOGGERS (rank 0; other ranks get NullLogger)."""
 
-from kohakumoss.logging.sinks import (
-    BoardLogger,
-    ConsoleLogger,
-    NullLogger,
-    WandbLogger,
-    fresh_run,
-)
+from kohakumoss.logging.sinks import ConsoleLogger, NullLogger, WandbLogger, fresh_run
 from kohakumoss_common.registry import Registry
 
 LOGGERS = Registry("logger")
 LOGGERS.add(
     "console", lambda output_dir, name, project, config: ConsoleLogger(output_dir)
 )
-LOGGERS.add("board", BoardLogger)
 LOGGERS.add("wandb", WandbLogger)
 
 
@@ -29,7 +22,6 @@ def build_logger(
 
 __all__ = [
     "LOGGERS",
-    "BoardLogger",
     "ConsoleLogger",
     "NullLogger",
     "WandbLogger",

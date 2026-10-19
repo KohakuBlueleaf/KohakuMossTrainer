@@ -1,5 +1,5 @@
 """Run files across attempts of one RUN_NAME, model-free: a fresh run moves an earlier
-attempt's metrics.jsonl / log.txt / board aside to the first free numbered name, and a
+attempt's metrics.jsonl / log.txt aside to the first free numbered name, and a
 resumed run keeps the rows up to its step (later rows moved aside) and appends."""
 
 import json
@@ -29,7 +29,6 @@ def _steps(path) -> list[int]:
 def check_fresh(out, start) -> None:
     _attempt(out, [1, 2, 3])
     (out / "log.txt").write_text("old log\n")
-    (out / "board").mkdir()
     (out / "metrics.1.jsonl").write_text("")
     with collecting(logging.WARNING) as logs:
         start(out)
@@ -37,7 +36,6 @@ def check_fresh(out, start) -> None:
     assert _steps(out / "metrics.jsonl") == [1, 2]
     assert _steps(out / "metrics.2.jsonl") == [1, 2, 3]
     assert (out / "log.1.txt").read_text() == "old log\n"
-    assert (out / "board.1").is_dir() and not (out / "board").exists()
     assert any("fresh run" in m for m in logs.messages), logs.messages
 
 

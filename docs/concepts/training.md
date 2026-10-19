@@ -385,7 +385,7 @@ RNG, the CUDA state of that rank's devices, the σ and noise generators).
 | callback | output |
 | --- | --- |
 | throughput / MFU, VRAM peaks | metrics |
-| metric logging | console + `metrics.jsonl`, KohakuBoard or wandb |
+| metric logging | console + `metrics.jsonl`, or wandb |
 | samples | through `MossPipeline` on the live model: images + `settings.json` per step |
 | validation | fixed-noise validation loss per σ (the global per-token mean over every rank's validation batches, all conditional: no text dropout) |
 | instability dumps | `instability/step_X.json` on a non-finite step or a loss above 5× its running average |

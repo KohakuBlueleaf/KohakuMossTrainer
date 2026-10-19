@@ -192,7 +192,7 @@ OUTPUT_DIR = "runs/moss"
 RUN_NAME = ""
 
 # ===================== LOGGING =====================
-LOGGER = "console"  # "console" | "board" | "wandb"
+LOGGER = "console"  # "console" | "wandb"
 PROJECT = "kohakumoss"
 LOG_EVERY = 10  # console step line every N steps (and the first / last)
 METRICS_EVERY: int | None = (
