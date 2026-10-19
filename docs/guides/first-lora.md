@@ -118,10 +118,12 @@ Fixed recipes compose the same layers for common targets (`configs/moss/recipes/
 | GPU | recipe |
 | --- | --- |
 | 24 GB with bf16 (3090, 4090, 50xx) | `recipes_lora_24g_bf16.py` |
+| RTX 5090 32 GB, maximum speed | `recipes_lora_5090.py` |
 | fp16-only (V100, 2080 Ti) | `recipes_lora_16g_fp16.py` |
 | 12 GB | `recipes_lora_12g_stream.py` |
 | Intel Arc B-series | `recipes_lora_xpu_b50.py` |
 | two GPUs (Linux) | `recipes_lora_ddp.py` |
+| four RTX 5090 (Linux) | `recipes_lora_ddp_4x5090.py` |
 
 - Other algorithms on a 24 GB bf16 card: `recipes_lycoris_loha.py`,
   `recipes_lycoris_lokr.py`, `recipes_lycoris_oft.py`, `recipes_dora.py` (each composes

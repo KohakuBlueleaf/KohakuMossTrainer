@@ -19,7 +19,9 @@ State per parameter is about 16 bytes (fp32 master, two Adam moments, gradient),
 | --- | --- |
 | 4x 32 GB with FSDP2 (Linux) | `recipes_full_fsdp_4xv100.py` |
 | one 24 GB GPU, host masters + weight streaming | `recipes_full_24g_offload.py` |
+| one RTX 5090 32 GB, host masters + weight streaming at 36864 tokens per step | `recipes_full_5090.py` |
 | several 24 GB GPUs (Linux), DDP over the same streaming profile | `kohakumoss-config new train --algo full --gpus N` |
+| 4x RTX 5090 32 GB on PCIe (Linux), DDP over the 5090 streaming profile | `recipes_full_ddp_4x5090.py` |
 
 A full finetune trains the 16-bit DiT: in a ComfyUI folder it takes
 `diffusion_models/moss_image_<VARIANT>_bf16.safetensors` (the default for `ALGO="full"`),
