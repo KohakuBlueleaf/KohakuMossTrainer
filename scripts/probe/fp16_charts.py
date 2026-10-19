@@ -1,5 +1,6 @@
-"""Model-card assets of the fp16-fix study: charts (svg + webp, transparent, readable on
-light and dark pages) and labelled image triptychs (webp) from the outputs of
+"""Model-card assets of the fp16-fix study: charts (svg + webp on an opaque white
+background, readable on light and dark pages) and labelled image triptychs (webp) from
+the outputs of
 fp16_study.py, fp16_quality.py, the ComfyUI runner and scripts/export/fp16_fix.py, plus
 one merged report per variant.
 
@@ -24,7 +25,8 @@ OUT = ""  # staging dir: images/, reports/
 VARIANTS = ("base", "sft")
 PANEL = 512  # triptych panel size in pixels
 FP16_MAX = 65504.0
-INK = "#8a8a8a"  # axes / text grey, readable on white and on black
+INK = "#333333"  # axes / text on the white chart background
+PAPER = "#ffffff"  # chart background, opaque
 COLORS = {
     "orig": "#e4572e",
     "sampled": "#f3a712",
@@ -41,9 +43,10 @@ COLORS = {
 def style() -> None:
     plt.rcParams.update(
         {
-            "figure.facecolor": "none",
-            "axes.facecolor": "none",
-            "savefig.transparent": True,
+            "figure.facecolor": PAPER,
+            "axes.facecolor": PAPER,
+            "savefig.facecolor": PAPER,
+            "savefig.transparent": False,
             "text.color": INK,
             "axes.labelcolor": INK,
             "axes.edgecolor": INK,
