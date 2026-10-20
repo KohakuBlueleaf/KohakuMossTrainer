@@ -18,7 +18,7 @@ from kohakumoss.encoders.text.encoder import (
 )
 from kohakumoss.encoders.text.plan import DTYPES as TEXT_DTYPES
 from kohakumoss.encoders.text.plan import MEMORY_ALIASES as TEXT_MEMORY_ALIASES
-from kohakumoss.encoders.vae import FluxVae, resolve_vae_dtype, vae_device
+from kohakumoss.encoders.vae import FluxVae, resolve_vae_dtype
 from kohakumoss.logging.log import get_logger, hl
 from kohakumoss.memory.apply import apply_to_backbone
 from kohakumoss.memory.estimate import Workload, estimate
@@ -360,13 +360,13 @@ def training_text_plan(k: dict, device: torch.device, plan=None):
 
 def data_knobs(k: dict, device: torch.device) -> dict:
     """The knobs the run's DataConfig reads: `k` plus the encoder compute specs its
-    cache keys record (VAE_DTYPE resolved on the VAE's device, `vae_device`; the text
-    encoder's resolved dtype, precision and quantization layout)."""
+    cache keys record (VAE_DTYPE resolved for `device`; the text encoder's dtype
+    resolved for `device`, its precision for where it computes, its quantization
+    layout), whatever the encoders' placements."""
     plan, te_device = training_text_plan(k, device)
     on = torch.device("cpu") if plan.memory == "cpu" else te_device
-    plan, _, layout = resolve_text_plan(_component_path(k, TEXT), plan, on)
-    on_vae = vae_device(k.get("VAE_ENCODE"), device)
-    vae_dtype = resolve_vae_dtype(k.get("VAE_DTYPE", "auto"), on_vae)
+    plan, _, layout = resolve_text_plan(_component_path(k, TEXT), plan, on, device)
+    vae_dtype = resolve_vae_dtype(k.get("VAE_DTYPE", "auto"), device)
     return {**k, **cache_specs(vae_dtype, plan, TEXT_DTYPES[plan.dtype], layout)}
 
 
@@ -391,8 +391,7 @@ def build_encoders(
     vae_path = _component_path(k, VAE)
     text_path = _component_path(k, TEXT)
     if need_vae and vae_path:
-        on_vae = vae_device(k.get("VAE_ENCODE"), device)
-        vae_dtype = resolve_vae_dtype(k.get("VAE_DTYPE", "auto"), on_vae)
+        vae_dtype = resolve_vae_dtype(k.get("VAE_DTYPE", "auto"), device)
         vae = place_vae(
             FluxVae.from_pretrained(vae_path, "cpu", vae_dtype, k["LATENT_DRAW"]),
             {
@@ -419,6 +418,7 @@ def build_encoders(
             output_device=hold,
             auto_memory=choose,
             auto_w4a8=w4a8,
+            run_device=device,
         )
         rule = encoder_rule(k, "text", mem_plan)
         log.info(f"text encoder placement: {hl(text.plan.memory)} ({rule})")

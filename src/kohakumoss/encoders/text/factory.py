@@ -33,7 +33,7 @@ def text_encoder_spec(
     loading the weights (their headers only)."""
     spec = factory_plan(dtype, plan)
     on = torch.device("cpu") if spec.memory == "cpu" else torch.device(device)
-    spec, _, layout = resolve_text_plan(path, spec, on)
+    spec, _, layout = resolve_text_plan(path, spec, on, device)
     return text_spec(spec, DTYPES[spec.dtype], layout)
 
 
@@ -48,8 +48,8 @@ def text_encoder(
     `path` (pipeline root or model dir); `dtype` ("bf16" | "fp16" or a torch dtype,
     default the plan's) and `plan` (TextEncoderPlan fields) place it; an unset memory
     is "auto" (the fastest placement that fits the device); memory "cpu" runs on the
-    host whatever `device`. Its outputs land on the host; the plan is checked for the
-    device before the weights load."""
+    host whatever `device`, in the dtype "auto" resolves for `device`. Its outputs
+    land on the host; the plan is checked for the device before the weights load."""
     if not str(path):
         raise ValueError(
             "text_encoder: path is empty; set TEXT_ENCODER_KWARGS['path'] to the text "

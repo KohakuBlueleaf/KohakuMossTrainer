@@ -156,7 +156,8 @@ The VRAM layers from `8g` up set the text-encoder plan `TEXT_ENCODE`
   2 GiB during a pass and nothing between passes) and encode `ahead` batches per pass.
 - With an offline text cache the encoder runs once for the sample prompts and is freed.
 - `auto` picks the fastest placement that fits next to the DiT step.
-- The CPU is for the offline precompute pass (`scripts/data/cache_text.py`) only.
+- `TEXT_DEVICE = "cpu"` (or `TEXT_ENCODE["memory"] = "cpu"`) runs it on the host with
+  every `TEXT_CACHE` mode, in the dtype `auto` resolves for the training device.
 
 ### Host RAM
 

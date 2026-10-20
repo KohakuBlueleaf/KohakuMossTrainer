@@ -15,7 +15,7 @@ from typing import Annotated
 import torch
 from kohakuengine import FormatArg
 
-from kohakumoss.encoders.vae import resolve_vae_dtype, vae_device, vae_dtype_problems
+from kohakumoss.encoders.vae import resolve_vae_dtype, vae_dtype_problems
 from kohakumoss.inference import MossPipeline, grid, knobs
 from kohakumoss.inference.placement_report import forward_tokens
 from kohakumoss.logging.log import get_logger, hl, setup
@@ -160,9 +160,7 @@ def main() -> None:
         fp16_fix=k["FP16_FIX"],
         fp16_fix_kwargs=dict(k["FP16_FIX_KWARGS"]),
         tune=k["TUNE"],
-        vae_dtype=resolve_vae_dtype(
-            k["VAE_DTYPE"], vae_device(knobs.vae_spec(k), k["DEVICE"])
-        ),
+        vae_dtype=resolve_vae_dtype(k["VAE_DTYPE"], k["DEVICE"]),
         forward_tokens=forward_tokens(
             sizes_of(k), min(k["BATCH"], len(k["PROMPTS"])), k["CFG"], k["CFG_MODE"]
         ),

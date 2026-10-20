@@ -111,23 +111,59 @@ class TextPlacement:
 
 
 class HostPlacement(TextPlacement):
-    """Everything on the host; the encoder runs there (a tensor already on the host in
-    its compute dtype is used as it is), each pass under `host_gemm` of that dtype."""
+    """Everything on the host; the encoder runs there, each pass under `host_gemm` of
+    its compute dtype. A tensor already in its compute dtype is used as it is; decoder
+    layers whose host form holds another dtype (file pages of a bf16 checkpoint run in
+    fp16) are cast per pass through a host ring of `slots` copies per layer signature,
+    the small rest once; the embedding table stays as loaded (rows cast at lookup)."""
 
     name = "cpu"
 
-    def __init__(self, model, layers, embedding, device="cpu", pinned=False, **kw):
+    def __init__(
+        self, model, layers, embedding, device="cpu", pinned=False, slots=2, **kw
+    ):
+        self.slots = max(int(slots), 2)
         super().__init__(model, layers, embedding, "cpu", False, **kw)
 
     def place(self) -> None:
-        super().place()
+        inside = tensor_ids(self.layers)
+        cast = any(i in self.dtypes for i in inside)
+        self.streamer = None
+        if cast:
+            self.streamer = LayerStreamer(
+                self.layers,
+                self.device,
+                slots=self.slots,
+                pinned=False,
+                host="file",
+                dtypes=self.dtypes,
+            )
+            n = len(self.layers)
+            self.enter = [partial(self.streamer.enter, i) for i in range(n)]
+            self.leave = [partial(self.streamer.leave, i) for i in range(n)]
+        for t in module_tensors(self.model).values():
+            if id(t) in self.emb_ids or (cast and id(t) in inside):
+                continue
+            self.to_device(t)
         self.gemm = host_gemm(self.model.norm.weight.dtype)
 
+    def embed(self, ids: Tensor) -> Tensor:
+        return self.lookup(ids, self.device)
+
     def begin(self) -> None:
+        if self.streamer is not None:
+            self.streamer.open()
         self.gemm.__enter__()
 
     def end(self) -> None:
         self.gemm.__exit__(None, None, None)
+        if self.streamer is not None:
+            self.streamer.close()
+
+    def release(self) -> None:
+        if self.streamer is not None:
+            self.streamer.remove()
+        super().release()
 
 
 class OffloadPlacement(TextPlacement):

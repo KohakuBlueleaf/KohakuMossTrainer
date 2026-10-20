@@ -129,6 +129,44 @@ def test_cache_encoder_gets_the_dtype_and_placement(monkeypatch):
     assert seen["spec"] == {"memory": "offload", "batch": 1, "tile": True}
 
 
+def assert_host_vae_keys_like_the_run(encoder, monkeypatch) -> None:
+    """A host VAE (memory 'cpu') for an fp16 card loads, computes and keys in the
+    card's auto dtype, like the run that reads its latents."""
+    seen = {}
+
+    def load(path, device="cuda", dtype=torch.float32, mode="mode"):
+        seen["dtype"] = dtype
+        return SimpleNamespace()
+
+    monkeypatch.setattr(FluxVae, "from_pretrained", load)
+    monkeypatch.setattr(
+        vae_mod, "place_vae", lambda vae, spec, d: SimpleNamespace(encode_images=None)
+    )
+    _has_bf16(monkeypatch, False)
+    monkeypatch.setattr(vae_mod, "FP16_PROBLEM", None)
+    encode = encoder("vae", "cuda:0", "auto", {"memory": "cpu"})
+    run = resolve_vae_dtype("auto", "cuda:0")
+    assert seen["dtype"] == run == torch.float16 and encode.encoder_spec == "fp16"
+
+
+def _placement_dtype(path, device, dtype, plan):
+    where = CPU if plan.get("memory") == "cpu" else device
+    return vae_mod.vae_encoder(path, device, resolve_vae_dtype(dtype, where), plan=plan)
+
+
+def test_a_host_vae_keys_like_the_run(monkeypatch):
+    assert_host_vae_keys_like_the_run(
+        lambda path, device, dtype, plan: vae_mod.vae_encoder(
+            path, device, dtype, plan=plan
+        ),
+        monkeypatch,
+    )
+    must_fail(
+        lambda: assert_host_vae_keys_like_the_run(_placement_dtype, monkeypatch),
+        "auto resolved for the host the VAE computes on",
+    )
+
+
 def test_compile_rule():
     cuda = torch.device("cuda", 0)
 

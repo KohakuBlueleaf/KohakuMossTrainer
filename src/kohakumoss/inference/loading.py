@@ -258,8 +258,8 @@ def load_text_encoder(
     reserve: int,
 ) -> QwenTextEncoder:
     """The text encoder computing on `text_device` (default `device`; "cpu" = memory
-    'cpu'), its outputs on `device`; an unset plan memory is 'auto' keeping `reserve`
-    bytes free."""
+    'cpu') in the dtype `device` resolves 'auto' to, its outputs on `device`; an unset
+    plan memory is 'auto' keeping `reserve` bytes free."""
     te_device = torch.device(text_device or device)
     spec = make_text_plan({"memory": "auto", **_plan_dict(text_plan)})
     if te_device.type == "cpu":
@@ -278,6 +278,7 @@ def load_text_encoder(
             output_device=device,
             auto_memory=choose,
             auto_w4a8=w4a8,
+            run_device=device,
         )
         done["memory"] = te.plan.memory
     return te

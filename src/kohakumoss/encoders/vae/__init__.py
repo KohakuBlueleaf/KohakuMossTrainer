@@ -44,17 +44,19 @@ BATCH_PIXELS = 4 * 1024 * 1024
 
 
 def _has_bf16(device: torch.device) -> bool:
-    """bf16 on `device`: a CUDA card that has it, XPU, and the host (natively, or
-    through `host_gemm`'s fp32-accumulated 16-bit GEMMs)."""
+    """bf16 on `device`: a CUDA card that has it (or one this process cannot query),
+    XPU, and the host (natively, or through `host_gemm`'s fp32-accumulated 16-bit
+    GEMMs)."""
     match device.type:
         case "cuda":
-            return torch.cuda.is_available() and arch_of(device).has_bf16
+            return not torch.cuda.is_available() or arch_of(device).has_bf16
     return True
 
 
 def resolve_vae_dtype(name: str | torch.dtype, device) -> torch.dtype:
-    """VAE_DTYPE -> torch dtype on `device`: `auto` is bf16 where the device has bf16,
-    else fp16 when fp16 is safe, else fp32."""
+    """VAE_DTYPE -> torch dtype for `device`, the device the latents and decodes are
+    for (whatever the VAE's placement): `auto` is bf16 where the device has bf16, else
+    fp16 when fp16 is safe, else fp32."""
     if isinstance(name, torch.dtype):
         return name
     if name != "auto":
@@ -67,11 +69,12 @@ def resolve_vae_dtype(name: str | torch.dtype, device) -> torch.dtype:
     return torch.float32
 
 
-def vae_device(plan: dict | None, device) -> torch.device:
-    """The device a VAE placed by VaePlan fields `plan` computes on: the host for
-    memory 'cpu', else `device` (VAE_DTYPE 'auto' resolves for it)."""
-    memory = (plan or {}).get("memory")
-    return torch.device("cpu") if memory == "cpu" else torch.device(device)
+def vae_encoder_spec(
+    path: str | Path = "", device: torch.device | str = "cuda", dtype="auto", **_
+) -> str:
+    """The `encoder_spec` `vae_encoder(...)` gives for the same arguments, without
+    loading the weights."""
+    return vae_spec(resolve_vae_dtype(dtype, device))
 
 
 def vae_dtype_problems(name: str, device) -> list[str]:
@@ -105,13 +108,13 @@ def vae_encoder(
             "vae_encoder: path is empty; set IMAGE_ENCODER_KWARGS['path'] to the VAE dir, "
             "a VAE file or a pipeline root"
         )
-    resolved = resolve_vae_dtype(dtype, vae_device(plan, device))
+    resolved = resolve_vae_dtype(dtype, device)
     spec = {"memory": "auto", "batch": batch, **(plan or {})}
     if compile is not None:
         spec["compile"] = "on" if compile else "off"
     vae = FluxVae.from_pretrained(path, "cpu", resolved, mode)
     placed = place_vae(vae, spec, device)
-    return SpecEncoder(placed.encode_images, vae_spec(resolved))
+    return SpecEncoder(placed.encode_images, vae_encoder_spec(path, device, resolved))
 
 
 def to_pixels(image: np.ndarray, device, dtype) -> Tensor:

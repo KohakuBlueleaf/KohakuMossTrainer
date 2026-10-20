@@ -517,6 +517,13 @@ goes through `apply_to_text_encoder(text_model, TextEncoderPlan, device, dtype)`
 | `ring` | final norm, rotary tables | + a ring of `stream_resident` slots per layer kind | all layer weights, prefetched one layer ahead |
 | `cpu` | nothing (runs on the host) | nothing | 0 |
 
+Under `cpu` a tensor whose loaded form is already in the compute dtype is used as it
+is (the bf16 file pages of a bf16 run). When the decoder layers' loaded form holds
+another dtype (the bf16 file pages of a run whose `dtype` resolves to fp16, a 2080 Ti
+or T4 run), `HostPlacement` streams them through a `LayerStreamer` on the host: two
+cast copies per layer kind, filled per pass from the file pages, so no whole fp16
+copy is held; the small rest is cast once and the embedding rows are cast at lookup.
+
 The host form of the weights `offload` / `ring` hold on the host is the plan's `host`:
 `copy` makes host copies in the compute dtype (pinned when `pinned`, one caching host
 allocator block per tensor, rounded up to a power of two); `file` keeps the
@@ -578,7 +585,7 @@ places the FLUX.2 VAE for online latent encoding and for sample decodes
 | `resident` (default) | weights on the device | weights + activations |
 | `offload` | nothing (pinned host copy) | weights moved in, released after the pass |
 | `ring` (`stream` is accepted too) | nothing | encoder / decoder blocks through 2-slot rings, the rest moved in per pass |
-| `cpu` | host | host (training: offline latent cache only, i.e. sample decodes) |
+| `cpu` | host | host (every `LATENT_CACHE` mode) |
 | `auto` | the fastest of resident / offload / ring that fits next to the DiT step reserve | |
 
 `offload` copies the weights in from their pinned host copies on the compute stream at
@@ -604,10 +611,14 @@ seconds and the cost per step.
 `kohakumoss.encoders.vae.resolve_vae_dtype`) selects the VAE's weight and compute dtype.
 It is `auto` | `bf16` | `fp16` | `fp32`.
 
-- `auto` is bf16 where the card has bf16 and fp16 elsewhere (V100, 2080 Ti); on the
-  host (`memory="cpu"`) it is bf16, whose GEMMs run through `HostGemm` where the host
-  has no native bf16 ([text-encoder.md](text-encoder.md#host-gemm)); an explicit
-  `fp32` stays fp32.
+- `auto` is bf16 where the card has bf16 and fp16 elsewhere (V100, 2080 Ti), resolved
+  for the device the run computes on (`DEVICE`, the training device, the cache
+  factory's `device`), not where the VAE is placed: a host VAE (`memory="cpu"`) of a
+  2080 Ti run computes in fp16, so the latent cache key is the same whichever pass
+  encodes. A run on the host alone, or a cache pass whose CUDA `device` this process
+  cannot query, takes bf16. Host GEMMs in either dtype run through `HostGemm` where
+  the host has no native 16-bit GEMMs ([text-encoder.md](text-encoder.md#host-gemm));
+  an explicit `fp32` stays fp32.
 - One dtype covers every path: the online latent encode and the sample decode in
   training (both `PlacedVae`), the offline cache pass (`vae_encoder`) and the pipeline
   decode (`MossPipeline.from_pretrained(vae_dtype=...)`). Latents always come out in

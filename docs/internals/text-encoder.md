@@ -24,7 +24,7 @@ One knob set (`kohakumoss.types.plans.TextEncoderPlan`) serves:
 | `quant_group` | `0` (per output channel), or any multiple of 16 (e.g. `64`, `128`) | weight-only scale groups of input columns; `int8` / `fp8` only |
 | `fp8_recipe` | `row`, `tensor`, `block` | `fp8_compute` scaling |
 | `stored` | `""`, a file | a pre-quantized text encoder ([below](#pre-quantized-text-encoder)) |
-| `dtype` | `auto` (bf16, or fp16 where the device has no bf16), `bf16`, `fp16` | compute dtype |
+| `dtype` | `auto` (bf16, or fp16 where the device the embeddings are for or the card the encoder computes on has no bf16; a host placement takes the dtype of the device it encodes for, so the cache keys do not depend on where a pass encodes), `bf16`, `fp16` | compute dtype |
 | `stream_resident` | `2` | ring slots per layer kind under `ring` |
 | `pinned` | `True`, `False` | pinned host copies for offload / ring |
 | `host` | `auto`, `copy`, `file` | the host form of what offload / ring keep on the host: copies in the compute dtype, or the checkpoint's file pages; `auto` copies when they fit the host's room ([offload.md](offload.md#host-room)) |

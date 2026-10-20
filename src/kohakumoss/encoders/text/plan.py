@@ -66,12 +66,22 @@ def resolve_precision(
     return replace(plan, precision=stored if runs else "compute")
 
 
-def resolve_dtype(plan: TextEncoderPlan, device: torch.device | str) -> TextEncoderPlan:
-    """`dtype="auto"`: bf16 where the device has it (the host included), else fp16."""
+def _has_bf16(device: torch.device | str) -> bool:
+    device = torch.device(device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return True
+    return arch_of(device).has_bf16
+
+
+def resolve_dtype(
+    plan: TextEncoderPlan, *devices: torch.device | str
+) -> TextEncoderPlan:
+    """`dtype="auto"`: bf16 where every one of `devices` has it (the device the
+    embeddings are for, whatever the placement, and the device the encoder computes
+    on; the host and a CUDA device this process cannot query have it), else fp16."""
     if plan.dtype != "auto":
         return plan
-    device = torch.device(device)
-    has_bf16 = device.type != "cuda" or arch_of(device).has_bf16
+    has_bf16 = all(_has_bf16(d) for d in devices)
     return replace(plan, dtype="bf16" if has_bf16 else "fp16")
 
 
