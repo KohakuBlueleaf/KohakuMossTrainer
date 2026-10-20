@@ -125,6 +125,10 @@ Fixed recipes compose the same layers for common targets (`configs/moss/recipes/
 | two GPUs (Linux) | `recipes_lora_ddp.py` |
 | four RTX 5090 (Linux) | `recipes_lora_ddp_4x5090.py` |
 
+- LoKr factor 8 at maximum speed: `recipes_lokr_5090.py` (one RTX 5090) and
+  `recipes_lokr_ddp_4x5090.py` (four, Linux).
+- The 5090 recipes take 294,912 tokens per optimizer step (64 x 4608-token
+  micro-batches over GRAD_ACC and the GPUs).
 - Other algorithms on a 24 GB bf16 card: `recipes_lycoris_loha.py`,
   `recipes_lycoris_lokr.py`, `recipes_lycoris_oft.py`, `recipes_dora.py` (each composes
   `vram_24g` and `precision_bf16`).

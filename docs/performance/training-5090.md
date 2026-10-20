@@ -5,10 +5,143 @@ settings behind the 5090 recipes, and the neighbouring settings each was chosen 
 
 | recipe | GPUs | setup |
 | --- | --- | --- |
-| `recipes_lora_5090.py` | 1 | LoRA r32 bf16, `MAX_TOKENS=4608`, `CHECKPOINT="partial:0.2"` |
-| `recipes_lora_ddp_4x5090.py` | 4 | the same per rank, `PARALLEL="ddp"` |
+| `recipes_lora_5090.py` | 1 | LoRA r32 bf16, `MAX_TOKENS=4608`, `CHECKPOINT="partial:0.2"`, `GRAD_ACC=64` |
+| `recipes_lora_ddp_4x5090.py` | 4 | the same per rank, `PARALLEL="ddp"`, `GRAD_ACC=16` |
+| `recipes_lokr_5090.py` | 1 | LoKr factor 8 full matrix bf16, `MAX_TOKENS=4608`, `CHECKPOINT="partial:0.2"`, `GRAD_ACC=64` (lycoris-lora >= 4.1.3) |
+| `recipes_lokr_ddp_4x5090.py` | 4 | the same per rank, `PARALLEL="ddp"`, `CHECKPOINT="partial:0.262"`, `GRAD_ACC=16` |
 | `recipes_full_5090.py` | 1 | full finetune, `ckpt-ring8-actoff-optstream`, `MAX_TOKENS=36864` |
 | `recipes_full_ddp_4x5090.py` | 4 | the same per rank, `PARALLEL="ddp"` (one shared host copy of the masters) |
+
+The LoRA and LoKr recipes take one optimizer step of 294,912 tokens (64 x 4608) over
+GRAD_ACC and the GPUs; [One step of 294,912 tokens](#one-step-of-294912-tokens) has
+the grid they were chosen from.
+
+## One step of 294,912 tokens
+
+Every arm runs the same optimizer step: 64 slots of 4608 tokens, split as GPUs x
+micro-batch `MAX_TOKENS` x `GRAD_ACC`, each micro-batch with the lowest checkpoint share
+that fits. The metric is the step time, and real tokens/s is the step's real (image +
+text, unpadded) tokens over it.
+
+**Setup.** Tree 4b1b9dc with the changes of 0a943f9 and 2c5acba and lycoris-lora 4.1.2
+(LoRA, the LoKr compile path, the full finetune); the same with the changes up to
+1d2d0b9 and lycoris-lora 4.1.3's code (LoKr kernels); torch 2.14.1+cu130, Triton 3.8.0;
+the scaling
+layer with the HF bf16 weights; `BATCHING="tokens_ffd"`, `MAX_SAMPLES=0`; LoRA r32
+`attn-mlp`; LoKr factor 8, `full_matrix=True`, DIM 10000, alpha 1; 9 steps for DDP and 5
+for one GPU, medians over steps 3 to the end outside the traced step.
+
+**Columns.** s/step: median step time (the slowest rank). Real tok/s: the step's image +
+text tokens summed over the ranks, over the step time. Fill: real tokens over the
+294,912 budget; the ~1 MP images (about 4000-4100 tokens) leave the rest of each bin
+empty. Peak: the largest device memory in use on any rank (nvidia-smi), GiB, of 31.36.
+
+### LoRA r32
+
+| GPUs | micro-batch x GRAD_ACC | ckpt | s/step | real tok/s | samples/s | fill | peak |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 4 | **4608 x 16** (recipe) | `partial:0.2` | **10.25** | **25,190** | 6.40 | 88.8% | 30.35 |
+| 4 | 9216 x 8 | `partial:0.62` | 11.67 | 22,620 | 5.69 | 89.9% | 31.35 |
+| 4 | 18432 x 4 | `partial:0.857` | 13.14 | 20,100 | 5.11 | 90.9% | 30.1 |
+| 4 | 36864 x 2 | `partial:0.976` | 14.72 | 19,640 | 4.95 | 98.0% | 28.1 |
+| 1 | **4608 x 64** (recipe) | `partial:0.2` | **40.26** | **6,545** | 1.66 | 89.3% | 30.0 |
+| 1 | 9216 x 32 | `partial:0.62` | 45.95 | 5,758 | 1.46 | 89.7% | 31.1 |
+| 1 | 18432 x 16 | `partial:0.857` | 51.17 | 5,237 | 1.32 | 91.0% | 29.8 |
+| 1 | 36864 x 8 | `partial:0.976` | 57.26 | 4,999 | 1.26 | 96.6% | 28.0 |
+
+Four GPUs run a 4608 micro-batch in 0.640 s against 0.629 s on one, 98% per GPU. A
+step of twice or four times the tokens keeps the rate: 4608 x 32 runs 25,030 real tok/s,
+4608 x 64 25,610.
+
+### LoKr factor 8
+
+| GPUs | path | micro-batch x GRAD_ACC | ckpt | s/step | real tok/s | samples/s | peak |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 4 | kernels | **4608 x 16** (recipe) | `partial:0.262` | **12.59** | **20,570** | 5.22 | 29.31 |
+| 4 | kernels | 4608 x 16 | `partial:0.214` | 12.57 | 19,680 | 5.00 | 30.36 |
+| 4 | kernels | 9216 x 8 | `partial:0.69` | 15.24 | 16,450 | 4.14 | 31.25 |
+| 4 | kernels | 18432 x 4 | `partial:0.881` | 16.12 | 16,570 | 4.21 | 30.56 |
+| 4 | kernels | 36864 x 2 | `partial:0.976` | 17.45 | 16,560 | 4.17 | 29.81 |
+| 4 | compile | 4608 x 16 | `partial:0.476` | 14.50 | 18,140 | 4.60 | 29.3 |
+| 1 | compile | 4608 x 64 | `partial:0.476` | 56.42 | 4,664 | 1.18 | 29.55 |
+| 1 | compile | 9216 x 32 | `partial:0.762` | 61.05 | 4,325 | 1.10 | 25.4 |
+| 1 | compile | 18432 x 16 | `partial:0.857` | out of memory | | | |
+| 1 | compile | 36864 x 8 | `partial:0.976` | 73.90 | 3,944 | 1.00 | 27.65 |
+
+"kernels" is LyCORIS 4.1.3's token-major GEMM layout of the LoKr bypass, which the
+adapter prewarm now selects for 50 of 54 `lokr.bypass` and 51 of 54
+`lokr.bypass_with_base` buckets; "compile" is the compiled torch chain that 4.1.2 left
+selected for every bucket. The kernels save only `x` for backward (LoRA's
+bypass saves the same), so a 4608 micro-batch fits with 11 recomputed blocks in DDP
+against 20 on the compile path. A LoKr step costs 23% more than a LoRA step at the
+same micro-batch (12.59 s against 10.25 s); on the compile path it cost 41%.
+
+### What sets the speed
+
+A smaller micro-batch is faster only because it fits with fewer recomputed blocks.
+Its kernels are as efficient as a larger micro-batch's, and the bins fill the same.
+
+At one checkpoint share (`partial:0.857`, 36 of 42 blocks), one GPU, LoRA r32:
+
+| micro-batch | real tokens per micro-batch | ms per real token |
+| --- | --- | --- |
+| 4608 | 4080 | 0.190 |
+| 9216 | 8362 | 0.189 |
+| 18432 | 15915 | 0.194 |
+
+A ~4000-token micro-batch already fills the card: the same cutlass GEMMs and flash
+kernels run in both, and the GPU idles 27 ms of a 617 ms micro-batch. Each recomputed
+block costs its forward again, 5.5 ms at 4080 tokens and 14.6 ms at 15915, so the
+share that fits sets the step:
+
+| LoRA at the share that fits | ms per real token |
+| --- | --- |
+| 4608, `partial:0.2` (8 blocks) | 0.150 |
+| 4608, `partial:0.62` (26) | 0.175 |
+| 18432, `partial:0.857` (36) | 0.194 |
+| 18432, `partial:0.905` (38) | 0.197 |
+
+Step split of the traced DDP step (rank 0, one step of 294,912 tokens, ms; NCCL kernels
+spin while they wait for the slowest rank, so "NCCL" includes that wait):
+
+| arm | forward | backward | recompute | optimizer | NCCL (exposed) | idle |
+| --- | --- | --- | --- | --- | --- | --- |
+| LoRA 4608 x 16, `partial:0.2` | 3800 | 5281 | 722 | 2 | 419 (146) | 240 |
+| LoRA 9216 x 8, `partial:0.62` | 3841 | 5305 | 2379 | 2 | 559 (62) | 49 |
+| LoRA 18432 x 4, `partial:0.857` | 3741 | 5138 | 3196 | 2 | 2960 (1365) | 1333 |
+| LoRA 36864 x 2, `partial:0.976` | 4271 | 5903 | 4200 | 2 | 1385 (159) | 79 |
+| LoKr kernels 4608 x 16, `partial:0.262` | 4407 | 6640 | 1148 | 2 | 507 (175) | 260 |
+| LoKr kernels 18432 x 4, `partial:0.881` | 4503 | 6577 | 3929 | 2 | 2575 (588) | 788 |
+| LoKr compile 4608 x 16, `partial:0.476` | 4717 | 6873 | 2226 | 2 | 647 (233) | 222 |
+
+- Forward and backward are the same at every micro-batch size; only the recompute
+  column grows.
+- With 4 micro-batches of up to 18432 tokens per rank, the ranks' token counts differ
+  per step: the 18432 rows wait 0.3-1.4 s for the slowest rank.
+- DDP sums the gradients once per optimizer step: the trace shows 13 fp32 all-reduce
+  launches per step (283.5 MB of LoRA gradients in 25 MB buckets) and one int64, at
+  `GRAD_ACC` 16, 8 and 4 alike. The optimizer runs once per step: 35 kernels at every
+  `GRAD_ACC`.
+- DDP peaks 0.5-1.9 GiB above the same share on one GPU (NCCL buffers, and the worst bin
+  over four ranks), so the DDP rows use a higher share than the one-GPU fit where the
+  margin needs it.
+
+### Full finetune
+
+| GPUs | micro-batch x GRAD_ACC | profile | s/step | real tok/s | peak |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 36864 x 8 | `ckpt-ring8-actoff-optstream` | 117.7 | 2,432 | 22.3 |
+| 1 | 36864 x 8 | manual: `STREAM="swap"`, 8 resident, `ACT_OFFLOAD`, `OPTIM_STATE="stream"`, `partial:0.905` | 125.4 | 2,161 | 31.3 |
+| 1 | 18432 x 16 | the same without `ACT_OFFLOAD`, `partial:0.81` | out of memory | | |
+| 1 | 9216 x 32 | the same without `ACT_OFFLOAD`, `partial:0.62` | out of memory | | |
+
+- A 36864-token micro-batch takes 8.8 s at `GRAD_ACC=1` and 14.7 s inside an 8-step
+  accumulation. Between micro-batches every streamed block's gradient goes to the host
+  and is added into its fp32 sum there (10 GB of gradients per micro-batch), and that
+  host add sets the step, not memory.
+- Spending the free memory on fewer recomputed blocks loses: with `ACT_OFFLOAD` the
+  uncheckpointed blocks' whole activations cross PCIe, and without it the checkpointed
+  blocks' inputs no longer leave the card.
 
 ## Method
 
