@@ -11,6 +11,7 @@ from torch import Tensor, nn
 
 from kohakumoss.model.linear import MossLinear
 from kohakumoss.offload.accel import module, streamed, with_index
+from kohakumoss.offload.host.arena import HostArena
 from kohakumoss.offload.weights.layers import host_copy
 from kohakumoss.offload.weights.shared import aligned, nbytes_of
 from kohakumoss.offload.weights.streamed_weights import (
@@ -92,14 +93,22 @@ class WeightStream:
         self.arena = None
         if trainable and share is not None:
             self.arena = share(self._shared_bytes(blocks, dtype))
-        host_pinned = self.pinned if self.arena is None else self.arena.pinned
         self.host: list[dict[str, Tensor]] = []
         self.params: dict[tuple[int, str], nn.Parameter] = {}
         self.layout: dict[str, tuple[torch.Size, torch.dtype]] = {}
-        for i, block in enumerate(blocks):
-            self.host.append(self._take(i, block, dtype))
+        self.host_arena = None
+        if trainable:
+            for i, block in enumerate(blocks):
+                self.host.append(self._take(i, block, dtype))
+        else:
+            self._take_frozen(blocks, dtype)
         if self.arena is not None:
             self.arena.ready()
+        host_pinned = self.pinned
+        if self.arena is not None:
+            host_pinned = self.arena.pinned
+        elif self.host_arena is not None:
+            host_pinned = self.host_arena.pinned
         self.stats = {"loads": 0, "bytes_h2d": 0, "bytes_d2h": 0, "host_syncs": 0}
         dev = DeviceStreams(self.device, self.dm, self.streamed)
         self.timer = SpanTimer(dev, self.stats)
@@ -228,6 +237,62 @@ class WeightStream:
             )
             lin.set_base(StreamedWeight(self, index, name, w.shape))
         return out
+
+    @staticmethod
+    def _frozen_parts(name: str, lin: MossLinear, dtype) -> list[tuple]:
+        """(host key, tensor, host dtype) of each part a frozen linear streams: a
+        quantized base's stored parts (a W4A8 base at its int8 decode), else the dense
+        weight in `dtype`."""
+        if isinstance(lin.base, W4A8Weight):
+            lin.set_base(lin.base.to_int8())
+        if isinstance(lin.base, QuantWeight):
+            parts = (("q", lin.base.q), ("scale", lin.base.scale))
+            return [(f"{name}:{p}", t, t.dtype) for p, t in parts]
+        if isinstance(lin.base, ComputeWeight):
+            parts = lin.base.tensors().items()
+            return [(f"{name}:{p}", t, t.dtype) for p, t in parts]
+        w = lin.weight.detach()
+        return [(name, w, dtype or w.dtype)]
+
+    def _take_frozen(self, blocks: Sequence[nn.Module], dtype) -> None:
+        """Every frozen block's streamed parts copied into one HostArena (`host_arena`,
+        exact size, pinned when the stream is), each linear's base re-pointed at its
+        views as it goes, so the host sources are freed while the arena fills."""
+        linears = [
+            (i, name, lin, self._frozen_parts(name, lin, dtype))
+            for i, block in enumerate(blocks)
+            for name, lin in self._linears(block)
+        ]
+        specs = [(t.shape, d) for *_, parts in linears for _, t, d in parts]
+        self.host_arena = arena = HostArena(specs, self.pinned, self.device)
+        self.host = [{} for _ in blocks]
+        k = 0
+        for j in range(len(linears)):
+            index, name, lin, parts = linears[j]
+            linears[j] = None
+            for key, t, d in parts:
+                self.host[index][key] = arena.fill(k, t)
+                self.layout.setdefault(key, (t.shape, d))
+                k += 1
+            parts = t = None
+            self._rebase(index, name, lin, dtype)
+        arena.finish()
+
+    def _rebase(self, index: int, name: str, lin: MossLinear, dtype) -> None:
+        """Point a frozen linear at its streamed form (its host parts are taken)."""
+        if isinstance(lin.base, QuantWeight):
+            shape, rotation = lin.base.shape, lin.base.rotation
+            lin.set_base(StreamedQuantWeight(self, index, name, shape, rotation))
+            return
+        if isinstance(lin.base, ComputeWeight):
+            lin.set_base(StreamedComputeWeight(self, index, name, lin.base, dtype))
+            return
+        shape = lin.weight.shape
+        lin.weight = nn.Parameter(
+            torch.empty(0, dtype=lin.weight.dtype, device=self.device),
+            requires_grad=False,
+        )
+        lin.set_base(StreamedWeight(self, index, name, shape))
 
     def set_timing(self, on: bool) -> None:
         """Record copy and copy-wait spans on the device (read by `take_timing`)."""

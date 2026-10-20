@@ -21,7 +21,6 @@ from kohakumoss.encoders.text.comfy_files import comfy_text_key, packaged_config
 from kohakumoss.encoders.text.files import VALUES, TextFiles, hf_text_files
 from kohakumoss.encoders.text.plan import DTYPES
 from kohakumoss.logging.log import get_logger
-from kohakumoss.offload.accel import streamed
 from kohakumoss.offload.encoders.text import (
     QUANTIZE,
     TextPlacement,
@@ -29,6 +28,7 @@ from kohakumoss.offload.encoders.text import (
     place_text,
     w4a8_extra_bytes,
 )
+from kohakumoss.offload.host.arena import arena_bytes, arena_kind
 from kohakumoss.offload.weights.deferred import Deferred, placeholder
 from kohakumoss.offload.weights.layers import device_dtype, module_tensors
 from kohakumoss.quant.bind import work_device
@@ -284,22 +284,14 @@ def held_on_host(text: nn.Module, memory: str) -> list[Tensor]:
     return []
 
 
-def pow2(nbytes: int) -> int:
-    """The caching host allocator's size class of a pinned request of `nbytes`."""
-    return 1 << max(int(nbytes) - 1, 0).bit_length()
-
-
-def copy_bytes(held: list[Tensor], fill: _Fill, pinned: bool) -> int:
-    """Host bytes `host="copy"` adds over the loaded form of `held`: each copy in its
-    compute dtype (a pinned one rounded to its size class), less the private host
-    tensor it replaces; a Deferred host form is not copied."""
-    total = 0
-    for t in held:
-        if id(t) in fill.deferred:
-            continue
-        n = t.numel() * device_dtype(t, fill.dtypes).itemsize
-        total += (pow2(n) if pinned else n) - (0 if id(t) in fill.views else t.nbytes)
-    return total
+def copy_bytes(held: list[Tensor], fill: _Fill, kind: str) -> int:
+    """Host bytes `host="copy"` adds over the loaded form of `held`: the HostArena of
+    their copies in the compute dtype (`kind`: `arena_kind`), less the private host
+    tensors it replaces; a Deferred host form is not copied."""
+    copied = [t for t in held if id(t) not in fill.deferred]
+    sizes = [t.numel() * device_dtype(t, fill.dtypes).itemsize for t in copied]
+    replaced = sum(t.nbytes for t in copied if id(t) not in fill.views)
+    return arena_bytes(sizes, kind) - replaced
 
 
 def _warn_dense(ck: TextCheckpoint, text: nn.Module, dtype: torch.dtype) -> None:
@@ -389,8 +381,8 @@ def load_placed_text(
         log_sources(f"text encoder {plan.precision}", report["sources"])
     host = plan.host
     if host == "auto":
-        pinned = plan.pinned and streamed(device)
-        need = copy_bytes(held_on_host(text, plan.memory), fill, pinned)
+        kind = arena_kind(plan.pinned, device)
+        need = copy_bytes(held_on_host(text, plan.memory), fill, kind)
         host = "copy" if host_fits(need) else "file"
     plan = replace(plan, host=host)
     placement = place_text(text, plan, device, dtype, host, fill.dtypes, fill.deferred)

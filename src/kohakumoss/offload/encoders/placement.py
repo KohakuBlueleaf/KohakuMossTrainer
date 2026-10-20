@@ -7,13 +7,15 @@ from collections.abc import Iterable, Mapping
 import torch
 from torch import Tensor
 
+from kohakumoss.offload.host.arena import host_copies
 from kohakumoss.offload.weights.deferred import Deferred
-from kohakumoss.offload.weights.layers import device_dtype, host_copy, tensor_bytes
+from kohakumoss.offload.weights.layers import device_dtype, tensor_bytes
 
 
 class HostCopies:
     """The host form of `tensors` (the tensors point at it between passes): `host`
-    "copy" makes host copies in each tensor's device dtype (pinned when `pinned`),
+    "copy" makes host copies in each tensor's device dtype in one HostArena (pinned
+    when `pinned`),
     "file" keeps the tensors as they are (the checkpoint's file pages); `dtypes` maps a
     tensor id to its device dtype where its host form holds another, `deferred` to a
     Deferred host form. `begin()` moves them onto `device` for a pass, `end()` points
@@ -30,14 +32,15 @@ class HostCopies:
         deferred: Mapping[int, Deferred] | None = None,
     ):
         deferred = deferred or {}
+        tensors = list(tensors)
         self.device = device
+        copied = [t for t in tensors if host == "copy" and id(t) not in deferred]
+        wants = [device_dtype(t, dtypes) for t in copied]
+        self.arena, _ = host_copies(copied, pinned, device, wants)
         self.pairs: list[tuple[Tensor, Tensor, torch.dtype]] = []
         self.sources: list = []
         for t in tensors:
-            want = device_dtype(t, dtypes)
-            if host == "copy" and id(t) not in deferred:
-                t.data = host_copy(t, pinned, want)
-            self.pairs.append((t, t.data, want))
+            self.pairs.append((t, t.data, device_dtype(t, dtypes)))
             self.sources.append(deferred.get(id(t), t.data))
         self.nbytes = tensor_bytes(self.sources)
         self.h2d_bytes = 0
@@ -55,3 +58,4 @@ class HostCopies:
         """Drop the host form (the caller re-points the tensors)."""
         self.pairs = []
         self.sources = []
+        self.arena.release()

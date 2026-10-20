@@ -14,10 +14,10 @@ from kohakumoss.encoders.text.load import (
     _Fill,
     copy_bytes,
     dense_weight,
-    pow2,
     quantized_delta,
 )
 from kohakumoss.encoders.text.plan import text_plan
+from kohakumoss.offload.host.arena import HostArena
 from kohakumoss.quant.text import linear_fate, quantize_text_linears, quantizes
 from kohakumoss.quant.weights import QuantWeight
 from tests._util.negative import must_fail
@@ -144,14 +144,15 @@ def test_dense_weight_by_rows_equals_the_whole():
     must_fail(lambda: assert_rows(_shifted_rows), "rows paired with the wrong scales")
 
 
-def test_copy_bytes():
-    assert [pow2(n) for n in (1, 2, 3, 4096, 4097)] == [1, 2, 4, 4096, 8192]
+def test_copy_bytes_is_the_arena_less_what_it_replaces():
     fill = _Fill.__new__(_Fill)
     view = torch.empty(3, 4, dtype=torch.bfloat16)
     private = torch.empty(5, dtype=torch.int8)
     fill.views, fill.dtypes = {id(view)}, {id(view): torch.float32}
     fill.deferred = {}
-    assert copy_bytes([view, private], fill, pinned=False) == 48
-    assert copy_bytes([view, private], fill, pinned=True) == 64 + (8 - 5)
+    assert copy_bytes([view, private], fill, "pageable") == 48
+    assert copy_bytes([view, private], fill, "registered") == 4096 - 5
+    arena = HostArena([((3, 4), torch.float32), ((5,), torch.int8)], False)
+    assert copy_bytes([view, private], fill, "pageable") == arena.nbytes - 5
     fill.deferred = {id(view): None}
-    assert copy_bytes([view, private], fill, pinned=False) == 0
+    assert copy_bytes([view, private], fill, "pageable") == 0

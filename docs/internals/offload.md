@@ -164,7 +164,9 @@ The device-dependent calls (`copier.copy` / `wait` / `mark_free`,
 share one `stats` dict (loads, H2D / D2H bytes, host syncs).
 
 - **Frozen bases (`ring`)**: host -> device only; quantized bases stream `q` and `scale`
-  and dequantize on use.
+  and dequantize on use. Every block's host parts sit in one HostArena (`host_arena`,
+  [below](#host-arena)), each linear's base re-pointed at its views while the arena
+  fills, so the host sources are freed as it goes.
 - **Trainable blocks (`swap`)**: fp32 masters on the host are the parameters. Before
   the last micro-batch, each weight gradient goes device -> pinned host and is summed in
   fp32 on a host worker thread (`HostAccumulator`), off the autograd thread. On the last
@@ -194,6 +196,30 @@ share one `stats` dict (loads, H2D / D2H bytes, host syncs).
   refilling a set the host waits only for the H2D that last read it, two block loads
   back, so the host memcpy of block `i+1` overlaps the H2D of block `i`; a trainable
   ring also waits for the block's master write-back.
+
+### Host arena
+
+A pinned allocation per tensor holds the next power of two of its bytes (the caching
+host allocator's size classes): the int8 DiT base's 262 block linears (4.64 GiB of
+codes) take 6.84 GiB that way. `HostArena` (`offload/host/arena.py`) lays every
+tensor one engine keeps on the host out in one buffer, 64-byte aligned:
+
+| device | storage | bytes held |
+| --- | --- | --- |
+| CUDA | one pageable buffer, filled, then page-locked once (`cudaHostRegister`) | the aligned payload, rounded up to a page |
+| XPU (pinned, no host registration) | power-of-two pinned chunks of up to 256 MiB, packed first-fit decreasing | the chunks |
+| host, or `pinned=False` | one tensor per spec | the payload |
+
+`host_copies(tensors, pinned, device, dtypes)` fills an arena from a list of tensors,
+each re-pointed at its copy as it is made (a source nothing else holds is freed while
+the arena fills: the peak is one tensor over the arena). A refused registration (the
+driver's limit on locked memory, an already-registered range) clears the runtime's
+last error through the libcudart torch loaded, moves the views into pinned chunks
+(every view handed out and every tracked tensor follows) and logs one WARNING with the
+size. `arena_bytes(sizes, kind)` is what an arena of those sizes holds; the text
+encoder's `host="auto"` choice counts with it. The frozen weight stream, the text
+encoder's and VAE's offload copies and the encoder layer rings use it; `release()`
+(and the arena's own finalizer) unregisters the buffer.
 
 ## Allocator
 

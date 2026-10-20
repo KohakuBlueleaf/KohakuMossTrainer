@@ -9,6 +9,7 @@ import torch
 from torch import Tensor, nn
 
 from kohakumoss.offload.accel import module, streamed, with_index
+from kohakumoss.offload.host.arena import host_copies
 from kohakumoss.offload.weights.deferred import Deferred, put
 from kohakumoss.offload.weights.streaming.events import SlotEvents
 from kohakumoss_common.calls import nothing
@@ -108,7 +109,7 @@ class _Pool:
 class LayerStreamer:
     """Streams `layers` through `slots` device slots per layer signature.
 
-    `host` "copy" copies the layers' tensors to the host in their device dtype
+    `host` "copy" copies the layers' tensors to one HostArena in their device dtype
     (`dtypes`), pinned when `pinned`; "file" keeps them as they are; a tensor in
     `deferred` is copied from its Deferred host form. `open()` allocates the slots
     (implicitly on the first entry), `close()` orders the compute stream after the
@@ -138,13 +139,21 @@ class LayerStreamer:
         self.pool_of: list[_Pool] = []
         self.layer_bytes: list[int] = []
         pools: dict[tuple, _Pool] = {}
-        for layer in layers:
-            params = module_tensors(layer)
+        per_layer = [module_tensors(layer) for layer in layers]
+        copied = [
+            t
+            for params in per_layer
+            for t in params.values()
+            if host == "copy" and id(t) not in deferred
+        ]
+        wants_copied = [device_dtype(t, dtypes) for t in copied]
+        self.arena, _ = host_copies(
+            copied, pinned and self.streamed, self.device, wants_copied
+        )
+        for params in per_layer:
             hosts, wants, sources = [], [], []
             for t in params.values():
                 want = device_dtype(t, dtypes)
-                if host == "copy" and id(t) not in deferred:
-                    t.data = host_copy(t, pinned and self.streamed, want)
                 hosts.append(t.data)
                 wants.append(want)
                 sources.append(deferred.get(id(t), t.data))
@@ -281,4 +290,5 @@ class LayerStreamer:
         self.handles = []
         self.host = []
         self.sources = []
+        self.arena.release()
         self.targets = []
