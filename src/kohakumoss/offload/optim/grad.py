@@ -12,6 +12,7 @@ import torch
 from torch import Tensor, nn
 
 from kohakumoss.offload.accel import DONE, module, streamed
+from kohakumoss.offload.host.arena import host_tensors
 from kohakumoss.offload.optim.host_acc import HostAccumulator
 from kohakumoss_common.weak import weak_call
 
@@ -65,7 +66,8 @@ class _Ring:
 
 
 class GradOffload:
-    """Post-accumulate-grad hooks moving gradients to host fp32 accumulators."""
+    """Post-accumulate-grad hooks moving gradients to host fp32 accumulators (one
+    exact-size HostArena, `arena`, for the device parameters' sums)."""
 
     def __init__(self, params: Iterable[nn.Parameter], pinned: bool = True):
         self.params = [p for p in params if p.requires_grad]
@@ -82,9 +84,14 @@ class GradOffload:
         largest: dict[torch.device, int] = {}
         for p in self.params:
             largest[p.device] = max(largest.get(p.device, 0), p.numel())
+        side_params = [p for p in self.params if streamed(p.device)]
+        specs = [(p.shape, torch.float32) for p in side_params]
+        where = side_params[0].device if side_params else torch.device("cpu")
+        self.arena, side_sums = host_tensors(specs, pinned, where)
+        sums = {id(p): s for p, s in zip(side_params, side_sums)}
         for p in self.params:
             side = streamed(p.device)
-            host = torch.zeros(p.shape, dtype=torch.float32, pin_memory=pinned and side)
+            host = sums[id(p)] if side else torch.zeros(p.shape, dtype=torch.float32)
             lane = _Lane(host)
             if side:
                 stream = self._stream(p.device)

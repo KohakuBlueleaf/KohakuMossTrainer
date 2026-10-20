@@ -7,6 +7,7 @@ import torch
 from torch import Tensor, nn
 
 from kohakumoss.offload.accel import module, streamed
+from kohakumoss.offload.host.arena import host_tensors
 
 RING_SLOTS = 3
 
@@ -127,8 +128,9 @@ class MasterAdamW(_GroupsMixin):
 
 
 class HostStateAdamW(_GroupsMixin):
-    """AdamW computed on the device with master / moments in (pinned) host memory,
-    streamed per parameter through a 3-slot device ring on side streams."""
+    """AdamW computed on the device with master / moments in (pinned) host memory, one
+    exact-size HostArena (`arena`), streamed per parameter through a 3-slot device ring
+    on side streams."""
 
     def __init__(
         self,
@@ -152,11 +154,11 @@ class HostStateAdamW(_GroupsMixin):
             id(p): torch.zeros((), dtype=torch.float32, device=step_device)
             for p in self.params
         }
-        for p in self.params:
-            master = p.detach().float().cpu()
-            master = master.pin_memory() if pin else master.clone()
-            zeros = [torch.zeros(master.shape, pin_memory=pin) for _ in range(2)]
-            self.host[id(p)] = (master, *zeros)
+        specs = [(p.shape, torch.float32) for p in self.params for _ in range(3)]
+        fill = [t for p in self.params for t in (p.detach(), None, None)]
+        self.arena, states = host_tensors(specs, pin, self.device, fill)
+        for i, p in enumerate(self.params):
+            self.host[id(p)] = tuple(states[3 * i : 3 * i + 3])
         self.n_slots = RING_SLOTS
         # rows: master, m, v, the fp32 gradient
         self.slots = [

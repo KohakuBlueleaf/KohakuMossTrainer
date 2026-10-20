@@ -1,6 +1,7 @@
 """HostArena, model-free: packed views never overlap, are aligned and hold what was
 filled; host copies re-point their tensors so the sources are freed as the arena
-fills; `arena_bytes` is what an arena holds. The CUDA properties (exact size,
+fills; `arena_bytes` is what an arena holds; `host_tensors` zeroes or copies each
+spec. The CUDA properties (exact size,
 asynchronous copies, reuse safety) are in test_arena_cuda.py."""
 
 import pytest
@@ -102,3 +103,26 @@ def _rounded(sizes, kind):
 def test_arena_bytes_is_what_an_arena_holds():
     assert_arena_bytes(ha.arena_bytes)
     must_fail(lambda: assert_arena_bytes(_rounded), "per-tensor size classes")
+
+
+def assert_host_tensors(make) -> None:
+    """Zeros where no fill is given, the fill's values cast to the spec dtype else."""
+    src = torch.randn(4, 6, dtype=torch.bfloat16)
+    specs = [((4, 6), torch.float32), ((5,), torch.float32), ((3, 3), torch.float16)]
+    arena, views = make(specs, False, "cpu", [src, None, None])
+    assert torch.equal(views[0], src.float())
+    assert not views[1].any() and not views[2].any()
+    assert [v.dtype for v in views] == [d for _, d in specs]
+    assert arena.payload == sum(ha.spec_bytes(s) for s in specs)
+
+
+def _uninitialised(specs, pinned, device, fill):
+    arena = ha.HostArena(specs, pinned, device)
+    views = [arena.view(i).fill_(1) for i in range(len(arena))]
+    views[0].copy_(fill[0])
+    return arena, views
+
+
+def test_host_tensors_zero_or_copy_each_spec():
+    assert_host_tensors(ha.host_tensors)
+    must_fail(lambda: assert_host_tensors(_uninitialised), "states left unzeroed")

@@ -223,6 +223,27 @@ class HostArena:
         self.buffers = []
 
 
+def host_tensors(
+    specs: Sequence[Spec],
+    pinned: bool,
+    device: torch.device | str,
+    fill: Sequence[Tensor | None] | None = None,
+) -> tuple[HostArena, list[Tensor]]:
+    """(arena, a host tensor per spec), each holding its `fill` entry's values (cast to
+    the spec dtype), zeros where it is None or `fill` is not given; page-locked once
+    filled."""
+    arena = HostArena(specs, pinned, device)
+    fill = list(fill) if fill is not None else [None] * len(arena)
+    for i, src in enumerate(fill):
+        view = arena.view(i)
+        if src is None:
+            view.zero_()
+        else:
+            view.copy_(src)
+    arena.finish()
+    return arena, [arena.view(i) for i in range(len(arena))]
+
+
 def host_copies(
     tensors: Sequence[Tensor],
     pinned: bool,

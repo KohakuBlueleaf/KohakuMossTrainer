@@ -219,7 +219,10 @@ last error through the libcudart torch loaded, moves the views into pinned chunk
 size. `arena_bytes(sizes, kind)` is what an arena of those sizes holds; the text
 encoder's `host="auto"` choice counts with it. The frozen weight stream, the text
 encoder's and VAE's offload copies and the encoder layer rings use it; `release()`
-(and the arena's own finalizer) unregisters the buffer.
+(and the arena's own finalizer) unregisters the buffer. The gradient-offload sums
+(`GradOffload.arena`) and `HostStateAdamW`'s masters and moments (`arena`) sit in one
+exact-size arena each too (`host_tensors`: zeros or a copy per spec, page-locked once
+filled).
 
 ### Host heap
 
