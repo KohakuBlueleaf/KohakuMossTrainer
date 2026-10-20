@@ -221,6 +221,16 @@ encoder's `host="auto"` choice counts with it. The frozen weight stream, the tex
 encoder's and VAE's offload copies and the encoder layer rings use it; `release()`
 (and the arena's own finalizer) unregisters the buffer.
 
+### Host heap
+
+glibc serves an allocation below its mmap threshold (dynamic, up to 32 MiB) from the C
+heap, and a freed one stays resident there until trimmed: the int8 codes of the
+quantized DiT base (most of them under 32 MiB each) are 2.95 GiB of such heap once the
+frozen stream has copied them into its arena. `kohakumoss_common.hostmem.trim_heap`
+(`malloc_trim(0)`, a no-op off glibc) returns those pages: after each block the frozen
+stream copies, after `host_copies` fills an arena, and at the end of the training
+build.
+
 ## Allocator
 
 Allocated memory of a run is flat from step to step, but the token count of a packed

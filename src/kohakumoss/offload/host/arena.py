@@ -18,6 +18,7 @@ from torch import Tensor
 from kohakumoss.logging.log import get_logger
 from kohakumoss.offload.accel import streamed
 from kohakumoss.offload.host import cudart
+from kohakumoss_common.hostmem import trim_heap
 from kohakumoss_common.units import GIB, MIB
 
 log = get_logger(__name__)
@@ -230,11 +231,13 @@ def host_copies(
 ) -> tuple[HostArena, list[Tensor]]:
     """(arena, host copies of `tensors`, each in its `dtypes` entry or its own dtype),
     each tensor re-pointed at its copy as the copy is made, so a host source nothing
-    else holds is freed while the arena fills."""
+    else holds is freed while the arena fills (the C heap's freed pages returned
+    after)."""
     dtypes = list(dtypes) if dtypes is not None else [t.dtype for t in tensors]
     arena = HostArena([(t.shape, d) for t, d in zip(tensors, dtypes)], pinned, device)
     for i, t in enumerate(tensors):
         t.data = arena.fill(i, t.detach())
         arena.track(i, t)
     arena.finish()
+    trim_heap()
     return arena, [arena.view(i) for i in range(len(arena))]

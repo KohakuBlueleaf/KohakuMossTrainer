@@ -50,6 +50,7 @@ from kohakumoss.training.optim.optimizers.factory import STATE_BYTES
 from kohakumoss.training.weights import component, stored_dit_precision
 from kohakumoss.types.plans import PrecisionConfig
 from kohakumoss.weights import DIT, TEXT, VAE
+from kohakumoss_common.hostmem import trim_heap
 from kohakumoss_kernels.hardware.current import rng_kept
 
 log = get_logger(__name__)
@@ -262,6 +263,7 @@ def build_model(
     engines.exclude_params(trainable.trainable_params())
     backbone.bind_ops(OpSet.resolve(device, prec.compute, k["KERNELS"]))
     vae, text, embeds = build_encoders(k, device, prec, step_reserve(k, plan), plan)
+    trim_heap()
     return Built(backbone, trainable, plan, engines, vae, text, embeds)
 
 

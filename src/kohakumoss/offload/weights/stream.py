@@ -35,6 +35,7 @@ from kohakumoss.quant.compute import ComputeWeight
 from kohakumoss.quant.w4a8 import W4A8Weight
 from kohakumoss.quant.weights import QuantWeight
 from kohakumoss_common.calls import nothing
+from kohakumoss_common.hostmem import trim_heap
 
 __all__ = [
     "StreamedComputeWeight",
@@ -257,7 +258,8 @@ class WeightStream:
     def _take_frozen(self, blocks: Sequence[nn.Module], dtype) -> None:
         """Every frozen block's streamed parts copied into one HostArena (`host_arena`,
         exact size, pinned when the stream is), each linear's base re-pointed at its
-        views as it goes, so the host sources are freed while the arena fills."""
+        views as it goes, so the host sources are freed while the arena fills (the C
+        heap's freed pages returned after each block)."""
         linears = [
             (i, name, lin, self._frozen_parts(name, lin, dtype))
             for i, block in enumerate(blocks)
@@ -276,6 +278,8 @@ class WeightStream:
                 k += 1
             parts = t = None
             self._rebase(index, name, lin, dtype)
+            if j + 1 == len(linears) or linears[j + 1][0] != index:
+                trim_heap()
         arena.finish()
 
     def _rebase(self, index: int, name: str, lin: MossLinear, dtype) -> None:
