@@ -344,7 +344,11 @@ def build_callbacks(
     cbs.append(VramAtStepOne(device_use))
     if k["SAMPLE_EVERY"] > 0 and is_main:
         pipe = MossPipeline.from_components(
-            built.backbone, built.text_encoder, built.vae
+            built.backbone,
+            built.text_encoder,
+            built.vae,
+            memory_plan=built.plan,
+            weight_stream=built.engines.weight_stream,
         )
         cbs.append(
             SampleGrid(

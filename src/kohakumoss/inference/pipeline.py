@@ -150,12 +150,22 @@ class MossPipeline:
 
     @classmethod
     def from_components(
-        cls, backbone, text_encoder=None, vae=None, device=None
+        cls,
+        backbone,
+        text_encoder=None,
+        vae=None,
+        device=None,
+        memory_plan: MemoryPlan | None = None,
+        weight_stream=None,
     ) -> "MossPipeline":
-        """Share already-built modules (the training model, its placed VAE): no
-        reload, no_grad only, TUNE left to the trainer (it owns the kernels)."""
+        """Share already-built modules (the training model under its `memory_plan` and
+        `weight_stream`, its placed VAE): no reload, no_grad only, TUNE left to the
+        trainer (it owns the kernels)."""
         device = device or next(backbone.parameters()).device
-        return cls(backbone, text_encoder, vae, device, owned=False)
+        pipe = cls(backbone, text_encoder, vae, device, owned=False)
+        pipe.memory_plan = memory_plan or MemoryPlan()
+        pipe.weight_stream = weight_stream
+        return pipe
 
     @classmethod
     def from_pretrained(
