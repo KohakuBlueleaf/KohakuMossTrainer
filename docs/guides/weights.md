@@ -141,8 +141,10 @@ models/MOSS-Image-Base/   transformer/  text_encoder/  tokenizer/  vae/
 hf download OpenMOSS-Team/MOSS-Image-Base --local-dir models/MOSS-Image-Base
 ```
 
-`WEIGHTS` is the pipeline folder (the train script) or a weights root holding `base/`
-and `sft/` (the sample script, `VARIANT` picks one). `TRANSFORMER` / `TEXT_ENCODER` /
+`WEIGHTS` is the pipeline folder or a weights root holding `base/` and `sft/`, in the
+train script, the sample scripts and the cache factories alike: `VARIANT` picks the
+folder (the factories take `base/`), and a component the variant folder ships no
+weights of comes from `base/`. `TRANSFORMER` / `TEXT_ENCODER` /
 `VAE` empty read `transformer/`, `text_encoder/` (+ `tokenizer/`), `vae/`; set, they are
 paths (a single DiT file, an fp16-fix checkpoint, another text-encoder folder or a
 ComfyUI file). Every weight is bf16: `BASE_PRECISION` and `TEXT_ENCODE["precision"]`

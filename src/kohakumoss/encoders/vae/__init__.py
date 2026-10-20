@@ -15,7 +15,7 @@ from torch import Tensor, nn
 from kohakumoss.encoders.specs import SpecEncoder, vae_spec
 from kohakumoss.encoders.vae.comfy import load_vae_file
 from kohakumoss.offload.encoders.vae import place_vae
-from kohakumoss.weights import VAE, comfy_file, is_comfy_folder
+from kohakumoss.weights import VAE, comfy_file, hf_root, is_comfy_folder
 from kohakumoss_kernels import compile_setup
 from kohakumoss_kernels.dtypes import BY_NAME
 from kohakumoss_kernels.hardware.arch import arch_of
@@ -157,13 +157,13 @@ class FluxVae(nn.Module):
         dtype: torch.dtype = torch.float32,
         mode: str = "mode",
     ) -> "FluxVae":
-        """`path` is the VAE dir, a pipeline root containing `vae/`, one safetensors
-        file (diffusers or BFL keys, e.g. ComfyUI's `flux2-vae_small` / `flux2-vae`) or
-        a ComfyUI models folder (its default VAE file). Loaded in fp32 (the
+        """`path` is the VAE dir, a pipeline root containing `vae/`, an HF weights root
+        (its `base/` VAE), one safetensors file (diffusers or BFL keys, e.g. ComfyUI's
+        `flux2-vae_small` / `flux2-vae`) or a ComfyUI models folder (its default VAE
+        file). Loaded in fp32 (the
         normalisation statistics stay fp32), then the VAE is cast to `dtype`."""
         path = Path(path)
-        if is_comfy_folder(path):
-            path = comfy_file(path, VAE)
+        path = comfy_file(path, VAE) if is_comfy_folder(path) else hf_root(path, VAE)
         if path.is_file():
             vae = load_vae_file(path)
         else:

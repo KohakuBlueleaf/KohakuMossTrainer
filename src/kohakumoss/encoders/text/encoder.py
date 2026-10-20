@@ -51,7 +51,7 @@ from kohakumoss.quant.source import SourceWeights
 from kohakumoss.quant.stored_text import read_text_record
 from kohakumoss.quant.text import GroupQuantLinear
 from kohakumoss.types.plans import TextEncoderPlan
-from kohakumoss.weights import TEXT, comfy_file, is_comfy_folder
+from kohakumoss.weights import TEXT, comfy_file, hf_root, is_comfy_folder
 from kohakumoss_common.calls import nothing
 from kohakumoss_kernels.dtypes import short
 from kohakumoss_kernels.hardware.current import synchronize
@@ -109,11 +109,12 @@ def _stored(model_dir: Path, plan: TextEncoderPlan):
 
 def text_source_of(path: str | Path) -> Path:
     """The text-encoder weights `path` names: a ComfyUI folder's default text-encoder
-    file, else `path` (a ComfyUI file, a pipeline root or a model dir)."""
+    file, an HF weights root's `base/` pipeline (`hf_root`), else `path` (a ComfyUI
+    file, a pipeline root or a model dir)."""
     if not str(path):
         return Path(path)
     path = Path(path)
-    return comfy_file(path, TEXT) if is_comfy_folder(path) else path
+    return comfy_file(path, TEXT) if is_comfy_folder(path) else hf_root(path, TEXT)
 
 
 def stored_text_format(path: str | Path, plan: TextEncoderPlan) -> tuple[str, str]:

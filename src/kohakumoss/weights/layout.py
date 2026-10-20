@@ -7,6 +7,9 @@ docs/guides/weights.md."""
 
 from pathlib import Path
 
+from kohakumoss_common.log import get_logger
+
+log = get_logger(__name__)
 DIT, TEXT, VAE = "transformer", "text_encoder", "vae"
 COMPONENTS = (DIT, TEXT, VAE)
 COMFY_DIRS = {DIT: "diffusion_models", TEXT: "text_encoders", VAE: "vae"}
@@ -61,6 +64,45 @@ def comfy_file(
     raise FileNotFoundError(f"no {component} file in {folder}: tried {listed}")
 
 
+def ships(root: str | Path, name: str) -> bool:
+    """`root/name/` holds safetensors files."""
+    return any((Path(root) / name).glob(f"*{SUFFIX}"))
+
+
+def component_root(path: str | Path, variant: str | None, name: str) -> Path:
+    """The folder holding component `name` (a `name/` with safetensors files):
+    `path/<variant>` (a weights root with base/ sft/); `path/base` when that variant
+    folder does not ship `name`'s weights (logged); `path` itself (one pipeline dir)
+    when there is no variant folder. FileNotFoundError when none holds it. See
+    docs/guides/inference.md."""
+    path = Path(path)
+    own = path / variant if variant else None
+    if own is not None and own.is_dir():
+        for root in (own, path / "base"):
+            if ships(root, name):
+                if root != own:
+                    log.info(f"{name}/ from {root} ({own} does not ship its weights)")
+                return root
+        raise FileNotFoundError(f"no {name}/ weights in {own} or {path / 'base'}")
+    if ships(path, name):
+        return path
+    where = f"no VARIANT folder {own}/ and " if own is not None else ""
+    raise FileNotFoundError(f"{where}no {name}/ under {path}")
+
+
+def hf_root(path: str | Path, component: str, variant: str | None = "base") -> Path:
+    """The HF pipeline folder of `component` under `path`: a weights root's variant
+    folder (`component_root`), else `path` itself (a pipeline dir, a component dir or a
+    file)."""
+    path = Path(path)
+    if not path.is_dir():
+        return path
+    try:
+        return component_root(path, variant, component)
+    except FileNotFoundError:
+        return path
+
+
 def component_path(
     weights: str | Path,
     component: str,
@@ -69,15 +111,17 @@ def component_path(
     full: bool = False,
 ) -> Path:
     """The weights of `component`: `choice` when it is an existing path; in a ComfyUI
-    folder `comfy_file`; else `choice` as a path, the DiT at `weights` itself, the
-    other components in `weights/<component>`."""
+    folder `comfy_file`; else `choice` as a path, the DiT at the HF pipeline folder
+    (`hf_root`: a weights root's `<variant>/`), the other components in its
+    `<component>/`."""
     if choice and Path(choice).exists():
         return Path(choice)
     if is_comfy_folder(weights):
         return comfy_file(weights, component, choice, variant, full)
     if choice:
         return Path(choice)
-    return Path(weights) if component == DIT else Path(weights) / component
+    root = hf_root(weights, component, variant)
+    return root if component == DIT else root / component
 
 
 def layout_of(weights: str | Path) -> str:

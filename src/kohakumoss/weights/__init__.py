@@ -1,5 +1,5 @@
 """Weights layouts: which file or folder holds each component (ComfyUI models folder,
-HF pipeline folder, single files)."""
+HF weights root or pipeline folder, single files)."""
 
 from kohakumoss.weights.layout import (
     COMPONENTS,
@@ -9,6 +9,8 @@ from kohakumoss.weights.layout import (
     comfy_defaults,
     comfy_file,
     component_path,
+    component_root,
+    hf_root,
     is_comfy_folder,
     layout_of,
 )
@@ -21,6 +23,8 @@ __all__ = [
     "comfy_defaults",
     "comfy_file",
     "component_path",
+    "component_root",
+    "hf_root",
     "is_comfy_folder",
     "layout_of",
 ]

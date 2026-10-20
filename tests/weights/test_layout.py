@@ -12,6 +12,7 @@ from kohakumoss.weights import (
     comfy_defaults,
     comfy_file,
     component_path,
+    hf_root,
     is_comfy_folder,
     layout_of,
 )
@@ -83,3 +84,30 @@ def test_hf_layout_is_unchanged(tmp_path):
 
 def _assert_comfy(path) -> None:
     assert is_comfy_folder(path)
+
+
+def _weights_root(root):
+    """An HF weights root: base/ with every component, sft/ with its own DiT only."""
+    for sub in ("base/transformer", "base/text_encoder", "base/vae", "sft/transformer"):
+        (root / sub).mkdir(parents=True)
+        (root / sub / "model.safetensors").write_bytes(b"")
+    return root
+
+
+def assert_root_resolved(path_of, root) -> None:
+    assert path_of(root, DIT, variant="sft") == root / "sft"
+    assert path_of(root, TEXT, variant="sft") == root / "base" / "text_encoder"
+    assert path_of(root, VAE) == root / "base" / "vae"
+    assert path_of(root, DIT) == root / "base"
+    assert hf_root(root, TEXT) == root / "base"
+    assert hf_root(root / "base" / "vae", VAE) == root / "base" / "vae"
+
+
+def _flat(weights, component, choice="", variant="base", full=False):
+    return weights if component == DIT else weights / component
+
+
+def test_hf_weights_root_resolves_its_variant(tmp_path):
+    root = _weights_root(tmp_path / "MOSS-Image")
+    assert_root_resolved(component_path, root)
+    must_fail(lambda: assert_root_resolved(_flat, root), "the root taken as a pipeline")
