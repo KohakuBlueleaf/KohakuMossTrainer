@@ -311,6 +311,11 @@ implementation.
 - On first use per device the kernel runs once without autograd (`_probe`), so a kernel
   that cannot build hands the op to the registry fallback before any graph is recorded.
 
+An op served by the `compile` backend takes inductor's launch config, which inductor
+benchmarks per process (several reduction splits for one generated kernel): two
+processes can round its output differently, so cross-run comparisons use the error
+statistics, never bitwise equality.
+
 ### Pipelines
 
 A `MossPipeline` that owns its model (`from_pretrained`, or the constructor with
