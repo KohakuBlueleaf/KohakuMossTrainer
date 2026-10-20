@@ -1,8 +1,9 @@
 """fp16-fix quality of one MOSS-Image variant: the fixed fp16 transformer vs the official
-bf16 and fp32 ones, the study's prompts x SEEDS, per runtime (KohakuMoss; the official
-diffusers MOSSImagePipeline; ComfyUI images from the ComfyUI-venv runner), LPIPS /
-PSNR per image against that runtime's fp32; plus every fix-file value against the
-official weights, the study reproduction checks and the model-card diffusers snippet.
+weights in plain fp16, bf16 and fp32, the study's prompts x SEEDS, per runtime
+(KohakuMoss; the official diffusers MOSSImagePipeline; ComfyUI images from the
+ComfyUI-venv runner), LPIPS / SSIM / PSNR per image against that runtime's fp32 (with an
+adapter: against fp32 + adapter); plus every fix-file value against the official weights,
+the study reproduction checks and the model-card diffusers snippet.
 
     kogine run scripts/probe/fp16_quality.py --set ROOT=<root>/base --set STUDY=<study out> \
         --set FIX_FILE=<repo>/comfyui/moss_image_base_fp16_fixed.safetensors \
@@ -29,6 +30,7 @@ from kohakumoss.inference.pipeline import apply_tune
 from kohakumoss.logging.log import get_logger, setup
 from kohakumoss.model import load_backbone
 from kohakumoss.model.io.load import INDEX, read_fp16_fix
+from kohakumoss.probe.image_metrics import psnr, ssim
 from kohakumoss.probe.official import official_module
 from kohakumoss_common.knobs import check_script
 
@@ -42,6 +44,9 @@ FIX_FILE = ""  # ComfyUI fp16-fix single file
 FIX_DIR = ""  # diffusers fp16-fix transformer dir
 COMFY_DIR = ""  # images of the ComfyUI-venv runner ("" = not scored)
 ADAPTERS = ()  # adapter files trained on the official weights (KohakuMoss runtime)
+PLAIN_FP16_PROMPTS = (
+    0  # prompts of the official-weights plain-fp16 config (0 = every prompt)
+)
 COMFY_REF = ""  # a Comfy-Org MOSS-Image file the single file's layout must match
 OUT = ""  # output dir: quality.json, images/<runtime>/
 RUNTIMES = ("kohakumoss", "diffusers")
@@ -66,28 +71,28 @@ def load_png(path: Path) -> torch.Tensor:
     return torch.from_numpy(a / 127.5 - 1).permute(2, 0, 1)[None]
 
 
-def psnr(a: torch.Tensor, b: torch.Tensor) -> float:
-    """PSNR in dB of two [-1, 1] images (peak-to-peak 2)."""
-    mse = float(((a.float() - b.float()) / 2).pow(2).mean())
-    return 99.0 if mse == 0 else 10 * math.log10(1.0 / mse)
-
-
 def score(metric, imgs: dict, ref: str, names: list[str]) -> dict:
-    """Per config in `names`: LPIPS / PSNR of each image vs config `ref` (same key)."""
+    """Per config in `names`: LPIPS / SSIM / PSNR of each image vs config `ref` (same
+    key)."""
     out = {}
     for name in names:
         rows = []
         for key, px in imgs[name].items():
             if key not in imgs[ref]:
                 continue
+            r = imgs[ref][key]
             with torch.inference_mode():
-                d = float(metric(px.to(DEVICE), imgs[ref][key].to(DEVICE)).item())
-            rows.append({"key": key, "lpips": d, "psnr": psnr(px, imgs[ref][key])})
+                d = float(metric(px.to(DEVICE), r.to(DEVICE)).item())
+            rows.append(
+                {"key": key, "lpips": d, "ssim": ssim(px, r), "psnr": psnr(px, r)}
+            )
         n = max(len(rows), 1)
         out[name] = {
             "rows": rows,
-            "mean_lpips": sum(r["lpips"] for r in rows) / n,
-            "mean_psnr": sum(r["psnr"] for r in rows) / n,
+            **{
+                f"mean_{k}": sum(x[k] for x in rows) / n
+                for k in ("lpips", "ssim", "psnr")
+            },
         }
     return out
 
@@ -190,8 +195,9 @@ def file_checks(root: Path) -> dict:
 
 
 def lora_scores(metric, imgs: dict) -> dict:
-    """Per adapter i: the fixed fp16 + adapter vs official bf16 + adapter, and the
-    adapter's own effect (official bf16 + adapter vs official bf16)."""
+    """Per adapter i: the fixed fp16 + adapter vs official bf16 + adapter, the adapter's
+    own effect (official bf16 + adapter vs official bf16), and plain fp16 / fixed fp16 /
+    bf16 + adapter vs fp32 + adapter where that exists."""
     out = {}
     for name in sorted(n for n in imgs if n.startswith("bf16_lora")):
         i = name[len("bf16_lora") :]
@@ -202,7 +208,16 @@ def lora_scores(metric, imgs: dict) -> dict:
             "fix_vs_bf16": score(metric, imgs, name, [fix])[fix],
             "effect_vs_bf16": score(metric, imgs, "bf16", [name])[name],
         }
+        ref = f"fp32_lora{i}"
+        if ref in imgs:
+            names = [n for n in (f"official_fp16_lora{i}", fix, name) if n in imgs]
+            out[f"lora{i}"]["vs_fp32"] = score(metric, imgs, ref, names)
     return out
+
+
+def plain_prompts(n: int) -> int:
+    """Prompts of the plain-fp16 config: PLAIN_FP16_PROMPTS, capped at `n` (0 = all)."""
+    return min(PLAIN_FP16_PROMPTS, n) if PLAIN_FP16_PROMPTS else n
 
 
 def max_diff(a: list, b: list) -> float:
@@ -241,7 +256,8 @@ def generate(pipe, embeds: list, empty: torch.Tensor, n: int) -> dict:
 
 def kohakumoss_runtime(root, te_root, study, out) -> tuple[dict, dict, dict]:
     """KohakuMoss MossPipeline on the study's bf16 embeddings; fp32 VAE decode. Each
-    ADAPTERS file is merged into the official bf16 and the fixed fp16 transformer."""
+    ADAPTERS file is merged into the official weights (fp32, bf16, plain fp16) and the
+    fixed fp16 transformer."""
     data = torch.load(study / "latents" / "embeds.pt")
     embeds, empty = data["bf16"][:-1], data["bf16"][-1]
     dev = torch.device(DEVICE)
@@ -250,7 +266,12 @@ def kohakumoss_runtime(root, te_root, study, out) -> tuple[dict, dict, dict]:
         ("bf16", root / "transformer", torch.bfloat16, len(embeds)),
         ("fix_fp16", Path(FIX_FILE), torch.float16, len(embeds)),
         ("fixdir_fp16", Path(FIX_DIR), torch.float16, len(embeds)),
-        ("official_fp16", root / "transformer", torch.float16, 1),
+        (
+            "official_fp16",
+            root / "transformer",
+            torch.float16,
+            plain_prompts(len(embeds)),
+        ),
     )
     latents, adopted = {}, {}
     for name, path, dtype, n in configs:
@@ -269,7 +290,9 @@ def kohakumoss_runtime(root, te_root, study, out) -> tuple[dict, dict, dict]:
         torch.cuda.empty_cache()
     for i, adapter in enumerate(ADAPTERS):
         for base, path, dtype in (
+            ("fp32", root / "transformer", torch.float32),
             ("bf16", root / "transformer", torch.bfloat16),
+            ("official_fp16", root / "transformer", torch.float16),
             ("fix_fp16", Path(FIX_FILE), torch.float16),
             ("fixdir_fp16", Path(FIX_DIR), torch.float16),
         ):
@@ -389,7 +412,12 @@ def diffusers_runtime(root, te_root, prompts, out) -> tuple[dict, dict, dict]:
         ("fp32", root / "transformer", torch.float32, len(prompts)),
         ("bf16", root / "transformer", torch.bfloat16, len(prompts)),
         ("fix_fp16", Path(FIX_DIR), torch.float16, len(prompts)),
-        ("official_fp16", root / "transformer", torch.float16, 1),
+        (
+            "official_fp16",
+            root / "transformer",
+            torch.float16,
+            plain_prompts(len(prompts)),
+        ),
     )
     imgs = {}
     for name, path, dtype, n in configs:

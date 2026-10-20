@@ -1,8 +1,8 @@
 """Model-card assets of the fp16-fix study: charts (svg + webp on an opaque white
-background, readable on light and dark pages) and labelled image triptychs (webp) from
-the outputs of
-fp16_study.py, fp16_quality.py, the ComfyUI runner and scripts/export/fp16_fix.py, plus
-one merged report per variant.
+background, readable on light and dark pages) and labelled image strips (webp; every
+comparison in four columns: fp16 without the fix | fp16-fixed | bf16 | fp32) from the
+outputs of fp16_study.py, fp16_quality.py, the ComfyUI runner and
+scripts/export/fp16_fix.py, plus one merged report per variant.
 
     kogine run scripts/probe/fp16_charts.py --set RUNS=<fp16 runs dir> --set OUT=<staging>
 
@@ -16,17 +16,20 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
+from kohakumoss.probe.card_panels import INK, PAPER, strip
 from kohakumoss_common.knobs import check_script
 
 RUNS = ""  # fp16 runs dir (see the module docstring)
 OUT = ""  # staging dir: images/, reports/
 VARIANTS = ("base", "sft")
-PANEL = 512  # triptych panel size in pixels
 FP16_MAX = 65504.0
-INK = "#333333"  # axes / text on the white chart background
-PAPER = "#ffffff"  # chart background, opaque
+COLUMNS = (  # the compared configs left of the fp32 reference, with their labels
+    ("official_fp16", "fp16, no fix"),
+    ("fix_fp16", "fp16-fixed"),
+    ("bf16", "bf16"),
+)
 COLORS = {
     "orig": "#e4572e",
     "sampled": "#f3a712",
@@ -68,7 +71,9 @@ def save(fig, out: Path, name: str) -> list[str]:
     fig.savefig(d / f"{name}.svg", bbox_inches="tight")
     png = d / f"{name}.tmp.png"
     fig.savefig(png, dpi=200, bbox_inches="tight")
-    Image.open(png).save(d / f"{name}.webp", "WEBP", quality=92, method=6)
+    Image.open(png).convert("RGB").save(
+        d / f"{name}.webp", "WEBP", quality=92, method=6
+    )
     png.unlink()
     plt.close(fig)
     return [f"images/{name}.svg", f"images/{name}.webp"]
@@ -284,43 +289,16 @@ def sweep_chart(variant: str, study: dict, out: Path) -> list[str]:
     return save(fig, out, f"{variant}_c_sweep")
 
 
-def font(size: int):
-    try:
-        return ImageFont.truetype("DejaVuSans.ttf", size)
-    except OSError:
-        return ImageFont.load_default(size)
-
-
-def label(img: Image.Image, text: str) -> Image.Image:
-    img = img.resize((PANEL, PANEL), Image.LANCZOS).convert("RGB")
-    d = ImageDraw.Draw(img)
-    f = font(20)
-    w = d.textlength(text, font=f)
-    d.rectangle((0, 0, w + 16, 32), fill=(0, 0, 0))
-    d.text((8, 5), text, fill=(255, 255, 255), font=f)
-    return img
-
-
-def triptych(paths: list[tuple[Path, str]], dest: Path) -> bool:
-    """Labelled panels side by side as webp; False when a panel is missing."""
-    if not all(p.is_file() for p, _ in paths):
-        return False
-    panels = [label(Image.open(p), t) for p, t in paths]
-    out = Image.new("RGB", (PANEL * len(panels), PANEL))
-    for i, p in enumerate(panels):
-        out.paste(p, (i * PANEL, 0))
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    out.save(dest, "WEBP", quality=88, method=6)
-    return True
-
-
-def lpips_of(q: dict, runtime: str, name: str, key: str) -> float | None:
-    rows = q.get(runtime, {}).get("vs_fp32", {}).get(name, {}).get("rows", [])
-    return next((r["lpips"] for r in rows if r["key"] == key), None)
+def lpips_tag(scores: dict, name: str, key: str) -> str:
+    """ "  LPIPS* x" of image `key` of config `name` in a score dict, "" when absent."""
+    rows = scores.get(name, {}).get("rows", [])
+    v = next((r["lpips"] for r in rows if r["key"] == key), None)
+    return "" if v is None else f"  LPIPS* {v:.3f}"
 
 
 def gallery(variant: str, quality: dict, runs: Path, out: Path) -> list[dict]:
-    """fp16-fixed | official bf16 | fp32 per runtime, prompt and seed; LoRA pairs."""
+    """COLUMNS | fp32 per runtime, prompt and seed; the same four with each adapter
+    (first seed), fp32 + adapter as the reference."""
     made = []
     dirs = {
         "kohakumoss": runs / "quality" / variant / "images" / "kohakumoss",
@@ -328,55 +306,40 @@ def gallery(variant: str, quality: dict, runs: Path, out: Path) -> list[dict]:
         "comfyui": runs / "comfy" / variant,
     }
     for rt, d in dirs.items():
+        q = quality.get(rt, {})
         for p in range(len(quality["prompts"])):
             for s in quality["seeds"]:
                 key = f"p{p}_s{s}"
-                lf = lpips_of(quality, rt, "fix_fp16", key)
-                lb = lpips_of(quality, rt, "bf16", key)
-                tf = "fp16-fixed" + (f"  LPIPS* {lf:.3f}" if lf is not None else "")
-                tb = "official bf16" + (f"  LPIPS* {lb:.3f}" if lb is not None else "")
+                panels = [
+                    (
+                        d / f"{name}_{key}.png",
+                        text + lpips_tag(q.get("vs_fp32", {}), name, key),
+                    )
+                    for name, text in COLUMNS
+                ]
+                panels.append((d / f"fp32_{key}.png", "fp32 (* = LPIPS to it)"))
                 dest = out / "images" / "gallery" / f"{variant}_{rt}_{key}.webp"
-                ok = triptych(
-                    [
-                        (d / f"fix_fp16_{key}.png", tf),
-                        (d / f"bf16_{key}.png", tb),
-                        (d / f"fp32_{key}.png", "fp32 reference (* = LPIPS to it)"),
-                    ],
-                    dest,
-                )
-                if ok:
+                if strip(panels, dest):
                     made.append(
-                        {
-                            "runtime": rt,
-                            "key": key,
-                            "file": str(dest.relative_to(out)),
-                            "lpips_fix": lf,
-                            "lpips_bf16": lb,
-                        }
+                        {"runtime": rt, "key": key, "file": str(dest.relative_to(out))}
                     )
         for i in range(4):
             key = f"p0_s{quality['seeds'][0]}"
-            if not (d / f"bf16_lora{i}_{key}.png").is_file():
+            if not (d / f"fp32_lora{i}_{key}.png").is_file():
                 break
-            pair = quality.get(rt, {}).get("lora", {}).get(f"lora{i}", {})
-            pair = {
-                r["key"]: r["lpips"]
-                for r in pair.get("fix_vs_bf16", {}).get("rows", [])
-            }
+            scores = q.get("lora", {}).get(f"lora{i}", {}).get("vs_fp32", {})
             for p in range(len(quality["prompts"])):
                 key = f"p{p}_s{quality['seeds'][0]}"
+                panels = [
+                    (
+                        d / f"{name}_lora{i}_{key}.png",
+                        f"{text} + LoRA" + lpips_tag(scores, f"{name}_lora{i}", key),
+                    )
+                    for name, text in COLUMNS
+                ]
+                panels.append((d / f"fp32_lora{i}_{key}.png", "fp32 + LoRA (*)"))
                 dest = out / "images" / "gallery" / f"{variant}_{rt}_lora{i}_{key}.webp"
-                tl = "fp16-fixed + LoRA"
-                if key in pair:
-                    tl += f"  LPIPS* {pair[key]:.3f}"
-                if triptych(
-                    [
-                        (d / f"fix_fp16_lora{i}_{key}.png", tl),
-                        (d / f"bf16_lora{i}_{key}.png", "official bf16 + LoRA (*)"),
-                        (d / f"bf16_{key}.png", "official bf16, no LoRA"),
-                    ],
-                    dest,
-                ):
+                if strip(panels, dest):
                     made.append(
                         {
                             "runtime": rt,
@@ -389,7 +352,7 @@ def gallery(variant: str, quality: dict, runs: Path, out: Path) -> list[dict]:
 
 
 def failure(variant: str, runs: Path, out: Path) -> list[str]:
-    """Plain fp16 on the official weights next to bf16 and the fixed fp16, prompt 0."""
+    """The study's plain fp16 / fixed fp16 / bf16 / fp32 on prompts 0 and 1."""
     d = runs / "study" / variant / "images"
     c = json.loads((runs / "study" / variant / "report.json").read_text())["probe"][
         "chosen_c"
@@ -397,11 +360,12 @@ def failure(variant: str, runs: Path, out: Path) -> list[str]:
     made = []
     for p in range(2):
         dest = out / "images" / f"{variant}_plain_fp16_p{p}.webp"
-        if triptych(
+        if strip(
             [
-                (d / f"official_fp16_p{p}.png", "official weights, fp16"),
-                (d / f"official_bf16_p{p}.png", "official weights, bf16"),
-                (d / f"fix_c{round(1 / c)}_p{p}.png", "fp16-fixed, fp16"),
+                (d / f"official_fp16_p{p}.png", "fp16, no fix"),
+                (d / f"fix_c{round(1 / c)}_p{p}.png", "fp16-fixed"),
+                (d / f"official_bf16_p{p}.png", "bf16"),
+                (d / f"fp32_p{p}.png", "fp32"),
             ],
             dest,
         ):
@@ -423,7 +387,7 @@ def sweep_strip(variant: str, study: dict, runs: Path, out: Path) -> list[str]:
     panels.append((d / "fp32_p0.png", "fp32 reference"))
     for i in range(0, len(panels), 4):
         dest = out / "images" / f"{variant}_c_sweep_p0_{i // 4}.webp"
-        if triptych(panels[i : i + 4], dest):
+        if strip(panels[i : i + 4], dest):
             made.append(str(dest.relative_to(out)))
     return made
 
@@ -440,8 +404,15 @@ def mean(xs: list[float]) -> float:
 
 
 def score_row(name: str, v: dict) -> list:
-    """[name, images, mean LPIPS, mean PSNR] of one fp16_quality.py score entry."""
-    return [name, len(v["rows"]), f"{v['mean_lpips']:.4f}", f"{v['mean_psnr']:.2f}"]
+    """[name, images, mean LPIPS, mean SSIM, mean PSNR] of one fp16_quality.py score entry."""
+    ssim = f"{v['mean_ssim']:.4f}" if "mean_ssim" in v else ""
+    return [
+        name,
+        len(v["rows"]),
+        f"{v['mean_lpips']:.4f}",
+        ssim,
+        f"{v['mean_psnr']:.2f}",
+    ]
 
 
 def tables(variant: str, study: dict, quality: dict) -> str:
@@ -528,7 +499,12 @@ def tables(variant: str, study: dict, quality: dict) -> str:
             for i, v in q.get("lora", {}).items()
             for k in ("fix_vs_bf16", "effect_vs_bf16")
         ]
-        out += md_table(["config", "n", "LPIPS", "PSNR"], rows)
+        rows += [
+            score_row(f"{i} {name} vs fp32 + adapter", s)
+            for i, v in q.get("lora", {}).items()
+            for name, s in v.get("vs_fp32", {}).items()
+        ]
+        out += md_table(["config", "n", "LPIPS", "SSIM", "PSNR"], rows)
     te, vae = study["text_encoder"]["cos"], study["vae"]
     wf = study["whole_fp16"]["vs_fp32"]
     out += ["## Whole pipeline in fp16", ""]
