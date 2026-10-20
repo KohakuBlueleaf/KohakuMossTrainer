@@ -448,7 +448,12 @@ jobs on one `HostWorker` thread. `HostAccumulator` copies each device gradient i
 next buffer of a ring of `STAGING_SLOTS` (4) pinned staging buffers shared by every
 parameter, each grown to the largest gradient it took, and the worker adds it into the
 fp32 sum; a buffer is reused once its add has landed, so backward waits only when the
-worker is four gradients behind. Its host staging is 4 x the largest gradient in the
+worker is four gradients behind. A 16-bit gradient goes into its fp32 sum through
+`widening_add`, which converts it into a 4M-element fp32 scratch one chunk at a time
+and adds each chunk. On the 128-core host of the 5090 runs, `dst.add_(src)` with a
+bf16 `src` and an fp32 `dst` runs at about 14 GB/s, on torch's mixed-dtype path. The
+chunked copy-then-add runs at about 140 GB/s, the speed of an fp32 add, and gives
+bitwise the same sum. Its host staging is 4 x the largest gradient in the
 gradient's dtype, independent of the parameter count: under `swap` with `GRAD_ACC > 1`
 the host holds the fp32 sums (4 B per trainable block parameter) and nothing per
 parameter beyond them. The thread holds only its queue, never its owner. It

@@ -13,6 +13,7 @@ from kohakumoss.offload.worker import HostWorker
 
 STAGING_SLOTS = 4
 RING_WAIT = "ring_wait_s"
+WIDEN_CHUNK = 1 << 22  # elements per fp32 chunk of a widening add
 
 
 class _Staging:
@@ -23,6 +24,19 @@ class _Staging:
         self.buffer = torch.empty(0, dtype=torch.uint8)
         self.done = threading.Event()
         self.done.set()
+
+
+def widening_add(dst: Tensor, src: Tensor, scratch: Tensor) -> None:
+    """`dst += src` for a 16-bit `src` and an fp32 `dst` (same shape), through
+    `scratch` (fp32, WIDEN_CHUNK elements) one chunk at a time; bitwise the same sum as
+    `dst.add_(src)`. See docs/internals/offload.md#host-workers."""
+    flat_dst, flat_src = dst.view(-1), src.reshape(-1)
+    n = flat_dst.numel()
+    for start in range(0, n, WIDEN_CHUNK):
+        stop = min(start + WIDEN_CHUNK, n)
+        part = scratch[: stop - start]
+        part.copy_(flat_src[start:stop])
+        flat_dst[start:stop].add_(part)
 
 
 def _accumulate(event, write, src: Tensor, dst: Tensor, done: threading.Event) -> None:
@@ -52,6 +66,7 @@ class HostAccumulator:
         self.next = 0
         self.last: dict[int, threading.Event] = {}
         self.bytes_d2h = 0
+        self.scratch = torch.empty(WIDEN_CHUNK, dtype=torch.float32)
         self.worker = HostWorker("kohakumoss-grad-accumulate")
 
     def close(self) -> None:
@@ -92,9 +107,16 @@ class HostAccumulator:
         ev = dm.Event()
         ev.record(stream)
         self.bytes_d2h += grad.nbytes
-        write = Tensor.copy_ if first else Tensor.add_
+        write = Tensor.copy_ if first else self._adder(grad.dtype, dst.dtype)
         self.last[key] = done
         self.worker.put(partial(_accumulate, ev, write, buf, dst, done))
+
+    def _adder(self, src: torch.dtype, dst: torch.dtype):
+        """`dst += src` for these dtypes: a widening add through the worker's fp32
+        scratch for a 16-bit gradient into an fp32 sum, else `Tensor.add_`."""
+        if src == dst or dst != torch.float32:
+            return Tensor.add_
+        return partial(widening_add, scratch=self.scratch)
 
     def wait(self, key: int) -> None:
         """Every queued add for `key` has landed (the worker runs adds in order)."""
