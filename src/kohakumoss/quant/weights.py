@@ -6,12 +6,15 @@ fp8 (e4m3fn): q = fp8(w / s), s = max|w_row| / 448.
 R = blockdiag(H_g) over K, so y = (x R) (q * s)^T and W = (q * s) R.
 `linear` uses a registered `quant_linear` (`quant_linear_rotated`) kernel when one
 serves the device, else the eager op (dequantize + matmul, saving only `q` / `scale`
-for backward); the choice is made once per weight, not per call.
+for backward); on the host the eager composition runs as plain ops over the dense
+weight `dense` (built per layer per pass, `build_dense`) or one dequantized per call;
+the choice is made once per weight, not per call.
 """
 
 from functools import partial
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from kohakumoss_kernels import registry
@@ -64,6 +67,7 @@ class QuantWeight(nn.Module):
         self.register_buffer("q", q)
         self.register_buffer("scale", scale.float())
         self.shape = q.shape
+        self.dense: Tensor | None = None
         self._linear = _eager_for(self.rotation)
 
     @classmethod
@@ -84,9 +88,13 @@ class QuantWeight(nn.Module):
     def bind(
         self, dtype: torch.dtype, device: torch.device | str | None = None
     ) -> None:
-        """Bind `linear` for (device, dtype) once: the `quant_linear` (rotated:
-        `quant_linear_rotated`) kernel when one serves, else the eager op."""
+        """Bind `linear` for (device, dtype) once: on the host the plain-op composition
+        (`_host_linear`, its GEMMs visible to `host_gemm`), else the `quant_linear`
+        (rotated: `quant_linear_rotated`) kernel when one serves, else the eager op."""
         device = self.q.device if device is None else torch.device(device)
+        if device.type == "cpu":
+            self._linear = _host_linear
+            return
         name = "quant_linear_rotated" if self.rotation else "quant_linear"
         query = {"fmt": self.fmt}
         if self.rotation:
@@ -103,6 +111,14 @@ class QuantWeight(nn.Module):
         """x W^T (+ bias) through the bound implementation."""
         return self._linear(self, x, bias)
 
+    def build_dense(self, dtype: torch.dtype) -> None:
+        """Hold `dense`, the stored weight (rotated as stored) dequantized to `dtype`,
+        for the host linear's calls until `drop_dense`."""
+        self.dense = dequantize(self.q, self.scale, dtype)
+
+    def drop_dense(self) -> None:
+        self.dense = None
+
     def nbytes(self) -> int:
         return self.q.nbytes + self.scale.numel() * 4
 
@@ -117,6 +133,44 @@ def _dequant_linear(qw: QuantWeight, x: Tensor, bias: Tensor | None) -> Tensor:
 
 def _rotated_eager(qw: QuantWeight, x: Tensor, bias: Tensor | None) -> Tensor:
     return quant_linear_rotated_eager(x, qw.q, qw.scale, bias, qw.fmt, qw.rotation)
+
+
+def _rotate(t: Tensor, group: int) -> Tensor:
+    return group_hadamard_eager(t, group) if group else t
+
+
+class _HostLinear(torch.autograd.Function):
+    """The eager composition as plain ops, which a dispatch mode sees (x rotated, then
+    a dense linear over `dense` when it is in x's dtype, else the weight dequantized
+    for this call), saving only `q` / `scale` for the input gradient."""
+
+    @staticmethod
+    def forward(ctx, x, q, scale, bias, group: int, dense):
+        w = dense
+        if w is None or w.dtype != x.dtype:
+            w = dequantize(q, scale, x.dtype)
+        b = None if bias is None else bias.to(x.dtype)
+        ctx.save_for_backward(q, scale)
+        ctx.group = group
+        ctx.bias_dtype = None if bias is None else bias.dtype
+        return F.linear(_rotate(x, group), w, b)
+
+    @staticmethod
+    def backward(ctx, grad):
+        q, scale = ctx.saved_tensors
+        gx = gb = None
+        if ctx.needs_input_grad[0]:
+            gx = _rotate(grad @ dequantize(q, scale, grad.dtype), ctx.group)
+        if ctx.bias_dtype is not None and ctx.needs_input_grad[3]:
+            gb = grad.float().sum(0).to(ctx.bias_dtype)
+        return gx, None, None, gb, None, None
+
+
+def _host_linear(qw: QuantWeight, x: Tensor, bias: Tensor | None) -> Tensor:
+    lead = x.shape[:-1]
+    x2 = x.reshape(-1, x.shape[-1])
+    y = _HostLinear.apply(x2, qw.q, qw.scale, bias, qw.rotation, qw.dense)
+    return y.reshape(*lead, qw.q.shape[0])
 
 
 def _kernel_linear(kernel, qw: QuantWeight, x: Tensor, bias: Tensor | None) -> Tensor:

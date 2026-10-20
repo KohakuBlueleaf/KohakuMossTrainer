@@ -36,6 +36,7 @@ from kohakumoss.quant.embedding import QuantEmbedding, dense_lookup
 from kohakumoss.quant.source import SourceWeights
 from kohakumoss.quant.text import quantize_text_linears
 from kohakumoss.quant.w4a8 import W4A8Weight
+from kohakumoss.quant.weights import QuantWeight
 from kohakumoss.types.plans import TextEncoderPlan
 from kohakumoss_common.calls import nothing
 from kohakumoss_kernels.hardware.host_gemm import host_gemm
@@ -110,12 +111,37 @@ class TextPlacement:
         self.deferred = {}
 
 
+class _HostLayers:
+    """A host pass's per-layer enter / leave: the layer's tensors into the cast ring
+    (`streamer`, None when none is needed), then the dense weights of its quantized
+    bases built in `dtype` (`QuantWeight.build_dense`), dropped on leave."""
+
+    def __init__(self, streamer, bases: list[list[QuantWeight]], dtype: torch.dtype):
+        self.streamer = streamer
+        self.bases = bases
+        self.dtype = dtype
+
+    def enter(self, i: int) -> None:
+        if self.streamer is not None:
+            self.streamer.enter(i)
+        for base in self.bases[i]:
+            base.build_dense(self.dtype)
+
+    def leave(self, i: int) -> None:
+        for base in self.bases[i]:
+            base.drop_dense()
+        if self.streamer is not None:
+            self.streamer.leave(i)
+
+
 class HostPlacement(TextPlacement):
     """Everything on the host; the encoder runs there, each pass under `host_gemm` of
     its compute dtype. A tensor already in its compute dtype is used as it is; decoder
     layers whose host form holds another dtype (file pages of a bf16 checkpoint run in
     fp16) are cast per pass through a host ring of `slots` copies per layer signature,
-    the small rest once; the embedding table stays as loaded (rows cast at lookup)."""
+    the small rest once; a decoder layer's quantized bases get their dense weights for
+    the layer's turn in the pass (`_HostLayers`); the embedding table stays as loaded
+    (rows cast at lookup)."""
 
     name = "cpu"
 
@@ -138,14 +164,21 @@ class HostPlacement(TextPlacement):
                 host="file",
                 dtypes=self.dtypes,
             )
-            n = len(self.layers)
-            self.enter = [partial(self.streamer.enter, i) for i in range(n)]
-            self.leave = [partial(self.streamer.leave, i) for i in range(n)]
         for t in module_tensors(self.model).values():
             if id(t) in self.emb_ids or (cast and id(t) in inside):
                 continue
             self.to_device(t)
-        self.gemm = host_gemm(self.model.norm.weight.dtype)
+        dtype = self.model.norm.weight.dtype
+        bases = [
+            [m for m in layer.modules() if isinstance(m, QuantWeight)]
+            for layer in self.layers
+        ]
+        if cast or any(bases):
+            turns = _HostLayers(self.streamer, bases, dtype)
+            n = len(self.layers)
+            self.enter = [partial(turns.enter, i) for i in range(n)]
+            self.leave = [partial(turns.leave, i) for i in range(n)]
+        self.gemm = host_gemm(dtype)
 
     def embed(self, ids: Tensor) -> Tensor:
         return self.lookup(ids, self.device)

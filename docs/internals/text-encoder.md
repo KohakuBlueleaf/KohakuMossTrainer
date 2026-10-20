@@ -82,7 +82,9 @@ reach the GEMM, and the product of two bf16 (or two fp16) values is exact in fp3
 this is the GEMM the numerics rules ask for, 16-bit inputs with fp32 accumulation, at
 the fp32 rate; weights stay 16-bit in storage and are upcast per call. A host with
 native 16-bit GEMMs binds nothing. `tests/kernels/hardware/test_host_gemm.py` witnesses
-the form on integer inputs where it is exact.
+the form on integer inputs where it is exact. The mode sees only the ops dispatched in
+the pass itself, not those inside a custom op's kernel, so the host binds every
+quantized linear to plain ops.
 
 Peak private host memory (anon + shmem of the process) of load + encode + release,
 Qwen3.5-9B fp16 from the bf16 checkpoint, RTX 2080 Ti:
@@ -235,9 +237,16 @@ streams onto it, the tokenizer is the packaged one.
   records (`text_file_format`): `compute` for the bf16 file, `int8` (int8 ConvRot
   linears) or `w4a8`. Its quantized linears attach as `QuantLinear` over the stored
   base, its int8 embedding as `QuantEmbedding`; nothing is quantized at load. On the
-  host (memory `cpu`) the weight-only formats run as stored too (the eager
-  `quant_linear` / W4A8 decode), so an offline host cache pass writes the keys a GPU
-  run reads; only a stored fp8-compute format becomes `compute` there.
+  host (memory `cpu`) the weight-only formats run as stored too, so an offline host
+  cache pass writes the keys a GPU run reads; only a stored fp8-compute format becomes
+  `compute` there. A host `QuantWeight` binds the eager composition as plain ops
+  (`_host_linear`: the input rotated, then a dense linear), so its GEMMs reach
+  [Host GEMM](#host-gemm) on every core; `HostPlacement` builds a decoder layer's
+  dense 16-bit weights (dequantized, still rotated) once for the layer's turn in the
+  pass and drops them after it. The ComfyUI int8 ConvRot file on an EPYC 7542 host (32
+  threads, bf16): 3.83 s per caption in a 65-caption `cache_text` pass (3.3 GiB
+  private), 5.6 s per caption at 4 captions a pass (the per-pass dequantize weighs more
+  in a small pass).
 - Any other precision dequantizes the stored layers into the dense model (one INFO
   line) and quantizes from there. Under `offload` / `ring` the host keeps each
   dequantized layer's stored codes and scales (file pages) and the copy to the device
