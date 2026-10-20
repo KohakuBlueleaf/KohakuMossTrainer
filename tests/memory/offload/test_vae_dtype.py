@@ -32,7 +32,8 @@ def _has_bf16(monkeypatch, value: bool):
 
 def test_auto_dtype(monkeypatch):
     monkeypatch.setattr(vae_mod, "FP16_PROBLEM", UNSAFE)
-    assert resolve_vae_dtype("auto", CPU) == torch.float32
+    assert resolve_vae_dtype("auto", CPU) == torch.bfloat16
+    assert resolve_vae_dtype("fp32", CPU) == torch.float32
     _has_bf16(monkeypatch, True)
     assert resolve_vae_dtype("auto", "cuda:0") == torch.bfloat16
     _has_bf16(monkeypatch, False)
@@ -99,8 +100,8 @@ def _captured_training_dtype(monkeypatch, name: str) -> torch.dtype:
 
 def test_training_vae_gets_the_knob_dtype(monkeypatch):
     def check():
-        assert _captured_training_dtype(monkeypatch, "bf16") == torch.bfloat16
-        assert _captured_training_dtype(monkeypatch, "auto") == torch.float32
+        assert _captured_training_dtype(monkeypatch, "fp32") == torch.float32
+        assert _captured_training_dtype(monkeypatch, "auto") == torch.bfloat16
 
     check()
     monkeypatch.setattr(model_build, "resolve_vae_dtype", lambda n, d: torch.float32)
@@ -123,7 +124,7 @@ def test_cache_encoder_gets_the_dtype_and_placement(monkeypatch):
     encode = vae_mod.vae_encoder("vae", CPU, "bf16")
     assert seen["dtype"] == torch.bfloat16 and encode.encoder_spec == "bf16"
     assert seen["spec"]["memory"] == "auto"
-    vae_mod.vae_encoder("vae", CPU, plan={"memory": "offload", "tile": True})
+    vae_mod.vae_encoder("vae", CPU, "fp32", plan={"memory": "offload", "tile": True})
     assert seen["dtype"] == torch.float32
     assert seen["spec"] == {"memory": "offload", "batch": 1, "tile": True}
 

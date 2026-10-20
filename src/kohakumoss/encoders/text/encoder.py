@@ -85,9 +85,9 @@ def default_auto_memory(
 ) -> str:
     """The fastest placement whose footprint fits the device's free memory (minus
     `reserve` bytes kept for the caller's own peak) once the load adds `extra_layers`
-    bytes to the decoder layers; the host has no limit."""
+    bytes to the decoder layers; 'cpu' on the host."""
     if device.type == "cpu":
-        return "resident"
+        return "cpu"
     sizes = text_sizes(text, plan.stream_resident, extra_layers)
     budget = int(device_budget(device))
     tokens = plan.max_tokens or 16384

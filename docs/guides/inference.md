@@ -213,9 +213,10 @@ sample):
 - A placement set by the user is used as given. The per-phase memory of a call is in
   [sampling-memory.md](../internals/sampling-memory.md).
 - **Text device**: `text_device="cpu"` (`TEXT_DEVICE = "cpu"`) runs the text encoder on
-  the CPU and moves only the embeddings to the compute device. The 9B encoder then needs
-  ~18 GB of host RAM in bf16 and no VRAM; encoding speed is the CPU's. Training uses the
-  CPU only for the offline cache pass.
+  the CPU and moves only the embeddings to the compute device. The 9B encoder then reads
+  its bf16 weights from their file pages (a stored int8 / W4A8 file runs as stored) and
+  needs no VRAM; encoding speed is the CPU's. Training can encode on the CPU too, with any
+  `TEXT_CACHE`.
 
 ### VAE placement
 

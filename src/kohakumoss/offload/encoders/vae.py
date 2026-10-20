@@ -18,6 +18,7 @@ from kohakumoss.offload.weights.layers import (
     tensor_ids,
 )
 from kohakumoss_common.calls import nothing
+from kohakumoss_kernels.hardware.host_gemm import host_gemm
 
 MEMORY = ("resident", "offload", "ring", "cpu", "auto")
 MEMORY_ALIASES = {"stream": "ring"}
@@ -66,9 +67,8 @@ def vae_plan(spec: dict | VaePlan | None = None) -> VaePlan:
     return replace(plan, memory=MEMORY_ALIASES.get(plan.memory, plan.memory))
 
 
-def plan_problems(plan: VaePlan, training: bool = False, latent_cache: str = "off"):
-    """Every problem with `plan`; in training the VAE runs on the host only when the
-    latent cache is offline (sample decodes, the offline cache pass)."""
+def plan_problems(plan: VaePlan) -> list[str]:
+    """Every problem with `plan`."""
     p = []
     if plan.memory not in MEMORY:
         p.append(f"VAE memory={plan.memory!r} not in {MEMORY}")
@@ -76,12 +76,6 @@ def plan_problems(plan: VaePlan, training: bool = False, latent_cache: str = "of
         p.append("VAE batch >= 1 and ahead >= 1")
     if plan.compile not in COMPILE:
         p.append(f"VAE compile={plan.compile!r} not in {COMPILE}")
-    if training and plan.memory == "cpu" and latent_cache != "offline":
-        p.append(
-            "the VAE runs on the CPU only for the offline cache pass; with "
-            f"LATENT_CACHE={latent_cache!r} it encodes during training on the GPU: set "
-            "VAE_ENCODE memory to 'offload' / 'ring' / 'resident' (or 'auto')"
-        )
     return p
 
 
@@ -134,6 +128,23 @@ class _Resident:
 
     def end(self) -> None:
         return None
+
+
+class _Host(_Resident):
+    """Everything on the host; encode and decode run there, each pass under
+    `host_gemm` of the VAE's dtype."""
+
+    name = "cpu"
+
+    def __init__(self, inner: nn.Module, device: torch.device):
+        super().__init__(inner, device)
+        self.gemm = host_gemm(next(inner.parameters()).dtype)
+
+    def begin(self) -> None:
+        self.gemm.__enter__()
+
+    def end(self) -> None:
+        self.gemm.__exit__(None, None, None)
 
 
 class _Offload:
@@ -192,7 +203,7 @@ PLACEMENTS = {
     "resident": _Resident,
     "offload": _Offload,
     "ring": _Ring,
-    "cpu": _Resident,
+    "cpu": _Host,
 }
 
 
@@ -272,7 +283,7 @@ def place_vae(
 ) -> PlacedVae:
     """`vae` (a FluxVae, loaded on the host) placed by its plan; `memory='auto'` picks
     the fastest placement that fits the device's free memory next to `reserve` bytes
-    (`choose_vae_plan`: tiled passes when nothing fits untiled)."""
+    (`choose_vae_plan`: tiled passes when nothing fits untiled), 'cpu' on the host."""
     plan = vae_plan(spec)
     device = torch.device(device)
     if plan.memory == "auto":
@@ -280,5 +291,6 @@ def place_vae(
             free = free_bytes(with_index(device))
             plan = choose_vae_plan(plan, vae_bytes(vae.vae), free, reserve, pixels)
         else:
-            plan = replace(plan, memory="resident")
+            on_host = device.type == "cpu"
+            plan = replace(plan, memory="cpu" if on_host else "resident")
     return PlacedVae(vae, plan, device)

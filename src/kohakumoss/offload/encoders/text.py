@@ -38,6 +38,7 @@ from kohakumoss.quant.text import quantize_text_linears
 from kohakumoss.quant.w4a8 import W4A8Weight
 from kohakumoss.types.plans import TextEncoderPlan
 from kohakumoss_common.calls import nothing
+from kohakumoss_kernels.hardware.host_gemm import host_gemm
 
 
 class TextPlacement:
@@ -111,12 +112,22 @@ class TextPlacement:
 
 class HostPlacement(TextPlacement):
     """Everything on the host; the encoder runs there (a tensor already on the host in
-    its compute dtype is used as it is)."""
+    its compute dtype is used as it is), each pass under `host_gemm` of that dtype."""
 
     name = "cpu"
 
     def __init__(self, model, layers, embedding, device="cpu", pinned=False, **kw):
         super().__init__(model, layers, embedding, "cpu", False, **kw)
+
+    def place(self) -> None:
+        super().place()
+        self.gemm = host_gemm(self.model.norm.weight.dtype)
+
+    def begin(self) -> None:
+        self.gemm.__enter__()
+
+    def end(self) -> None:
+        self.gemm.__exit__(None, None, None)
 
 
 class OffloadPlacement(TextPlacement):

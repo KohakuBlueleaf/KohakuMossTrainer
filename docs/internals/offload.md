@@ -594,7 +594,9 @@ the latents until the batcher takes them, so an offloaded VAE moves once per `ah
 batches and is released before the DiT step. `VaeEncodeStats` logs `vae_time`,
 `vae_share`, `vae_images` and `vae_h2d_gb` per step; the VRAM timeline marks the VAE
 pass (`vram_vae_peak`, `vram_vae_after`) apart from the DiT step. The `8g` and `12g`
-VRAM layers offload the VAE, `auto` picks.
+VRAM layers offload the VAE, `auto` picks. `memory="cpu"` runs encode and decode on the
+host with every `LATENT_CACHE` mode; online, one INFO line gives the first pass's
+seconds and the cost per step.
 
 ### VAE dtype, compile and batching
 
@@ -602,8 +604,10 @@ VRAM layers offload the VAE, `auto` picks.
 `kohakumoss.encoders.vae.resolve_vae_dtype`) selects the VAE's weight and compute dtype.
 It is `auto` | `bf16` | `fp16` | `fp32`.
 
-- `auto` is bf16 where the card has bf16 and fp16 elsewhere (V100, 2080 Ti); on the CPU it
-  is fp32.
+- `auto` is bf16 where the card has bf16 and fp16 elsewhere (V100, 2080 Ti); on the
+  host (`memory="cpu"`) it is bf16, whose GEMMs run through `HostGemm` where the host
+  has no native bf16 ([text-encoder.md](text-encoder.md#host-gemm)); an explicit
+  `fp32` stays fp32.
 - One dtype covers every path: the online latent encode and the sample decode in
   training (both `PlacedVae`), the offline cache pass (`vae_encoder`) and the pipeline
   decode (`MossPipeline.from_pretrained(vae_dtype=...)`). Latents always come out in

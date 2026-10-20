@@ -8,7 +8,7 @@ from pathlib import Path
 from kohakumoss.diffusion.objective import WEIGHTINGS, TokenNormalizer
 from kohakumoss.diffusion.timestep import TIMESTEPS
 from kohakumoss.inference.pipeline import MossPipeline
-from kohakumoss.logging.log import interactive, progress_enabled
+from kohakumoss.logging.log import get_logger, interactive, progress_enabled
 from kohakumoss.memory.device_use import NoDeviceUse
 from kohakumoss.memory.release import release_callbacks
 from kohakumoss.memory.timeline import NoTimeline
@@ -63,6 +63,8 @@ from kohakumoss_common.registry import build
 from kohakumoss_data import CacheWriter, DataConfig
 from kohakumoss_kernels.dist import initialized
 from kohakumoss_kernels.tuning.window import tuning_window
+
+log = get_logger(__name__)
 
 
 def build_step(
@@ -147,9 +149,13 @@ def build_ahead(k: dict, built, loader):
     per TEXT_ENCODE['ahead'] host batches), else None."""
     if k["TEXT_CACHE"] == "offline" or built.text_encoder is None:
         return None
-    n = getattr(built.text_encoder, "plan", None)
-    n = 1 if n is None else n.ahead
-    return TextAhead(loader, built.text_encoder.encode, n)
+    plan = getattr(built.text_encoder, "plan", None)
+    n = 1 if plan is None else plan.ahead
+    on_host = plan is not None and plan.memory == "cpu"
+    report = (
+        partial(host_pass_line, "text encoder", "prompts", n) if on_host else nothing
+    )
+    return TextAhead(loader, built.text_encoder.encode, n, report)
 
 
 def build_latent_ahead(k: dict, built, loader):
@@ -157,7 +163,19 @@ def build_latent_ahead(k: dict, built, loader):
     (one VAE pass per VAE_ENCODE['ahead'] host batches), else None."""
     if k["LATENT_CACHE"] == "offline" or not hasattr(built.vae, "encode_batches"):
         return None
-    return LatentAhead(loader, built.vae, built.vae.plan.ahead)
+    n = built.vae.plan.ahead
+    on_host = built.vae.plan.memory == "cpu"
+    report = partial(host_pass_line, "VAE", "images", n) if on_host else nothing
+    return LatentAhead(loader, built.vae, n, report)
+
+
+def host_pass_line(what: str, unit: str, n: int, seconds: float, count: int) -> None:
+    """The one INFO line of an encoder that encodes online on the host: what its first
+    encode-ahead pass cost."""
+    log.info(
+        f"{what} on the host encodes online: the first pass ({count} {unit}, {n} host "
+        f"batches) took {seconds:.1f} s, about {seconds / n:.1f} s per step"
+    )
 
 
 def build_writer(k: dict, loader, writes: bool, rank: int = 0):

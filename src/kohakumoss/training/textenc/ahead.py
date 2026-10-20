@@ -3,28 +3,38 @@ misses of the next `n` host batches, so streamed / offloaded weights cross the b
 per `n` batches. The wrapper is the loader the driver and checkpoints see: its state
 is the position of the first batch not yet handed out."""
 
+import time
 from collections import deque
 
 from torch import Tensor
 
+from kohakumoss_common.calls import nothing
+
 
 class TextAhead:
     """Iterates `loader`; every `n` batches it encodes the prompts of the batches that
-    miss the text cache in one `encode` call and keeps the results until `take(hb)`."""
+    miss the text cache in one `encode` call and keeps the results until `take(hb)`.
+    `report(seconds, prompts)` is called once, after the first pass that encodes."""
 
-    def __init__(self, loader, encode, n: int):
+    def __init__(self, loader, encode, n: int, report=nothing):
         self.loader = loader
         self.dataset = getattr(loader, "dataset", None)
         self.encode = encode
         self.n = max(int(n), 1)
         self.buf: deque = deque()
         self.ready: dict[int, list[Tensor]] = {}
+        self.report = report
 
     def _fill(self, it) -> None:
         batches = [next(it) for _ in range(self.n)]
         misses = [hb for hb in batches if hb.text is None and hb.prompts]
         prompts = [p for hb in misses for p in hb.prompts]
-        encoded = self.encode(prompts) if prompts else []
+        encoded = []
+        if prompts:
+            start = time.perf_counter()
+            encoded = self.encode(prompts)
+            self.report(time.perf_counter() - start, len(prompts))
+            self.report = nothing
         at = 0
         for hb in misses:
             self.ready[id(hb)] = encoded[at : at + len(hb.prompts)]

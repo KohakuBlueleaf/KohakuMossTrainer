@@ -1,9 +1,13 @@
-"""VAE placement, model-free: the auto choice and the training knob check. The
+"""VAE placement, model-free: the auto choice, the training knob check (every placement
+with every latent cache mode) and each
+placement class's name (the text encoder's too). The
 placements themselves (same latents, no weight on the device between passes, encode
 ahead) run on the real VAE in tests/integration/test_vae_real.py."""
 
 import pytest
 
+from kohakumoss.offload.encoders.text import PLACEMENTS as TEXT_PLACEMENTS
+from kohakumoss.offload.encoders.vae import PLACEMENTS as VAE_PLACEMENTS
 from kohakumoss.offload.encoders.vae import choose_vae_memory
 from kohakumoss.training.checks.encoders import vae_problems
 from tests._util.negative import must_fail
@@ -29,20 +33,25 @@ def _assert_choice(weights, budget, reserve, want):
 
 
 def test_vae_knob_problems():
-    assert (
-        vae_problems({"VAE_ENCODE": {"memory": "offload"}, "LATENT_CACHE": "online"})
-        == []
-    )
-    assert (
-        vae_problems({"VAE_ENCODE": {"memory": "cpu"}, "LATENT_CACHE": "offline"}) == []
-    )
-    bad = vae_problems({"VAE_ENCODE": {"memory": "cpu"}, "LATENT_CACHE": "online"})
-    assert bad and "offline cache pass" in bad[0]
+    for memory in ("offload", "ring", "cpu", "resident", "auto"):
+        for cache in ("offline", "online", "off"):
+            _assert_clean({"memory": memory}, cache)
     assert vae_problems({"VAE_ENCODE": {"memroy": "auto"}, "LATENT_CACHE": "off"})
-    must_fail(
-        lambda: _assert_clean({"memory": "cpu"}, "off"), "CPU VAE with online encoding"
-    )
+    must_fail(lambda: _assert_clean({"memroy": "cpu"}, "off"), "an unknown field")
 
 
 def _assert_clean(spec, cache):
     assert vae_problems({"VAE_ENCODE": spec, "LATENT_CACHE": cache}) == []
+
+
+def assert_named(placements) -> None:
+    """Every placement class reports the memory value it implements (the reports, the
+    GPU-peak estimate and `vae_on_device` read the name)."""
+    assert {k: cls.name for k, cls in placements.items()} == {k: k for k in placements}
+
+
+def test_every_placement_names_its_memory():
+    assert_named(VAE_PLACEMENTS)
+    assert_named(TEXT_PLACEMENTS)
+    broken = {**VAE_PLACEMENTS, "cpu": VAE_PLACEMENTS["resident"]}
+    must_fail(lambda: assert_named(broken), "the host VAE under the resident class")

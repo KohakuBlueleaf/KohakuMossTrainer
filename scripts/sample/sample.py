@@ -30,7 +30,7 @@ from typing import Annotated
 
 from kohakuengine import FormatArg
 
-from kohakumoss.encoders.vae import resolve_vae_dtype
+from kohakumoss.encoders.vae import resolve_vae_dtype, vae_device
 from kohakumoss.inference import MossPipeline, knobs, outputs
 from kohakumoss.inference.placement_report import forward_tokens
 from kohakumoss.logging.log import get_logger, hl, setup
@@ -146,7 +146,9 @@ def main() -> None:
         fp16_fix=k["FP16_FIX"],
         fp16_fix_kwargs=dict(k["FP16_FIX_KWARGS"]),
         tune=k["TUNE"],
-        vae_dtype=resolve_vae_dtype(k["VAE_DTYPE"], k["DEVICE"]),
+        vae_dtype=resolve_vae_dtype(
+            k["VAE_DTYPE"], vae_device(knobs.vae_spec(k), k["DEVICE"])
+        ),
         forward_tokens=forward_tokens(
             [it["size"] for it in items],
             min(k["BATCH"], len(items)),

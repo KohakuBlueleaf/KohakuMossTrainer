@@ -44,12 +44,12 @@ BATCH_PIXELS = 4 * 1024 * 1024
 
 
 def _has_bf16(device: torch.device) -> bool:
+    """bf16 on `device`: a CUDA card that has it, XPU, and the host (natively, or
+    through `host_gemm`'s fp32-accumulated 16-bit GEMMs)."""
     match device.type:
         case "cuda":
             return torch.cuda.is_available() and arch_of(device).has_bf16
-        case "xpu":
-            return True
-    return False
+    return True
 
 
 def resolve_vae_dtype(name: str | torch.dtype, device) -> torch.dtype:
@@ -65,6 +65,13 @@ def resolve_vae_dtype(name: str | torch.dtype, device) -> torch.dtype:
     if device.type != "cpu" and FP16_PROBLEM is None:
         return torch.float16
     return torch.float32
+
+
+def vae_device(plan: dict | None, device) -> torch.device:
+    """The device a VAE placed by VaePlan fields `plan` computes on: the host for
+    memory 'cpu', else `device` (VAE_DTYPE 'auto' resolves for it)."""
+    memory = (plan or {}).get("memory")
+    return torch.device("cpu") if memory == "cpu" else torch.device(device)
 
 
 def vae_dtype_problems(name: str, device) -> list[str]:
@@ -98,7 +105,7 @@ def vae_encoder(
             "vae_encoder: path is empty; set IMAGE_ENCODER_KWARGS['path'] to the VAE dir, "
             "a VAE file or a pipeline root"
         )
-    resolved = resolve_vae_dtype(dtype, device)
+    resolved = resolve_vae_dtype(dtype, vae_device(plan, device))
     spec = {"memory": "auto", "batch": batch, **(plan or {})}
     if compile is not None:
         spec["compile"] = "on" if compile else "off"

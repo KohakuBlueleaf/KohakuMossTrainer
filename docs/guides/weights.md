@@ -86,7 +86,7 @@ other three parts unread.
 
 - `TEXT_ENCODE["precision"]="auto"` (the default) keeps what the file stores: the int8
   linears and embedding run as stored, the W4A8 linears decode their codes to the same
-  int8 grid. On the host (memory `cpu`) `auto` is `compute`.
+  int8 grid, on the host (memory `cpu`) as on the GPU.
 - `TEXT_ENCODE["w4a8"]` picks the W4A8 decode: `int8` decodes once at load (1 byte per
   weight, the int8 linear per call), `packed` keeps the 4-bit codes (0.56 bytes per
   weight) and decodes them per call, `auto` (default) takes `int8` when the decoded

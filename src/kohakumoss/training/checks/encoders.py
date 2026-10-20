@@ -13,13 +13,12 @@ from kohakumoss_kernels.hardware.arch import arch_of
 
 
 def vae_problems(k: dict) -> list[str]:
-    """VAE_ENCODE (a VaePlan dict); memory 'cpu' only with the offline latent cache."""
+    """VAE_ENCODE (a VaePlan dict) and VAE_DTYPE."""
     try:
         plan = vae_plan(k.get("VAE_ENCODE") or {})
     except (TypeError, ValueError) as err:
         return [f"VAE_ENCODE: {err}"]
-    problems = vae_plan_problems(plan, training=True, latent_cache=k["LATENT_CACHE"])
-    out = [f"VAE_ENCODE: {m}" for m in problems]
+    out = [f"VAE_ENCODE: {m}" for m in vae_plan_problems(plan)]
     kind = default_type()
     index = (k.get("DEVICES") or (0,))[0]
     device = "cpu" if kind == "cpu" else f"{kind}:{index}"
@@ -28,8 +27,7 @@ def vae_problems(k: dict) -> list[str]:
 
 def text_problems(k: dict, arch=arch_of) -> list[str]:
     """TEXT_ENCODE (a TextEncoderPlan dict) and TEXT_DEVICE; TEXT_DEVICE='cpu' means
-    memory 'cpu', which training allows only with the offline text cache; `arch` reads
-    a device's ArchInfo."""
+    memory 'cpu'; `arch` reads a device's ArchInfo."""
     spec = dict(k.get("TEXT_ENCODE") or {})
     device = str(k.get("TEXT_DEVICE") or "")
     if device.startswith("cpu"):
@@ -41,9 +39,7 @@ def text_problems(k: dict, arch=arch_of) -> list[str]:
     target = None
     if not device.startswith("cpu") and default_type() == "cuda":
         target = device or "cuda:0"
-    problems = text_plan_problems(
-        plan, target, training=True, text_cache=k["TEXT_CACHE"], arch=arch
-    )
+    problems = text_plan_problems(plan, target, arch=arch)
     problems += stored_text_problems(k, plan)
     return [f"TEXT_ENCODE / TEXT_DEVICE: {m}" for m in problems]
 

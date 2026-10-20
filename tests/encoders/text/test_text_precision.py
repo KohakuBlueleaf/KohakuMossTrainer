@@ -1,5 +1,5 @@
 """Text-encoder precision `auto` (model-free): it takes the format the weights store
-(compute on the host), a stored-only precision on other weights is refused, the W4A8
+(on the host too, but for fp8 compute), a stored-only precision on other weights is refused, the W4A8
 decode knob is checked, the cache spec names a stored layout, and a ComfyUI file's
 stored format is read from its headers and records (constructed tensors)."""
 
@@ -29,15 +29,19 @@ def test_auto_takes_the_stored_format():
     assert auto.precision == "auto" and auto.w4a8 == "auto"
     assert resolve_precision(auto, "int8", "cuda").precision == "int8"
     assert resolve_precision(auto, "compute", "cuda").precision == "compute"
-    assert resolve_precision(auto, "w4a8", "cpu").precision == "compute"
+    assert resolve_precision(auto, "w4a8", "cpu").precision == "w4a8"
     on_host = text_plan({"memory": "cpu"})
-    assert resolve_precision(on_host, "int8", "cuda").precision == "compute"
+    assert resolve_precision(on_host, "int8", "cuda").precision == "int8"
+    assert resolve_precision(on_host, "fp8_compute", "cuda").precision == "compute"
+    assert not plan_problems(text_plan({"memory": "cpu", "precision": "int8"}))
+    assert plan_problems(text_plan({"memory": "cpu", "precision": "mxfp8"}))
     explicit = text_plan({"precision": "fp8"})
     assert resolve_precision(explicit, "int8", "cuda").precision == "fp8"
     with pytest.raises(ValueError, match="stored format"):
         resolve_precision(text_plan({"precision": "w4a8"}), "int8", "cuda")
     must_fail(
-        lambda: _assert_precision(auto, "int8", "cpu", "int8"), "int8 on the host"
+        lambda: _assert_precision(on_host, "int8", "cuda", "compute"),
+        "the host dequantizing a format it runs (the cache key differs from the GPU's)",
     )
 
 

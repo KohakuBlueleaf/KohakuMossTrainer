@@ -52,8 +52,8 @@ def te_line(te, path, device) -> tuple[str, dict]:
             where = f"resident on {dev} ({hl(gib_text(res))}; {precision})"
         case "cpu":
             where = (
-                f"cpu (weights in host RAM, {hl(gib_text(host))}; runs on the host; "
-                f"{precision})"
+                f"cpu (weights in host RAM, {hl(gib_text(host))}; runs on the host, "
+                f"{hl(torch.get_num_threads())} threads; {precision})"
             )
         case "offload":
             where = (
@@ -93,7 +93,10 @@ def vae_line(vae, path, placement: str, device) -> tuple[str, dict]:
                 f"a 2-layer ring on {device}, the rest moved per pass)"
             )
         case "cpu":
-            where = f"cpu (host RAM, {hl(gib_text(size))}; runs on the host)"
+            where = (
+                f"cpu (host RAM, {hl(gib_text(size))}; runs on the host, "
+                f"{hl(torch.get_num_threads())} threads)"
+            )
         case _:
             where = f"resident on {device} ({hl(gib_text(size))})"
     return f"VAE: {hl(path, 'path')} -> {where}", {"gib": round(size / GIB, 2)}

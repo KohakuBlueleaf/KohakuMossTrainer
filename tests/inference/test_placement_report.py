@@ -105,7 +105,13 @@ def _host_half_gib() -> nn.Module:
             ],
         ),
         ("resident", ["-> resident on cuda:0 (0.25 GiB; precision fp8, bf16)"]),
-        ("cpu", ["-> cpu (weights in host RAM, 0.50 GiB;", "runs on the host"]),
+        (
+            "cpu",
+            [
+                "-> cpu (weights in host RAM, 0.50 GiB;",
+                f"runs on the host, {torch.get_num_threads()} threads",
+            ],
+        ),
     ],
 )
 def test_text_encoder_lines(name, words):
@@ -135,7 +141,11 @@ def test_vae_lines():
     line, _ = report.vae_line(vae, "w/vae", "ring", "cuda:0")
     _names(line, "VAE: w/vae -> ring (host RAM, 0.25 GiB;", "2-layer ring on cuda:0")
     line, _ = report.vae_line(vae, "w/vae", "cpu", "cpu")
-    _names(line, "VAE: w/vae -> cpu (host RAM, 0.25 GiB; runs on the host)")
+    threads = torch.get_num_threads()
+    _names(
+        line,
+        f"VAE: w/vae -> cpu (host RAM, 0.25 GiB; runs on the host, {threads} threads)",
+    )
     line, _ = report.vae_line(vae, "w/vae", "gpu", "cuda:0")
     _names(line, "VAE: w/vae -> resident on cuda:0 (0.25 GiB)")
     must_fail(lambda: _names(line, "host RAM"), "a resident VAE read as offloaded")

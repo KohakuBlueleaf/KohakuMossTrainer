@@ -40,7 +40,8 @@ def estimated(backbone, plan: MemoryPlan, tokens: int, place, pixels: int):
     te_res, te_pass = fp.get("resident_bytes", 0), fp.get("pass_bytes", 0)
     vae_w = module_bytes(vae.vae) if vae is not None else 0
     vae_res = vae_w if place.vae_on_device else 0
-    vae_pass = vae_w + vae_act_bytes(pixels, vae.plan.tile) if vae is not None else 0
+    on_host = vae is None or vae.device.type == "cpu"
+    vae_pass = 0 if on_host else vae_w + vae_act_bytes(pixels, vae.plan.tile)
     out = {"dit": est.total, "te_resident": te_res, "te_pass": te_pass, "vae": vae_res}
     out["encode"] = weights + te_pass + vae_res
     out["sampling"] = est.total + te_res + vae_res

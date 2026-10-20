@@ -95,7 +95,7 @@ wandb runs silent and captures no console output.
 - the model / adapters / encoders build with its memory plan;
 - the text encoder's and the VAE's placement lines after it (the
   [inference lines](#what-sampling-shows); a VAE also as `ring (... 2-layer ring on
-  cuda:0 ...)` or `cpu (... runs on the host)`; `text encoder: not kept,
+  cuda:0 ...)` or `cpu (... runs on the host, N threads)` (torch's intra-op threads); `text encoder: not kept,
   TEXT_CACHE='offline'` / `VAE: not loaded, ...` when the run holds none);
 - the kernel prewarm (per-op progress lines, the wall time per op and in total) and the
   adapter prewarm;

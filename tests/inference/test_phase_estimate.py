@@ -1,6 +1,7 @@
 """The sampling memory estimate per phase and the automatic VAE placement, model-free:
 the text-encode, sampling and decode phases each count what the device holds then (the
-peak is the largest), and "auto" tiles the VAE pass before it rings untiled."""
+peak is the largest; a VAE on the host adds nothing to decode), and "auto" tiles the
+VAE pass before it rings untiled."""
 
 from types import SimpleNamespace
 
@@ -19,11 +20,13 @@ GIB = 2**30
 TOKENS = 2 * (64 * 64 + 300)
 
 
-def _place(te_pass: int, vae_bytes: int, resident: bool, tile: bool):
+def _place(te_pass: int, vae_bytes: int, resident: bool, tile: bool, where="cuda"):
     te = SimpleNamespace(footprint=lambda: {"resident_bytes": 0, "pass_bytes": te_pass})
     weights = torch.empty(vae_bytes // 2, dtype=torch.bfloat16, device="meta")
     vae = SimpleNamespace(
-        vae=torch.nn.ParameterList([weights]), plan=VaePlan(tile=tile)
+        vae=torch.nn.ParameterList([weights]),
+        plan=VaePlan(tile=tile),
+        device=torch.device(where),
     )
     return SimpleNamespace(text_encoder=te, vae=vae, vae_on_device=resident)
 
@@ -47,6 +50,16 @@ def test_each_phase_counts_what_it_holds():
     )
     assert tiled["decode"] < est["decode"]
     must_fail(lambda: _phases_add_up(est, 0, vae_bytes, act), "no text-encoder pass")
+    host = peaks.estimated(
+        backbone, plan, TOKENS, _place(te_pass, vae_bytes, False, False, "cpu"), 1 << 20
+    )
+    _host_decode_free(host, est)
+    must_fail(lambda: _host_decode_free(est, est), "a host VAE counted on the device")
+
+
+def _host_decode_free(host: dict, gpu: dict) -> None:
+    """A VAE on the host adds nothing to the device's decode phase."""
+    assert host["decode"] < gpu["decode"] and host["vae"] == 0
 
 
 def test_auto_tiles_before_it_rings_untiled():

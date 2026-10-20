@@ -36,8 +36,9 @@ One knob set (`kohakumoss.types.plans.TextEncoderPlan`) serves:
 | `ahead_device` | `host`, `device` | where encoded results wait |
 | `kernels` | `{}` | a text op -> a backend, e.g. `{"gated_delta_rule_varlen": "triton"}` |
 
-In training the encoder runs on the host only for the offline cache pass: `memory
-="cpu"` (or `TEXT_DEVICE="cpu"`) with `TEXT_CACHE` online / off is a knob error.
+In training `memory="cpu"` (or `TEXT_DEVICE="cpu"`) runs with every `TEXT_CACHE`
+mode: with `online` / `off` each encode-ahead pass runs on the host (one INFO line
+gives the first pass's seconds and the cost per step).
 
 ## Streamed load
 
@@ -65,6 +66,23 @@ copy of the model in host memory:
 
 The embeddings equal those of a load that reads the whole model to the host first:
 every value is the same cast of the same stored tensor.
+
+## Host GEMM
+
+A host without native 16-bit GEMMs (no avx512_bf16 / AMX; torch's oneDNN capability
+check) runs bf16 matmuls far below its fp32 rate: an EPYC 7542 (Zen2, avx2 + fma)
+runs a [512, 4096] x [4096, 12288] linear at 1060 GFLOP/s in fp32, 155 in bf16, 219 in
+fp16. On such a host every pass of a placement that computes there (the text
+encoder's `cpu`, the VAE's `cpu`) runs under `HostGemm`
+(`kohakumoss_kernels.hardware.host_gemm`, bound once from the capability check): each
+matmul-class op on a 16-bit host tensor (mm, addmm, bmm, baddbmm, mv, convolution,
+the CPU flash attention) runs on its inputs upcast to fp32, and its output is rounded
+back to the 16-bit dtype once. The activations are already 16-bit values when they
+reach the GEMM, and the product of two bf16 (or two fp16) values is exact in fp32, so
+this is the GEMM the numerics rules ask for, 16-bit inputs with fp32 accumulation, at
+the fp32 rate; weights stay 16-bit in storage and are upcast per call. A host with
+native 16-bit GEMMs binds nothing. `tests/kernels/hardware/test_host_gemm.py` witnesses
+the form on integer inputs where it is exact.
 
 Peak private host memory (anon + shmem of the process) of load + encode + release,
 Qwen3.5-9B fp16 from the bf16 checkpoint, RTX 2080 Ti:
@@ -217,7 +235,9 @@ streams onto it, the tokenizer is the packaged one.
   records (`text_file_format`): `compute` for the bf16 file, `int8` (int8 ConvRot
   linears) or `w4a8`. Its quantized linears attach as `QuantLinear` over the stored
   base, its int8 embedding as `QuantEmbedding`; nothing is quantized at load. On the
-  host (memory `cpu`) `auto` is `compute`.
+  host (memory `cpu`) the weight-only formats run as stored too (the eager
+  `quant_linear` / W4A8 decode), so an offline host cache pass writes the keys a GPU
+  run reads; only a stored fp8-compute format becomes `compute` there.
 - Any other precision dequantizes the stored layers into the dense model (one INFO
   line) and quantizes from there. Under `offload` / `ring` the host keeps each
   dequantized layer's stored codes and scales (file pages) and the copy to the device

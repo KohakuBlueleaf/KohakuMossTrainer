@@ -1,5 +1,5 @@
 """TextEncoderPlan from a knob dict, and every problem with one (training and inference
-share the rules; training adds the TE-on-CPU rule)."""
+share the rules)."""
 
 from dataclasses import fields, replace
 from pathlib import Path
@@ -16,6 +16,7 @@ MEMORY = ("resident", "offload", "ring", "cpu", "auto")
 MEMORY_ALIASES = {"stream": "ring"}
 PRECISION = ("auto", "compute", "int8", "fp8", *COMPUTE, "w4a8")
 STORED_ONLY = ("w4a8",)
+HOST_PRECISIONS = ("compute", "int8", "fp8", "w4a8")
 W4A8 = ("auto", "int8", "packed")
 LAYOUT = ("single", "padded", "packed")
 FORWARD = ("kernels", "hf")
@@ -49,8 +50,9 @@ def resolve_precision(
     plan: TextEncoderPlan, stored: str, device: torch.device | str
 ) -> TextEncoderPlan:
     """`precision="auto"`: the format the weights store (`stored`: `compute` for a
-    16-bit checkpoint), `compute` when the encoder runs on the host (memory 'cpu');
-    ValueError for a stored-only precision (`w4a8`) the weights do not store."""
+    16-bit checkpoint); on the host (memory 'cpu') a stored format the host cannot run
+    (`HOST_PRECISIONS`: fp8 compute GEMMs need CUDA) is `compute`; ValueError for a
+    stored-only precision (`w4a8`) the weights do not store."""
     if plan.precision in STORED_ONLY and stored != plan.precision:
         raise ValueError(
             f"text-encoder precision {plan.precision!r} is a stored format; these "
@@ -60,7 +62,8 @@ def resolve_precision(
     if plan.precision != "auto":
         return plan
     on_host = plan.memory == "cpu" or torch.device(device).type == "cpu"
-    return replace(plan, precision="compute" if on_host else stored)
+    runs = not on_host or stored in HOST_PRECISIONS
+    return replace(plan, precision=stored if runs else "compute")
 
 
 def resolve_dtype(plan: TextEncoderPlan, device: torch.device | str) -> TextEncoderPlan:
@@ -75,13 +78,10 @@ def resolve_dtype(plan: TextEncoderPlan, device: torch.device | str) -> TextEnco
 def plan_problems(
     plan: TextEncoderPlan,
     device: torch.device | str | None = None,
-    training: bool = False,
-    text_cache: str = "offline",
     arch=arch_of,
 ) -> list[str]:
-    """Every problem with `plan` (empty = valid). In training, the encoder may run on
-    the host only for the offline cache pass: online / uncached text encodes on the
-    GPU (offload / ring). `arch(device)` gives the CUDA arch (default arch_of)."""
+    """Every problem with `plan` (empty = valid). `arch(device)` gives the CUDA arch
+    (default arch_of)."""
     p = []
     for name, value, opts in (
         ("memory", plan.memory, MEMORY),
@@ -122,8 +122,11 @@ def plan_problems(
     bad_ops = sorted(set(plan.kernels) - set(kernel_ops.TEXT) - {"rms_norm"})
     if bad_ops:
         p.append(f"text-encoder kernels has unknown ops {bad_ops}")
-    if plan.memory == "cpu" and plan.precision not in ("compute", "auto"):
-        p.append("text-encoder memory='cpu' runs precision 'compute' (or 'auto')")
+    if plan.memory == "cpu" and plan.precision not in ("auto", *HOST_PRECISIONS):
+        p.append(
+            f"text-encoder memory='cpu' runs precision auto / {' / '.join(HOST_PRECISIONS)}"
+            " (fp8 compute GEMMs need CUDA)"
+        )
     if plan.precision in COMPUTE and plan.memory != "cpu" and device is not None:
         kind = torch.device(device).type
         if kind != "cuda":
@@ -139,12 +142,6 @@ def plan_problems(
             p.append(
                 f"text-encoder dtype 'bf16' on {info.name} (no bf16): use fp16 or auto"
             )
-    if training and plan.memory == "cpu" and text_cache != "offline":
-        p.append(
-            "the text encoder runs on the CPU only for the offline cache pass; with "
-            f"TEXT_CACHE={text_cache!r} it encodes during training on the GPU: set "
-            "TEXT_ENCODE memory to 'offload' / 'ring' / 'resident' (or 'auto')"
-        )
     return p
 
 

@@ -47,15 +47,18 @@ def text_encoder(
     """An EncodeText callable (with `encoder_id`) over the real Qwen3.5 weights at
     `path` (pipeline root or model dir); `dtype` ("bf16" | "fp16" or a torch dtype,
     default the plan's) and `plan` (TextEncoderPlan fields) place it; an unset memory
-    is "auto" (the fastest placement that fits the device). Its outputs land on the
-    host; the plan is checked for the device before the weights load."""
+    is "auto" (the fastest placement that fits the device); memory "cpu" runs on the
+    host whatever `device`. Its outputs land on the host; the plan is checked for the
+    device before the weights load."""
     if not str(path):
         raise ValueError(
             "text_encoder: path is empty; set TEXT_ENCODER_KWARGS['path'] to the text "
             "encoder dir or a pipeline root"
         )
-    if str(device) == "cuda" and not torch.cuda.is_available():
+    spec = factory_plan(dtype, plan)
+    on_host = spec.memory == "cpu"
+    if not on_host and str(device) == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("the text-encoder factory defaults to CUDA; pass device=")
     return QwenTextEncoder.from_pretrained(
-        path, device, factory_plan(dtype, plan), max_length, output_device="cpu"
+        path, device, spec, max_length, output_device="cpu"
     )
