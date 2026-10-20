@@ -115,18 +115,27 @@ RTX 5090, LoRA, online VAE and text encode, 1 MP, 6 steps
 Unpaced, 2.79 GiB of `minimal`'s reserved peak are block inputs whose free waits for
 their device-to-host copy.
 
-Host buffers come from a pool of pinned byte buffers in power-of-two size classes (at
-least 1 MiB). A packet takes the smallest free class that holds it, so a smaller bucket
-shape reuses a larger buffer. A buffer returns to the pool when its H2D copy is queued,
-and it is reused only after that copy has finished. The fetched device copy stays with
-its packet until the packet is freed, so a saved tensor that backward reads more often
-than it was saved never re-reads a recycled host buffer. The kept (never offloaded)
-storages are rebuilt from the live tensors after the build (`exclude_params` ->
-`rebuild`), so an address freed by a parameter dtype change never stays kept. New pinned memory is allocated only
-when a packet is larger than every free buffer. A pinned allocation (`cudaHostAlloc`)
-blocks the host for about 10-30 ms per 8-32 MiB buffer on the V100 host, and 42 of them
-per step cost more than the step's compute. With the pool, the LoRA `balanced` step on
-V100 with offload takes 1207 ms against 1199 ms without it.
+### Activation host slab
+
+Host buffers are cut from a `HostSlab` (`offload/host/slab.py`): in order, 512-byte
+aligned, from exact-size page-locked chunks (one `HostArena` each). Every packet of a
+micro-batch is handed back by the end of its backward (its H2D copy queued, or by
+`reset()` after the step for one backward never read), so when none is out the next
+packet starts over at the first chunk; the D2H stream, which writes the buffers, first
+waits on the events of every copy handed back, so a buffer is overwritten only after
+the device has read it, with no host wait. A micro-batch that outgrows the chunks
+takes a new one; at the next rewind they are replaced by one chunk of the bytes cut,
+rounded up to 64 MiB (after a device synchronize), so the slab holds one micro-batch's
+packets at their own sizes and allocates only when a micro-batch needs more than any
+before it. The fetched device copy stays with its packet until the packet is freed, so
+a saved tensor that backward reads more often than it was saved never re-reads a
+recycled host buffer. The kept (never offloaded) storages are rebuilt from the live
+tensors after the build (`exclude_params` -> `rebuild`), so an address freed by a
+parameter dtype change never stays kept. A pinned allocation blocks the host for about
+10-30 ms per 8-32 MiB on the V100 host, and 42 of them per step cost more than the
+step's compute, so chunks are kept across steps. The `12g` LoRA layer at 6144 tokens
+(2080 Ti) holds one 1.37 GiB chunk, and the trainer's private memory stays flat (8.1
+GiB) from the first steps to the 80th at varying token counts.
 
 ## Weight streaming
 

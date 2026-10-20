@@ -8,11 +8,13 @@ from collections import deque
 from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 from torch import Tensor
 
 from kohakumoss.offload.accel import module, streamed, with_index
+from kohakumoss.offload.host.slab import HostSlab
 from kohakumoss_common.calls import nothing
 
 CAST = "ToCopyBackward0"
@@ -122,7 +124,8 @@ class ActivationOffload:
         self.skip: set[int] = set()
         self.seen: dict[tuple, tuple] = {}
         self.pending: dict[int, list[Packet]] = {}
-        self.pool: dict[int, list[tuple[Tensor, object]]] = {}
+        sync = partial(self.dm.synchronize, self.device) if self.streamed else nothing
+        self.slab = HostSlab(self.device, self.pinned, sync)
         self.queued: dict[str, deque] = {"d2h": deque(), "h2d": deque()}
         self.current = 0
         self.stats = {
@@ -214,25 +217,14 @@ class ActivationOffload:
         self.pending.pop(pk.block, None)
         return pk.host
 
-    @staticmethod
-    def capacity(nbytes: int) -> int:
-        """Pool size class of a packet: the next power of two, at least 1 MiB."""
-        return 1 << max(20, (nbytes - 1).bit_length())
-
     def _take(self, t: Tensor) -> Tensor:
-        """A pinned byte buffer for `t` from the smallest pooled size class that holds
-        it (last copy done), else a new one of its class."""
-        cap = self.capacity(t.nbytes)
-        fits = [k for k, free in self.pool.items() if k >= cap and free]
-        if not fits:
-            return torch.empty(cap, dtype=torch.uint8, pin_memory=self.pinned)
-        flat, done = self.pool[min(fits)].pop()
-        done.synchronize()
-        return flat
+        """A (pinned) host byte buffer for `t`, cut from the slab; the D2H stream that
+        writes it waits for the device reads of the buffers it reuses."""
+        return self.slab.take(t.nbytes, self.d2h_stream)
 
     def _give(self, flat: Tensor, done) -> None:
-        """Return a host buffer to the pool once the copy `done` has finished."""
-        self.pool.setdefault(flat.numel(), []).append((flat, done))
+        """Hand a host buffer back to the slab; `done`: its last copy's event."""
+        self.slab.give(done)
 
     def _pace(self, kind: str, block: int, ev) -> None:
         """Record `ev` as `block`'s latest `kind` copy; while more than `inflight`

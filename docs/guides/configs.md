@@ -170,7 +170,7 @@ int8 / fp8 base halves the DiT parts):
 | the DiT, loaded on the host before placement; with a quantized base (`int8` / `fp8`) its block linears are left unread and quantized from the file | build | 9.47 in 16-bit; about 4.8 with an int8 base (the codes and the 16-bit rest) |
 | the text encoder, streamed from its file pages to its placement ([streamed load](../internals/text-encoder.md#streamed-load)) | when `SAMPLE_EVERY > 0` or `TEXT_CACHE` is not `offline`; with an offline text cache it is freed after the sample prompts | private only for what `ring` / `offload` copy to the host (`host` copy: 15.63 in bf16 / fp16, rounded up per tensor when pinned; `host` file: none, the file pages are page cache) and for layers quantized at load held on the host |
 | streamed DiT blocks, pinned (0.21 per block of 42; the device keeps `stream_resident`) | streaming profiles | about 5.5 (`balanced`) to 8.4 (two resident blocks) |
-| offloaded activations (block inputs, one per block, in pinned buffers rounded up to a power of two) | `act_offload` | about 1 at 4352 tokens, 2 at 8192 |
+| offloaded activations (block inputs, one per block, cut at their own sizes from one pinned host slab) | `act_offload` | about 1.4 at 6144 tokens per micro-batch, in proportion to the tokens |
 | adapter master, moments and gradient sums (16 bytes per trainable parameter) | `optim_state` `stream` / `cpu`, `grad_offload` | about 1.1 for LoRA DIM 32 on `attn-mlp` (74 M parameters) |
 
 Totals per layer:
@@ -179,6 +179,7 @@ Totals per layer:
 | --- | --- | --- |
 | `8g` | near 32 GiB (process, streamed blocks and the text encoder) | about 19 GiB |
 | `24g` (`balanced`) | near 29 GiB | about 14 GiB |
+| `12g`, `BASE_PRECISION = "int8"`, fp16, both caches offline, sampling every 5 steps (2080 Ti, measured private memory of the process tree) | 5.9 GiB | 9.2 GiB: the trainer 8.4 (int8 blocks 4.44, activation slab 1.37, adapter states and sums 1.11, C heap 0.80), 0.44 for the compile workers (one per core: 33 on a 64-thread host), 0.36 for the loader workers |
 
 With `SAMPLE_EVERY = 0` and both caches offline only the caches are read and the text
 encoder stays on disk. Full finetune:
