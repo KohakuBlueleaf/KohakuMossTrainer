@@ -130,7 +130,7 @@ physical:
 | rule | reason |
 | --- | --- |
 | `stream_resident >= 2` | one slot computes while the next one loads |
-| `stream='ring'` is frozen-base only; `swap` is trainable-only | a ring slot is overwritten without a write-back; `swap` writes trained blocks back to the host |
+| a frozen base streams as `ring`, a trainable one as `swap` (either spelling is accepted and resolved, one INFO line) | a ring slot is overwritten without a write-back; `swap` writes trained blocks back to the host |
 | `swap`: `fused_step` is `True` with a GPU `optim_state`, `False` with `optim_state='cpu'` | a swapped block leaves the device after its backward, so a GPU step runs inside backward; a host step runs after it |
 | a quantized base (`fp8`, `int8`, `quant`) is not trainable | the stored weights are not the trained values |
 | an `fp8_compute` / `mxfp8` full FT keeps the weights resident | the fp8 copies are requantized after each step |
@@ -140,8 +140,9 @@ physical:
 | DDP runs every profile; FSDP / pipeline / threaded need resident compute-precision weights, GPU states, no activation offload, no `fused_step` and no `grad_offload` | DDP sums every gradient across ranks wherever the plan moves it; the other multi-GPU strategies own the parameters; see [multi-gpu.md](../guides/multi-gpu.md) |
 | `checkpoint='sub-block'` not with `COMPILE='block'` or FSDP | sub-block checkpointing calls block parts directly |
 
-With a full finetune (`ALGO='full'`), a catalog entry's `ring` resolves to `swap`, and
-the fused step follows the `swap` rule above.
+With a full finetune (`ALGO='full'`), a catalog entry's (or an explicit) `ring`
+resolves to `swap`, and the fused step follows the `swap` rule above; an explicit
+`swap` over a frozen base (adapters, inference) resolves to `ring`.
 
 ## The catalog
 

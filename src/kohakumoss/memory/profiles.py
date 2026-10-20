@@ -12,11 +12,19 @@ from kohakumoss.quant.compute import COMPUTE as FP8_COMPUTE
 from kohakumoss.quant.compute import DGRAD as FP8_DGRAD
 from kohakumoss.quant.compute import FP8_RECIPES
 from kohakumoss.types.plans import MemoryPlan
+from kohakumoss_common.log import get_logger
 from kohakumoss_common.typecheck import describe, mismatches
 from kohakumoss_kernels.hardware.arch import arch_of
 
 CHECKPOINT_MODES = ("none", "block", "sub-block", "selective")
 STREAM_MODES = ("off", "ring", "swap")
+# a streamed base by (stream asked, frozen base): ring streams a frozen base, swap a trainable one
+STREAM_FOR = {
+    "ring": {True: "ring", False: "swap"},
+    "swap": {True: "ring", False: "swap"},
+}
+_LOGGED: set[tuple[str, str]] = set()
+log = get_logger(__name__)
 BASE_PRECISIONS = ("auto", "compute", "fp8", "int8", "quant", *FP8_COMPUTE)
 QUANTIZED_BASES = ("fp8", "int8", "quant")
 KNOB_FIELDS = {"compile": "COMPILE", "kernels": "KERNELS"}
@@ -116,10 +124,6 @@ def validate(
         problems.append(f"fp8_recipe {plan.fp8_recipe!r} not in {FP8_RECIPES}")
     if plan.fp8_dgrad not in FP8_DGRAD:
         problems.append(f"fp8_dgrad {plan.fp8_dgrad!r} not in {FP8_DGRAD}")
-    if plan.stream == "swap" and not trainable_base and not inference:
-        problems.append(
-            "stream='swap' streams trainable blocks; a frozen base uses 'ring'"
-        )
     mode, frac = checkpoint_mode(plan.checkpoint)
     if mode not in CHECKPOINT_MODES:
         problems.append(f"checkpoint {plan.checkpoint!r} not in {CHECKPOINT_MODES}")
@@ -131,8 +135,6 @@ def validate(
         problems.append("weight streaming needs stream_resident >= 2")
     if plan.act_offload and plan.act_offload_inflight < 1:
         problems.append("activation offload needs act_offload_inflight >= 1")
-    if plan.stream == "ring" and trainable_base:
-        problems.append("stream='ring' is frozen-base only; use 'swap' for full FT")
     if plan.base_precision not in BASE_PRECISIONS:
         problems.append(
             f"base_precision {plan.base_precision!r} not in {BASE_PRECISIONS}"
@@ -158,6 +160,15 @@ def validate(
     return problems + _fp8_device_problems(plan, device)
 
 
+def _log_stream_once(asked: str, used: str, frozen: bool) -> None:
+    """One INFO line per process for each streamed-base mode the base turned into."""
+    if (asked, used) in _LOGGED:
+        return
+    _LOGGED.add((asked, used))
+    base = "a frozen base" if frozen else "a trainable base (full FT)"
+    log.info(f"stream={asked!r} on {base} streams as {used!r}")
+
+
 def resolve(
     profile: str,
     overrides: dict | None = None,
@@ -168,7 +179,9 @@ def resolve(
     """Named profile + overrides -> concrete MemoryPlan for `device`; raises listing all
     problems. `auto` is resolved by `planner.auto_plan`, not here. With `inference`,
     activation knobs are dropped (no_grad saves nothing) and streaming needs no
-    checkpointing. `profile` may use the old ring spelling (`profile_name`)."""
+    checkpointing. A streamed base takes the mode its base needs (`STREAM_FOR`: ring
+    for a frozen base, swap for full FT; an explicit other mode is logged once).
+    `profile` may use the old ring spelling (`profile_name`)."""
     profile = profile_name(profile)
     if profile not in PROFILES:
         raise ValueError(f"memory profile {profile!r} not in {tuple(PROFILES)}")
@@ -181,8 +194,12 @@ def resolve(
     values = {**defaults, **overrides, "profile": profile}
     if trainable_base and "base_precision" not in overrides:
         values["base_precision"] = "auto"
-    if trainable_base and "stream" not in overrides and values.get("stream") == "ring":
-        values["stream"] = "swap"
+    frozen = not trainable_base or inference
+    stream = values.get("stream")
+    if stream in STREAM_FOR and STREAM_FOR[stream][frozen] != stream:
+        values["stream"] = STREAM_FOR[stream][frozen]
+        if "stream" in overrides:
+            _log_stream_once(stream, values["stream"], frozen)
     swap = trainable_base and not inference and values.get("stream") == "swap"
     gpu_optim = values.get("optim_state", "gpu") != "cpu"
     if swap and "fused_step" not in overrides:
@@ -193,8 +210,6 @@ def resolve(
         values.update(checkpoint="none", act_offload=False, fused_step=False)
         values.pop("grad_offload", None)
         values["optim_state"] = "gpu"
-        if values.get("stream") == "swap":
-            values["stream"] = "ring"
     plan = replace(MemoryPlan(), **values)
     plan = replace(
         plan, base_precision=resolve_base_precision(plan.base_precision, device)
