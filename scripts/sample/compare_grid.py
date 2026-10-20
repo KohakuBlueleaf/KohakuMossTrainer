@@ -15,10 +15,11 @@ from typing import Annotated
 import torch
 from kohakuengine import FormatArg
 
-from kohakumoss.encoders.vae import resolve_vae_dtype
+from kohakumoss.encoders.vae import resolve_vae_dtype, vae_dtype_problems
 from kohakumoss.inference import MossPipeline, grid, knobs
 from kohakumoss.inference.placement_report import forward_tokens
 from kohakumoss.logging.log import get_logger, hl, setup
+from kohakumoss.memory.knob_map import mixing_problems, primary_names
 from kohakumoss.model.numerics import fix_problems
 from kohakumoss_common.knobs import check_script, choice_problems, prompt_list
 
@@ -126,15 +127,19 @@ def problems(k: dict) -> list[str]:
         "TRANSFORMER",
     )
     p += choice_problems(k, {n: knobs.CHOICES[n] for n in GRID_CHOICES})
+    p += mixing_problems(
+        k, k["MEMORY_PROFILE"], "MEMORY_PROFILE", knobs.INFERENCE_KNOBS
+    )
     if k["GRID_LAYOUT"] not in LAYOUTS:
         p.append(f"GRID_LAYOUT={k['GRID_LAYOUT']!r} not in {tuple(LAYOUTS)}")
     p += knobs.component_problems(k)
+    p += vae_dtype_problems(k["VAE_DTYPE"], k["DEVICE"])
     return p + knobs.size_problems(k) + knobs.encoder_problems(k)
 
 
 def main() -> None:
     setup()
-    k = check_script(globals(), knobs.RENAMED)
+    k = primary_names(check_script(globals(), knobs.RENAMED))
     found = problems(k)
     if found:
         raise SystemExit("invalid configuration:\n  - " + "\n  - ".join(found))

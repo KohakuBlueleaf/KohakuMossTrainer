@@ -72,14 +72,15 @@ def plan_fields(k: dict, profile: str) -> dict:
 
 
 def mixing_problems(k: dict, profile: str, profile_knob: str, knobs=MEMORY_KNOBS):
-    """A named profile together with set memory knobs is an error naming both."""
-    if profile in (MANUAL, "", None):
+    """A named profile, or "" (the resident default), together with set memory knobs
+    is an error naming both: the knobs would be ignored."""
+    if profile in (MANUAL, None):
         return []
     named = [name for name in knobs if k.get(name) is not None]
     if not named:
         return []
+    what = "places the DiT resident" if profile == "" else "sets every memory knob"
     return [
-        f"{profile_knob}={profile!r} sets every memory knob, so {', '.join(named)} must "
-        f"stay None: drop them, or set {profile_knob}='manual' and set every memory "
-        "knob yourself"
+        f"{profile_knob}={profile!r} {what}, so {', '.join(named)} must stay None: "
+        f"drop them, or set {profile_knob}='manual' and set every memory knob yourself"
     ]

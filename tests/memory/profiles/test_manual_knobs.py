@@ -77,6 +77,28 @@ def test_inference_manual_and_mixing():
     assert mixed and "STREAM" in mixed[0]
 
 
+def assert_resident_mixing(problems_of) -> None:
+    """MEMORY_PROFILE='' (the resident default) with a placement knob is an error, not a
+    silently ignored knob; unset knobs pass."""
+    knobs = inference_knobs.INFERENCE_KNOBS
+    mixed = problems_of(
+        {"MEMORY_PROFILE": "", "STREAM": "ring"}, "", "MEMORY_PROFILE", knobs
+    )
+    assert mixed and "resident" in mixed[0] and "STREAM" in mixed[0]
+    assert problems_of({"MEMORY_PROFILE": ""}, "", "MEMORY_PROFILE", knobs) == []
+
+
+def _resident_exempt(k, profile, profile_knob, knobs):
+    if profile == "":
+        return []
+    return knob_map.mixing_problems(k, profile, profile_knob, knobs)
+
+
+def test_resident_default_with_a_placement_knob_is_an_error():
+    assert_resident_mixing(knob_map.mixing_problems)
+    must_fail(lambda: assert_resident_mixing(_resident_exempt), "STREAM ignored")
+
+
 def _names(parts) -> str:
     return "-".join(part for part in parts if part)
 
