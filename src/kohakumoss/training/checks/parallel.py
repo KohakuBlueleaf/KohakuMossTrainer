@@ -146,17 +146,33 @@ def threaded_problems(k: dict) -> list[str]:
     return p
 
 
+ALLOWED = {
+    "fsdp": "checkpointing (CHECKPOINT block / selective / partial:<f>) is supported "
+    "there, memory offload is not",
+    "pipeline": "checkpointing (every CHECKPOINT) is supported there, memory offload "
+    "is not",
+    "threaded": "checkpointing (every CHECKPOINT) is supported there, memory offload "
+    "is not",
+}
+
+
 def _in_backward_steps(k: dict, plan) -> list[str]:
     kind, p = k["PARALLEL"], []
+    allowed = ALLOWED.get(kind, "")
     if plan.fused_step:
-        p.append(f"PARALLEL={kind!r} needs fused_step=False (none / ddp only)")
+        p.append(
+            f"PARALLEL={kind!r} needs fused_step=False (none / ddp only): {allowed}"
+        )
     if plan.grad_offload:
-        p.append(f"PARALLEL={kind!r} needs grad_offload=False (none / ddp only)")
+        p.append(
+            f"PARALLEL={kind!r} needs grad_offload=False (none / ddp only): {allowed}"
+        )
     return p
 
 
 def _resident(k: dict, plan) -> list[str]:
     kind, p = k["PARALLEL"], []
+    allowed = ALLOWED.get(kind, "")
     precision = base_precision(plan, stored_dit_precision(k))
     for field, value, ok in (
         ("stream", plan.stream, "off"),
@@ -165,7 +181,9 @@ def _resident(k: dict, plan) -> list[str]:
         ("act_offload", plan.act_offload, False),
     ):
         if value != ok:
-            p.append(f"PARALLEL={kind!r} needs {field}={ok!r}, not {value!r}")
+            p.append(
+                f"PARALLEL={kind!r} needs {field}={ok!r}, not {value!r}: {allowed}"
+            )
     return p
 
 

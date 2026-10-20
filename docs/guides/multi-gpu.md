@@ -47,6 +47,18 @@ table with one message each:
 | `fsdp` | `off` | `gpu` | `compute` | no | no |
 | `pipeline`, `threaded` | `off` | `gpu` | `compute` | no | no |
 
+One line per mode, what it runs:
+
+- `ddp`: every memory plan, offload included (stock torch DDP: every plan whose
+  trainable gradients stay on the device until the step, so no streamed base, no
+  `fused_step`, no `grad_offload`).
+- `fsdp`: checkpointing (`CHECKPOINT` block / selective / partial:<f>), no memory offload.
+- `pipeline`: checkpointing (every `CHECKPOINT`), no memory offload.
+- `threaded`: checkpointing (every `CHECKPOINT`; the async schedule with per-micro-batch
+  adapter state needs `gpipe` or `checkpoint='none'`), no memory offload.
+
+Each refusal names what the mode runs instead.
+
 - `ddp` runs every memory profile that runs on one GPU (`ckpt-ring*`, `*-gradoff`,
   `*optfused*`, `*-optcpu`, `*-optstream`, `low`, `minimal`, the full-finetune `swap`
   profiles); every trainable gradient is summed across ranks before the optimiser
