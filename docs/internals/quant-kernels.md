@@ -42,12 +42,25 @@ weight from the checkpoint's stored values, not from its live copy
   delta merged into it, a different checkpoint, a model not loaded from a file.
 - A weight stored in the live dtype with no fold since the load is not read again (the
   live copy is already its stored values).
+- A training build resolves its memory plan before the load: the weights the plan
+  quantizes (`kohakumoss.memory.apply.quantized_weights`, the same selection
+  `quantize_model` makes) are left unread on the meta device
+  (`load_backbone(defer=...)`, `model.deferred_weights`), so no 16-bit copy of the
+  block linears is built on the host. The quantizer reads each one from the checkpoint
+  (`deferred_weight`: the stored values times the fold since the load, or the stored
+  tensor itself when it is in the compute dtype with no fold), the values the guarded
+  path above takes for a weight that is their cast. A deferred weight the quantizer
+  does not reach is a ValueError at build. MOSS-Image, int8 base, fp16 compute: the
+  build's private host peak is 5.7 GiB (the codes and the 16-bit rest), and the 263
+  bases hash (SHA-256 of every code and scale) the same as those quantized from a
+  loaded 16-bit copy.
 - The lookup runs once per weight, when the model is quantized (load / memory plan /
   export), never per step. Each quantizer logs one INFO line per model:
   `base fp8: quantized <n> linears: from the stored values <n>` (the DiT) or
   `text encoder fp8: ...`, with the live-weight counts by reason (stored in its dtype,
-  no stored values, not the stored values' cast); the report carries the same counts
-  (`from_source`, `sources`).
+  no stored values, not the stored values' cast) and the deferred ones (`from the stored
+  values (no 16-bit copy loaded)`); the report carries the same counts (`from_source`
+  counts both stored kinds, `sources`).
 
 So the codes and scales depend on the checkpoint, never on the compute dtype: a bf16
 checkpoint quantizes the same at fp16 compute (sm75, fp16 training) as at bf16, and a

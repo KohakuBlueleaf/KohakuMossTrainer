@@ -1,6 +1,7 @@
 """Quantization source: a weight's checkpoint values, quantized instead of its live
-copy when that copy is exactly their cast (times a fold multiplier) to another dtype.
-See docs/internals/quant-kernels.md#source."""
+copy when that copy is exactly their cast (times a fold multiplier) to another dtype,
+and in place of a copy the load left unread. See docs/internals/quant-kernels.md#source.
+"""
 
 from collections.abc import Callable
 from pathlib import Path
@@ -13,8 +14,10 @@ from kohakumoss_common.log import get_logger
 from kohakumoss_kernels.dtypes import SAFETENSORS as SAFETENSORS_DTYPES
 
 STORED, SAME, NO_SOURCE, NOT_THE_CAST = "stored", "same", "no_source", "not_the_cast"
+DEFERRED = "deferred"
 SOURCES = {
     STORED: "from the stored values",
+    DEFERRED: "from the stored values (no 16-bit copy loaded)",
     SAME: "from the live weight (stored in its dtype)",
     NO_SOURCE: "from the live weight (no stored values)",
     NOT_THE_CAST: (
@@ -127,6 +130,28 @@ def source_weight(
     if torch.equal(values.to(live.dtype), here):
         return values, STORED
     return here, NOT_THE_CAST
+
+
+def deferred_weight(
+    source: SourceWeights | None,
+    name: str,
+    dtype: torch.dtype,
+    scale: Tensor | float | None = None,
+    work: torch.device | str = "cpu",
+) -> Tensor:
+    """The values to quantize for weight `name`, which the load left unread: its stored
+    values on `work`, in `dtype` (the compute dtype) when stored in it and unscaled
+    (what a loaded copy would hold), else in fp32 times the fold multiplier `scale`;
+    ValueError when `source` does not hold them."""
+    if source is None or source.dtype(name) is None:
+        raise ValueError(
+            f"{name} was left unread at load and no checkpoint source holds it"
+        )
+    stored = source.get(name)
+    if stored.dtype == dtype and scale is None:
+        return stored.to(work)
+    values = stored.to(work, torch.float32)
+    return values * _rows(scale, values) if scale is not None else values
 
 
 def tally(counts: dict[str, int], kind: str) -> None:

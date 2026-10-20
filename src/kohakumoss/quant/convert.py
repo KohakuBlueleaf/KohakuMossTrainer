@@ -15,8 +15,10 @@ from kohakumoss.quant.compute import (
     recipe_of,
 )
 from kohakumoss.quant.source import (
+    DEFERRED,
     STORED,
     SourceWeights,
+    deferred_weight,
     log_sources,
     source_weight,
     tally,
@@ -155,6 +157,36 @@ def attach_compute(
     return out
 
 
+def quantizable(
+    model: nn.Module, fmt: str, accept: Callable[[str, MossLinear], bool]
+) -> tuple[list[tuple[str, MossLinear]], int]:
+    """(the dense MossLinears `quantize_model` replaces under `fmt` and `accept`, by
+    module path; how many accepted ones fp8 compute's shapes refuse)."""
+    out, skipped = [], 0
+    for name, lin in model.named_modules():
+        if not isinstance(lin, MossLinear) or lin.base is not None:
+            continue
+        if not accept(name, lin):
+            continue
+        if accepts(fmt, lin.out_features, lin.in_features):
+            out.append((name, lin))
+        else:
+            skipped += 1
+    return out, skipped
+
+
+def unread_problems(model: nn.Module) -> list[str]:
+    """Weights the load left unread (`deferred_weights`, for a quantizer reading the
+    checkpoint) that are still not quantized."""
+    left = sorted(getattr(model, "deferred_weights", {}))
+    if not left:
+        return []
+    return [
+        f"{len(left)} weights the load left unread for quantization are not "
+        f"quantized: {left[:3]}"
+    ]
+
+
 @torch.no_grad()
 def quantize_model(
     model: nn.Module,
@@ -170,38 +202,42 @@ def quantize_model(
     """Replace accepted MossLinear bases with QuantWeight (int8 / fp8) or ComputeWeight
     (fp8_compute / mxfp8; `recipe`, `dgrad` copy), quantizing on `work_device`
     (default: where the weight is) from each weight's stored values in `source` (times
-    its fold rows in `scales`, by module path) where `source_weight` takes them, the
-    tally logged once; returns counts and bytes (`skipped`: accepted layers whose shape
-    fp8 compute cannot take, `from_source`: layers quantized from stored values,
-    `sources`: layers per `source_weight` kind)."""
+    its fold rows in `scales`, by module path) where `source_weight` takes them, and
+    always for a weight the load left unread (`model.deferred_weights`: name -> its
+    home device), the tally logged once; returns counts and bytes (`skipped`: accepted
+    layers whose shape fp8 compute cannot take, `from_source`: layers quantized from
+    stored values, `sources`: layers per `source_weight` kind)."""
     accept = accept or default_filter(())
-    report = {"layers": 0, "dense_bytes": 0, "quant_bytes": 0, "skipped": 0}
+    linears, skipped = quantizable(model, fmt, accept)
+    report = {"layers": 0, "dense_bytes": 0, "quant_bytes": 0, "skipped": skipped}
     report["from_source"] = 0
     sources: dict[str, int] = {}
     scales = scales or {}
-    for name, lin in list(model.named_modules()):
-        if not isinstance(lin, MossLinear) or lin.base is not None:
-            continue
-        if not accept(name, lin):
-            continue
-        if not accepts(fmt, lin.out_features, lin.in_features):
-            report["skipped"] += 1
-            continue
+    deferred = getattr(model, "deferred_weights", {})
+    for name, lin in linears:
         w = lin.weight.detach()
-        values, kind = source_weight(
-            w, source, f"{name}.weight", scales.get(name), work_device or w.device
-        )
+        key = f"{name}.weight"
+        home = deferred.pop(key, None)
+        if home is not None:
+            work = work_device or home
+            values = deferred_weight(source, key, w.dtype, scales.get(name), work)
+            kind = DEFERRED
+        else:
+            home = w.device
+            values, kind = source_weight(
+                w, source, key, scales.get(name), work_device or w.device
+            )
         tally(sources, kind)
-        qw = make_base(values, fmt, recipe, dgrad).to(w.device)
+        qw = make_base(values, fmt, recipe, dgrad).to(home)
         report["layers"] += 1
         report["dense_bytes"] += w.nbytes
         report["quant_bytes"] += qw.nbytes()
         lin.weight = nn.Parameter(
-            torch.empty(0, dtype=w.dtype, device=w.device), requires_grad=False
+            torch.empty(0, dtype=w.dtype, device=home), requires_grad=False
         )
         lin.set_base(qw)
         qw.bind(compute_dtype or w.dtype)
-    report["from_source"] = sources.get(STORED, 0)
+    report["from_source"] = sources.get(STORED, 0) + sources.get(DEFERRED, 0)
     report["sources"] = sources
     if source is not None:
         log_sources(f"base {fmt}", sources)

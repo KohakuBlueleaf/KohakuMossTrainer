@@ -8,7 +8,7 @@ import torch
 from torch import Tensor
 
 from kohakumoss.model.backbone import MossBackbone
-from kohakumoss.model.io.load import read_fp16_fix
+from kohakumoss.model.io.load import holds_values, read_fp16_fix
 from kohakumoss.model.io.source import CheckpointSource, ModelKeyView
 from kohakumoss.model.numerics.fold import output_row_scales, record_row_scales
 from kohakumoss.quant.source import SourceWeights
@@ -41,9 +41,6 @@ def fold_since_load(model: MossBackbone, file_fold: dict | None) -> dict[str, Te
     return out
 
 
-CODES = (torch.int8, torch.uint8, torch.float8_e4m3fn, torch.float8_e5m2)
-
-
 def backbone_source(
     model: MossBackbone,
 ) -> tuple[SourceWeights | None, dict[str, Tensor]]:
@@ -56,9 +53,7 @@ def backbone_source(
     view = ModelKeyView(CheckpointSource(path))
 
     def resolve(name: str) -> str | None:
-        if name not in view.map or view.dtype(name) in CODES:
-            return None
-        return name
+        return name if holds_values(view, name) else None
 
     source = SourceWeights(view, resolve)
     return source, fold_since_load(model, file_fold_record(read_fp16_fix(path)))

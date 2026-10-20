@@ -167,7 +167,7 @@ int8 / fp8 base halves the DiT parts):
 | part | when | GiB |
 | --- | --- | --- |
 | trainer process and its `NUM_WORKERS` loader workers (spawned processes on Windows, each importing torch) | always | the bench matrix budgets 8 per run (`kohakumoss_bench/plan/hostmem.py`) |
-| the DiT, loaded on the host before placement | build | 9.47 |
+| the DiT, loaded on the host before placement; with a quantized base (`int8` / `fp8`) its block linears are left unread and quantized from the file | build | 9.47 in 16-bit; about 4.8 with an int8 base (the codes and the 16-bit rest) |
 | the text encoder, streamed from its file pages to its placement ([streamed load](../internals/text-encoder.md#streamed-load)) | when `SAMPLE_EVERY > 0` or `TEXT_CACHE` is not `offline`; with an offline text cache it is freed after the sample prompts | private only for what `ring` / `offload` copy to the host (`host` copy: 15.63 in bf16 / fp16, rounded up per tensor when pinned; `host` file: none, the file pages are page cache) and for layers quantized at load held on the host |
 | streamed DiT blocks, pinned (0.21 per block of 42; the device keeps `stream_resident`) | streaming profiles | about 5.5 (`balanced`) to 8.4 (two resident blocks) |
 | offloaded activations (block inputs, one per block, in pinned buffers rounded up to a power of two) | `act_offload` | about 1 at 4352 tokens, 2 at 8192 |

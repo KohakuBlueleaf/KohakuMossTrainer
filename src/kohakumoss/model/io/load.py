@@ -2,6 +2,7 @@
 
 import json
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -222,6 +223,27 @@ def _layer_keys(layers: dict[str, ComfyLayer]) -> tuple[set[str], set[str]]:
     return weights, rest
 
 
+VALUE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def holds_values(view: ModelKeyView, name: str) -> bool:
+    """`view` holds model weight `name` as 16-bit / fp32 values (not stored codes)."""
+    return name in view.map and view.dtype(name) in VALUE_DTYPES
+
+
+def _unread(
+    defer: Callable[[nn.Module], Iterable[str]] | None,
+    model: nn.Module,
+    view: ModelKeyView,
+    stored: set[str],
+) -> set[str]:
+    """The weights `defer(model)` names that the file holds as values (not a stored
+    base): the load leaves them on the meta device."""
+    if defer is None:
+        return set()
+    return {k for k in defer(model) if k not in stored and holds_values(view, k)}
+
+
 def load_backbone(
     path: str | Path,
     device: torch.device | str = "cuda",
@@ -231,13 +253,16 @@ def load_backbone(
     kernels: dict[str, str] | None = None,
     strict: bool = True,
     fp16_fix_eps: str = "stock",
+    defer: Callable[[nn.Module], Iterable[str]] | None = None,
 ) -> tuple[MossBackbone, LoadReport]:
     """Build on meta, then read, cast and move one tensor at a time (host and device
     peaks are one tensor plus the model), bind ops. An fp16-fix file is recorded as
     folded (savers and adapter exports undo it); `fp16_fix_eps="exact"` uses eps * c^2.
     A pre-quantized file (KohakuMoss fp8, ComfyUI int8 / fp8 / W4A8, ConvRot included)
     attaches its stored bases (no 16-bit copy is built); ComfyUI runtime hints are
-    skipped.
+    skipped. The weights `defer(meta model)` names that the file holds as values stay
+    unread on the meta device, for a quantizer reading them from the checkpoint
+    (`model.deferred_weights`: name -> the device they would have loaded to).
     """
     start = time.perf_counter()
     log.info("loading transformer", path=path, dtype=short(dtype), device=device)
@@ -249,9 +274,12 @@ def load_backbone(
     stored, extra = stored_keys(record) if record else (set(), set())
     weights, rest = _layer_keys(layers)
     stored, extra = stored | weights, extra | rest
+    unread = _unread(defer, model, view, stored)
+    skip = frozenset(stored | unread)
     report = load_state_into(
-        model, view, str(path), strict, device, frozenset(stored), frozenset(extra)
+        model, view, str(path), strict, device, skip, frozenset(extra)
     )
+    model.deferred_weights = {k: torch.device(device) for k in sorted(unread)}
     if record:
         attach_stored(model, view, record, device, dtype)
         log.info(
@@ -274,13 +302,15 @@ def load_backbone(
         adopt_fold(model, fix["c"], (fix["s_attn"], fix["s_ffn"]), fp16_fix_eps)
         model.fp16_fix = "weights"
     model.bind_ops(OpSet.resolve(device, dtype, kernels))
-    size = gib(sum(p.nbytes for p in model.parameters()))
+    size = gib(sum(p.nbytes for p in model.parameters() if not p.is_meta))
     fold = {"fp16_fold_c": fix["c"]} if fix is not None else {}
+    left = {"unread_for_quantization": len(unread)} if unread else {}
     log.info(
         f"transformer loaded from {hl(path, 'path')}",
         tensors=report.n_source,
         gib=round(size, 2),
         secs=round(time.perf_counter() - start, 2),
         **fold,
+        **left,
     )
     return model, report

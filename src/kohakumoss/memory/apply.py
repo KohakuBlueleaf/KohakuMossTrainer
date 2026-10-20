@@ -20,7 +20,13 @@ from kohakumoss.offload.weights.stream import WeightStream
 from kohakumoss.quant.bind import rebind_quant, work_device
 from kohakumoss.quant.compute import COMPUTE as FP8_COMPUTE
 from kohakumoss.quant.compute import ComputeWeight
-from kohakumoss.quant.convert import attach_compute, default_filter, quantize_model
+from kohakumoss.quant.convert import (
+    attach_compute,
+    default_filter,
+    quantizable,
+    quantize_model,
+    unread_problems,
+)
 from kohakumoss.quant.densify import densify_bases, stored_formats
 from kohakumoss.types.plans import MemoryPlan
 from kohakumoss_kernels.dist import dist_rank, grouped
@@ -159,6 +165,23 @@ def settle_stored(backbone: nn.Module, precision: str, trainable_base: bool) -> 
     )
 
 
+def quantized_weights(
+    backbone: nn.Module,
+    plan: MemoryPlan,
+    trainable_base: bool,
+    keep_fp32: tuple[str, ...] = (),
+    quant_min_features: int = 256,
+) -> set[str]:
+    """The weight names `quantize_base` replaces under `plan` (none for a trainable base
+    or a precision it does not quantize): what a load may leave unread
+    (`load_backbone(defer=...)`); works on the meta model."""
+    if plan.base_precision not in QUANT or trainable_base:
+        return set()
+    accept = default_filter(keep_fp32, quant_min_features)
+    linears, _ = quantizable(backbone, plan.base_precision, accept)
+    return {f"{name}.weight" for name, _ in linears}
+
+
 @torch.no_grad()
 def quantize_base(
     backbone: nn.Module,
@@ -192,6 +215,9 @@ def quantize_base(
             source=source,
             scales=scales,
         )
+    problems = unread_problems(backbone)
+    if problems:
+        raise ValueError(problems[0])
     if training and plan.fp8_dgrad == "fp8":
         for m in backbone.modules():
             if isinstance(m, ComputeWeight):

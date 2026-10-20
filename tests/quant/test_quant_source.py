@@ -3,7 +3,8 @@ raw tensors: a weight stored in bf16 and live as its fp16 cast quantizes from th
 values, so its codes do not depend on the compute dtype; a live weight that is not the
 cast of the stored one (a merged delta) quantizes as it is; a fold applied since the
 load is multiplied into the stored values; the same through `quantize_model` (DiT) and
-`quantize_text_linears` (text encoder)."""
+`quantize_text_linears` (text encoder); a weight the load left unread is quantized
+from the checkpoint, and the unread set is the quantized one."""
 
 import logging
 
@@ -11,9 +12,11 @@ import pytest
 import torch
 from torch import nn
 
+from kohakumoss.memory.apply import quantize_base, quantized_weights
 from kohakumoss.model.linear import MossLinear
-from kohakumoss.quant.convert import quantize_model
+from kohakumoss.quant.convert import quantize_model, unread_problems
 from kohakumoss.quant.source import (
+    DEFERRED,
     NO_SOURCE,
     NOT_THE_CAST,
     SAME,
@@ -25,6 +28,7 @@ from kohakumoss.quant.source import (
 )
 from kohakumoss.quant.text import quantize_text_linears
 from kohakumoss.quant.weights import quantize
+from kohakumoss.types.plans import MemoryPlan
 from kohakumoss_kernels.fp8 import quantize as fp8_quantize
 from tests._util.negative import must_fail
 
@@ -229,6 +233,62 @@ def test_quantize_model_takes_the_stored_values():
     old = nn.ModuleDict({"lin": _moss(want)})
     quantize_model(old, "fp8")
     must_fail(lambda: check_base(old["lin"].base, want), "no source given")
+
+
+def _unread() -> nn.ModuleDict:
+    """A linear whose weight the load left unread (meta, `deferred_weights`)."""
+    with torch.device("meta"):
+        lin = MossLinear(IN, OUT, bias=False, dtype=torch.float16)
+    holder = nn.ModuleDict({"lin": lin})
+    holder.deferred_weights = {"lin.weight": torch.device("cpu")}
+    return holder
+
+
+def test_a_weight_left_unread_is_quantized_from_the_checkpoint():
+    w = stored_weight()
+    rows = torch.where(torch.arange(OUT) < OUT // 2, 0.5, 1.0)
+    want = w.float() * rows[:, None]
+    holder = _unread()
+    source = _source({"lin.weight": w})
+    report = quantize_model(holder, "fp8", source=source, scales={"lin": rows})
+    assert report["sources"] == {DEFERRED: 1} and report["from_source"] == 1, report
+    assert holder["lin"].base.q.device.type == "cpu"
+    assert not holder["lin"].weight.is_meta and unread_problems(holder) == []
+    check_base(holder["lin"].base, want)
+    unscaled = _unread()
+    quantize_model(unscaled, "fp8", source=source)
+    must_fail(lambda: check_base(unscaled["lin"].base, want), "the fold left out")
+    missed = _unread()
+    quantize_model(missed, "fp8", lambda name, lin: False, source=source)
+    assert unread_problems(missed), "an unread weight left unquantized"
+
+
+def test_the_unread_weights_are_the_quantized_ones():
+    plan = MemoryPlan(base_precision="int8")
+
+    def model() -> nn.ModuleDict:
+        sizes = {"big": (512, 256), "small": (64, 64), "kept": (512, 256)}
+        holder = nn.ModuleDict(
+            {
+                k: MossLinear(i, o, bias=False, dtype=torch.float16)
+                for k, (i, o) in sizes.items()
+            }
+        )
+        holder.weight_path = None
+        return holder
+
+    def check(names_of) -> None:
+        names = names_of(model())
+        built = model()
+        quantize_base(built, plan, torch.float16, True, False, ("kept",))
+        done = {f"{n}.weight" for n, m in built.items() if m.base is not None}
+        assert names == done == {"big.weight"}, (names, done)
+
+    check(lambda m: quantized_weights(m, plan, False, ("kept",)))
+    must_fail(
+        lambda: check(lambda m: quantized_weights(m, plan, False)), "KEEP_FP32 lost"
+    )
+    assert quantized_weights(model(), plan, True, ("kept",)) == set()
 
 
 def _linear(w: torch.Tensor) -> nn.ModuleDict:

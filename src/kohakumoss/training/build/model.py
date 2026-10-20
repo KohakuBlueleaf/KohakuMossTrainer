@@ -20,7 +20,7 @@ from kohakumoss.encoders.text.plan import DTYPES as TEXT_DTYPES
 from kohakumoss.encoders.text.plan import MEMORY_ALIASES as TEXT_MEMORY_ALIASES
 from kohakumoss.encoders.vae import FluxVae, resolve_vae_dtype
 from kohakumoss.logging.log import get_logger, hl
-from kohakumoss.memory.apply import apply_to_backbone
+from kohakumoss.memory.apply import apply_to_backbone, quantized_weights
 from kohakumoss.memory.estimate import Workload, estimate
 from kohakumoss.memory.planner import NothingFits, auto_plan
 from kohakumoss.memory.profiles import ORDER, catalog_name
@@ -67,8 +67,10 @@ class Built:
     sample_embeds: list | None = None
 
 
-def build_backbone(k: dict, device: torch.device, prec: PrecisionConfig):
-    """The backbone loaded from WEIGHTS (TRANSFORMER: the ComfyUI folder's file)."""
+def build_backbone(k: dict, device: torch.device, prec: PrecisionConfig, defer=None):
+    """The backbone loaded from WEIGHTS (TRANSFORMER: the ComfyUI folder's file); the
+    weights `defer(meta model)` names stay unread for the quantizer
+    (`load_backbone`)."""
     cfg = resolve_config(k["VARIANT"], k["ARCH_OVERRIDES"] or None)
     model, _ = load_backbone(
         component(k, DIT),
@@ -77,6 +79,7 @@ def build_backbone(k: dict, device: torch.device, prec: PrecisionConfig):
         keep_fp32=prec.keep_fp32,
         cfg=cfg,
         kernels=k["KERNELS"],
+        defer=defer,
     )
     return model
 
@@ -239,14 +242,19 @@ def build_model(
     text_tokens: int | None = None,
 ) -> Built:
     """Build order of types/context.py up to (not including) the parallel wrap and compile:
-    load on the host -> FP16_FIX -> memory plan (quantize, place or stream onto
-    `device`, offload, runner) -> trainable -> parameter dtypes -> bind_ops -> encoders.
-    `text_tokens`: the dataset's longest caption, for the `auto` plan.
+    memory plan -> load on the host (the weights the plan quantizes left unread, read
+    from the checkpoint by the quantizer) -> FP16_FIX -> the plan applied (quantize,
+    place or stream onto `device`, offload, runner) -> trainable -> parameter dtypes
+    -> bind_ops -> encoders -> the C heap's freed pages returned. `text_tokens`: the
+    dataset's longest caption, for the `auto` plan.
     """
-    backbone = build_backbone(k, torch.device("cpu"), prec)
-    apply_fp16_fix(backbone, prec.fp16_fix, **prec.fp16_fix_kwargs)
     plan, auto_rows = resolve_memory(k, device, prec.compute, world, text_tokens)
     full = is_full(k)
+    defer = partial(
+        quantized_weights, plan=plan, trainable_base=full, keep_fp32=prec.keep_fp32
+    )
+    backbone = build_backbone(k, torch.device("cpu"), prec, defer)
+    apply_fp16_fix(backbone, prec.fp16_fix, **prec.fp16_fix_kwargs)
     engines = apply_to_backbone(
         backbone,
         plan,
