@@ -58,7 +58,8 @@ Each layout has a data layer (`kohakumoss-config new train --source <name>`,
 A GBC dataset (images, GBC graphs and metadata from KohakuGBC) needs
 `pip install "kohakumoss[gbc]"` (Python 3.11+) and the `gbc` caption template, which
 builds each caption from the sample's metadata and graph
-([data.md](../concepts/data.md#gbc-captions)).
+([data.md](../concepts/data.md#gbc-captions)); `examples/gbc-danbooru/` is a complete
+run.
 
 The manifest sources (`jsonl`, `parquet`) read:
 
