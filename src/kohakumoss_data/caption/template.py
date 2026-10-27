@@ -210,3 +210,19 @@ class JsonTemplate:
 def build_template(caption: dict | str | None):
     """`{"template": name, **kwargs}` -> template instance (default: tags)."""
     return build(caption or {"template": "tags"}, CAPTIONS, "template")
+
+
+def _row_only(render, row: CatalogRow, rng: np.random.Generator, row_id: int) -> str:
+    return render(row, rng)
+
+
+def bind_template(template, source, geometry_of=None, max_chars: int = 0):
+    """`render(row, rng, row_id)` of `template` over its dataset entry: the template's
+    own `bind(source, geometry_of, max_chars)` when it has one (a template reading the
+    source's records or the row geometry), else its `render(row, rng)`.
+    `geometry_of(row_id)` gives the RowGeometry (None: the stored image, uncropped);
+    `max_chars` is the caption length the text budget allows (0: unbounded)."""
+    bind = getattr(template, "bind", None)
+    if bind is None:
+        return partial(_row_only, template.render)
+    return bind(source, geometry_of, max_chars)

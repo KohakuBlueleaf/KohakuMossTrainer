@@ -15,7 +15,7 @@ from kohakumoss_common.registry import build
 from kohakumoss_data.cache.settings import offline_miss, record
 from kohakumoss_data.cache.store import LengthTable
 from kohakumoss_data.cache.tensor_cache import LatentCache, TextCache
-from kohakumoss_data.caption.template import build_template
+from kohakumoss_data.caption.template import bind_template, build_template
 from kohakumoss_data.catalog.vault import is_catalog_vault
 from kohakumoss_data.config import (
     TOKEN_BUDGETS,
@@ -33,7 +33,7 @@ from kohakumoss_data.scan.paths import scan_path
 from kohakumoss_data.scan.runner import scan_catalog
 from kohakumoss_data.scan.walk import rows_of
 from kohakumoss_data.seeds import rng_of
-from kohakumoss_data.types import HostBatch, PlanItem
+from kohakumoss_data.types import HostBatch, PlanItem, RowGeometry
 
 DATASET_KEYS = ("weight", "caption", "loss_weight", "catalog", "import_to")
 log = get_logger(__name__)
@@ -87,7 +87,7 @@ def first_captions(
     """The first `n` non-empty rendered captions (variant 0) among the first `limit`
     rows of dataset entry `entry`, reading only those rows."""
     source = build_source(entry)
-    template = build_template(entry.get("caption", caption))
+    render = bind_template(build_template(entry.get("caption", caption)), source)
     if getattr(source, "catalog", None) is not None:
         catalog = source.catalog()
         rows = (catalog[i] for i in range(len(catalog)))
@@ -97,7 +97,7 @@ def first_captions(
         rows = source.scan()
     out = []
     for i, row in enumerate(rows):
-        text = template.render(row, rng_of("caption", seed, i, 0))
+        text = render(row, rng_of("caption", seed, i, 0), i)
         if text:
             out.append(text)
         if len(out) == n or i + 1 == limit:
@@ -122,6 +122,13 @@ def text_estimate(cfg: DataConfig, catalog: Catalog, templates: list) -> np.ndar
     per = np.float32(cfg.text_chars_per_token)
     tokens = np.ceil(chars.astype(np.float32) / per).astype(np.int64)
     return np.minimum(tokens + cfg.text_overhead_tokens, cfg.max_text_tokens)
+
+
+def text_chars_budget(cfg: DataConfig) -> int:
+    """The caption characters `max_text_tokens` holds under the estimate the planner uses
+    (`text_chars_per_token`, `text_overhead_tokens`)."""
+    tokens = max(cfg.max_text_tokens - cfg.text_overhead_tokens, 1)
+    return int(tokens * cfg.text_chars_per_token)
 
 
 def draw_drop(seed: int, p: float, index: int, rank: int, slot: int) -> bool:
@@ -192,6 +199,10 @@ class MossDataset:
         self._text_lengths = self.texts.lengths() if offline else LengthTable()
         self._bind()
         self.planner = self._planner()
+        self.renderers = [
+            bind_template(t, s, self.row_geometry, text_chars_budget(cfg))
+            for t, s in zip(self.templates, self.sources)
+        ]
 
     def _bind(self) -> None:
         cfg = self.cfg
@@ -252,8 +263,15 @@ class MossDataset:
     def caption(self, row_id: int, variant: int) -> str:
         """Caption variant `variant` of row `row_id` (fixed per seed, row, variant)."""
         row = self.catalog[row_id]
-        template = self.templates[int(self.catalog.source[row_id])]
-        return template.render(row, rng_of("caption", self.cfg.seed, row_id, variant))
+        render = self.renderers[int(self.catalog.source[row_id])]
+        return render(row, rng_of("caption", self.cfg.seed, row_id, variant), row_id)
+
+    def row_geometry(self, row_id: int) -> RowGeometry:
+        """Row `row_id`'s stored size, planned target and centre crop box."""
+        w, h = int(self.catalog.w[row_id]), int(self.catalog.h[row_id])
+        target = tuple(self.planner.targets[row_id])
+        crop = self.geometry.center_box(w, h, target, None)
+        return RowGeometry(w, h, target, crop)
 
     def _live_text(self) -> np.ndarray:
         return self._text_est[np.asarray(self.catalog.live, dtype=bool)]

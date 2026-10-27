@@ -68,6 +68,13 @@ Templates (`CAPTION = {"template": ...}`):
 - `json`: `row.json` plus listed row fields as `key: value` lines or compact JSON, with
   `field_dropout` (fields in `keep` never drop).
 
+A template is bound to its dataset entry once, at build (`bind_template`): a template
+with a `bind(source, geometry_of, max_chars)` reads the source's records, the row's
+geometry (its target size and centre crop) and the caption length the text budget
+allows (`MAX_TEXT_TOKENS` under the planner's chars-per-token estimate); the others
+render from the row alone. A template that follows the row's crop (`geometric`) refuses
+`CROP="random"`, `RESOLUTION_MODE="shifted_square"` and `FLIP`.
+
 Caption variant `k` of row `r` is rendered from a generator seeded by `(seed, r, k)`, so
 there are exactly `max(1, CAPTION_VARIANTS)` captions per row (0 draws variant 0): what
 the text cache stores is what training draws, since the cache pass takes the count from

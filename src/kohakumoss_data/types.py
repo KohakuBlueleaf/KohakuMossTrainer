@@ -48,6 +48,17 @@ class PlanItem:
     keep_seed: int = 0
 
 
+@dataclass(frozen=True)
+class RowGeometry:
+    """A row's stored size (w, h), its training target (h, w) and the centre crop box
+    (l, t, r, b) in stored pixels the target is resized from."""
+
+    w: int
+    h: int
+    target_hw: tuple[int, int]
+    crop_ltrb: tuple[int, int, int, int]
+
+
 @dataclass
 class BatchPlan:
     """A whole batch decided by a planner; a pure function of (seed, rank, index)."""

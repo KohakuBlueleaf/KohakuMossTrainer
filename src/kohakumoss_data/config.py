@@ -7,7 +7,7 @@ from kohakumoss_common.typecheck import describe, mismatches
 from kohakumoss_data.cache.store import STORAGE
 from kohakumoss_data.cache.tensor_cache import MODES
 from kohakumoss_data.loader.decode import BACKGROUNDS, RESAMPLE
-from kohakumoss_data.registry import PLANNERS
+from kohakumoss_data.registry import CAPTIONS, PLANNERS, SOURCES
 from kohakumoss_data.resolution.batching import BATCHINGS
 from kohakumoss_data.resolution.geometry import LATENT_FACTOR
 from kohakumoss_data.resolution.overlong import OVERLONG
@@ -163,7 +163,29 @@ def data_problems(cfg: DataConfig) -> list[str]:
         )
     if cfg.max_tokens < 2:
         problems.append("MAX_TOKENS must be >= 2")
-    return problems
+    return problems + entry_problems(cfg)
+
+
+def entry_problems(cfg: DataConfig) -> list[str]:
+    """Per dataset entry: its source's own checks (`problems(entry)`), and a caption
+    template that reads the row geometry (`geometric`) under a crop or flip it cannot
+    follow (a random crop, a flip)."""
+    out = []
+    random_crop = cfg.crop == "random" or cfg.resolution_mode == "shifted_square"
+    for entry in cfg.datasets:
+        name = entry.get("source")
+        source = SOURCES.get(name) if name in SOURCES else None
+        if source is not None and hasattr(source, "problems"):
+            out += source.problems(entry)
+        caption = entry.get("caption", cfg.caption) or {}
+        kind = caption.get("template", "tags") if isinstance(caption, dict) else caption
+        template = CAPTIONS.get(kind) if kind in CAPTIONS else None
+        if getattr(template, "geometric", False) and (random_crop or cfg.flip):
+            out.append(
+                f"caption template {kind!r} follows the row's centre crop: needs "
+                "CROP='center', FLIP=False and not RESOLUTION_MODE='shifted_square'"
+            )
+    return out
 
 
 def pipeline_problems(cfg: DataConfig) -> list[str]:
