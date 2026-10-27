@@ -11,7 +11,8 @@ layouts, encode-ahead, quantization, reporting, and then the text ops and their 
 
 One knob set (`kohakumoss.types.plans.TextEncoderPlan`) serves:
 
-- training: `TEXT_ENCODE`, plus `TEXT_DEVICE` for the device;
+- training: `TEXT_ENCODE`, plus `TEXT_DEVICE` for the device, or `ENCODE_DEVICES` for
+  encoder cards of their own ([encode-feed.md](encode-feed.md));
 - the pipeline: `text_plan=`, and `TEXT_ENCODE` in `scripts/sample/sample.py`;
 - the offline cache factory: `kohakumoss.encoders.text.text_encoder`.
 
@@ -175,7 +176,7 @@ Under `ring` / `offload` one pass moves the weights once for `ahead` batches.
 A sample whose text the planner fits by cutting (`OVERLONG="truncate_text"`, a
 `text_limit` > 0) keeps the first `text_limit` rows of its encoding. `encode(prompts,
 limits)` cuts each prompt's token ids to its limit before the pass, so the encoder runs
-only the tokens the step keeps. Every layer of
+only the tokens the step keeps; the encode feed passes the limits. Every layer of
 Qwen3.5 is causal (the gated delta rule, causal conv and attention), so the kept rows
 equal those of the full prompt's pass cut afterwards, within the encoder's precision. A
 cut encoding is never written to the online cache (the writer stores only uncut ones).

@@ -164,6 +164,31 @@ class VaeEncodeStats:
         self.t0, self.mark, self.step0 = now, cur, state.step
 
 
+class FeedWait:
+    """The encode feed between log points: seconds per step the rank waited for a
+    ready batch (`feed_wait`; 0 while the feed keeps ahead) and the encoder-process
+    seconds its batches took per step (`feed_encode`, text encoder + VAE)."""
+
+    edges = True
+
+    def __init__(self, every: int, feed):
+        self.every = every
+        self.feed = feed
+        self.mark = self._snapshot()
+        self.step0 = 0
+
+    def _snapshot(self) -> tuple:
+        busy = self.feed.text.stats["seconds"] + self.feed.vae.stats["seconds"]
+        return self.feed.wait_seconds, busy
+
+    def on_step_end(self, state: TrainState, out) -> None:
+        cur = self._snapshot()
+        wait, busy = (a - b for a, b in zip(cur, self.mark))
+        steps = max(state.step - self.step0, 1)
+        state.metrics.update(feed_wait=wait / steps, feed_encode=busy / steps)
+        self.mark, self.step0 = cur, state.step
+
+
 class StepLine:
     """The console step line (`step N [loss=, grad_norm=, lr=]`) every `every` steps and
     at the run's first and last step."""

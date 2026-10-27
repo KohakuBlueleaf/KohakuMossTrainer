@@ -3,6 +3,7 @@ CallbackRunner schedules."""
 
 from kohakumoss.training.callbacks.evaluate import FixedSigma, SampleGrid, Validation
 from kohakumoss.training.callbacks.monitor import (
+    FeedWait,
     InstabilityDump,
     LogMetrics,
     StepLine,
@@ -20,6 +21,7 @@ from kohakumoss.training.callbacks.runner import (
 
 __all__ = [
     "CallbackRunner",
+    "FeedWait",
     "FixedSigma",
     "InstabilityDump",
     "LogMetrics",

@@ -29,7 +29,7 @@ class _Holder(nn.Module):
 
 
 def _built(te=None, vae=None):
-    return SimpleNamespace(text_encoder=te, vae=vae)
+    return SimpleNamespace(text_encoder=te, vae=vae, feed=None)
 
 
 def _vae(name: str):

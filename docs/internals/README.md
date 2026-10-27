@@ -15,6 +15,7 @@ does on the device. Start from the [concepts](../concepts/README.md) and
 | | [checkpoints.md](checkpoints.md) | streaming checkpoint writes, memory and disk cost |
 | | [reference-cycles.md](reference-cycles.md) | no reference cycle through a tensor holder: class-function slots, weak hooks and callbacks |
 | text encoder | [text-encoder.md](text-encoder.md) | text-encoder ops and kernels, batched / packed encode, TextEncoderPlan, encode-ahead, quantization |
+| encode feed | [encode-feed.md](encode-feed.md) | ENCODE_DEVICES: encoder processes on their own cards, fed by the main process, streaming ready batches to the training processes |
 | adapters | [adapter-kinds.md](adapter-kinds.md) | the per-algorithm adapter records |
 | | [adapter-binding.md](adapter-binding.md) | bound adapter forwards, kernel ops, autotuned ops, forward wrappers |
 | multi-GPU | [distributed-launch.md](distributed-launch.md) | process launch, store and backends (multi-GPU training is Linux-only; the CPU gloo self-checks also run on Windows) |

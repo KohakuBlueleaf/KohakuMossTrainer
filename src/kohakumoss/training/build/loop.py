@@ -17,6 +17,7 @@ from kohakumoss.training.build.objective import build_loss, is_masked
 from kohakumoss.training.build.pipelines import filter_groups
 from kohakumoss.training.callbacks import (
     CallbackRunner,
+    FeedWait,
     InstabilityDump,
     LogMetrics,
     SampleGrid,
@@ -119,8 +120,11 @@ def build_batcher(
     `latent_ahead` when given);
     `writer` (a CacheWriter) receives every fresh encoding. With an `online` cache,
     fresh encodings are rounded as `dataset`'s cache stores them, so a miss trains on
-    what a later hit returns."""
+    what a later hit returns. Under the encode feed every batch arrives encoded (the
+    feed rounds and writes), so the batcher only moves it."""
     kw = {"masked": is_masked(k)}
+    if built.feed is not None:
+        return DeviceBatcher(device, built.backbone.cfg.rope_axes, **kw)
     if k["TEXT_CACHE"] != "offline":
         rounding = (
             {"as_cached": dataset.texts.as_cached}
@@ -161,7 +165,9 @@ def build_ahead(k: dict, built, loader):
 def build_latent_ahead(k: dict, built, loader):
     """The latent encode-ahead wrapper when latents are encoded online by a placed VAE
     (one VAE pass per VAE_ENCODE['ahead'] host batches), else None."""
-    if k["LATENT_CACHE"] == "offline" or not hasattr(built.vae, "encode_batches"):
+    if k["LATENT_CACHE"] == "offline" or built.feed is not None:
+        return None
+    if not hasattr(built.vae, "encode_batches"):
         return None
     n = built.vae.plan.ahead
     on_host = built.vae.plan.memory == "cpu"
@@ -347,15 +353,18 @@ def build_callbacks(
     mode = "full" if is_full(k) else "adapter"
     recompute = getattr(built.plan, "checkpoint", "none") != "none"
     cbs = retune_callbacks(k) + [DecisionsLive()] + speed_callbacks(k)
-    cbs.append(StepOneBreakdown(built.text_encoder, built.vae, output_dir, device))
+    text, vae = encode_stats(built)
+    cbs.append(StepOneBreakdown(text, vae, output_dir, device))
     cbs.append(Throughput(rows, built.backbone.cfg, mode, recompute, device))
     sources = transfer_sources(built.engines, bundle)
     if sources:
         cbs.append(TransferStats(rows, sources))
-    if hasattr(built.text_encoder, "stats"):
-        cbs.append(TextEncodeStats(rows, built.text_encoder, device))
-    if hasattr(built.vae, "stats"):
-        cbs.append(VaeEncodeStats(rows, built.vae))
+    if hasattr(text, "stats"):
+        cbs.append(TextEncodeStats(rows, text, device))
+    if hasattr(vae, "stats"):
+        cbs.append(VaeEncodeStats(rows, vae))
+    if built.feed is not None:
+        cbs.append(FeedWait(rows, built.feed))
     cbs += vram_callbacks(k, device)
     cbs += release_callbacks(device, rows, k["STEP_RELEASE"])
     cbs.append(Vram(rows, timeline, device_use))
@@ -419,6 +428,14 @@ def build_callbacks(
             )
         )
     return CallbackRunner(cbs, last=k["STEPS"])
+
+
+def encode_stats(built) -> tuple:
+    """(text, VAE) objects whose `stats` the encode callbacks read: the built encoders,
+    or the encode feed's statistics under the feed."""
+    if built.feed is not None:
+        return built.feed.text, built.feed.vae
+    return built.text_encoder, built.vae
 
 
 def validation_data_config(k: dict):

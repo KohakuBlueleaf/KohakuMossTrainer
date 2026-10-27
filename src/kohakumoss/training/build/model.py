@@ -65,6 +65,7 @@ class Built:
     vae: object | None
     text_encoder: object | None
     sample_embeds: list | None = None
+    feed: object | None = None
 
 
 def build_backbone(k: dict, device: torch.device, prec: PrecisionConfig, defer=None):
@@ -127,9 +128,11 @@ def fsdp_grads_sharded(k: dict) -> bool:
 def auto_text(k: dict, device: torch.device):
     """The `auto` planner's text-encoder term: (TextSizes from its config, tokens per
     pass / call, the placement rule per candidate plan), or None when text is not
-    encoded online on `device`."""
-    path = _component_path(k, TEXT)
-    if k["TEXT_CACHE"] == "offline" or not path or not Path(path).exists():
+    encoded online on `device` (none on the training card under the encode feed)."""
+    path = component_path(k, TEXT)
+    if k["TEXT_CACHE"] == "offline" or k["ENCODE_DEVICES"]:
+        return None
+    if not path or not Path(path).exists():
         return None
     plan, te_device = training_text_plan(k, device)
     if plan.memory == "cpu" or te_device != torch.device(device):
@@ -240,13 +243,15 @@ def build_model(
     prec: PrecisionConfig,
     world: int = 1,
     text_tokens: int | None = None,
+    feed=None,
 ) -> Built:
     """Build order of types/context.py up to (not including) the parallel wrap and compile:
     memory plan -> load on the host (the weights the plan quantizes left unread, read
     from the checkpoint by the quantizer) -> FP16_FIX -> the plan applied (quantize,
     place or stream onto `device`, offload, runner) -> trainable -> parameter dtypes
     -> bind_ops -> encoders -> the C heap's freed pages returned. `text_tokens`: the
-    dataset's longest caption, for the `auto` plan.
+    dataset's longest caption, for the `auto` plan; `feed`: the rank's StreamedLoader
+    under the encode feed (the encoders run in the encoder processes).
     """
     plan, auto_rows = resolve_memory(k, device, prec.compute, world, text_tokens)
     full = is_full(k)
@@ -270,12 +275,16 @@ def build_model(
     apply_param_dtypes(backbone, prec, _ids(trainable), k["OPTIMIZER"] == "adamw16")
     engines.exclude_params(trainable.trainable_params())
     backbone.bind_ops(OpSet.resolve(device, prec.compute, k["KERNELS"]))
-    vae, text, embeds = build_encoders(k, device, prec, step_reserve(k, plan), plan)
+    reserve = step_reserve(k, plan)
+    if feed is None:
+        vae, text, embeds = build_encoders(k, device, prec, reserve, plan)
+    else:
+        vae, text, embeds = fed_encoders(k, device, reserve, plan, feed)
     trim_heap()
-    return Built(backbone, trainable, plan, engines, vae, text, embeds)
+    return Built(backbone, trainable, plan, engines, vae, text, embeds, feed)
 
 
-def _component_path(k: dict, which: str) -> str:
+def component_path(k: dict, which: str) -> str:
     """The path of component `which` ("" when a ComfyUI folder holds none: the knob
     checks report that)."""
     try:
@@ -290,11 +299,14 @@ def placement_lines(k: dict, built: Built, device) -> list[tuple[str, dict]]:
     te, vae = encoder_lines(
         built.text_encoder,
         built.vae,
-        _component_path(k, TEXT),
-        _component_path(k, VAE),
+        component_path(k, TEXT),
+        component_path(k, VAE),
         device,
     )
-    if te is None:
+    if built.feed is not None:
+        on = built.feed.text.device
+        te = (f"text encoder and VAE encoding: the encode feed on {hl(on)}", {})
+    elif te is None:
         sampled = " (the sample prompts were encoded at build, then it was freed)"
         why = sampled if k["SAMPLE_EVERY"] > 0 else ""
         te = (f"text encoder: not kept, TEXT_CACHE='offline'{why}", {})
@@ -375,7 +387,7 @@ def data_knobs(k: dict, device: torch.device) -> dict:
     layout), whatever the encoders' placements."""
     plan, te_device = training_text_plan(k, device)
     on = torch.device("cpu") if plan.memory == "cpu" else te_device
-    plan, _, layout = resolve_text_plan(_component_path(k, TEXT), plan, on, device)
+    plan, _, layout = resolve_text_plan(component_path(k, TEXT), plan, on, device)
     vae_dtype = resolve_vae_dtype(k.get("VAE_DTYPE", "auto"), device)
     return {**k, **cache_specs(vae_dtype, plan, TEXT_DTYPES[plan.dtype], layout)}
 
@@ -398,22 +410,10 @@ def build_encoders(
     sampling = k["SAMPLE_EVERY"] > 0
     need_vae = k["LATENT_CACHE"] != "offline" or sampling
     vae = text = embeds = None
-    vae_path = _component_path(k, VAE)
-    text_path = _component_path(k, TEXT)
+    vae_path = component_path(k, VAE)
+    text_path = component_path(k, TEXT)
     if need_vae and vae_path:
-        vae_dtype = resolve_vae_dtype(k.get("VAE_DTYPE", "auto"), device)
-        vae = place_vae(
-            FluxVae.from_pretrained(vae_path, "cpu", vae_dtype, k["LATENT_DRAW"]),
-            {
-                **dict(k.get("VAE_ENCODE") or {}),
-                "memory": encoder_memory(k, "vae", "resident", mem_plan),
-            },
-            device,
-            reserve,
-            int(k["TARGET_AREA"]),
-        )
-        rule = encoder_rule(k, "vae", mem_plan)
-        log.info(f"VAE placement: {hl(vae.plan.memory)} ({rule})")
+        vae = training_vae(k, device, reserve, mem_plan, vae_path)
     if (online_text or sampling) and text_path:
         plan, te_device = training_text_plan(k, device, mem_plan)
         if not online_text:
@@ -437,6 +437,38 @@ def build_encoders(
         if not online_text:
             text = None
     return vae, text, embeds
+
+
+def training_vae(k: dict, device, reserve: int, mem_plan, vae_path: str):
+    """The VAE placed on `device` by VAE_ENCODE (an unset memory follows the memory
+    plan, `encoder_memory`)."""
+    vae_dtype = resolve_vae_dtype(k.get("VAE_DTYPE", "auto"), device)
+    vae = place_vae(
+        FluxVae.from_pretrained(vae_path, "cpu", vae_dtype, k["LATENT_DRAW"]),
+        {
+            **dict(k.get("VAE_ENCODE") or {}),
+            "memory": encoder_memory(k, "vae", "resident", mem_plan),
+        },
+        device,
+        reserve,
+        int(k["TARGET_AREA"]),
+    )
+    rule = encoder_rule(k, "vae", mem_plan)
+    log.info(f"VAE placement: {hl(vae.plan.memory)} ({rule})")
+    return vae
+
+
+def fed_encoders(k: dict, device, reserve: int, mem_plan, feed):
+    """(VAE, text encoder, sample-prompt embeddings) of a rank under the encode feed:
+    no text encoder; the sample-prompt embeddings from the encoder processes and a VAE
+    for decoding samples, on the sampling rank only."""
+    feed.connect()
+    if k["SAMPLE_EVERY"] <= 0 or dist_rank()[0] != 0:
+        return None, None, None
+    embeds = [t.to(device) for t in feed.samples]
+    vae_path = component_path(k, VAE)
+    vae = training_vae(k, device, reserve, mem_plan, vae_path) if vae_path else None
+    return vae, None, embeds
 
 
 def export(k: dict, built: Built, root: Path, metadata: dict) -> list[Path]:

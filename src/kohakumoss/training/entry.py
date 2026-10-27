@@ -1,6 +1,7 @@
 """`run(globals())`: validate every knob, build in the fixed order, train, export."""
 
 import json
+import multiprocessing
 from functools import partial
 from pathlib import Path
 
@@ -68,6 +69,7 @@ from kohakumoss.training.build.pipelines import release_nonlocal
 from kohakumoss.training.callbacks.evaluate import FixedSigma
 from kohakumoss.training.context import RunContext
 from kohakumoss.training.drivers import Parts
+from kohakumoss.training.encode import EncodeFeed, RankFeed, StreamedLoader, pin_batches
 from kohakumoss.training.exports import (
     export_bytes,
     export_files,
@@ -82,7 +84,7 @@ from kohakumoss.training.step import LayoutTransform
 from kohakumoss.tuning.prewarm import prewarm_devices, release_workspaces, tunes
 from kohakumoss.types.plans import ParallelPlan
 from kohakumoss_common.calls import nothing
-from kohakumoss_data import DataConfig, build_loader
+from kohakumoss_data import DataConfig, MossDataset, build_loader
 from kohakumoss_kernels import compile_setup
 from kohakumoss_kernels.dist import dist_rank, initialized
 from kohakumoss_kernels.run_state import reset_run_state
@@ -101,25 +103,72 @@ def run(g: dict):
     shutdown.install()
     setup()
     k = check(g)
+    if k["ENCODE_DEVICES"] and not initialized():
+        return run_fed(k)
     if layout_of(k).spawns and not initialized():
-        plan = ParallelPlan(
-            kind=k["PARALLEL"],
-            backend=k["DIST_BACKEND"],
-            devices=tuple(k["DEVICES"]),
-            schedule=k["PIPELINE_SCHEDULE"],
-            microbatches=k["MICROBATCHES"],
-            timeout_s=float(k["DIST_TIMEOUT"]),
-            bind=k["DIST_BIND"],
-        )
-        return spawn(worker_env, plan, k, device_type=_device_type())
+        return spawn(worker_env, parallel_plan(k), k, device_type=_device_type())
     rank, world = dist_rank()
     return worker(k, rank, world)
 
 
-def worker_env(env, k: dict) -> TrainState:
-    """Spawned-process entry: `env` is kohakumoss.parallel.launch.DistEnv."""
+def parallel_plan(k: dict) -> ParallelPlan:
+    """The ParallelPlan of the process-group layouts."""
+    return ParallelPlan(
+        kind=k["PARALLEL"],
+        backend=k["DIST_BACKEND"],
+        devices=tuple(k["DEVICES"]),
+        schedule=k["PIPELINE_SCHEDULE"],
+        microbatches=k["MICROBATCHES"],
+        timeout_s=float(k["DIST_TIMEOUT"]),
+        bind=k["DIST_BIND"],
+    )
+
+
+def run_fed(k: dict) -> None:
+    """A run with ENCODE_DEVICES: this process runs the encode feed (data loading,
+    the encoder processes, the batch streams) and the training runs in processes of
+    its own: one per device for the process-group layouts, else one."""
+    layout = layout_of(k)
+    world = len(k["DEVICES"]) if layout.spawns else 1
+    feed = EncodeFeed(k, layout, world, _device_type())
+    feed.start()
+    try:
+        if layout.spawns:
+            spawn(
+                worker_env,
+                parallel_plan(k),
+                k,
+                feed.handles,
+                device_type=_device_type(),
+            )
+        else:
+            run_child(worker_child, k, feed.handles[0])
+    finally:
+        feed.close()
+
+
+def run_child(fn, *args) -> None:
+    """`fn(*args)` in one spawned child process, joined; a failing child raises."""
+    proc = multiprocessing.get_context("spawn").Process(target=fn, args=args)
+    proc.start()
+    proc.join()
+    if proc.exitcode != 0:
+        raise RuntimeError(f"the training process exited with code {proc.exitcode}")
+
+
+def worker_env(env, k: dict, feeds: list | None = None) -> TrainState:
+    """Spawned-process entry: `env` is kohakumoss.parallel.launch.DistEnv; `feeds`
+    holds every rank's end of the encode feed (ENCODE_DEVICES)."""
     setup(rank=env.rank, world=env.world)
-    return worker(k, env.rank, env.world, env.device)
+    feed = None if feeds is None else feeds[env.rank]
+    return worker(k, env.rank, env.world, env.device, feed)
+
+
+def worker_child(k: dict, feed: RankFeed) -> None:
+    """The training process of a single-process layout under the encode feed."""
+    shutdown.install()
+    setup()
+    worker(k, 0, 1, None, feed)
 
 
 def writer_first(rank: int, world: int, build):
@@ -214,6 +263,20 @@ def _data(k: dict, layout: Layout, rank: int, world: int, device):
     return kd, tokens, loader
 
 
+def _fed_data(k: dict, layout: Layout, rank: int, world: int, device, feed: RankFeed):
+    """(data knobs, token-layout transform, StreamedLoader) of a rank under the encode
+    feed: the feed's data knobs, the dataset read only (the feed wrote the catalog),
+    batches from the feed."""
+    kd = feed.knobs
+    cfg = DataConfig.from_knobs(kd)
+    arch = resolve_config(k["VARIANT"], k["ARCH_OVERRIDES"] or None)
+    tokens = LayoutTransform(arch.rope_axes)
+    dataset = MossDataset(cfg, writer=False)
+    devices = ", ".join(str(i) for i in k["ENCODE_DEVICES"])
+    pin = pin_batches(device, cfg.pin_memory)
+    return kd, tokens, StreamedLoader(feed, dataset, pin, devices)
+
+
 def _prewarm(k: dict, built, prec, device, dataset, device_use) -> list:
     """The kernel prewarm (weightless twin, segment counts from the dataset) and the
     adapter prewarm, before the stage split and the gradient-sync hooks; the
@@ -234,8 +297,10 @@ def _prewarm(k: dict, built, prec, device, dataset, device_use) -> list:
     return warm
 
 
-def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
-    """One rank of a run."""
+def worker(
+    k: dict, rank: int = 0, world: int = 1, device=None, feed: RankFeed | None = None
+) -> TrainState:
+    """One rank of a run; `feed`: the rank's end of the encode feed (ENCODE_DEVICES)."""
     is_main = rank == 0
     layout = layout_of(k)
     device = device or _device(k, rank)
@@ -243,11 +308,17 @@ def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
     device_use = build_device_use(device)
     data_rank = layout.data_rank(rank)
     data_world = layout.data_world(world)
-    kd, tokens, loader = _data(k, layout, rank, world, device)
+    if feed is None:
+        kd, tokens, loader = _data(k, layout, rank, world, device)
+    else:
+        kd, tokens, loader = _fed_data(k, layout, rank, world, device, feed)
     ranks_meet("data")
     torch.manual_seed(k["SEED"])
+    streamed = None if feed is None else loader
     with timed(log, "building model, adapters and encoders"):
-        built = build_model(k, device, prec, world, loader.dataset.text_tokens_max())
+        built = build_model(
+            k, device, prec, world, loader.dataset.text_tokens_max(), streamed
+        )
     log_object(log, "training memory plan", built.plan)
     for message, fields in placement_lines(k, built, device):
         log.info(message, **fields)
@@ -287,7 +358,8 @@ def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
     if objective is not None:
         objective.scaler = bundle.scaler
     ema = build_ema_for(k, built, bundle, names, rank)
-    writer = build_writer(k, loader, writes=data_rank == rank, rank=rank)
+    writes = data_rank == rank and built.feed is None
+    writer = build_writer(k, loader, writes=writes, rank=rank)
     loader, batcher = _inputs(k, built, device, loader, writer)
     timeline = build_timeline(device)
     for enc in (built.text_encoder, built.vae):
@@ -388,9 +460,15 @@ def _inputs(k: dict, built, device, loader, writer):
 
 
 def _validation_batches(k: dict, built, device, kd, tokens, rank, world) -> list:
-    """The fixed validation batches on `device` (none when VALIDATE_EVERY is 0)."""
+    """The fixed validation batches on `device` (none when VALIDATE_EVERY is 0; the
+    encode feed's under the feed)."""
     if k["VALIDATE_EVERY"] <= 0:
         return []
+    if built.feed is not None:
+        count = int(k["VALIDATION"].get("batches", 4))
+        return fixed_batches(
+            built.feed.validation(), build_batcher(k, built, device), count
+        )
     val_loader = writer_first(
         rank,
         world,
