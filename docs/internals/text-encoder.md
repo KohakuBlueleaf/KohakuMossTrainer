@@ -170,6 +170,16 @@ With the online text cache, `TextAhead` wraps the loader:
 
 Under `ring` / `offload` one pass moves the weights once for `ahead` batches.
 
+### Over-long prompts
+
+A sample whose text the planner fits by cutting (`OVERLONG="truncate_text"`, a
+`text_limit` > 0) keeps the first `text_limit` rows of its encoding. `encode(prompts,
+limits)` cuts each prompt's token ids to its limit before the pass, so the encoder runs
+only the tokens the step keeps. Every layer of
+Qwen3.5 is causal (the gated delta rule, causal conv and attention), so the kept rows
+equal those of the full prompt's pass cut afterwards, within the encoder's precision. A
+cut encoding is never written to the online cache (the writer stores only uncut ones).
+
 ## Quantization
 
 | `precision` | storage | GEMM |
