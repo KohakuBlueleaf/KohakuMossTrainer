@@ -392,7 +392,9 @@ its workers in order, so the stream is the same for any worker count. Resume sta
 - **Fresh worker processes.** Workers start from a fresh interpreter (`kohakumoss_data.loader.stateless.worker_context`: `forkserver` on
   Linux, `spawn` on Windows), so the dataset (sources, catalog, templates, caches) is
   pickled by value; file handles reopen lazily per process. Batches do not depend on
-  the start method.
+  the start method. Each worker takes the tensor sharing strategy of the loader's
+  process (`share_like`): a process that holds many batches (the encode feed's main
+  process, `file_system`) keeps no file descriptor per buffered tensor.
 - **Transform.** `Loader(transform=...)` / `build_loader(cfg, rank, world,
   transform=...)` (a picklable callable or a dotted path) runs on every batch inside the
   worker, before the DataLoader pins it (with `PIN_MEMORY` and an accelerator with
