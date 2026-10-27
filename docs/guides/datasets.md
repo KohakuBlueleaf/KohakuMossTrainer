@@ -52,7 +52,13 @@ Each layout has a data layer (`kohakumoss-config new train --source <name>`,
 {"source": "parquet", "path": "dataset/train.parquet", "image_col": "image", "bytes_col": None, "root": None}
 {"source": "webdataset", "path": "shards/*.tar", "txt_as": "tags"}  # <key>.png + <key>.txt / <key>.json members
 {"source": "moss_shard", "path": "dataset_shards"}                  # an imported directory (section 4)
+{"source": "gbc", "path": "my-gbc-set", "caption": {"template": "gbc", ...}}  # a KohakuGBC dataset
 ```
+
+A GBC dataset (images, GBC graphs and metadata from KohakuGBC) needs
+`pip install "kohakumoss[gbc]"` (Python 3.11+) and the `gbc` caption template, which
+builds each caption from the sample's metadata and graph
+([data.md](../concepts/data.md#gbc-captions)).
 
 The manifest sources (`jsonl`, `parquet`) read:
 

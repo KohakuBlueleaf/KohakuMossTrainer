@@ -3,6 +3,7 @@
 from kohakumoss_data.registry import SOURCES
 from kohakumoss_data.sources import (
     folder,
+    gbc,
     jsonl,
     kohya,
     moss_shard,
@@ -13,6 +14,7 @@ from kohakumoss_data.sources import (
 __all__ = [
     "SOURCES",
     "folder",
+    "gbc",
     "jsonl",
     "kohya",
     "moss_shard",

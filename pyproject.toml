@@ -42,6 +42,8 @@ baselines = ["flash-linear-attention", "causal-conv1d; sys_platform != 'win32'"]
 quant = ["bitsandbytes"]
 optim = ["prodigyopt", "schedulefree"]
 parquet = ["pyarrow"]
+# the GBC dataset format (KohakuGBC): graph records, prompt renderers, dataset reader
+gbc = ["kohakugbc-data>=0.1; python_version >= '3.11'"]
 wandb = ["wandb"]
 dev = ["pytest", "ruff", "black", "lpips", "kohakumoss[bench]"]
 bench = ["matplotlib", "pandas"]
