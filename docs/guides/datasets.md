@@ -149,7 +149,8 @@ Add `"import_to": "/path/out"` to a dataset entry and run `catalog_build.py`; th
 `{"source": "moss_shard", "path": "/path/out"}`. Shards are large sequential files,
 which suit network storage better than many small images.
 
-A catalog file written in another layout than the current one:
+A catalog file written in another layout than the current one (including any written
+with KohakuVault before 1.0: KohakuVault 1.x does not read their columns):
 
 - a scanning source's cached catalog is rebuilt by a rescan (one WARNING naming the
   file);

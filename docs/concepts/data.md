@@ -321,21 +321,25 @@ new ids, copying unchanged rows, which is exactly what a cold scan writes.
 
 ### The catalog file
 
-One KohakuVault file, a ColumnVault and a KVault on the same path:
+One KohakuVault (>= 1.1) file, a ColumnVault and a KVault on the same path; readers
+open both read-only:
 
 | part | contents |
 | --- | --- |
-| fixed i64 columns | `w`, `h`, `has_alpha`, `live`, `group_id`, `tags_chars`, `nl_chars`, `artist_chars`, `rating_chars`, `json_chars`; the stamps `st_size`, `st_mtime`, `s1_size` ... `s3_mtime` |
+| fixed i64 columns | `w`, `h`, `has_alpha`, `live`, `group_id`, `tags_chars`, `nl_chars`, `artist_chars`, `rating_chars`, `json_chars`, `prompt_chars` (a source's bound on its longest caption, `extra["prompt_chars"]`; 0 for the others); the stamps `st_size`, `st_mtime`, `s1_size` ... `s3_mtime` |
 | `weight32` | 4 little-endian float32 bytes per row |
 | `item` (str) | the scan item each row came from |
 | KVault `r<id, 8-byte BE>` | msgpack of the row's variable fields |
 | KVault `meta:info`, `meta:groups` | schema, generation, row count, source kind; group names |
 
-Opening reads each planning column with one range read straight into numpy; the stamps and items are read only by a rescan. `catalog.db` of a
+Opening reads each planning column with one range read (`Column.read_buffer`) straight
+into numpy; the stamps and items are read only by a rescan. `catalog.db` of a
 `moss_shard` dataset and `catalog_build.py` files use the same layout, the only one
-the runtime reads ([datasets.md](../guides/datasets.md#4-optional-import-into-shards)
-for a file of another layout). A `moss_shard` dataset without its `shards/` is an
-error saying so.
+the runtime reads: a file whose fixed columns are not all there (another layout, or one
+written by a KohakuVault before 1.0, whose columns 1.x does not read) is rebuilt by a
+rescan when it is a scan cache, and is an error naming the re-import for a prebuilt one
+([datasets.md](../guides/datasets.md#4-optional-import-into-shards)). A `moss_shard`
+dataset without its `shards/` is an error saying so.
 
 ## The `moss_shard` format
 

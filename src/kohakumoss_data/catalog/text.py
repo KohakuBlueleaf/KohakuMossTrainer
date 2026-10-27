@@ -5,7 +5,15 @@ import json
 
 from kohakumoss_data.types import CatalogRow
 
-CHAR_FIELDS = ("tags_chars", "nl_chars", "artist_chars", "rating_chars", "json_chars")
+CHAR_FIELDS = (
+    "tags_chars",
+    "nl_chars",
+    "artist_chars",
+    "rating_chars",
+    "json_chars",
+    "prompt_chars",
+)
+PROMPT_CHARS = "prompt_chars"
 
 
 def _chars(value) -> int:
@@ -18,9 +26,10 @@ def _chars(value) -> int:
             return len(str(value))
 
 
-def text_chars(row: CatalogRow) -> tuple[int, int, int, int, int]:
-    """(tags, caption_nl, artist, rating, json) character counts of `row`, in
-    CHAR_FIELDS order; tags as joined by ", ", json as its compact dump."""
+def text_chars(row: CatalogRow) -> tuple[int, int, int, int, int, int]:
+    """(tags, caption_nl, artist, rating, json, prompt) character counts of `row`, in
+    CHAR_FIELDS order; tags as joined by ", ", json as its compact dump, prompt the
+    source's own bound on its longest caption (`extra["prompt_chars"]`, 0 when none)."""
     meta = len(json.dumps(row.json, ensure_ascii=False)) if row.json else 0
     return (
         _chars(row.tags),
@@ -28,4 +37,5 @@ def text_chars(row: CatalogRow) -> tuple[int, int, int, int, int]:
         _chars(row.artist),
         _chars(row.rating),
         meta,
+        int(row.extra.get(PROMPT_CHARS, 0)),
     )

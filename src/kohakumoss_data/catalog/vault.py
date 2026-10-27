@@ -10,7 +10,7 @@ import numpy as np
 from kohakumoss_data.catalog.text import CHAR_FIELDS, text_chars
 from kohakumoss_data.types import CatalogRow
 
-SCHEMA = 2
+SCHEMA = 3
 STAMPS = (
     "st_size",
     "st_mtime",
@@ -44,19 +44,17 @@ def var_fields(row: CatalogRow) -> dict:
 
 def _raw(col, n: int) -> bytes:
     """The first `n` elements of a fixed-width column as raw bytes (one range read)."""
-    if n == 0:
-        return b""
-    return bytes(
-        col._inner.read_range(col._col_id, 0, n, col._elem_size, col._chunk_bytes)
-    )
+    return col.read_buffer(0, n) if n else b""
 
 
 def is_catalog_vault(path: str) -> bool:
-    """A catalog file of the current layout (it has the `live` column); opens only the
-    ColumnVault, so a file of another layout is not touched."""
+    """A catalog file of the current layout (every fixed column present); opens only
+    the ColumnVault, read only, so a file of another layout is not touched."""
     if not os.path.exists(path):
         return False
-    return "live" in {c[0] for c in kv.ColumnVault(path).list_columns()}
+    with kv.ColumnVault(path, read_only=True) as cols:
+        names = {c[0] for c in cols.list_columns()}
+    return set(FIXED) <= names
 
 
 class CatalogVault:
@@ -67,8 +65,8 @@ class CatalogVault:
             raise FileNotFoundError(path)
         self.path = path
         self.write = write
-        self.cols = kv.ColumnVault(path)
-        self.kv = kv.KVault(path)
+        self.cols = kv.ColumnVault(path, read_only=not write)
+        self.kv = kv.KVault(path, read_only=not write)
         if write:
             for name in FIXED:
                 self.cols.ensure(name, "i64")

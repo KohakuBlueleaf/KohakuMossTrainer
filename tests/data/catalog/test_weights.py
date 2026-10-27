@@ -32,7 +32,9 @@ def rows(weights) -> list[CatalogRow]:
 
 def check_column(path: str, weights) -> None:
     """Witness the `weight32` column against independently packed float32 bytes."""
-    raw = list(kv.ColumnVault(path)["weight32"])
+    vault = kv.ColumnVault(path, read_only=True)
+    raw = list(vault["weight32"])
+    vault.close()
     assert raw == [struct.pack("<f", w) for w in weights]
 
 
