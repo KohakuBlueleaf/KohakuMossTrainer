@@ -18,6 +18,7 @@ from kohakumoss.quant.bind import rebind_quant
 from kohakumoss.quant.convert import QuantLinear
 from kohakumoss.quant.embedding import QuantEmbedding
 from kohakumoss.quant.text import GroupQuantLinear
+from kohakumoss_kernels.hardware.current import on_device
 from kohakumoss_kernels.recording import recording
 from kohakumoss_kernels.tuning.buckets import (
     LENGTH_FLOOR,
@@ -212,6 +213,7 @@ def prewarm_text(te, max_text_tokens: int, data_tokens: int = 0) -> dict[str, Op
     the kernel forward)."""
     if not isinstance(getattr(te, "forward", None), KernelForward):
         return {}
-    calls, recorded = record_text(te)
-    targets = text_targets(te, max_text_tokens, recorded, data_tokens)
-    return replay(calls, targets, backward=False)
+    with on_device(torch.device(te.device)):
+        calls, recorded = record_text(te)
+        targets = text_targets(te, max_text_tokens, recorded, data_tokens)
+        return replay(calls, targets, backward=False)

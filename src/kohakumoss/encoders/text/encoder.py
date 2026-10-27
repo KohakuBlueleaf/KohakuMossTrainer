@@ -54,7 +54,7 @@ from kohakumoss.types.plans import TextEncoderPlan
 from kohakumoss.weights import TEXT, comfy_file, hf_root, is_comfy_folder
 from kohakumoss_common.calls import nothing
 from kohakumoss_kernels.dtypes import short
-from kohakumoss_kernels.hardware.current import synchronize
+from kohakumoss_kernels.hardware.current import on_device, synchronize
 
 ENCODER_ID = "qwen3.5-9b"
 log = get_logger(__name__)
@@ -305,7 +305,7 @@ class QwenTextEncoder:
             ck = _stored(model_dir, plan) if plan.stored else hf_checkpoint(model_dir)
         choose = auto_memory or partial(default_auto_memory, plan=plan)
         w4a8 = auto_w4a8 or partial(default_w4a8, plan=plan)
-        with hf_bars_off():
+        with hf_bars_off(), on_device(on):
             text, placement, report, plan = load_placed_text(ck, plan, on, choose, w4a8)
         return cls(
             text,
@@ -350,6 +350,20 @@ class QwenTextEncoder:
             for g in groups
         ]
         self.before_pass()
+        with on_device(torch.device(self.device)):
+            out = self._placed_pass(texts, groups, packs, lengths)
+        self.after_pass()
+        for dev in {self.device, self.output_device}:
+            synchronize(dev)
+        self.stats["passes"] += 1
+        self.stats["tokens"] += sum(lengths)
+        self.stats["seconds"] += time.perf_counter() - start
+        self.stats["h2d_bytes"] = self.placement.h2d_bytes
+        return out
+
+    def _placed_pass(self, texts, groups, packs, lengths) -> list[Tensor]:
+        """The packs through the placed model (the caller holds the encoder's card
+        current)."""
         self.placement.begin()
         pbar = log_bar(
             total=self.forward.units(packs),
@@ -369,13 +383,6 @@ class QwenTextEncoder:
             del hidden
         finally:
             self.placement.end()
-        self.after_pass()
-        for dev in {self.device, self.output_device}:
-            synchronize(dev)
-        self.stats["passes"] += 1
-        self.stats["tokens"] += sum(lengths)
-        self.stats["seconds"] += time.perf_counter() - start
-        self.stats["h2d_bytes"] = self.placement.h2d_bytes
         return out
 
     def release(self) -> None:

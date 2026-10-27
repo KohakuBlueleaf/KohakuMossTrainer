@@ -18,6 +18,7 @@ from kohakumoss.offload.weights.layers import (
     tensor_ids,
 )
 from kohakumoss_common.calls import nothing
+from kohakumoss_kernels.hardware.current import on_device
 from kohakumoss_kernels.hardware.host_gemm import host_gemm
 
 MEMORY = ("resident", "offload", "ring", "cpu", "auto")
@@ -246,7 +247,8 @@ class PlacedVae:
         self.before_pass()
         self.placement.begin()
         try:
-            out = fn()
+            with on_device(torch.device(self.device)):
+                out = fn()
         finally:
             self.placement.end()
         self.after_pass()
