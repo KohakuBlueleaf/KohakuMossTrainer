@@ -6,9 +6,10 @@ fp8 (e4m3fn): q = fp8(w / s), s = max|w_row| / 448.
 R = blockdiag(H_g) over K, so y = (x R) (q * s)^T and W = (q * s) R.
 `linear` uses a registered `quant_linear` (`quant_linear_rotated`) kernel when one
 serves the device, else the eager op (dequantize + matmul, saving only `q` / `scale`
-for backward); on the host the eager composition runs as plain ops over the dense
-weight `dense` (built per layer per pass, `build_dense`) or one dequantized per call;
-the choice is made once per weight, not per call.
+for backward); with `int8_dgrad` set (int8 compute, `set_int8_compute`) an int8 base
+off the host runs the `int8_linear` op instead; on the host the eager composition runs
+as plain ops over the dense weight `dense` (built per layer per pass, `build_dense`) or
+one dequantized per call; the choice is made once per weight, not per call.
 """
 
 from functools import partial
@@ -58,12 +59,21 @@ def unrotated(w: Tensor, rotation: int, dtype: torch.dtype) -> Tensor:
 
 class QuantWeight(nn.Module):
     """BaseWeight holding `q` and `scale` as buffers (they follow `.to(device)`);
-    `rotation` is the ConvRot group of a rotated stored weight (0: none)."""
+    `rotation` is the ConvRot group of a rotated stored weight (0: none);
+    `int8_dgrad` is None (weight-only) or the input-gradient mode of int8 compute."""
 
-    def __init__(self, q: Tensor, scale: Tensor, fmt: str, rotation: int = 0):
+    def __init__(
+        self,
+        q: Tensor,
+        scale: Tensor,
+        fmt: str,
+        rotation: int = 0,
+        int8_dgrad: str | None = None,
+    ):
         super().__init__()
         self.fmt = fmt
         self.rotation = int(rotation)
+        self.int8_dgrad = int8_dgrad
         self.register_buffer("q", q)
         self.register_buffer("scale", scale.float())
         self.shape = q.shape
@@ -89,11 +99,18 @@ class QuantWeight(nn.Module):
         self, dtype: torch.dtype, device: torch.device | str | None = None
     ) -> None:
         """Bind `linear` for (device, dtype) once: on the host the plain-op composition
-        (`_host_linear`, its GEMMs visible to `host_gemm`), else the `quant_linear`
-        (rotated: `quant_linear_rotated`) kernel when one serves, else the eager op."""
+        (`_host_linear`, its GEMMs visible to `host_gemm`); int8 compute the
+        `int8_linear` op; else the `quant_linear` (rotated: `quant_linear_rotated`)
+        kernel when one serves, else the eager op."""
         device = self.q.device if device is None else torch.device(device)
         if device.type == "cpu":
             self._linear = _host_linear
+            return
+        if self.int8_dgrad is not None:
+            kernel = registry.resolve(
+                "int8_linear", device, dtype, group=self.rotation, dgrad=self.int8_dgrad
+            )
+            self._linear = partial(_int8_linear, kernel)
             return
         name = "quant_linear_rotated" if self.rotation else "quant_linear"
         query = {"fmt": self.fmt}
@@ -179,3 +196,7 @@ def _kernel_linear(kernel, qw: QuantWeight, x: Tensor, bias: Tensor | None) -> T
 
 def _rotated_linear(kernel, qw: QuantWeight, x: Tensor, bias: Tensor | None) -> Tensor:
     return kernel(x, qw.q, qw.scale, bias, qw.fmt, qw.rotation)
+
+
+def _int8_linear(kernel, qw: QuantWeight, x: Tensor, bias: Tensor | None) -> Tensor:
+    return kernel(x, qw.q, qw.scale, bias, qw.rotation, qw.int8_dgrad)

@@ -72,6 +72,7 @@ STREAM_RESIDENT = None  # device block slots when streaming (>= 2)  [0]
 PINNED = None  # pinned host memory for the streamed weights  [True]
 BASE_PRECISION = "auto"  # DiT base: "auto" (what the DiT file stores) | "compute" (16-bit; a quantized file dequantized) | "int8" | "fp8" | "fp8_compute" | "mxfp8"
 FP8_RECIPE = "row"  # fp8_compute scaling: "tensor" | "row" | "block"
+INT8_COMPUTE = False  # int8 bases run int8 GEMMs (activations quantized per row), not weight-only; CUDA
 
 # ===================== PROMPTS =====================
 PROMPT = ""  # one prompt

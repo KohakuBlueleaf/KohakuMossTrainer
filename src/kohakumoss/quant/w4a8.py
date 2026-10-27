@@ -117,6 +117,7 @@ class W4A8Weight(nn.Module):
         self.register_buffer("correction", correction)
         self.shape = torch.Size((n, k))
         self.decoder = decode_codes
+        self.int8_dgrad: str | None = None
         self._linear = _eager_for(self)
 
     def decode(self) -> Tensor:
@@ -147,18 +148,27 @@ class W4A8Weight(nn.Module):
         """The QuantWeight of the decoded int8 grid and `s_channel` (same rotation)."""
         if not self.decodes_to_int8:
             raise ValueError("a W4A8 weight with a correction term has no int8 form")
-        return QuantWeight(self.decode(), self.s_channel, "int8", self.rotation)
+        return QuantWeight(
+            self.decode(), self.s_channel, "int8", self.rotation, self.int8_dgrad
+        )
 
     def bind(
         self, dtype: torch.dtype, device: torch.device | str | None = None
     ) -> None:
         """Bind `linear` for (device, dtype) once: per call, the codes decoded
         (`decoder_for`) into the rotated int8 linear (`quant_linear_rotated`, eager
-        when no kernel serves); a stored correction runs the dense weight."""
+        when no kernel serves; with `int8_dgrad` set off the host, the `int8_linear`
+        op); a stored correction runs the dense weight."""
         device = self.q.device if device is None else torch.device(device)
         self.decoder = decoder_for(device)
         self._linear = _eager_for(self)
         if not self.decodes_to_int8:
+            return
+        if self.int8_dgrad is not None and device.type != "cpu":
+            kernel = registry.resolve(
+                "int8_linear", device, dtype, group=self.rotation, dgrad=self.int8_dgrad
+            )
+            self._linear = partial(_int8_kernel, kernel)
             return
         name = "quant_linear_rotated" if self.rotation else "quant_linear"
         query = {"group": self.rotation} if self.rotation else {}
@@ -217,3 +227,7 @@ def _rotated_kernel(kernel, w: W4A8Weight, x: Tensor, bias: Tensor | None) -> Te
 
 def _plain_kernel(kernel, w: W4A8Weight, x: Tensor, bias: Tensor | None) -> Tensor:
     return kernel(x, w.codes(), w.s_channel, bias, "int8")
+
+
+def _int8_kernel(kernel, w: W4A8Weight, x: Tensor, bias: Tensor | None) -> Tensor:
+    return kernel(x, w.codes(), w.s_channel, bias, w.rotation, w.int8_dgrad)

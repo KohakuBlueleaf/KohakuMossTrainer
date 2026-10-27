@@ -25,6 +25,8 @@ PRECISION_KNOBS = {
     "BASE_PRECISION": "base_precision",
     "FP8_RECIPE": "fp8_recipe",
     "FP8_DGRAD": "fp8_dgrad",
+    "INT8_COMPUTE": "int8_compute",
+    "INT8_DGRAD": "int8_dgrad",
 }
 PLACEMENT_KNOBS = ("STREAM", "STREAM_RESIDENT", "PINNED")
 

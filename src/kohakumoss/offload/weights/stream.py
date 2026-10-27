@@ -205,8 +205,9 @@ class WeightStream:
                 for part, t in (("q", lin.base.q), ("scale", lin.base.scale)):
                     out[f"{name}:{part}"] = self._host(t)
                     self.layout.setdefault(f"{name}:{part}", (t.shape, t.dtype))
+                b = lin.base
                 base = StreamedQuantWeight(
-                    self, index, name, lin.base.shape, lin.base.rotation
+                    self, index, name, b.shape, b.rotation, b.int8_dgrad, dtype
                 )
                 lin.set_base(base)
                 continue
@@ -285,8 +286,12 @@ class WeightStream:
     def _rebase(self, index: int, name: str, lin: MossLinear, dtype) -> None:
         """Point a frozen linear at its streamed form (its host parts are taken)."""
         if isinstance(lin.base, QuantWeight):
-            shape, rotation = lin.base.shape, lin.base.rotation
-            lin.set_base(StreamedQuantWeight(self, index, name, shape, rotation))
+            b = lin.base
+            lin.set_base(
+                StreamedQuantWeight(
+                    self, index, name, b.shape, b.rotation, b.int8_dgrad, dtype
+                )
+            )
             return
         if isinstance(lin.base, ComputeWeight):
             lin.set_base(StreamedComputeWeight(self, index, name, lin.base, dtype))

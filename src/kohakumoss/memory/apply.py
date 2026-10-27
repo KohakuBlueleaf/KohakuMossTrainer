@@ -17,7 +17,7 @@ from kohakumoss.offload.optim.grad import GradOffload
 from kohakumoss.offload.weights.layers import move_except
 from kohakumoss.offload.weights.shared import SharedHost, block_owners
 from kohakumoss.offload.weights.stream import WeightStream
-from kohakumoss.quant.bind import rebind_quant, work_device
+from kohakumoss.quant.bind import rebind_quant, set_int8_compute, work_device
 from kohakumoss.quant.compute import COMPUTE as FP8_COMPUTE
 from kohakumoss.quant.compute import ComputeWeight
 from kohakumoss.quant.convert import (
@@ -225,6 +225,19 @@ def quantize_base(
     return report
 
 
+def select_int8_compute(backbone: nn.Module, dgrad: str) -> int:
+    """int8 compute on every int8 base of `backbone` (`set_int8_compute`, one INFO
+    line); ValueError when it has none."""
+    count = set_int8_compute(backbone, dgrad)
+    if not count:
+        raise ValueError(
+            "INT8_COMPUTE=True found no int8 base: load an int8 file under "
+            "BASE_PRECISION='auto', or set BASE_PRECISION='int8'"
+        )
+    log.info(f"int8 compute: {hl(count)} int8 bases, input gradient {hl(dgrad)}")
+    return count
+
+
 @torch.no_grad()
 def trainable_compute(
     backbone: nn.Module,
@@ -276,6 +289,8 @@ def apply_to_backbone(
     )
     if report is not None:
         engines.reports["quant"] = report
+    if plan.int8_compute:
+        select_int8_compute(backbone, plan.int8_dgrad)
     if plan.stream == "off":
         backbone.to(device)
     rebind_quant(backbone, device, compute_dtype, autograd=training)

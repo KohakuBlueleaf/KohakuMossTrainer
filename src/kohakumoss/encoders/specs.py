@@ -12,7 +12,7 @@ from kohakumoss_common.imports import import_object
 from kohakumoss_kernels.dtypes import NAME_OF
 
 WEIGHT_ONLY = ("int8", "fp8")
-TEXT_SPEC_FIELDS = ("dtype", "precision", "quant_group", "fp8_recipe")
+TEXT_SPEC_FIELDS = ("dtype", "precision", "quant_group", "fp8_recipe", "int8_compute")
 
 
 def dtype_name(dtype: torch.dtype) -> str:
@@ -28,8 +28,9 @@ def vae_spec(dtype: torch.dtype) -> str:
 
 def text_spec(plan: TextEncoderPlan, dtype: torch.dtype, layout: str = "") -> str:
     """`<dtype>/<precision>`, plus `g<quant_group>` for a weight-only int8 / fp8 base or
-    the kernel recipe for fp8 compute, plus `src:<layout>` when the weights were
-    stored quantized (a ComfyUI file's layout, e.g. `int8-convrot256`); any torch
+    the kernel recipe for fp8 compute, plus `int8c` for int8 compute, plus
+    `src:<layout>` when the weights were stored quantized (a ComfyUI file's layout,
+    e.g. `int8-convrot256`); any torch
     dtype has a name; an unresolved `auto` precision names the 16-bit checkpoint's
     `compute` (a stored file's callers resolve it first)."""
     precision = "compute" if plan.precision == "auto" else plan.precision
@@ -38,6 +39,8 @@ def text_spec(plan: TextEncoderPlan, dtype: torch.dtype, layout: str = "") -> st
         parts.append(f"g{plan.quant_group}")
     elif plan.precision in COMPUTE:
         parts.append(recipe_of(plan.precision, plan.fp8_recipe))
+    if plan.int8_compute:
+        parts.append("int8c")
     if layout:
         parts.append(f"src:{layout}")
     return "/".join(parts)

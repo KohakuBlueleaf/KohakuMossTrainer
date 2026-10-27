@@ -32,7 +32,9 @@ class MemoryPlan:
     dequantized); int8 / fp8 weight-only; fp8_compute / mxfp8 run the frozen base's
     GEMMs in fp8 (`fp8_recipe` tensor | row | block for fp8_compute); `fp8_dgrad` fp8
     stores a W^T copy for an fp8 input-gradient GEMM, 16bit dequantizes the forward
-    copy.
+    copy. `int8_compute` runs every int8 base's GEMMs in int8 (activations quantized
+    per row, the `int8_linear` op) instead of weight-only; `int8_dgrad` int8 | 16bit
+    is its input gradient.
     `act_offload_inflight`: blocks whose activation-offload copies may be queued before
     the host waits for the oldest block's."""
 
@@ -44,6 +46,8 @@ class MemoryPlan:
     base_precision: str = "auto"
     fp8_recipe: str = "row"
     fp8_dgrad: str = "fp8"
+    int8_compute: bool = False
+    int8_dgrad: str = "int8"
     stream: str = "off"
     stream_resident: int = 0
     pinned: bool = True
@@ -67,7 +71,9 @@ class TextEncoderPlan:
     (MX block-scaled GEMMs, sm89+) | w4a8 (stored only: a ComfyUI W4A8 file); fp8
     compute weights are quantized once, activations per call. `w4a8` decodes a W4A8
     file's codes: int8 (once, 1 byte per weight) | packed (per call) | auto (int8 when
-    the decoded encoder fits resident next to the DiT step). `dtype` bf16 | fp16 |
+    the decoded encoder fits resident next to the DiT step). `int8_compute` runs the
+    int8 linears' GEMMs in int8 (activations quantized per row; CUDA) instead of
+    weight-only. `dtype` bf16 | fp16 |
     auto (bf16, or fp16 where the device has no bf16). `batch` prompts / `max_tokens`
     tokens per kernel call, `layout`
     single | padded | packed, `forward` kernels (kohakumoss_kernels ops) | hf (the
@@ -85,6 +91,7 @@ class TextEncoderPlan:
     free_after_use: bool = False
     precision: str = "auto"
     w4a8: str = "auto"
+    int8_compute: bool = False
     quant_group: int = 0
     fp8_recipe: str = "row"
     stored: str = ""

@@ -155,10 +155,12 @@ FP8_RECIPE = None  # fp8_compute scaling: "tensor" | "row" | "block"  [row]
 FP8_DGRAD = (
     None  # fp8 bases: "fp8" (W^T copy, fp8 input-gradient GEMM) | "16bit"  [fp8]
 )
+INT8_COMPUTE = None  # int8 bases run int8 GEMMs (activations quantized per row), not weight-only; CUDA  [False]
+INT8_DGRAD = None  # int8 compute input gradient: "int8" | "16bit"  [int8]
 MEMORY_OVERRIDES = (
     {}
 )  # any MemoryPlan field, e.g. {"checkpoint": "sub-block", "stream": "ring"}
-# frozen-base precision: BASE_PRECISION / FP8_RECIPE / FP8_DGRAD above (docs/internals/quant-kernels.md)
+# frozen-base precision: BASE_PRECISION / FP8_RECIPE / FP8_DGRAD / INT8_COMPUTE / INT8_DGRAD above (docs/internals/quant-kernels.md)
 
 # ===================== PARALLEL =====================
 PARALLEL = "none"  # "none" | "ddp" | "fsdp" | "pipeline" | "threaded"

@@ -1,7 +1,7 @@
 """Eager reference backend: what every op computes, and the CPU path. Every name in a
 module's `__all__` is registered as that op."""
 
-from kohakumoss_kernels import fp8, quant  # noqa: F401  (register the eager quant ops)
+from kohakumoss_kernels import fp8, int8, quant  # noqa: F401  (the eager quant ops)
 from kohakumoss_kernels.backends.eager import (
     attention,
     ffn,

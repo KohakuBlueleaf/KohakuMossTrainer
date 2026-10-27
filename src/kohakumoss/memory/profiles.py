@@ -15,6 +15,7 @@ from kohakumoss.types.plans import MemoryPlan
 from kohakumoss_common.log import get_logger
 from kohakumoss_common.typecheck import describe, mismatches
 from kohakumoss_kernels.hardware.arch import arch_of
+from kohakumoss_kernels.int8 import DGRAD as INT8_DGRAD
 
 CHECKPOINT_MODES = ("none", "block", "sub-block", "selective")
 STREAM_MODES = ("off", "ring", "swap")
@@ -124,6 +125,18 @@ def validate(
         problems.append(f"fp8_recipe {plan.fp8_recipe!r} not in {FP8_RECIPES}")
     if plan.fp8_dgrad not in FP8_DGRAD:
         problems.append(f"fp8_dgrad {plan.fp8_dgrad!r} not in {FP8_DGRAD}")
+    if plan.int8_dgrad not in INT8_DGRAD:
+        problems.append(f"int8_dgrad {plan.int8_dgrad!r} not in {INT8_DGRAD}")
+    if plan.int8_compute and plan.base_precision in ("compute", "fp8", *FP8_COMPUTE):
+        problems.append(
+            f"int8_compute runs int8 bases; base_precision {plan.base_precision!r} "
+            "has none: use 'auto' on an int8 file, or 'int8'"
+        )
+    if plan.int8_compute and device is not None and torch.device(device).type != "cuda":
+        problems.append(
+            f"int8_compute needs a CUDA device (int8 GEMMs), not "
+            f"{torch.device(device).type}"
+        )
     mode, frac = checkpoint_mode(plan.checkpoint)
     if mode not in CHECKPOINT_MODES:
         problems.append(f"checkpoint {plan.checkpoint!r} not in {CHECKPOINT_MODES}")

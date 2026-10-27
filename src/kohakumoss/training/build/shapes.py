@@ -14,7 +14,7 @@ from kohakumoss.memory.apply import quantize_base, trainable_compute
 from kohakumoss.model import resolve_config
 from kohakumoss.model.build import build_shapes, weightless
 from kohakumoss.model.linear import MossLinear
-from kohakumoss.quant.bind import rebind_quant
+from kohakumoss.quant.bind import rebind_quant, set_int8_compute
 from kohakumoss.quant.compute import PARTS, ComputeCache
 from kohakumoss.quant.densify import mirror_stored
 from kohakumoss.training.knobs import is_full
@@ -25,11 +25,14 @@ def _storage(
     model, plan, compute: torch.dtype, full: bool, keep_fp32, real=None
 ) -> None:
     """The run's base storage swaps (training), on the meta device: the stored bases
-    `real` loaded from its checkpoint (`mirror_stored`), then the plan's."""
+    `real` loaded from its checkpoint (`mirror_stored`), then the plan's (int8 compute
+    included)."""
     if real is not None:
         mirror_stored(model, real)
     quantize_base(model, plan, compute, True, full, keep_fp32)
     trainable_compute(model, plan, compute, True, full, keep_fp32)
+    if plan.int8_compute:
+        set_int8_compute(model, plan.int8_dgrad)
 
 
 def _place_caches(model: nn.Module, device, compute: torch.dtype) -> None:

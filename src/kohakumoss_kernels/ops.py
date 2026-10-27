@@ -28,6 +28,9 @@ Hadamard of `kohakumoss_kernels.hadamard`, R = blockdiag(H_g) over the last dim)
     group_hadamard(x[..., K], group: int) -> x R [..., K]   (self-adjoint, involutory)
     quant_linear_rotated(x[N,K], q[M,K], scale[M], bias[M] | None, fmt, group: int)
         -> quant_linear(x R, q, scale, bias, fmt); dx = (dy (q * scale)) R
+    int8_linear(x[N,K], q[M,K] int8, scale[M], bias[M] | None, group: int, dgrad)
+        -> Q(x R) q^T * s_x * scale + bias (int8 GEMM, int32 accumulation; group 0: no
+        R); dx = Q(dy * scale) q * s_dy R (dgrad "int8") or (dy (q * scale)) R ("16bit")
 
 Text-encoder ops (Qwen3.5 Gated DeltaNet + causal GQA attention; forward only):
 
@@ -60,6 +63,7 @@ OPTIM = ("adamw_step", "adamw8bit_step", "adamw_step_multi")
 QUANT = (
     "quant_linear",
     "quant_linear_rotated",
+    "int8_linear",
     "fp8_linear",
     "fp8_linear_infer",
     "fp8_linear_train",

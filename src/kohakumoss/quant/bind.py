@@ -21,6 +21,19 @@ def rebind_quant(module: nn.Module, device, dtype, autograd: bool = True) -> Non
             m.bind(dtype, device)
 
 
+def set_int8_compute(module: nn.Module, dgrad: str) -> int:
+    """Select int8 compute (the `int8_linear` op, input gradient `dgrad`) on every int8
+    base inside `module` (int8 QuantWeights and int8-decoding W4A8 bases); they bind it
+    on their next `bind`. Returns how many."""
+    count = 0
+    for m in module.modules():
+        int8 = isinstance(m, QuantWeight) and m.fmt == "int8"
+        if int8 or (isinstance(m, W4A8Weight) and m.decodes_to_int8):
+            m.int8_dgrad = dgrad
+            count += 1
+    return count
+
+
 def work_device(device) -> torch.device:
     """Where weights are quantized: the compute device when it is an accelerator."""
     device = torch.device(device)

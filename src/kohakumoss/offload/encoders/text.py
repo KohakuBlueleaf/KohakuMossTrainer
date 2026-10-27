@@ -29,7 +29,7 @@ from kohakumoss.offload.weights.layers import (
     tensor_bytes,
     tensor_ids,
 )
-from kohakumoss.quant.bind import rebind_quant, work_device
+from kohakumoss.quant.bind import rebind_quant, set_int8_compute, work_device
 from kohakumoss.quant.compute import COMPUTE
 from kohakumoss.quant.convert import QuantLinear
 from kohakumoss.quant.embedding import QuantEmbedding, dense_lookup
@@ -401,5 +401,10 @@ def place_text(
         deferred=deferred,
         **kw,
     )
+    if plan.int8_compute and not set_int8_compute(text_model, "16bit"):
+        raise ValueError(
+            "text-encoder int8_compute found no int8 linear: use an int8 / W4A8 file "
+            "under precision 'auto', or precision 'int8'"
+        )
     rebind_quant(text_model, placement.device, compute_dtype, autograd=False)
     return placement

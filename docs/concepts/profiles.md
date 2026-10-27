@@ -118,6 +118,8 @@ manual mode, and only `BASE_PRECISION` selects a quantized base:
 | `BASE_PRECISION` | `base_precision` | `auto`, `compute`, `fp8`, `int8`, `quant` (fp8 where the arch has fp8 GEMMs, else int8), `fp8_compute`, `mxfp8` | `auto` | storage of the frozen base weights (`auto`: what the DiT file stores, a 16-bit file in the PRECISION dtype, a pre-quantized file its own bases; `compute`: the PRECISION dtype, a pre-quantized file dequantized; `fp8` / `int8` weight-only); `fp8_compute` / `mxfp8` run the GEMMs in fp8 on sm89+; see [quant-kernels.md](../internals/quant-kernels.md#stored-formats) |
 | `FP8_RECIPE` | `fp8_recipe` | `row`, `tensor`, `block` | `row` | scale granularity of `fp8_compute` |
 | `FP8_DGRAD` | `fp8_dgrad` | `fp8`, `16bit` | `fp8` | input-gradient GEMM in fp8 (a W^T fp8 copy, 2 bytes per weight in all) or 16-bit (1 byte per weight) |
+| `INT8_COMPUTE` | `int8_compute` | `False`, `True` | `False` | every int8 base (an int8 ConvRot file under `auto`, or `int8`) runs int8 GEMMs with per-row int8 activations instead of weight-only; CUDA; see [quant-kernels.md](../internals/quant-kernels.md#int8-compute) |
+| `INT8_DGRAD` | `int8_dgrad` | `int8`, `16bit` | `int8` | int8 compute's input-gradient GEMM in int8 (no extra stored copy) or 16-bit |
 
 ## Rules that constrain a plan
 

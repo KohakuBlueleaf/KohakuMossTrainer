@@ -1,9 +1,12 @@
 # Quantized frozen-base kernels
 
-The GEMMs that serve a frozen base weight stored below 16 bits. Two families:
+The GEMMs that serve a frozen base weight stored below 16 bits. Three families:
 
 * **weight-only** (`base_precision` / TE `precision` `int8`, `fp8`): the weight is
   stored quantized and dequantized inside a 16-bit GEMM ([weight-only](#weight-only));
+* **int8 compute** (`INT8_COMPUTE` / TE `int8_compute` over any int8 base): the GEMM
+  runs on int8 operands with int32 accumulation, the activations quantized per row per
+  call ([int8 compute](#int8-compute));
 * **fp8 compute** (`fp8_compute`, `mxfp8`): the weight is stored quantized once and the
   GEMM itself runs on e4m3 operands, the activations quantized per call
   ([fp8 compute](#fp8-compute)).
@@ -293,6 +296,69 @@ W4A8 file) attaches them at load. The memory plan's `base_precision` then decide
 quant records (no weight read): the planner's estimate counts its bytes under `auto`
 (`Workload.stored_precision`), and the knob checks refuse a full finetune of a stored
 file under `auto`.
+
+## int8 compute
+
+`kohakumoss_kernels.int8` serves `int8_linear(x, q, scale, bias, group, dgrad)` over any
+int8 base: a ComfyUI int8 ConvRot file under `auto` (`group` = its rotation), a
+KohakuMoss `int8` base (`group` 0), a W4A8 base through its int8 decode.
+
+### Knobs
+
+| component | knob | values | default |
+| --- | --- | --- | --- |
+| DiT (training and sampling) | `INT8_COMPUTE` (`int8_compute`) | `False` (weight-only), `True` | `False` |
+| DiT, training | `INT8_DGRAD` (`int8_dgrad`) | `int8`, `16bit` | `int8` |
+| text encoder | `TEXT_ENCODE["int8_compute"]` | `False`, `True` | `False` |
+
+`set_int8_compute` (`kohakumoss.quant.bind`) marks every int8 base; each binds the op on
+its next `bind` (resident, offload and ring placements alike, the weight ring included).
+With no int8 base the run is refused. CUDA only: the host keeps the weight-only plain
+ops. The text cache key records `int8c`.
+
+### What runs
+
+| step | eager reference | Triton backend (sm75+) |
+| --- | --- | --- |
+| x rotated, per-row int8 codes and scales | `group_hadamard_eager` in x's dtype, then `formats.quantize_rows` | `_quant_rows`: rotation in fp32 registers, amax, `div_rn` + `rint`, one pass per chunk |
+| GEMM | `torch._int_mm(xq, q.t())` (int32) | per shape, the tuner (`int8_fwd`) picks cuBLAS `_int_mm` plus `_epilogue` or the fused Triton tile (sm80+; Triton has no int8 MMA on sm75) |
+| y = acc * s_x * s_w + b | fp32, one rounding | in the epilogue's fp32 registers |
+| dx (`int8`) | `Q(dy * scale) @ q`, times dy's row scales, rotated back | `_quant_rows` with the column scale, `_int_mm` over a column-major copy of q (made per call, 1 byte per weight, freed after), `_epilogue` with the rotation |
+| dx (`16bit`) | `(dy (q * scale)) R` | the same, rotation by `rotate_2d` |
+
+The input gradient contracts over N, the axis the weight's row scales live on, so the
+scales move onto dy's columns before dy is quantized per row: no second weight copy is
+stored. `_int_mm` reads a row-major right operand about 3x slower than a column-major
+one (RTX 3090: 62 against 181 TOPS at 6144 x 9216 x 3072), so the dgrad transposes q
+per call (2 x N x K bytes moved).
+
+### Precision
+
+int8 compute is quantized compute, as fp8 compute is: the bar is not 16-bit PyTorch.
+`tests/kernels/quant/test_int8_linear.py` holds an fp64 model of the scheme (fp64
+rotation, per-row codes, exact integer products, both scales): the eager reference
+equals it on inputs whose codes are exact; the Triton kernels match the eager reference
+against it with no regression (`assert_no_regression`); a missing rotation, a dropped
+activation scale, an unquantized activation and weight scales left off dy's columns
+fail the checks.
+
+### Measured
+
+`int8 fwd`: int8 compute; `w-only`: the weight-only rotated int8 linear; `dense`: the
+16-bit matmul. Device ms; M = 6144 (DiT) / 2048 (text encoder).
+
+| card | layer (N x K) | dense fwd / fwd+dgrad | w-only fwd / fwd+dgrad | int8 fwd / fwd+dgrad (int8) / fwd+dgrad (16bit) |
+| --- | --- | --- | --- | --- |
+| RTX 3090 bf16 | qkv 9216 x 3072 | 2.64 / 5.47 | 2.74 / 6.01 | 2.14 / 4.69 / 5.79 |
+| RTX 3090 bf16 | o 3072 x 3072 | 0.98 / 1.96 | 1.02 / 2.41 | 0.85 / 1.92 / 2.24 |
+| RTX 3090 bf16 | up_gate 16384 x 3072 | 4.73 / 9.74 | 5.12 / 10.65 | 3.61 / 7.81 / 9.75 |
+| RTX 3090 bf16 | down 3072 x 8192 | 2.54 / 4.92 | 2.80 / 5.98 | 1.87 / 4.41 / 5.39 |
+| RTX 3090 bf16 | TE mlp up 24576 x 4096 | 3.17 / 6.68 | 3.76 / 7.56 | 2.40 / 6.18 / 8.03 |
+| RTX 3090 bf16 | TE mlp down 4096 x 12288 | 1.62 / 3.38 | 1.89 / 4.22 | 1.28 / 3.31 / 4.30 |
+| RTX 2080 Ti fp16 | qkv 9216 x 3072 | 4.56 / 9.08 | 4.86 / 9.97 | 3.63 / 7.67 / 9.21 |
+| RTX 2080 Ti fp16 | o 3072 x 3072 | 1.54 / 3.07 | 1.76 / 3.68 | 1.42 / 3.12 / 3.48 |
+| RTX 2080 Ti fp16 | up_gate 16384 x 3072 | 8.29 / 16.29 | 8.71 / 17.38 | 6.17 / 13.20 / 16.00 |
+| RTX 2080 Ti fp16 | down 3072 x 8192 | 4.08 / 8.14 | 4.59 / 9.56 | 3.10 / 7.18 / 8.66 |
 
 ## fp8 compute
 

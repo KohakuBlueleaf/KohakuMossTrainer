@@ -21,6 +21,7 @@ One knob set (`kohakumoss.types.plans.TextEncoderPlan`) serves:
 | `free_after_use` | `False`, `True` | drop the model after its first pass |
 | `precision` | `auto`, `compute`, `int8`, `fp8`, `fp8_compute`, `mxfp8`, `w4a8` | weight storage and GEMMs ([Quantization](#quantization)); `auto` is what the weights store ([ComfyUI files](#comfyui-files)), `w4a8` a ComfyUI W4A8 file only |
 | `w4a8` | `auto`, `int8`, `packed` | a W4A8 file's decode ([ComfyUI files](#comfyui-files)) |
+| `int8_compute` | `False`, `True` | the int8 linears (an int8 / W4A8 file under `auto`, or `int8`) run int8 GEMMs with per-row int8 activations instead of weight-only; CUDA, `quant_group` 0; the cache key gains `int8c` ([quant-kernels.md](quant-kernels.md#int8-compute)) |
 | `quant_group` | `0` (per output channel), or any multiple of 16 (e.g. `64`, `128`) | weight-only scale groups of input columns; `int8` / `fp8` only |
 | `fp8_recipe` | `row`, `tensor`, `block` | `fp8_compute` scaling |
 | `stored` | `""`, a file | a pre-quantized text encoder ([below](#pre-quantized-text-encoder)) |

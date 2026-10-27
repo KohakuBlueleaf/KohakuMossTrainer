@@ -12,6 +12,8 @@ from kohakumoss.quant.weights import dequantize, unrotated
 from kohakumoss_kernels import registry
 from kohakumoss_kernels.fp8 import dequantize as fp8_dequantize
 from kohakumoss_kernels.fp8.op import dgrad as fp8_dgrad
+from kohakumoss_kernels.int8.op import input_grad as int8_input_grad
+from kohakumoss_kernels.int8.op import linear_forward as int8_forward
 
 
 class _StreamedLinear(Function):
@@ -63,6 +65,36 @@ class _StreamedFp8Linear(Function):
         if ctx.needs_input_grad[0]:
             parts = (h.q, h.scale, h.q_t, h.scale_t, h.aux_t)
             dx = fp8_dgrad(g2, *parts, h.recipe, h.train.backend)
+            dx = dx.reshape(*g.shape[:-1], dx.shape[-1]).to(ctx.x_dtype)
+        if ctx.bias_dtype is not None and ctx.needs_input_grad[1]:
+            db = g2.float().sum(0).to(ctx.bias_dtype)
+        return dx, db, None
+
+
+class _StreamedInt8Linear(Function):
+    """`int8_linear` over ring slots that saves nothing: the input gradient re-reads
+    `q` and `scale` from the slot (the block is re-streamed); no slot is held in the
+    autograd graph."""
+
+    @staticmethod
+    def forward(ctx, x, bias, handle):
+        ctx.handle = handle
+        ctx.x_dtype = x.dtype
+        ctx.bias_dtype = None if bias is None else bias.dtype
+        x2 = x.reshape(-1, x.shape[-1]).contiguous()
+        q, scale = handle._parts()
+        b = None if bias is None else bias.to(x.dtype)
+        y = int8_forward(x2, q, scale, b, handle.rotation, handle.backend)
+        return y.reshape(*x.shape[:-1], y.shape[-1])
+
+    @staticmethod
+    def backward(ctx, g):
+        h = ctx.handle
+        g2 = g.reshape(-1, g.shape[-1]).contiguous()
+        dx = db = None
+        if ctx.needs_input_grad[0]:
+            q, scale = h._parts()
+            dx = int8_input_grad(g2, q, scale, h.rotation, h.int8_dgrad, h.backend)
             dx = dx.reshape(*g.shape[:-1], dx.shape[-1]).to(ctx.x_dtype)
         if ctx.bias_dtype is not None and ctx.needs_input_grad[1]:
             db = g2.float().sum(0).to(ctx.bias_dtype)
@@ -123,16 +155,38 @@ class StreamedParamWeight(StreamedWeight):
 class StreamedQuantWeight(StreamedWeight):
     """Streamed int8/fp8 base: the ring carries `q` and `scale`, dequantized on use; a
     ConvRot base (`rotation` > 0) is rotated back in fp32 by the device's
-    `group_hadamard` before the one rounding to the compute dtype."""
+    `group_hadamard` before the one rounding to the compute dtype. With `int8_dgrad`
+    set (int8 compute) `linear` runs `int8_linear` over the slot's parts in `dtype`."""
 
-    def __init__(self, weight_stream, block, key, shape, rotation: int = 0):
+    def __init__(
+        self,
+        weight_stream,
+        block,
+        key,
+        shape,
+        rotation: int = 0,
+        int8_dgrad: str | None = None,
+        dtype: torch.dtype | None = None,
+    ):
         super().__init__(weight_stream, block, key, shape)
         self.rotation = int(rotation)
+        self.int8_dgrad = int8_dgrad
         self._weight_now = StreamedQuantWeight._plain
+        device = weight_stream.device
         if self.rotation:
-            device = weight_stream.device
             self.rotate = registry.resolve("group_hadamard", device, torch.float32)
             self._weight_now = StreamedQuantWeight._rotated
+        if int8_dgrad is not None:
+            if dtype is None:
+                raise ValueError("an int8-compute base streams with a compute dtype")
+            op = registry.resolve(
+                "int8_linear", device, dtype, group=self.rotation, dgrad=int8_dgrad
+            )
+            self.backend = op.backend
+            self.linear = self._int8_linear
+
+    def _int8_linear(self, x: Tensor, bias: Tensor | None) -> Tensor:
+        return _StreamedInt8Linear.apply(x, bias, self)
 
     def weight_now(self, dtype: torch.dtype) -> Tensor:
         return self._weight_now(self, dtype)

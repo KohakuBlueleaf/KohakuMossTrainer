@@ -37,7 +37,7 @@ KNOWN = frozenset(
     SEED_BASE STEPS CFG SHIFT SKIP_LAYERS CFG_MODE BATCH PRECISION FP16_FIX
     FP16_FIX_KWARGS ADAPTERS ADAPTER_MODE DEVICE TEXT_DEVICE TEXT_ENCODE VAE_ENCODE
     VAE_DTYPE TUNE OUT MEMORY_PROFILE MEMORY_OVERRIDES BASE_PRECISION FP8_RECIPE STREAM
-    STREAM_RESIDENT PINNED PROGRESS""".split()
+    STREAM_RESIDENT PINNED PROGRESS INT8_COMPUTE""".split()
 )
 BASE_PRECISIONS = ("auto", "compute", "int8", "fp8", "fp8_compute", "mxfp8")
 FP8_RECIPES = ("tensor", "row", "block")
@@ -227,8 +227,9 @@ def encoder_problems(k: dict) -> list[str]:
 
 def memory_of(k: dict) -> tuple[str | None, dict]:
     """(DiT memory profile or None, MemoryPlan overrides) of MEMORY_PROFILE /
-    BASE_PRECISION / FP8_RECIPE / MEMORY_OVERRIDES: a quantized BASE_PRECISION places
-    the DiT under the `speed` profile unless MEMORY_PROFILE names one; `compute` is
+    BASE_PRECISION / FP8_RECIPE / INT8_COMPUTE / MEMORY_OVERRIDES: a quantized
+    BASE_PRECISION places the DiT under the `speed` profile unless MEMORY_PROFILE
+    names one; `compute` is
     passed on (a pre-quantized DiT file is dequantized at load); `auto` keeps what the
     file stores."""
     overrides = dict(k.get("MEMORY_OVERRIDES") or {})
@@ -242,6 +243,8 @@ def memory_of(k: dict) -> tuple[str | None, dict]:
         overrides.setdefault("base_precision", precision)
         overrides.setdefault("fp8_recipe", k.get("FP8_RECIPE", "row"))
         memory = memory or "speed"
+    if k.get("INT8_COMPUTE"):
+        overrides.setdefault("int8_compute", True)
     return memory, overrides
 
 

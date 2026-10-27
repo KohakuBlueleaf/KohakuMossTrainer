@@ -137,6 +137,20 @@ def plan_problems(
             f"text-encoder memory='cpu' runs precision auto / {' / '.join(HOST_PRECISIONS)}"
             " (fp8 compute GEMMs need CUDA)"
         )
+    if plan.int8_compute and plan.precision not in ("auto", "int8", "w4a8"):
+        p.append(
+            f"text-encoder int8_compute runs int8 linears; precision {plan.precision!r} "
+            "has none: use 'auto' on an int8 / W4A8 file, or 'int8'"
+        )
+    if plan.int8_compute and plan.quant_group:
+        p.append("text-encoder int8_compute runs per-channel int8: quant_group 0")
+    if plan.int8_compute and plan.memory == "cpu":
+        p.append("text-encoder int8_compute needs a CUDA device, not memory 'cpu'")
+    if plan.int8_compute and device is not None and torch.device(device).type != "cuda":
+        p.append(
+            f"text-encoder int8_compute needs a CUDA device, not "
+            f"{torch.device(device).type}"
+        )
     if plan.precision in COMPUTE and plan.memory != "cpu" and device is not None:
         kind = torch.device(device).type
         if kind != "cuda":
