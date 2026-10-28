@@ -13,7 +13,7 @@ ADAPTERS = []  # [(path, multiplier), ...]: LyCORIS, ComfyUI or training-state f
 OUT = ""  # output file (or directory for FORMAT="diffusers")
 FORMAT = "merged"  # "merged" (= "comfy": one DiT file) | "diffusers" (= "hf")
 SAVE_DTYPE = "bf16"  # dtype of the written tensors: "bf16" | "fp16" | "fp32"
-FUSED_QKV = "auto"  # merged: joint q/k/v as one proj.qkv: "auto" (as WEIGHTS stores them) | True | False
+FUSED_QKV = False  # merged: False (separate q / k / v keys) | True (joint q/k/v as one proj.qkv) | "auto" (as WEIGHTS stores them)
 DEVICE = "cpu"
 
 

@@ -10,12 +10,12 @@ with `CHECKPOINT_EXPORT=True` (the default), into every checkpoint's `export/` f
 | --- | --- |
 | `SAVE_FORMAT` | `comfy` (default), `hf`, `both`, `none` |
 | `SAVE_MERGED` | `False` (default); `True` adds the merged DiT (adapters only) |
-| `SAVE_FUSED_QKV` | `auto` (default: as the DiT file the run trained on stores q / k / v; the Comfy-Org files are fused), `True`, `False` |
+| `SAVE_FUSED_QKV` | `False` (default: separate q / k / v keys), `True` (one fused `proj.qkv`), `auto` (as the DiT file the run trained on stores q / k / v; the Comfy-Org files are fused) |
 | `CHECKPOINT_EXPORT` | `True` (default): every checkpoint also holds the exports |
 
 | run | `comfy` | `hf` |
 | --- | --- | --- |
-| adapters | `<run>-comfy.safetensors`: the ComfyUI LyCORIS file (`lora_unet_...` keys, fused q/k/v per `SAVE_FUSED_QKV`) | `<run>-lycoris.safetensors`: the LyCORIS file with diffusers module keys |
+| adapters | `<run>-comfy.safetensors`: the ComfyUI LyCORIS file (`lora_unet_...` keys, separate q/k/v unless `SAVE_FUSED_QKV`) | `<run>-lycoris.safetensors`: the LyCORIS file with diffusers module keys |
 | adapters, `SAVE_MERGED` | + `<run>-merged.safetensors`: one ComfyUI DiT file (bare keys, bf16) | + `<run>-diffusers/`: the HF transformer folder |
 | full finetune | `<run>-merged.safetensors`: one ComfyUI DiT file | `<run>-diffusers/` |
 
@@ -49,8 +49,8 @@ kogine run scripts/export/merge.py --config <file with WEIGHTS / ADAPTERS / OUT>
 - `FORMAT`: `comfy`, `hf` (= `lycoris`), `lycoris`, `merged`, `diffusers`; a
   full-finetune checkpoint (`ALGO="full"`) exports as `merged` (`comfy`) or `diffusers`
   (`hf`).
-- `FUSED_QKV` (`auto` default: as `WEIGHTS` stores q / k / v) writes the fused layout of
-  the Comfy-Org files for `comfy` and `merged`.
+- `FUSED_QKV` (`False` default: separate q / k / v; `True`; `auto`: as `WEIGHTS` stores
+  q / k / v) writes the fused layout of the Comfy-Org files for `comfy` and `merged`.
 - With a ComfyUI folder as `WEIGHTS`, `TRANSFORMER` / `VARIANT` pick the DiT file as in
   training ([weights.md](weights.md)).
 - `SAVE_DTYPE` (`bf16` default, `fp16`, `fp32`) is the dtype of the written tensors in
@@ -58,8 +58,10 @@ kogine run scripts/export/merge.py --config <file with WEIGHTS / ADAPTERS / OUT>
 
 ## Loading the file
 
-- With a ComfyUI MOSS-Image loader, load the adapter with a LoRA loader node in its
-  default (merging) mode.
+- With a ComfyUI MOSS-Image loader, load the adapter with a LoRA loader node. On the
+  fused Comfy-Org DiT files, ComfyUI maps the separate q / k / v keys onto their slices
+  of `proj.qkv`; the merging mode handles them, and the bypass mode needs
+  [Comfy-Org/ComfyUI#17408](https://github.com/Comfy-Org/ComfyUI/pull/17408).
 - Without one, `scripts/sample/sample.py` samples the `comfy` file directly (`ADAPTERS`,
   [inference.md](inference.md#cli)).
 
@@ -120,14 +122,18 @@ Joint-block q/k/v are separate layers in KohakuMoss and are written as separate
   Comfy-Org repack;
 - the generic LoRA key map (`comfy/lora.py`, `model_lora_keys_unet`) maps
   `lora_unet_<path with _>` and `diffusion_model.<path>` to the model's own
-  `<path>.weight` keys.
+  `<path>.weight` keys, and on a fused checkpoint maps each `layers.N.proj.{q,k,v}` key
+  to its row slice of `layers.N.proj.qkv.weight`.
 
-So an unfused file targets an unfused checkpoint and the fused repack takes a fused
-file. `SAVE_FUSED_QKV` / `FUSED_QKV` `auto` follow the DiT file the run trained on (the
-Comfy-Org files: fused; the HF transformer folder: unfused); `True` / `False` force
-either.
+So a separate-q/k/v file loads on both checkpoints, and is the default
+(`SAVE_FUSED_QKV` / `FUSED_QKV` `False`): its adapter tensors stay in their trained form
+(a LoKr stays a LoKr). Bypass loading of it on the fused repack needs
+[Comfy-Org/ComfyUI#17408](https://github.com/Comfy-Org/ComfyUI/pull/17408). `True`
+writes the fused layout below; `auto` follows the DiT file the run trained on (the
+Comfy-Org files: fused; the HF transformer folder: unfused).
 
-A fused `comfy` file writes each block's q/k/v as one `layers.N.proj.qkv` layer:
+A fused `comfy` file (`True`) writes each block's q/k/v as one `layers.N.proj.qkv`
+layer:
 
 | q/k/v layers | written as |
 | --- | --- |

@@ -16,7 +16,7 @@ FORMAT = "comfy"  # "comfy" | "hf" (= "lycoris") | "lycoris" | "merged" | "diffu
 STYLE = "lora_unet"  # comfy/lycoris keys: "lora_unet" | "diffusion_model"
 SAVE_DTYPE = "bf16"  # dtype of the written tensors: "bf16" | "fp16" | "fp32"
 MULTIPLIER = 1.0  # strength baked into merged outputs
-FUSED_QKV = "auto"  # comfy / merged: joint q/k/v as one proj.qkv: "auto" (as WEIGHTS stores them; the Comfy-Org files are fused) | True | False
+FUSED_QKV = False  # comfy / merged: False (separate q / k / v keys) | True (joint q/k/v as one proj.qkv) | "auto" (as WEIGHTS stores them; the Comfy-Org files are fused)
 DEVICE = "cpu"
 
 

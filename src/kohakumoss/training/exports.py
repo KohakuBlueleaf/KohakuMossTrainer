@@ -93,8 +93,9 @@ def _fused(path: str) -> bool:
 
 
 def fused_qkv(k: dict) -> bool:
-    """SAVE_FUSED_QKV resolved: `auto` writes q / k / v fused when the DiT file the run
-    trains on stores them fused (the Comfy-Org files)."""
+    """SAVE_FUSED_QKV resolved (default False: separate q / k / v); `auto` writes q / k
+    / v fused when the DiT file the run trains on stores them fused (the Comfy-Org
+    files)."""
     choice = k["SAVE_FUSED_QKV"]
     if choice != "auto":
         return bool(choice)

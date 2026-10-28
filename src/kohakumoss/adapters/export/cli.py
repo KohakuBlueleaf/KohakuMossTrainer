@@ -34,9 +34,9 @@ def dit_weights(cfg: dict):
 
 
 def fused_of(cfg: dict, weights) -> bool:
-    """FUSED_QKV resolved: `auto` writes q / k / v fused when the DiT file stores them
-    fused (the Comfy-Org files)."""
-    choice = cfg.get("FUSED_QKV", "auto")
+    """FUSED_QKV resolved (default False: separate q / k / v); `auto` writes q / k / v
+    fused when the DiT file stores them fused (the Comfy-Org files)."""
+    choice = cfg.get("FUSED_QKV", False)
     return stores_fused_qkv(weights) if choice == "auto" else bool(choice)
 
 
