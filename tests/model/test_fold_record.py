@@ -54,6 +54,30 @@ def test_record_rebuilds_the_row_scales_on_an_unfolded_model():
     assert record_row_scales(meta_model(), None) == {}
 
 
+def _scales_check(scales: dict) -> None:
+    dim = PRESETS["base"].dim
+    o = scales["layers.3.proj.o"]
+    assert o.shape == (dim,) and bool((o == 0.5).all())
+
+
+def test_row_scales_of_a_stored_base():
+    """A quantized / streamed layer's dense weight is an empty placeholder: the fold's row
+    scales still cover every output row (the width of the layer, not of the weight)."""
+    model = folded()
+    _scales_check(output_row_scales(model))
+    layer = model.get_submodule("layers.3.proj.o")
+    layer.weight = torch.nn.Parameter(
+        torch.empty(0, device="meta"), requires_grad=False
+    )
+    _scales_check(output_row_scales(model))
+    n = PRESETS["base"].dim
+    must_fail(
+        lambda: _scales_check({"layers.3.proj.o": torch.full((0,), 0.5)}),
+        "placeholder width",
+    )
+    assert layer.out_features == n
+
+
 def _same(a, b) -> None:
     assert same_fold(a, b)
 

@@ -229,7 +229,7 @@ def _output_scales(
         if not name.endswith(".weight"):
             continue
         module = name[: -len(".weight")]
-        n = model.get_submodule(module).weight.shape[0]
+        n = model.get_submodule(module).out_features
         out[module] = s.float() if isinstance(s, Tensor) else torch.full((n,), float(s))
     return out
 
