@@ -91,6 +91,8 @@ def apply_row_scale(t: Target, tensors: dict, scale: Tensor | float) -> dict:
     same tensor set: the output-row factor of each term, a uniform factor of each term,
     or an exact `diff` when the set has neither for this scale."""
     per_row = _per_row(scale)
+    if isinstance(scale, Tensor) and not per_row:
+        scale = float(scale.flatten()[0]) if scale.numel() else 1.0
     if "diff" in tensors:
         return _row_scaled(tensors, names(("diff", "diff_b"), tensors), scale)
     if t.record.stacking == Stacking.COMMUTING and not per_row:
