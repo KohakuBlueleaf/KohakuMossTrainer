@@ -6,6 +6,7 @@ graph per image, the danbooru post metadata with normalized quality scores).
 | file | holds |
 | --- | --- |
 | `caption_danbooru.py` | the caption layer: `artist, copyright, character, <middle>, quality, era, rating`, the middle `tags` / `nl` / `tags, nl` / `graph` at 2 : 2 : 3 : 3, every dropout |
+| `caption_danbooru_mix.py` | the same rules with an artist-heavy share: 10 % empty, 40 % `artist, quality, era, rating`, 30 % `tags` / `tags, nl` / `nl`, 20 % `graph`; every drop rate a per-caption range, so some captions keep every item |
 | `train_4x3090_2x2080ti.py` | the run: four RTX 3090 train, two RTX 2080 Ti encode, 16 samples x 7,000 steps |
 
 ## Captions

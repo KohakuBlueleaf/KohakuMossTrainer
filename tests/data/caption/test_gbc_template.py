@@ -14,6 +14,7 @@ from kohakumoss_data.caption.gbc import (
     Format,
     GbcTemplate,
     Parts,
+    Rate,
     crop_box,
     drop_each,
     rules_of,
@@ -29,6 +30,21 @@ pytestmark = pytest.mark.cpu
 EXAMPLE = (
     Path(__file__).parents[3] / "examples" / "gbc-danbooru" / "caption_danbooru.py"
 )
+
+
+def test_mix_example_shares():
+    mix = runpy.run_path(str(EXAMPLE.with_name("caption_danbooru_mix.py")))
+    t = GbcTemplate(**_kwargs(mix["CAPTION"]))
+    kept = 1 - mix["TEXT_DROP"]
+    total = sum(f.weight for f in t.formats)
+    share = {f.sections: kept * f.weight / total for f in t.formats}
+    heavy = next(f for f in t.formats if f.requires == ("artist",))
+    assert heavy.sections == ("artist", "quality", "era", "rating")
+    assert share[heavy.sections] == pytest.approx(0.4)
+    graph = [s for s in share if "graph" in s]
+    assert sum(share[s] for s in graph) == pytest.approx(0.2)
+    assert sum(share.values()) + mix["TEXT_DROP"] == pytest.approx(1.0)
+    assert heavy.drop["artist"] == Rate(0.0, 0.0)
 
 
 def example_caption() -> dict:
@@ -63,7 +79,9 @@ def check_rules(rules: dict) -> None:
     assert rating("questionable") == ["nsfw"]
     assert rating("explicit") == ["nsfw", "explicit"]
     assert rules["artist"].items({"artist": ["a", "b"]}) == ["a", "b"]
-    assert rules["artist"].drop == 0.2 and rules["quality"].drop == 0.0
+    assert rules["artist"].drop == Rate(0.2, 0.2) and rules["quality"].drop == Rate(
+        0, 0
+    )
 
 
 def test_example_rules_at_every_boundary():
@@ -165,12 +183,61 @@ def test_section_drop_and_trailing_metadata():
     )
     fmt = Format(1.0, ("artist", "tags", "quality"))
     rng = np.random.default_rng(2)
-    texts = [
-        t.draw(fmt, _parts(), "meta:general", rng, (0.0, 0.0, 0.5)) for _ in range(4000)
-    ]
+    texts = []
+    for _ in range(4000):
+        meta = t.rates(fmt, rng).meta
+        texts.append(t.draw(fmt, _parts(), "meta:general", rng, (0.0, 0.0, 0.5), meta))
     dropped = sum(not s.startswith("a,\n") for s in texts) / len(texts)
     assert abs(dropped - 0.2) < 5 * (0.16 / 4000) ** 0.5
     assert all(s.endswith(",\nmasterpiece") for s in texts)
+
+
+def check_range(rate: Rate, lo: float, hi: float) -> None:
+    rng = np.random.default_rng(4)
+    draws = np.array([rate.draw(rng) for _ in range(4000)])
+    assert draws.min() >= lo and draws.max() <= hi
+    assert draws.min() < lo + 0.02 and draws.max() > hi - 0.02
+    assert abs(draws.mean() - (lo + hi) / 2) < 0.02
+
+
+def test_rates_fixed_or_drawn_per_caption():
+    check_range(Rate.of([0.0, 0.4]), 0.0, 0.4)
+    must_fail(lambda: check_range(Rate.of(0.2), 0.0, 0.4), "a fixed rate as a range")
+    rng = np.random.default_rng(9)
+    state = rng.bit_generator.state
+    assert Rate.of(0.3).draw(rng) == 0.3 and rng.bit_generator.state == state
+    for bad in (1.5, [0.5, 0.2], [-0.1, 0.3]):
+        with pytest.raises(ValueError):
+            Rate.of(bad)
+    t = _template(tags={"sources": [{"from": "meta:general"}], "drop": [0.0, 0.6]})
+    rates = [t.rates(t.formats[0], rng).tag_drop for _ in range(2000)]
+    assert min(rates) < 0.01 and max(rates) > 0.59
+
+
+def test_format_requires_and_drop_override():
+    t = _template(
+        formats=[
+            {
+                "weight": 4,
+                "sections": ["artist", "quality"],
+                "requires": ["artist"],
+                "drop": {"artist": 0.0},
+            },
+            {"weight": 1, "sections": ["artist", "tags", "quality"]},
+        ],
+        meta={"artist": {"field": "artist", "drop": 0.5}, "quality": {"field": "q"}},
+    )
+    heavy, normal = (f.sections for f in t.formats)
+    check_draws(t.choose, _parts(), {heavy: 0.8, normal: 0.2})
+    no_artist = replace(_parts(), meta={"quality": ["masterpiece"]})
+    check_draws(t.choose, no_artist, {normal: 1.0})
+    rng = np.random.default_rng(3)
+    assert all(t.rates(t.formats[0], rng).meta["artist"] == 0.0 for _ in range(50))
+    assert all(t.rates(t.formats[1], rng).meta["artist"] == 0.5 for _ in range(50))
+    must_fail(
+        lambda: check_draws(t.choose, no_artist, {heavy: 0.8, normal: 0.2}),
+        "requires ignored",
+    )
 
 
 @pytest.fixture

@@ -53,17 +53,42 @@ def items_of(value) -> list[str]:
 
 
 @dataclass(frozen=True)
+class Rate:
+    """A probability or fraction: fixed, or drawn uniformly from [lo, hi] per caption
+    (config: a number or [lo, hi]). A fixed rate draws nothing from the rng."""
+
+    lo: float
+    hi: float
+
+    @classmethod
+    def of(cls, value) -> "Rate":
+        match value:
+            case list() | tuple():
+                lo, hi = (float(v) for v in value)
+            case _:
+                lo = hi = float(value)
+        if not 0.0 <= lo <= hi <= 1.0:
+            raise ValueError(
+                f"gbc template: rate {value!r} is not in [0, 1] as [lo, hi]"
+            )
+        return cls(lo, hi)
+
+    def draw(self, rng: np.random.Generator) -> float:
+        return self.lo if self.lo == self.hi else float(rng.uniform(self.lo, self.hi))
+
+
+@dataclass(frozen=True)
 class MetaRule:
     """One metadata section: the value at the dotted `path` (config key `field`), then
     `bins` ([[lower, tag], ...], lower bound inclusive, highest first), `ranges`
     ([[first, last, tag], ...], both inclusive) or `map` ({value: text or [texts]});
-    "" means no item. `drop`: the section's drop probability."""
+    "" means no item. `drop`: the section's drop probability (a Rate)."""
 
     path: str
     bins: tuple = ()
     ranges: tuple = ()
     map: dict = field(default_factory=dict)
-    drop: float = 0.0
+    drop: Rate = Rate(0.0, 0.0)
 
     def items(self, meta: dict) -> list[str]:
         value = field_value(meta, self.path)
@@ -90,7 +115,7 @@ def rules_of(meta: dict) -> dict[str, MetaRule]:
             bins=tuple(tuple(b) for b in r.get("bins", ())),
             ranges=tuple(tuple(x) for x in r.get("ranges", ())),
             map=dict(r.get("map", {})),
-            drop=float(r.get("drop", 0.0)),
+            drop=Rate.of(r.get("drop", 0.0)),
         )
         for name, r in meta.items()
     }
@@ -98,13 +123,35 @@ def rules_of(meta: dict) -> dict[str, MetaRule]:
 
 @dataclass(frozen=True)
 class Format:
-    """A weighted section order."""
+    """A weighted section order. `requires`: metadata sections the sample must have for
+    the format to be chosen; `drop`: {section: rate} overriding a metadata section's or
+    the tags' ("tags") drop rate in this format."""
 
     weight: float
     sections: tuple[str, ...]
+    requires: tuple[str, ...] = ()
+    drop: dict = field(default_factory=dict)
+
+    @classmethod
+    def of(cls, f: dict) -> "Format":
+        drop = {k: Rate.of(v) for k, v in dict(f.get("drop", {})).items()}
+        return cls(
+            float(f["weight"]), tuple(f["sections"]), tuple(f.get("requires", ())), drop
+        )
 
     def needs(self) -> tuple[str, ...]:
         return tuple(s for s in self.sections if s in CONTENT)
+
+
+@dataclass(frozen=True)
+class Rates:
+    """One caption's drawn rates: tag drop, graph tag drop, graph keep, and the drop of
+    each metadata section."""
+
+    tag_drop: float
+    graph_tag_drop: float
+    keep: float
+    meta: dict
 
 
 @dataclass
@@ -183,10 +230,10 @@ class GbcTemplate:
     `meta`: {section: rule} (MetaRule fields) or `meta_formatter`: a dotted path to
     `f(meta) -> {section: str | [str]}`; `tags`: {"sources": [{"from": "meta:<field>" |
     "graph:root", "weight"}], "drop", "shuffle", "exclude": [regex], "dedupe": [section]};
-    `nl`: {"short"}; `graph`: {"keep", "tag_drop"}; `formats`: [{"weight", "sections"}];
-    `list_sep` / `section_sep` / `text_sep`; `underscores`; `fit`: {"tag_drop_step",
-    "tag_drop_max", "keep_step", "keep_min", "fallback", "margin"}; `prefix` /
-    `suffix`."""
+    `nl`: {"short"}; `graph`: {"keep", "tag_drop"}; `formats`: [{"weight", "sections",
+    "requires", "drop"}]; `list_sep` / `section_sep` / `text_sep`; `underscores`; `fit`:
+    {"tag_drop_step", "tag_drop_max", "keep_step", "keep_min", "fallback", "margin"};
+    `prefix` / `suffix`. Every drop rate and `keep` is a number or [lo, hi] (a Rate)."""
 
     geometric = True
 
@@ -211,9 +258,7 @@ class GbcTemplate:
                 "the gbc caption template needs kohakugbc-data "
                 "(pip install 'kohakumoss[gbc]', Python 3.11+)"
             )
-        self.formats = [
-            Format(float(f["weight"]), tuple(f["sections"])) for f in formats
-        ]
+        self.formats = [Format.of(f) for f in formats]
         if not self.formats:
             raise ValueError("gbc template: formats is empty")
         self.rules = rules_of(meta or {})
@@ -223,14 +268,14 @@ class GbcTemplate:
             (str(s["from"]), float(s.get("weight", 1.0)))
             for s in tags.get("sources", [{"from": "graph:root"}])
         ]
-        self.tag_drop = float(tags.get("drop", 0.0))
+        self.tag_drop = Rate.of(tags.get("drop", 0.0))
         self.shuffle = bool(tags.get("shuffle", True))
         self.exclude = [re.compile(p) for p in tags.get("exclude", ())]
         self.dedupe = tuple(tags.get("dedupe", ()))
         self.nl_short = float(dict(nl or {}).get("short", 0.0))
         graph = dict(graph or {})
-        self.keep = float(graph.get("keep", 0.6))
-        self.graph_tag_drop = float(graph.get("tag_drop", self.tag_drop))
+        self.keep = Rate.of(graph.get("keep", 0.6))
+        self.graph_tag_drop = Rate.of(graph.get("tag_drop", tags.get("drop", 0.0)))
         self.list_sep, self.section_sep, self.text_sep = list_sep, section_sep, text_sep
         self.underscores = underscores
         fit = dict(fit or {})
@@ -242,9 +287,20 @@ class GbcTemplate:
         self.fallback = tuple(fit.get("fallback", ()))
         self.prefix, self.suffix = prefix, suffix
 
-    def schedule(self) -> list[tuple[float, float, float]]:
-        """(tag drop, graph tag drop, keep) of each attempt, the configured one first."""
-        out = [(self.tag_drop, self.graph_tag_drop, self.keep)]
+    def rates(self, fmt: Format, rng: np.random.Generator) -> Rates:
+        """The rates of one caption of `fmt`: each Rate drawn (the format's overrides
+        first), fixed ones without touching `rng`."""
+        tag = fmt.drop.get("tags", self.tag_drop).draw(rng)
+        graph_tag = self.graph_tag_drop.draw(rng)
+        keep = self.keep.draw(rng)
+        meta = {}
+        for name, rule in self.rules.items():
+            meta[name] = fmt.drop.get(name, rule.drop).draw(rng)
+        return Rates(tag, graph_tag, keep, meta)
+
+    def schedule(self, start: Rates) -> list[tuple[float, float, float]]:
+        """(tag drop, graph tag drop, keep) of each attempt, the drawn one first."""
+        out = [(start.tag_drop, start.graph_tag_drop, start.keep)]
         while True:
             t, g, k = out[-1]
             nxt = (
@@ -323,7 +379,12 @@ class GbcTemplate:
 
     def choose(self, parts: Parts, rng: np.random.Generator) -> Format:
         """A format whose content sections the sample has, by weight."""
-        ok = [f for f in self.formats if all(self.has(parts, s) for s in f.needs())]
+        ok = [
+            f
+            for f in self.formats
+            if all(self.has(parts, s) for s in f.needs())
+            and all(parts.meta.get(s) for s in f.requires)
+        ]
         if not ok:
             raise ValueError("gbc template: no format fits a sample (check `formats`)")
         return ok[pick([f.weight for f in ok], rng)]
@@ -332,8 +393,11 @@ class GbcTemplate:
         live = [(n, w) for n, w in self.tag_sources if parts.tags.get(n)]
         return live[pick([w for _, w in live], rng)][0] if live else ""
 
-    def draw(self, fmt, parts: Parts, source: str, rng, attempt) -> str:
-        """One caption of `fmt` under the attempt's dropout."""
+    def draw(
+        self, fmt, parts: Parts, source: str, rng, attempt, meta_drop: dict
+    ) -> str:
+        """One caption of `fmt` under the attempt's dropout and the caption's drawn
+        metadata-section drops."""
         tag_drop, graph_tag_drop, keep = attempt
         out: list[tuple[str, str]] = []
         for section in fmt.sections:
@@ -349,8 +413,7 @@ class GbcTemplate:
                 case "graph":
                     text = self.graph_text(parts, rng, keep, graph_tag_drop)
                 case _:
-                    rule = self.rules.get(section)
-                    drop = rule.drop if rule is not None else 0.0
+                    drop = meta_drop.get(section, 0.0)
                     items = parts.meta.get(section, [])
                     text = (
                         ""
@@ -396,7 +459,6 @@ class BoundGbc:
         self.source = source
         self.geometry_of = geometry_of
         self.max_chars = max_chars
-        self.attempts = template.schedule()
         self.fallback = Format(1.0, template.fallback) if template.fallback else None
 
     def geometry(self, row: CatalogRow, row_id: int) -> RowGeometry:
@@ -409,11 +471,13 @@ class BoundGbc:
         parts = t.parts(self.source.record(row.locator), self.geometry(row, row_id))
         fmt = t.choose(parts, rng)
         source = t.tag_source(parts, rng)
+        rates = t.rates(fmt, rng)
+        attempts = t.schedule(rates)
         text = ""
-        for attempt in self.attempts:
-            text = t.draw(fmt, parts, source, rng, attempt)
+        for attempt in attempts:
+            text = t.draw(fmt, parts, source, rng, attempt, rates.meta)
             if not self.max_chars or len(text) <= self.max_chars:
                 return text
         if self.fallback is not None:
-            return t.draw(self.fallback, parts, source, rng, self.attempts[-1])
+            return t.draw(self.fallback, parts, source, rng, attempts[-1], rates.meta)
         return text

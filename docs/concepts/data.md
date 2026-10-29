@@ -413,7 +413,7 @@ A rule takes the value at `field` (a dotted path) and writes it as items:
 | `ranges` | `[[first, last, tag], ...]`, both ends inclusive |
 | `map` | `{value: text or [texts]}` |
 | (none) | the value itself (a string, a number or a list) |
-| `drop` | the whole section's drop probability |
+| `drop` | the whole section's drop probability (a rate: a number or `[lo, hi]`) |
 
 A missing field, or a value outside every bin / range / map key, writes nothing.
 `underscores` (default True) turns `_` into spaces in list items; nothing is escaped.
@@ -428,7 +428,15 @@ formats whose content sections (`tags`, `nl`, `graph`) it has, by weight; a meta
 section with no items is left out. Items join with `list_sep` (`", "`); a section is
 followed by `text_sep` (`"\n"`) after a text section (`nl`, `graph`, which end as
 written) and by `section_sep` (`",\n"`) otherwise; `prefix` / `suffix` wrap the
-caption.
+caption. A format may also hold `requires` (metadata sections the sample must have
+items in, else the format is not drawn for it, e.g. an artist-only caption for posts
+with an artist) and `drop` (`{section: rate}` overriding a metadata section's or the
+tags' (`"tags"`) drop rate in that format, e.g. an artist that never drops there).
+
+**Rates.** Every drop rate (`meta` sections' `drop`, `tags["drop"]`,
+`graph["tag_drop"]`) and `graph["keep"]` is a number or `[lo, hi]`; a range is drawn
+uniformly once per caption, so `[0.0, 0.4]` gives some captions with no dropout at all.
+A fixed rate draws nothing.
 
 **Draw.**
 
