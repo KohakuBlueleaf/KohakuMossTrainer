@@ -413,7 +413,8 @@ the live step passes.
 
 **Attention segment buckets.** Attention is warmed at every segment-length bucket up to
 the longest planned sample and, per length, at every segment-count bucket (1, 2, 4, then
-8 and above) the planned batches reach there, and no other:
+8 and above) and mean-segment-length bucket the planned batches reach there, and no
+other:
 
 - `planned_segments` gives the shortest joint sample and the most samples a batch holds.
 - The shortest joint sample is the smallest grid `Geometry.fit` yields at TARGET_AREA
@@ -426,8 +427,12 @@ the longest planned sample and, per length, at every segment-count bucket (1, 2,
   over the shortest sample, capped by MAX_SAMPLES. A batch whose longest sample has
   length L holds at most `1 + (MAX_TOKENS - L) // shortest` of them
   (`reachable_segments`).
-- Each call packs one segment of L and the rest of the shortest length, within
-  MAX_TOKENS.
+- Each call packs one segment of L and the rest of one tail length, within MAX_TOKENS
+  (`pack_sizes`): per segment count one tail per mean-length bucket it reaches, from the
+  shortest sample up to L (`tail_lengths`); in the 8-and-above bucket also doubling
+  counts up to the most segments, whose short tails give the smallest means
+  (`tests/training/prewarm/test_prewarm_buckets.py`, negative: every tail at the
+  shortest sample).
 - With a dataset the smallest image grid is the dataset's own
   (`MossDataset.image_tokens_min`: the smallest of the resolution planner's per-row
   targets over the live rows; `tests/training/prewarm/test_prewarm_buckets.py`,

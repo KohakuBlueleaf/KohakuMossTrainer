@@ -186,7 +186,7 @@ class ModelPrewarm:
             str(self.dtype),
             self.sample_max,
             self.backward,
-            ("segments", self.segments, self.shortest, self.batch_max),
+            ("segments", self.segments, self.shortest, self.batch_max, "mean"),
             ("streams", *(tuple(vars(s).values()) for s in streams)),
         )
         return problem_key("attention_varlen", layout)

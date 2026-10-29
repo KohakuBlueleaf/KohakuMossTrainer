@@ -574,9 +574,20 @@ measured choices when a problem is first tuned.
 **Registry entry per backend** (`backends/triton/attention/entry.py` on sm80+ / XPU,
 `backends/tilelang/attention/entry.py`): a `VarlenChoice` (`backends/varlen_choice.py`)
 that times, per problem key, the backend's own kernels against torch's `varlen_attn`
-(when the torch build and card have flash) or else the per-segment SDPA loop, and binds
-the winner (table `attn_varlen_impl_<backend>`).
+(when the torch build and card have flash) and the per-segment SDPA loop, and binds the
+winner (table `attn_varlen_impl_<backend>`).
 
+- The SDPA loop is the eager reference: one `scaled_dot_product_attention` per segment
+  over split views of q / k / v and one concatenation of the outputs, so its backward
+  writes each input gradient once (slicing would build a zero-filled full-size gradient
+  per segment and sum them). On B300 its per-segment cuDNN kernels beat the Triton kernels
+  1.8x on 12 x 3k packs and 2x on 2 MP; cuDNN builds one execution plan per new segment
+  length (about 75 ms forward + backward, cached for the process), so a run's first
+  steps carry that build time ([training-b300.md](../performance/training-b300.md)).
+- The choice key adds the mean-segment-length bucket (`-M<tokens>`,
+  `tuning.buckets.mean_bucket`): one 4096 segment with seven 64-token ones and twelve
+  3k segments share the longest-segment and segment-count buckets, and the per-segment
+  loop's launch count makes them rank the candidates differently.
 - The key carries whether a backward runs through the call: `-g1` (grad mode on, an
   input requiring grad) is timed forward + backward on leaf copies, `-g0` (inference,
   sampling) the forward alone under no_grad, so a training run and an inference run on
@@ -584,7 +595,7 @@ the winner (table `attn_varlen_impl_<backend>`).
 - It times only outside inference mode, checkpointed forwards, recomputes and traces;
   inside torch.compile the SDPA loop is never used.
 - Trainers call `tuning.prewarm_attention` in the prewarm before the first step, so every
-  length bucket and segment-count bucket is decided ahead of the checkpointed training
+  length, segment-count and mean-length bucket is decided ahead of the checkpointed training
   forward ([tuning.md](tuning.md#prewarm)).
 
 The tile and strategy keys of both backends are

@@ -1,5 +1,5 @@
 """Per-shape choice of `attention_varlen`: a backend's varlen kernel against torch's
-flash `varlen_attn` (where the build and card have it), else the per-segment SDPA loop
+flash `varlen_attn` (where the build and card have it) and the per-segment SDPA loop
 (the eager reference; never used inside torch.compile). The tuner times, once per
 problem key, forward + backward on leaf copies where a backward will run (`-g1` keys),
 the forward alone where none will (`-g0`), and binds the winner; later calls only look
@@ -15,6 +15,7 @@ from kohakumoss_kernels import tuning
 from kohakumoss_kernels.backends.eager.attention import attention_varlen as sdpa_loop
 from kohakumoss_kernels.errors import BUILD_ERRORS, unavailable
 from kohakumoss_kernels.saved_ops import keep_named
+from kohakumoss_kernels.tuning.buckets import mean_bucket
 from kohakumoss_kernels.tuning.tuner import on_reset
 
 try:
@@ -71,9 +72,10 @@ def needs_backward(*ts: Tensor) -> bool:
 
 
 class VarlenChoice:
-    """`attention_varlen` through the fastest of `kernel` and the PyTorch path per
-    problem key `key(q, segments, max_seqlen)` plus whether a backward runs (`-g0` /
-    `-g1`); the tuning table is `attn_varlen_impl_<backend>`."""
+    """`attention_varlen` through the fastest of `kernel` and the PyTorch paths per
+    problem key `key(q, segments, max_seqlen)` plus the mean-segment-length bucket
+    (`-M<tokens>`) and whether a backward runs (`-g0` / `-g1`); the tuning table is
+    `attn_varlen_impl_<backend>`."""
 
     def __init__(self, backend: str, kernel: Callable, key: Callable):
         self.backend = backend
@@ -84,13 +86,17 @@ class VarlenChoice:
         self.__name__ = "attention_varlen"
         on_reset(self.bound.clear)
 
+    def problem(self, q: Tensor, segments: int, max_seqlen: int, backward: bool) -> str:
+        """The choice's table key of one call."""
+        mean = mean_bucket(q.shape[0], segments)
+        return f"{self.key(q, segments, max_seqlen)}-M{mean}-g{int(backward)}"
+
     def impls(self, device: torch.device) -> dict[str, Callable]:
-        """The candidates on `device`: the kernel, then torch varlen or the SDPA loop."""
+        """The candidates on `device`: the kernel, torch varlen and the SDPA loop."""
         impls = {self.backend: self.kernel}
         if flash_varlen_usable(device):
             impls["torch_varlen"] = torch_varlen
-        else:
-            impls["sdpa"] = sdpa_loop
+        impls["sdpa"] = sdpa_loop
         return impls
 
     def _build(self, q, k, v, cu, max_len, scale, key, backward: bool) -> Callable:
@@ -119,7 +125,7 @@ class VarlenChoice:
     ) -> Tensor:
         max_seqlen, scale = int(max_seqlen), float(scale)
         backward = needs_backward(q, k, v)
-        key = f"{self.key(q, cu_seqlens.shape[0] - 1, max_seqlen)}-g{int(backward)}"
+        key = self.problem(q, cu_seqlens.shape[0] - 1, max_seqlen, backward)
         ident = (q.device, key)
         if torch.compiler.is_compiling():
             fn = self.bound.get(ident, self.kernel)

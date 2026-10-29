@@ -1,11 +1,13 @@
 """Attention problem keys: the tile keys of both backends carry the segment-count
-bucket, and the implementation choice keys and times whether a backward runs."""
+bucket, and the implementation choice keys the mean segment length and keys and times
+whether a backward runs."""
 
 import pytest
 import torch
 
 from kohakumoss_kernels.backends import varlen_choice
 from kohakumoss_kernels.tuning import tuner
+from kohakumoss_kernels.tuning.buckets import length_bucket, segment_bucket
 from tests._util.negative import must_fail
 
 pytestmark = pytest.mark.cpu
@@ -76,11 +78,30 @@ def check_grad_keys(choice) -> None:
     choice(*_inputs(True))
     assert BACKWARDS, "the training problem was timed without a backward"
     keys = set(tuner.table(choice.table, "cpu").rows)
-    assert keys == {"k-S2-g0", "k-S2-g1"}, keys
+    assert keys == {"k-S2-M64-g0", "k-S2-M64-g1"}, keys
 
 
 def test_choice_keys_and_times_the_backward(entry):
     check_grad_keys(entry)
+
+
+def check_mean_keys(problem) -> None:
+    """12 segments of ~3k and one 4096 segment with seven 64-token ones share the
+    longest-segment and segment-count buckets, not the mean bucket."""
+    packed = torch.empty(36000, 4, 64, dtype=torch.float16, device="meta")
+    short = torch.empty(4096 + 7 * 64, 4, 64, dtype=torch.float16, device="meta")
+    assert problem(packed, 12, 3400, True) != problem(short, 8, 4096, True)
+
+
+def _bucketed(q, segs, max_len) -> str:
+    return f"L{length_bucket(max_len)}-S{segment_bucket(segs)}"
+
+
+def test_choice_keys_carry_the_mean_length():
+    choice = varlen_choice.VarlenChoice("test", _kernel, _bucketed)
+    check_mean_keys(choice.problem)
+    no_mean = lambda q, s, n, b: f"{_bucketed(q, s, n)}-g{int(b)}"  # noqa: E731
+    must_fail(lambda: check_mean_keys(no_mean), "mean bucket dropped")
 
 
 def test_negative_backward_always_timed(entry, monkeypatch):

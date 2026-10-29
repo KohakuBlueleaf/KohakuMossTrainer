@@ -41,6 +41,10 @@ try:
     from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 except ImportError:
     flex_attention = None
+try:
+    from kohakufa import attention_varlen as kohakufa_attention_varlen
+except ImportError:
+    kohakufa_attention_varlen = None
 
 CASES = {
     "joint-1MP-x2": [4096 + 300] * 2,
@@ -87,6 +91,14 @@ def torch_varlen(q, k, v, cu, max_len, scale):
     return varlen_attn(q, k, v, cu, cu, max_len, max_len, scale=scale)
 
 
+def kohakufa_varlen(q, k, v, cu, max_len, scale):
+    return kohakufa_attention_varlen(q, k, v, cu, cu, scale=scale)
+
+
+def _sm100(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.get_device_capability(device)[0] == 10
+
+
 def make_flex(cu, n):
     """flex_attention (compiled) with a document mask over the segments of `cu`."""
     seg = torch.repeat_interleave(
@@ -126,6 +138,8 @@ def implementations(device, dtype, cu, n):
     }
     if varlen_attn is not None and _sm80(device):
         impls["torch_varlen_attn"] = torch_varlen
+    if kohakufa_attention_varlen is not None and _sm100(device):
+        impls["kohakufa"] = kohakufa_varlen
     if flex_attention is not None and (_sm80(device) or device.type == "xpu"):
         impls["flex_doc_mask"] = make_flex(cu, n)
     for backend, kernels in KERNELS:
@@ -146,7 +160,7 @@ def bound_impl(fn, q, segments: int, max_len: int) -> str | None:
     choice = getattr(fn, "fn", fn)
     if not isinstance(choice, VarlenChoice):
         return None
-    bound = choice.bound.get((q.device, choice.key(q, segments, max_len)))
+    bound = choice.bound.get((q.device, choice.problem(q, segments, max_len, True)))
     names = {id(f): name for name, f in choice.impls(q.device).items()}
     return "undecided" if bound is None else names.get(id(bound), "?")
 

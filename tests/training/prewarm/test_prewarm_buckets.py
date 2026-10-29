@@ -22,9 +22,10 @@ from kohakumoss.tuning.prewarm import ModelPrewarm, prewarm_devices
 from kohakumoss_data import DataConfig
 from kohakumoss_data.dataset import MossDataset
 from kohakumoss_kernels.recording import Call, Snap
-from kohakumoss_kernels.tuning.buckets import pow2, segment_bucket
+from kohakumoss_kernels.tuning.buckets import mean_bucket, pow2, segment_bucket
 from kohakumoss_kernels.tuning.prewarm import (
     attention_lengths,
+    pack_sizes,
     prewarm_attention,
     segment_counts,
 )
@@ -318,6 +319,55 @@ def test_planned_minima_follow_the_live_rows():
     must_fail(
         lambda: check_live_minima(MossDataset.text_tokens_min, _all_rows_image),
         "tombstoned grids",
+    )
+
+
+def _reachable_means(length, segments, max_tokens, shortest) -> set[tuple[int, int]]:
+    """(segment-count bucket, mean-length bucket) of every pack a batch can hold: one
+    `length` segment plus s - 1 of `shortest` to `length` tokens, `max_tokens` total."""
+    short = min(shortest, length)
+    out = set()
+    for s in range(1, segments + 1):
+        lo = length + (s - 1) * short
+        hi = min(length + (s - 1) * length, max_tokens)
+        if lo > max_tokens:
+            break
+        for total in range(lo, hi + 1, max(1, (hi - lo) // 4096)):
+            out.add((segment_bucket(s), mean_bucket(total, s)))
+        out.add((segment_bucket(s), mean_bucket(hi, s)))
+    return out
+
+
+def check_mean_buckets(packs, cfg, dataset) -> None:
+    """Every (segment, mean) bucket a batch of `cfg` reaches is prewarmed (`packs`: the
+    pack sizes per longest-segment bucket)."""
+    sample, batch = planned_lengths(cfg)
+    shortest, segments = planned_segments(
+        cfg, dataset.text_tokens_min(), dataset.image_tokens_min()
+    )
+    for length in attention_lengths(sample):
+        warmed = {
+            (segment_bucket(len(p)), mean_bucket(sum(p), len(p)))
+            for p in packs(length, segments, batch, shortest)
+        }
+        want = _reachable_means(length, segments, batch, shortest)
+        assert want <= warmed, (length, sorted(want - warmed))
+
+
+def _shortest_tails(length, segments, max_tokens, shortest) -> list[list[int]]:
+    """The broken variant: every tail at the shortest sample."""
+    short = min(shortest or length, length)
+    counts = segment_counts(length, segments, max_tokens, shortest)
+    return [[length] + [short] * (s - 1) for s in counts]
+
+
+def test_attention_mean_buckets_follow_the_plan():
+    """GBC-like LoKr batches: 36864 tokens of up to 6144-token samples down to 356."""
+    cfg = DataConfig(target_area=1024 * 1024, max_tokens=36864, max_text_tokens=2048)
+    small = _Captions(100, image=256)
+    check_mean_buckets(pack_sizes, cfg, small)
+    must_fail(
+        lambda: check_mean_buckets(_shortest_tails, cfg, small), "shortest tails only"
     )
 
 

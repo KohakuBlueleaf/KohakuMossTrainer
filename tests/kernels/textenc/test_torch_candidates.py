@@ -55,7 +55,15 @@ def test_tilelang_text_ops_have_torch_candidates():
 def test_tilelang_attention_choice_has_torch_candidate():
     mod = _module("kohakumoss_kernels.backends.tilelang.attention.entry")
     impls = mod.CHOICE.impls(torch.device("cpu"))
-    assert "tilelang" in impls and ({"sdpa", "torch_varlen"} & set(impls))
+    assert "tilelang" in impls and "sdpa" in impls
+
+
+def test_varlen_choice_always_times_the_sdpa_reference():
+    mod = _module("kohakumoss_kernels.backends.varlen_choice")
+    choice = mod.VarlenChoice("test", lambda *a: None, lambda q, s, n: "k")
+    for device in ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",):
+        impls = choice.impls(torch.device(device))
+        assert impls["sdpa"] is mod.sdpa_loop, f"no sdpa reference on {device}"
 
 
 def test_quant_linears_have_pytorch_paths():
