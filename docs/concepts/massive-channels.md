@@ -148,6 +148,16 @@ while their weights shrink ×8.
 | readers (`q`, `k`, `v`, `ffn_up_gate`), norm gains | unchanged | unchanged | unchanged |
 | writers (`o`, `ffn_down`), embedders | ×8 | ×1/8 | ×64 |
 
+Measured on the flow-matching loss (8 held-out samples at σ 0.3 and 0.7, median over
+the linears of each depth band):
+
+![Weight gradient per linear and depth band, relative to the original](massive-channels/gradients.png)
+
+The ×1/8 copy's gradient is exactly 1.00× the healed model's on every reader and 8.00×
+on every writer, in every band. The heal itself already moved the gradients: the
+readers' gradients are 0.3–1.0× the original's (smallest in the first blocks), the
+`o` gradients grow toward the last blocks (2.6× in blocks 35–41).
+
 With Adam each step has about the same absolute size, so the same step on 8× smaller
 writers is an 8× larger relative change:
 
@@ -182,6 +192,66 @@ channels during finetuning. Keep the weight small: in the small pre-norm DiT a w
 of 0.01 kept the top-8 share at its starting value for +1.7 % loss, while 0.1 cost
 +8 %. On the healed model, a LoKr finetune with weight 0.01 and `k = 32` held the top-32
 share at 0.21–0.23 over 2,700 steps, down from 0.32 at the start.
+
+The heal takes the same penalty as `CONC_WEIGHT` / `CONC_K` (below), on the student's
+block outputs next to the distillation loss.
+
+## Running the heal
+
+`kohakumoss.heal` implements every step above; five scripts under `scripts/heal/` run
+them. Model, kernel and memory knobs come from a training config (`TRAIN_CONFIG`), so
+the teacher and the student are built and placed exactly as a training run builds its
+model.
+
+| step | script | writes |
+| --- | --- | --- |
+| 1. records | `cache.py` | per dataset row: planned latents and caption embedding (`part*.pt`), the empty-prompt embedding |
+| 2. calibration | `calibrate.py` | report: the 32 largest channels, per tau the shrink scales D, each norm's divisor ratio r̄, the training-free shrink's stream stats and velocity error |
+| 3. heal | `heal.py` | `heal.json`, `metrics.jsonl` (per step), `evals.jsonl` (held-out), `grads.json`, `step_<n>/` snapshots, `final/` |
+| 4. merge | `merge.py` | one plain single-file DiT from a parts directory at t = 1 |
+| 5. rescale | `rescale.py` | the ×c copy (c the power of two nearest 1 / the stream RMS) and its exactness report |
+
+```bash
+kogine run scripts/heal/cache.py --set TRAIN_CONFIG=my_run.py --set OUT=heal/records \
+    --set ROWS=17000 --set PART=0 --set PARTS=4          # one process per GPU, PART 0..3
+kogine run scripts/heal/calibrate.py --set DIT=moss_image_base_bf16.safetensors \
+    --set RECORDS=heal/records --set OUT=heal/calibration.json
+kogine run scripts/heal/heal.py --config configs/heal/recipes/recipes_anneal_5k_4x24g.py \
+    --set TRAIN_CONFIG=my_run.py --set TEACHER=moss_image_base_bf16.safetensors \
+    --set REPORT=heal/calibration.json --set RECORDS=heal/records --set OUT=heal/runs/heal5k
+kogine run scripts/heal/merge.py --set RUN=heal/runs/heal5k --set OUT=healed.safetensors
+kogine run scripts/heal/rescale.py --set DIT=healed.safetensors --set RECORDS=heal/records \
+    --set OUT=healed_x8.safetensors
+```
+
+How the run is built:
+
+- **Student.** `STUDENT` (the teacher's file when empty), loaded with LoKr adapters and
+  `TRAIN_NORMS` gain deltas. With `REPORT` set, the writers are scaled by D and the norm
+  gains by 1 / D in place, and the student's norms are bound to the weighted RMSNorm ops
+  (`kohakumoss.heal.wnorm`) through its `OpSet`; nothing in the model is patched.
+- **Anneal.** Each step sets `t = min(1, step / ANNEAL_STEPS)`: the norm channel weights
+  become (1 / D²)^(1 − t) and every gain g0 · r̄^−t (`ANNEAL_RBAR`; r̄ = 1 otherwise).
+  `ANNEAL_STEPS = 0` starts at t = 1; without `REPORT` the student starts from its file
+  as it is (a second heal stage from a healed model).
+- **Trainables.** `MODE="full_writers"`: `o` / `ffn_down` in full (AdamW16, stochastic
+  rounding, `LR_FULL`), LoKr factor `LOKR_FACTOR` on `q` / `k` / `v` / `ffn_up_gate`
+  (AdamW, `LR_LOKR`); `MODE="lokr"`: LoKr on `LOKR_TARGET` only. The norm-gain deltas
+  always train (AdamW, `LR_NORM`). Warmup, then cosine to 1 %.
+- **Loss.** relative squared error between the student's and the teacher's velocity on
+  the same noised records, plus `HARD_WEIGHT` × the relative error against the flow
+  target, plus `CONC_WEIGHT` × the top-`CONC_K` channel share of the student's block
+  outputs.
+- **Placement.** `TEACHER_MEMORY` / `STUDENT_MEMORY` are memory knobs layered on the
+  training config (the recipe: the teacher streamed through a two-slot block ring, the
+  student resident with block checkpointing). Ranks are spawned per `DEVICES` and
+  all-reduce their gradients each step.
+- **Evaluation.** Every `EVAL_EVERY` steps, on the `HELD` held-out records at σ 0.1 … 0.9
+  with fixed noise: velocity error against the teacher, both flow losses, per-block
+  stream stats of the student and of the D-scaled teacher, gain and writer drift. The
+  gradient map (`GRAD_MAP`) is taken before the first step and after the last.
+- **Merge.** The student file with the shrink rebuilt at t = 1 (writers × D, gains
+  w / (D r̄)), the trained writers, then the LyCORIS file merged: a standard DiT file.
 
 ## Open points
 
