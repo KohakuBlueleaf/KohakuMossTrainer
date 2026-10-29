@@ -139,23 +139,38 @@ which in a training process is this same setting.
 - **`WEIGHTING`** multiplies a σ-dependent weight into the data weight (`none` is the
   MOSS recipe; `x0` and `eps` reproduce x0- / noise-space MSE).
 
-### Concentration penalty
+### Stream penalties
 
-`CONCENTRATION_LOSS = {"weight": w, "k": k}` adds `w` times the mean, over the joint
-blocks, of the share of residual-stream energy held by the `k` largest channels of each
-block output (all tokens of the micro-batch). It is a regulariser against massive
-residual channels: a pre-norm block's RMSNorm divisor is a per-token gain, and training
-can grow a few channels whose main role is to set that divisor; the penalty makes
-concentrating the stream energy cost loss.
+`STREAM_LOSS = {term: {...}}` adds penalties on the residual stream at every joint
+block output. Both terms target the base model's massive residual channels
+([massive-channels.md](massive-channels.md)): a pre-norm block's RMSNorm divisor is a
+per-token gain, training can grow a few channels whose main role is to set it, and their
+peaks bring the stream near the fp16 maximum.
 
+| term | fields (default) | adds |
+| --- | --- | --- |
+| `concentration` | `weight`, `k` (32) | `weight` × the mean over blocks of the share of the block output's energy (all tokens of the micro-batch) in its `k` largest channels |
+| `peak` | `weight`, `cap` (32768), `top` (1e-4), `tau` (0.25), `sigma` ("sigma") | `weight` × the mean over samples, each weighted by `sigma` (σ, 1 − σ or 1), of the mean over blocks of `softplus((log m − log cap) / tau)`; `m` is the mean of the sample's largest `top` fraction of \|x\| in that block's output, in original units |
+
+`CONCENTRATION_LOSS = {"weight": w, "k": k}` is the `concentration` term alone; set one
+of the two knobs.
+
+- **Concentration.** Scale-free: it prices concentrating the energy, not its size. Keep
+  the weight small (0.01 with `k = 32` on MOSS): a large weight removes the channels and
+  also the gain path they provide, which costs task loss.
+- **Peak.** A soft cap on the stream's largest values. Below `cap` the hinge is about
+  zero; above it, it rises like `(log m − log cap) / tau`. The top fraction spreads the
+  gradient over the peak elements instead of one maximum, and it is taken per sample, so
+  it holds for every resolution. `m` is divided by the stream scale of the fp16 fix the
+  model carries (the weight fold, or `FP16_FIX="online"`'s factors), so `cap` means the
+  same with or without a fix (the fp16 maximum is 65504).
 - Each micro-batch adds its penalty weighted by its share of the step's loss tokens, so
   the step total is the token-weighted mean, as for the loss itself.
-- The training step only: validation reports the plain loss. The value is logged as the
-  `concentration` metric.
+- The training step only: validation reports the plain loss. Logged metrics:
+  `concentration`, `peak_loss` (the unweighted hinge) and `stream_peak` (the largest `m`
+  of the micro-batch, original units).
 - The block outputs are read by forward hooks, so the runner must call whole blocks:
   `CHECKPOINT="sub-block"` is rejected, and the layouts are `PARALLEL` `none` and `ddp`.
-- A small weight is the intended use (0.01 with `k = 32` on MOSS): a large weight removes
-  the channels and also the gain path they provide, which costs task loss.
 
 ## Timestep samplers
 

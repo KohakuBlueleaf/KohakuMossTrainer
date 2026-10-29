@@ -187,7 +187,8 @@ different effects on training:
 
 `CONCENTRATION_LOSS = {"weight": w, "k": k}` adds `w` times the mean, over the joint
 blocks, of the share of block-output energy in the `k` largest channels
-([training.md](training.md#concentration-penalty)). It puts a price on regrowing the
+([training.md](training.md#stream-penalties); `STREAM_LOSS` also holds a soft cap on
+the stream's peak values). It puts a price on regrowing the
 channels during finetuning. Keep the weight small: in the small pre-norm DiT a weight
 of 0.01 kept the top-8 share at its starting value for +1.7 % loss, while 0.1 cost
 +8 %. On the healed model, a LoKr finetune with weight 0.01 and `k = 32` held the top-32

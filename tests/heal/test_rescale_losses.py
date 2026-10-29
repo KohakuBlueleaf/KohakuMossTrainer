@@ -5,7 +5,7 @@ import torch
 
 from kohakumoss.heal.losses import HealLoss, concentration, rel_sq
 from kohakumoss.heal.rescale import power_of_two_scale
-from kohakumoss.training.concentration import top_share
+from kohakumoss.training.stream_loss import top_share
 from kohakumoss_kernels.backends.eager.norm import rms_norm
 from tests._util.negative import must_fail
 

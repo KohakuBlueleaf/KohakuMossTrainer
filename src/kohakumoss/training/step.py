@@ -310,15 +310,14 @@ class TrainStep:
         return StepOut(self.loss(pred, p, denom), denom, {"sigma_mean": p.sigma.mean()})
 
     def _penalised(self, batch: DeviceBatch, p: Prepared, denom: Tensor) -> StepOut:
-        """The step loss plus the concentration penalty, weighted by this micro-batch's
-        share of the step's loss tokens (the step total is the token-weighted mean)."""
+        """The step loss plus the stream penalty, weighted by this micro-batch's share
+        of the step's loss tokens (the step total is the token-weighted mean)."""
         with self.penalty.collecting(), self.autocast():
             pred = self.backbone(p.z, p.text, p.sigma, p.seq)
-        conc = self.penalty.take()
+        penalty, parts = self.penalty.take(p)
         share = self.count_of(batch) / denom
-        loss = self.loss(pred, p, denom) + self.penalty.weight * conc * share
-        metrics = {"sigma_mean": p.sigma.mean(), "concentration": conc.detach()}
-        return StepOut(loss, denom, metrics)
+        loss = self.loss(pred, p, denom) + penalty * share
+        return StepOut(loss, denom, {"sigma_mean": p.sigma.mean(), **parts})
 
     def rng_state(self) -> dict:
         return {

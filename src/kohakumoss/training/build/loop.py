@@ -44,7 +44,6 @@ from kohakumoss.training.callbacks.runner import MeetRanks, rank0_decision
 from kohakumoss.training.callbacks.startup import StepOneBreakdown
 from kohakumoss.training.callbacks.transfer import TransferStats, transfer_sources
 from kohakumoss.training.checkpoint import CheckpointManager
-from kohakumoss.training.concentration import build_penalty
 from kohakumoss.training.context import RunContext
 from kohakumoss.training.drivers import Parts
 from kohakumoss.training.ema import build_ema, ema_is_power
@@ -58,6 +57,7 @@ from kohakumoss.training.step import (
     TrainStep,
     token_counter,
 )
+from kohakumoss.training.stream_loss import build_penalty
 from kohakumoss.training.textenc import TextAhead
 from kohakumoss.training.vae import LatentAhead
 from kohakumoss_common.calls import nothing
@@ -84,7 +84,7 @@ def build_step(
     """TrainStep with the loss, weighting, sampler and mask handling bound; its sigma /
     noise streams are those of `data_rank`; `recorder` (a StepRecorder) keeps each
     prepared micro-batch; `forward` is the module the step calls instead of the
-    backbone (the backbone under torch DDP); `penalty` adds CONCENTRATION_LOSS (the
+    backbone (the backbone under torch DDP); `penalty` adds STREAM_LOSS (the
     training step; validation steps report the plain loss)."""
     masked = is_masked(k)
     loss = build_loss(k, built)

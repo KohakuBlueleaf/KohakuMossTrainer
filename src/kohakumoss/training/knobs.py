@@ -28,11 +28,12 @@ from kohakumoss.training.checks.parallel import (
     dist_backend,
     parallel_problems,
 )
-from kohakumoss.training.concentration import concentration_problems
 from kohakumoss.training.exports import with_export_formats
 from kohakumoss.training.layouts import LAYOUTS
 from kohakumoss.training.optim.optimizers.factory import OPTIMIZERS
 from kohakumoss.training.optim.optimizers.kwargs import optimizer_problems
+from kohakumoss.training.stream_loss import spec_of as stream_spec
+from kohakumoss.training.stream_loss import stream_loss_problems
 from kohakumoss.types.arch import PRESETS
 from kohakumoss.types.plans import MemoryPlan
 from kohakumoss_common.knobs import choice_problems, unknown_problems
@@ -77,7 +78,7 @@ KNOWN = frozenset(
     CROP PLANNER_KWARGS LATENT_ENCODER_ID LATENT_DRAW
     TEXT_ENCODER_ID BACKGROUND RESAMPLE TEXT_CHARS_PER_TOKEN TEXT_OVERHEAD_TOKENS
     MAX_TEXT_TOKENS PREFETCH PIN_MEMORY NONFINITE_PATIENCE DATA_RESCAN
-    DATA_SCAN_WORKERS DATA_WAIT CONCENTRATION_LOSS""".split()
+    DATA_SCAN_WORKERS DATA_WAIT CONCENTRATION_LOSS STREAM_LOSS""".split()
 )
 CHOICES = {
     "ADAPTER_MODE": ("bypass", "merge"),
@@ -253,7 +254,7 @@ def validate(k: dict) -> list[str]:
     p += parallel_problems(k, layout.problems if layout is not None else None)
     p += optimizer_problems(k)
     p += io_problems(k)
-    p += concentration_problems(k)
+    p += stream_loss_problems(k)
     return list(dict.fromkeys(p))
 
 
@@ -290,10 +291,11 @@ def plan_problems(k: dict, plan: MemoryPlan) -> list[str]:
             "profile without 'optfused' / stream for full FT (e.g. 'ckpt-resident') or "
             "FUSED_STEP=False with MEMORY_PROFILE='manual'"
         )
-    if plan.checkpoint == "sub-block" and k.get("CONCENTRATION_LOSS"):
+    if plan.checkpoint == "sub-block" and stream_spec(k):
         p.append(
-            "checkpoint='sub-block' calls block parts directly: CONCENTRATION_LOSS "
-            "needs whole-block forwards (CHECKPOINT 'block', 'partial:...' or 'none')"
+            "checkpoint='sub-block' calls block parts directly: STREAM_LOSS / "
+            "CONCENTRATION_LOSS need whole-block forwards (CHECKPOINT 'block', "
+            "'partial:...' or 'none')"
         )
     if plan.checkpoint == "sub-block" and plan.compile == "block":
         p.append(

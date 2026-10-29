@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from kohakumoss.training.concentration import top_share
+from kohakumoss.training.stream_loss import top_share
 
 
 def rel_sq(a: Tensor, b: Tensor) -> Tensor:

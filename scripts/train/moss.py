@@ -112,9 +112,13 @@ TIMESTEP_KWARGS = {
 LOSS = "mse"  # "mse" | "huber" | "l1" | "masked_mse" (needs a per-token loss mask)
 LOSS_KWARGS = {}
 WEIGHTING = "none"  # "none" | "x0" | "eps"
-# {} (off) | {"weight": 0.01, "k": 32}: + weight x the top-k channel share of the residual
-# energy, mean over joint blocks (docs/concepts/training.md#concentration-penalty)
-CONCENTRATION_LOSS = {}
+# residual-stream penalties on the joint block outputs (docs/concepts/training.md#stream-penalties):
+#   "concentration": {"weight": 0.01, "k": 32} (top-k channel share of the energy)
+#   "peak": {"weight": 0.02, "cap": 32768, "top": 1e-4, "tau": 0.25, "sigma": "sigma"}
+#     (soft hinge on each sample's top-`top` |x| per block, original units, weighted by
+#     "sigma" | "one_minus_sigma" | "none")
+STREAM_LOSS = {}
+CONCENTRATION_LOSS = {}  # the "concentration" term alone (set one of the two)
 
 # ===================== OPTIM =====================
 OPTIMIZER = "adamw"  # "adamw" | "adamw16" | "adamw8bit" (bitsandbytes) | "adamw8bit_kernel" (KohakuMoss 8-bit kernel) | "muon" | "prodigy" | "schedule_free"
