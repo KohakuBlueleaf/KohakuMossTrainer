@@ -139,6 +139,24 @@ which in a training process is this same setting.
 - **`WEIGHTING`** multiplies a σ-dependent weight into the data weight (`none` is the
   MOSS recipe; `x0` and `eps` reproduce x0- / noise-space MSE).
 
+### Concentration penalty
+
+`CONCENTRATION_LOSS = {"weight": w, "k": k}` adds `w` times the mean, over the joint
+blocks, of the share of residual-stream energy held by the `k` largest channels of each
+block output (all tokens of the micro-batch). It is a regulariser against massive
+residual channels: a pre-norm block's RMSNorm divisor is a per-token gain, and training
+can grow a few channels whose main role is to set that divisor; the penalty makes
+concentrating the stream energy cost loss.
+
+- Each micro-batch adds its penalty weighted by its share of the step's loss tokens, so
+  the step total is the token-weighted mean, as for the loss itself.
+- The training step only: validation reports the plain loss. The value is logged as the
+  `concentration` metric.
+- The block outputs are read by forward hooks, so the runner must call whole blocks:
+  `CHECKPOINT="sub-block"` is rejected, and the layouts are `PARALLEL` `none` and `ddp`.
+- A small weight is the intended use (0.01 with `k = 32` on MOSS): a large weight removes
+  the channels and also the gain path they provide, which costs task loss.
+
 ## Timestep samplers
 
 | `TIMESTEP` | sampler |

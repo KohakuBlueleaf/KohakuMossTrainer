@@ -377,7 +377,14 @@ def worker(
 
     def make_step(sampler: FixedSigma):
         return build_step(
-            k, built, normalizer, autocast, device, sampler, data_rank=data_rank
+            k,
+            built,
+            normalizer,
+            autocast,
+            device,
+            sampler,
+            data_rank=data_rank,
+            penalty=False,
         )
 
     rng_devices = stage_devices if layout.stage_rng else warm
