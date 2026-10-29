@@ -53,13 +53,24 @@ def attention_varlen(
     max_seqlen: int,
     scale: float,
 ) -> Tensor:
-    """q, k, v [N, H, Dh] packed by `cu_seqlens` [B+1]; full attention inside segments."""
+    """q, k, v [N, H, Dh] packed by `cu_seqlens` [B+1]; full attention inside segments
+    (rows past the last bound are zero). The segments are split views and the outputs
+    one concatenation, so backward writes each input gradient in one pass."""
     bounds = host_bounds(cu_seqlens)
-    out = torch.empty_like(q)
-    for start, end in zip(bounds[:-1], bounds[1:]):
-        if end == start:
-            continue
-        qs, ks, vs = (t[start:end].transpose(0, 1).unsqueeze(0) for t in (q, k, v))
+    if len(bounds) == 2 and bounds[0] == 0 and bounds[1] == q.shape[0] > 0:
+        qs, ks, vs = (t.transpose(0, 1).unsqueeze(0) for t in (q, k, v))
         o = F.scaled_dot_product_attention(qs, ks, vs, scale=scale)
-        out[start:end] = o.squeeze(0).transpose(0, 1)
-    return out
+        return o.squeeze(0).transpose(0, 1)
+    lens = [end - start for start, end in zip(bounds[:-1], bounds[1:])]
+    tail = q.shape[0] - bounds[-1]
+    lens = [bounds[0], *lens, tail]
+    parts = zip(*(t.split(lens) for t in (q, k, v)))
+    outs = []
+    for i, (qs, ks, vs) in enumerate(parts):
+        if i in (0, len(lens) - 1) or qs.shape[0] == 0:
+            outs.append(torch.zeros_like(qs))
+            continue
+        qs, ks, vs = (t.transpose(0, 1).unsqueeze(0) for t in (qs, ks, vs))
+        o = F.scaled_dot_product_attention(qs, ks, vs, scale=scale)
+        outs.append(o.squeeze(0).transpose(0, 1))
+    return torch.cat(outs)
