@@ -1,6 +1,7 @@
 """Full finetune on one RTX 5090 32 GB at maximum speed: block-checkpointed weight swap
-with eight resident blocks, activation offload and streamed host AdamW states, 36864
-tokens per step. Drives scripts/train/moss.py. Measured:
+with eight resident blocks, activation offload and streamed host AdamW states,
+36864-token micro-batches, 8 per optimizer step (294,912 tokens per step). Drives
+scripts/train/moss.py. Measured:
 docs/performance/training-5090.md.
 
     kogine run scripts/train/moss.py --config configs/moss/recipes/recipes_full_5090.py
@@ -16,4 +17,5 @@ OPTIMIZER = "adamw"
 EMA = 0.0
 MEMORY_PROFILE = "ckpt-ring8-actoff-optstream"
 MAX_TOKENS = 36864
+GRAD_ACC = 8
 TEXT_ENCODE = {"memory": "ring", "ahead": 8}

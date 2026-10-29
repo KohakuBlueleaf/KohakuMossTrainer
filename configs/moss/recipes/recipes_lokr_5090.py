@@ -1,6 +1,6 @@
 """LoKr factor 8 (w1 and w2 full) on one RTX 5090 32 GB at maximum speed: bf16 over a
 16-bit base, LyCORIS's token-major LoKr kernels (lycoris-lora >= 4.1.3), one 1 MP
-sample per 4608-token micro-batch, the first fifth of the blocks checkpointed, 64
+sample per 4608-token micro-batch, 11 of the 42 blocks checkpointed, 64
 micro-batches per optimizer step (294,912 tokens per step). Drives
 scripts/train/moss.py. Measured: docs/performance/training-5090.md.
 
@@ -22,6 +22,6 @@ BASE_PRECISION = "compute"
 MAX_TOKENS = 4608
 TOKEN_BUDGET = "render"
 MEMORY_PROFILE = "manual"
-CHECKPOINT = "partial:0.2"
+CHECKPOINT = "partial:0.262"
 TEXT_ENCODE = {"memory": "ring", "ahead": 8}
 GRAD_ACC = 64
