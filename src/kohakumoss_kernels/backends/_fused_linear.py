@@ -27,7 +27,7 @@ from kohakumoss_kernels.backends._master import (
     weight_grad,
 )
 from kohakumoss_kernels.backends.compile.ops import compiled_op
-from kohakumoss_kernels.saved_ops import keep
+from kohakumoss_kernels.saved_ops import keep, on_dispatch
 from kohakumoss_kernels.tuning.buckets import TOKEN_FLOOR, pow2
 from kohakumoss_kernels.tuning.tuner import decided, forget, on_reset
 
@@ -86,7 +86,10 @@ class FusedLinear:
         self.backend = backend
         self.forced: dict[str, dict] = {}
         self.bound: dict[tuple, Callable] = {}
+        self.eager: dict[str, _Eager] = {}
+        self._forward = self._direct
         on_reset(self.bound.clear)
+        on_dispatch(self.set_dispatch)
         self.paths = {
             "situ": {"split": self._situ_split, "fused": backend.fused["situ"]},
             "gres": {"split": self._res_split, "fused": backend.fused["gres"]},
@@ -175,18 +178,39 @@ class FusedLinear:
         for part, body in self.bodies.items():
             op = define(f"kohakumoss::{name}_linear_{part}", body, FAKES[part])
             setattr(self, f"_{part}", op)
-        self._situ_fwd.register_autograd(self._situ_backward, setup_context=_situ_setup)
-        self._gres_fwd.register_autograd(self._res_backward, setup_context=_res_setup)
-        self._qk_fwd.register_autograd(self._qk_backward, setup_context=_qk_setup)
+        for op, save, backward in (
+            ("situ", _situ_setup, self._situ_backward),
+            ("gres", _res_setup, self._res_backward),
+            ("qk", _qk_setup, self._qk_backward),
+        ):
+            custom = partial(_op_setup, save, getattr(self, f"_{op}_bwd"))
+            getattr(self, f"_{op}_fwd").register_autograd(
+                backward, setup_context=custom
+            )
+            self.eager[op] = _Eager(
+                self.bodies[f"{op}_fwd"], self.bodies[f"{op}_bwd"], save, backward
+            )
         space = torch.ops.kohakumoss
         keep(*(getattr(space, f"{name}_linear_{op}_fwd").default for op in OPS))
 
+    def set_dispatch(self, dispatch: bool) -> None:
+        """Run every forward through its custom op (`dispatch`), or eagerly direct."""
+        self._forward = self._dispatched if dispatch else self._direct
+
+    def _dispatched(self, op: str, *inputs):
+        return getattr(self, f"_{op}_fwd")(*inputs)
+
+    def _direct(self, op: str, *inputs):
+        """Op `op`'s forward: the custom op inside torch.compile; eagerly the op body
+        under a plain autograd.Function (no dispatcher)."""
+        if torch.compiler.is_compiling():
+            return getattr(self, f"_{op}_fwd")(*inputs)
+        return _EagerFn.apply(self.eager[op], *inputs)
+
     def _situ_backward(self, ctx, ga, _gug):
         y, w, ug = ctx.saved_tensors
-        need = ctx.needs_input_grad
-        dy, dw, db = self._situ_bwd(
-            ga.contiguous(), y, w, ug, need[0], need[1], need[2]
-        )
+        need = ctx.need
+        dy, dw, db = ctx.bwd(ga.contiguous(), y, w, ug, need[0], need[1], need[2])
         return (
             dy if need[0] else None,
             dw if need[1] else None,
@@ -196,9 +220,9 @@ class FusedLinear:
 
     def _res_backward(self, ctx, gy, _go):
         a, w, o, gate, seg = ctx.saved_tensors
-        need = ctx.needs_input_grad
+        need = ctx.need
         gy = gy.contiguous()
-        dx, da, dw, db, dgate = self._gres_bwd(
+        dx, da, dw, db, dgate = ctx.bwd(
             gy, a, w, o, gate, seg, ctx.r, need[0], need[1], need[2], need[4]
         )
         dx = gy if ctx.r == 1.0 else dx
@@ -215,11 +239,11 @@ class FusedLinear:
 
     def _qk_backward(self, ctx, gq, gk, *_rest):
         y, wq, wk, qp, kp, qr, kr, qw, kw, pos, bands = ctx.saved_tensors
-        need = ctx.needs_input_grad
+        need = ctx.need
         out_shape = ctx.out_shape
         gq = y.new_zeros(out_shape) if gq is None else gq.contiguous()
         gk = y.new_zeros(out_shape) if gk is None else gk.contiguous()
-        dy, dwq, dwk, dqw, dkw = self._qk_bwd(
+        dy, dwq, dwk, dqw, dkw = ctx.bwd(
             gq, gk, y, wq, wk, qp, kp, qr, kr, qw, kw, pos, bands, ctx.heads,
             need[0], need[1], need[2], ctx.eps, need[3] or need[4],
         )  # fmt: skip
@@ -242,7 +266,7 @@ class FusedLinear:
         )
         try:
             y2 = activation(y.reshape(-1, shape[-1])).contiguous()
-            a, _ = self._situ_fwd(y2, w_up_gate, bias, save)
+            a, _ = self._forward("situ", y2, w_up_gate, bias, save)
         except self.backend.fallback:
             return compiled_op("linear_situ")(y, w_up_gate, bias)
         return a.view(*shape[:-1], a.shape[-1])
@@ -261,8 +285,8 @@ class FusedLinear:
         shape = x.shape
         save = torch.is_grad_enabled() and gate is not None and gate.requires_grad
         try:
-            out, _ = self._gres_fwd(
-                activation(a.reshape(-1, a.shape[-1])).contiguous(), w, bias,
+            out, _ = self._forward(
+                "gres", activation(a.reshape(-1, a.shape[-1])).contiguous(), w, bias,
                 x.reshape(-1, shape[-1]).contiguous(), gate,
                 None if seg is None else seg.contiguous(), float(r), save,
             )  # fmt: skip
@@ -290,8 +314,8 @@ class FusedLinear:
             t.requires_grad for t in (y, wq, wk, q_weight, k_weight)
         )
         try:
-            qo, ko, _, _, _, _ = self._qk_fwd(
-                activation(y.reshape(m, -1)).contiguous(), wq, wk,
+            qo, ko, _, _, _, _ = self._forward(
+                "qk", activation(y.reshape(m, -1)).contiguous(), wq, wk,
                 q_weight.float().contiguous(), k_weight.float().contiguous(),
                 pos.float().contiguous(), bands.float().contiguous(), eps, heads, save,
             )  # fmt: skip
@@ -401,16 +425,51 @@ def _op_bodies(fl: FusedLinear) -> dict[str, Callable]:
 # --------------------------------------------------------- autograd setup
 
 
+@dataclass(frozen=True)
+class _Eager:
+    """One op's eager direct path: forward and backward bodies, the context setup and
+    the autograd backward (shared with the custom op)."""
+
+    fwd: Callable
+    bwd: Callable
+    save: Callable
+    backward: Callable
+
+
+class _EagerFn(torch.autograd.Function):
+    """An op body under autograd without the dispatcher; the saved-only outputs are
+    non-differentiable and unused output gradients stay None."""
+
+    @staticmethod
+    def forward(ctx, eager: _Eager, *inputs):
+        out = eager.fwd(*inputs)
+        ctx.need, ctx.bwd, ctx.eager = ctx.needs_input_grad[1:], eager.bwd, eager
+        eager.save(ctx, inputs, out)
+        ctx.mark_non_differentiable(*out[1 if len(out) == 2 else 2 :])
+        ctx.set_materialize_grads(False)
+        return out
+
+    @staticmethod
+    def backward(ctx, *grads):
+        return None, *ctx.eager.backward(ctx, *grads)
+
+
+def _op_setup(save, bwd, ctx, inputs, output):
+    """The custom op's context setup: `need`, the backward body `bwd`, then `save`."""
+    ctx.need, ctx.bwd = ctx.needs_input_grad, bwd
+    save(ctx, inputs, output)
+
+
 def _situ_setup(ctx, inputs, output):
     y, w, bias, _ = inputs
-    need = ctx.needs_input_grad
+    need = ctx.need
     ctx.save_for_backward(_kept(y, need[1]), _kept(w, need[0]), output[1])
     ctx.b_dtype = None if bias is None else bias.dtype
 
 
 def _res_setup(ctx, inputs, output):
     a, w, bias, x, gate, seg, r, _ = inputs
-    need = ctx.needs_input_grad
+    need = ctx.need
     ctx.save_for_backward(_kept(a, need[1]), _kept(w, need[0]), output[1], gate, seg)
     ctx.r = r
     ctx.b_dtype = None if bias is None else bias.dtype
@@ -418,7 +477,7 @@ def _res_setup(ctx, inputs, output):
 
 def _qk_setup(ctx, inputs, output):
     y, wq, wk, qw, kw, pos, bands, eps, heads, _ = inputs
-    need = ctx.needs_input_grad
+    need = ctx.need
     ctx.save_for_backward(
         _kept(y, need[1] or need[2]), _kept(wq, need[0]), _kept(wk, need[0]),
         output[2], output[3], output[4], output[5], qw, kw, pos, bands,

@@ -2,6 +2,8 @@
 the same public functions, op bodies and autograd for both, and the qk norm weights
 enter the op as fp32 on both (the TileLang side of the former drift)."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -18,7 +20,9 @@ def _modules() -> list:
     registry.load_backends()
     mods = []
     for backend in ("triton", "tilelang"):
-        mod = pytest.importorskip(f"kohakumoss_kernels.backends.{backend}.fused_linear")
+        mod = pytest.importorskip(
+            f"kohakumoss_kernels.backends.{backend}.blocks.fused_linear"
+        )
         mods.append(mod)
     return mods
 
@@ -64,7 +68,8 @@ def test_negative_diverged_copy():
 
 
 def check_norm_weights_fp32(entry, fl) -> None:
-    """The qk op receives the norm weights in fp32 whatever their storage dtype."""
+    """The qk op receives the norm weights in fp32 whatever their storage dtype, on the
+    eager direct path and through the custom op."""
     seen = []
 
     def recorder(y, wq, wk, qw, kw, pos, bands, eps, heads, save):
@@ -74,14 +79,19 @@ def check_norm_weights_fp32(entry, fl) -> None:
         return y.new_zeros(m, d), y.new_zeros(m, d), e, e, e, e
 
     real, fl._qk_fwd = fl._qk_fwd, recorder
+    eager = fl.eager["qk"]
+    fl.eager["qk"] = replace(eager, fwd=recorder)
     try:
         y = torch.randn(4, 16, dtype=torch.bfloat16)
         w = torch.randn(8, 16, dtype=torch.bfloat16)
         nw = torch.ones(4, dtype=torch.bfloat16)
-        entry(y, w, w, nw, nw, torch.zeros(4, 1), torch.ones(2), 1e-6, 2)
+        for dispatch in (False, True):
+            fl.set_dispatch(dispatch)
+            entry(y, w, w, nw, nw, torch.zeros(4, 1), torch.ones(2), 1e-6, 2)
     finally:
-        fl._qk_fwd = real
-    assert seen == [(torch.float32, torch.float32)], seen
+        fl._qk_fwd, fl.eager["qk"] = real, eager
+        fl.set_dispatch(False)
+    assert seen == [(torch.float32, torch.float32)] * 2, seen
 
 
 def test_qk_norm_weights_enter_as_fp32():
@@ -94,6 +104,6 @@ def test_negative_storage_dtype_norm_weights():
 
     def old_entry(y, wq, wk, q_weight, k_weight, pos, bands, eps, heads):
         args = (q_weight.contiguous(), k_weight.contiguous(), pos, bands, eps)
-        return fl._qk_fwd(y, wq, wk, *args, heads, False)
+        return fl._forward("qk", y, wq, wk, *args, heads, False)
 
     must_fail(lambda: check_norm_weights_fp32(old_entry, fl), "storage dtype passed")

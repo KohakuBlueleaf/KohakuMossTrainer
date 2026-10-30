@@ -180,6 +180,47 @@ def test_fp32_master_weights(backend, path, op, device):
         mod.force_path(None)
 
 
+def _run(fn, args, grads, seed: int = 0):
+    """Outputs and input gradients of fn(*args) under a fixed upstream gradient."""
+    leaves = [
+        a.detach().requires_grad_(g) if isinstance(a, torch.Tensor) else a
+        for a, g in zip(args, grads)
+    ]
+    out = fn(*leaves)
+    outs = out if isinstance(out, tuple) else (out,)
+    g = torch.Generator(device=outs[0].device).manual_seed(seed)
+    ups = [torch.randn(o.shape, generator=g, device=o.device).to(o.dtype) for o in outs]
+    torch.autograd.backward(outs, ups)
+    return [o.detach() for o in outs] + [a.grad for a, g in zip(leaves, grads) if g]
+
+
+def _same(a: list, b: list) -> None:
+    for x, y in zip(a, b, strict=True):
+        assert torch.equal(x, y), (x - y).abs().max()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("backend", ("triton", "tilelang"))
+@pytest.mark.parametrize(
+    "op", ("linear_situ", "linear_gated_residual", "linear_qk_rope")
+)
+def test_direct_path_equals_custom_op(backend, op, device):
+    """The eager direct path and the custom op run the same bodies: bitwise equal
+    outputs and gradients."""
+    fn = _impl(op, device, torch.float16, backend)
+    mod = _force(backend, "fused")
+    try:
+        _, args, grads = _master_case(op, device, torch.float16)
+        direct = _run(fn, args, grads)
+        mod.FUSED.set_dispatch(True)
+        dispatched = _run(fn, args, grads)
+        _same(direct, dispatched)
+        must_fail(lambda: _same(direct, _run(fn, args, grads, seed=1)), "other grads")
+    finally:
+        mod.FUSED.set_dispatch(False)
+        mod.force_path(None)
+
+
 def _autocast(fn, device):
     """fn run under fp16 autocast (the trainer's mixed-precision forward)."""
 

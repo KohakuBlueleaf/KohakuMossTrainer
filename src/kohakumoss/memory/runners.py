@@ -20,7 +20,7 @@ from torch.utils.checkpoint import (
 from kohakumoss.logging.phases import RECOMPUTE, phase
 from kohakumoss.model.runner import PlainRunner
 from kohakumoss.types.context import BlockCtx
-from kohakumoss_kernels.saved_ops import KEPT
+from kohakumoss_kernels.saved_ops import KEPT, require_dispatch
 
 SAVE_OPS = {
     torch.ops.aten.mm.default,
@@ -105,6 +105,8 @@ class CheckpointRunner:
         self.mode = mode
         self.blocks = blocks
         inner = selective_context if mode == "selective" else None
+        if inner is not None:
+            require_dispatch()
         self._ckpt = partial(
             checkpoint, use_reentrant=False, context_fn=forward_state(inner)
         )
