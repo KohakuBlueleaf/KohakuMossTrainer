@@ -249,6 +249,7 @@ SAVE_MINUTES = (
 KEEP_LAST = 3
 FINAL_CHECKPOINT = "auto"  # resume checkpoint at the run's end: "auto" = when SAVE_EVERY or SAVE_MINUTES is on | True | False (exports are always written)
 RESUME = ""  # checkpoint dir | "latest"
+INIT_FROM = ""  # checkpoint dir whose trainable weights start a fresh run
 SAVE_FORMAT = "comfy"  # exports: "comfy" (ComfyUI LyCORIS file; full FT: one ComfyUI DiT file) | "hf" (LyCORIS file with diffusers keys; full FT: the diffusers folder) | "both" | "none"
 SAVE_MERGED = False  # adapters: also the merged DiT in SAVE_FORMAT (ComfyUI single file / diffusers folder)
 SAVE_FUSED_QKV = False  # comfy files: False (separate q / k / v keys) | True (joint q/k/v as one proj.qkv) | "auto" (as the DiT file stores them; the Comfy-Org files are fused)

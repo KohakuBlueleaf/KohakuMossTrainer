@@ -2,6 +2,8 @@
 area checks live in `training.checks`; this module holds the knob set, the choices,
 the precision and memory-plan checks and `check`."""
 
+import os
+
 import torch
 
 from kohakumoss.adapters.build.config import config_from_knobs
@@ -82,7 +84,8 @@ KNOWN = frozenset(
     MAX_TEXT_TOKENS PREFETCH PIN_MEMORY NONFINITE_PATIENCE DATA_RESCAN
     DATA_SCAN_WORKERS DATA_WAIT CONCENTRATION_LOSS STREAM_LOSS STREAM_LOSS_PROBE
     METRICS_LEVEL STEP_SYNC
-    SAMPLE_BATCH SAMPLE_COLUMNS SAMPLE_AT_START""".split()
+    SAMPLE_BATCH SAMPLE_COLUMNS SAMPLE_AT_START
+    INIT_FROM""".split()
 )
 CHOICES = {
     "ADAPTER_MODE": ("bypass", "merge"),
@@ -242,6 +245,11 @@ def _value_problems(k: dict) -> list[str]:
     if isinstance(retune, bool) or not isinstance(retune, int) or retune < 0:
         p.append(f"RETUNE_STEPS must be an int >= 0, got {retune!r}")
     p += release_problems(k.get("STEP_RELEASE", "none"))
+    init = k.get("INIT_FROM") or ""
+    if init and not os.path.isfile(os.path.join(init, "trainable.safetensors")):
+        p.append(
+            f"INIT_FROM={init!r} is not a checkpoint dir (no trainable.safetensors)"
+        )
     return p
 
 

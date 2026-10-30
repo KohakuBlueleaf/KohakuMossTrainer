@@ -139,6 +139,11 @@ def load_checkpoint(path: str | Path) -> dict:
     }
 
 
+def load_trainable(path: str | Path) -> dict:
+    """The trainable state of a checkpoint directory alone (tensors on CPU)."""
+    return load_file(str(Path(path) / "trainable.safetensors"))
+
+
 def is_complete(path: Path) -> bool:
     """state.json (written last) and the trainable state are present."""
     return (path / "state.json").exists() and (path / "trainable.safetensors").exists()

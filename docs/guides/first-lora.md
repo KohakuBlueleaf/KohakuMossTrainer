@@ -66,6 +66,9 @@ write and check the config for you: `scripts\examples\train.ps1` (Windows) or
 
    - Any knob can be overridden on the command line (`--set LR=2e-4 --set DIM=16`).
    - Resume an interrupted run with `--set RESUME=latest`.
+   - Start a new run from another run's weights with `--set INIT_FROM=<checkpoint dir>`
+     (optimiser, schedule and data start fresh; a RESUME checkpoint wins). The weights
+     load before the optimiser and EMA copy their masters.
    - The first run on a card tunes its kernels before step 0 and stores the decisions;
      later runs reuse them ([What to expect](#what-to-expect)).
 

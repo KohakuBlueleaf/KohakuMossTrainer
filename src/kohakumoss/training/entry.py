@@ -26,6 +26,7 @@ from kohakumoss.memory.device_use import build_device_use
 from kohakumoss.memory.timeline import build_timeline
 from kohakumoss.model import resolve_config
 from kohakumoss.offload.accel import configure_allocator, release_cache
+from kohakumoss.parallel.fsdp import shard_like
 from kohakumoss.parallel.launch import (
     gate_name,
     ranks_meet,
@@ -67,6 +68,7 @@ from kohakumoss.training.build.model import (
 )
 from kohakumoss.training.build.pipelines import release_nonlocal
 from kohakumoss.training.callbacks.evaluate import FixedSigma
+from kohakumoss.training.checkpoint.io import load_trainable
 from kohakumoss.training.context import RunContext
 from kohakumoss.training.drivers import Parts
 from kohakumoss.training.encode import EncodeFeed, RankFeed, StreamedLoader, pin_batches
@@ -297,6 +299,20 @@ def _prewarm(k: dict, built, prec, device, dataset, device_use) -> list:
     return warm
 
 
+def init_weights(k: dict, built, output_dir: str) -> bool:
+    """INIT_FROM on a fresh run (no RESUME checkpoint in `output_dir`): the trainable
+    state of that checkpoint into the live trainable set (re-sharded like it), before
+    the optimiser and EMA copy their masters from it; returns whether it loaded."""
+    init = k.get("INIT_FROM")
+    if not init or resumed_from(k, output_dir) is not None:
+        return False
+    log.info(f"weights from {init} (optimiser, schedule and data fresh)")
+    live = built.trainable
+    live.load_state_dict(shard_like(load_trainable(init), live.state_dict()))
+    built.engines.after_restore()
+    return True
+
+
 def worker(
     k: dict, rank: int = 0, world: int = 1, device=None, feed: RankFeed | None = None
 ) -> TrainState:
@@ -336,6 +352,7 @@ def worker(
         release_nonlocal(built.backbone, keep)
     torch.manual_seed(k["SEED"] + rank)  # per-rank stream for everything after build
     hooks = layout.hooks(ctx)
+    init_weights(k, built, output_dir)
     _compile(built.backbone, built.plan.compile)
     normalizer = TokenNormalizer(hooks.reduce, hooks.world_factor)
     autocast = autocast_factory(prec, device)
