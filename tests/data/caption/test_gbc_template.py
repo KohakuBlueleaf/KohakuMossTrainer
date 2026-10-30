@@ -5,6 +5,7 @@ small on-disk GBC dataset."""
 
 import runpy
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +20,7 @@ from kohakumoss_data.caption.gbc import (
     drop_each,
     rules_of,
 )
+from kohakumoss_data.sources import gbc
 from kohakumoss_data.sources.gbc import GbcSource
 from kohakumoss_data.types import CatalogRow, RowGeometry
 from tests._util.gbc import ROOT_LONG, ROOT_SHORT, write_dataset
@@ -337,3 +339,27 @@ def test_source_rows_and_records(gbc_root):
     assert rec.meta["rating"] == "explicit" and rec.graph.num_vertices == 4
     assert src.open("shard_00000/101")[:4] == b"RIFF"
     assert isinstance(rows[0], CatalogRow)
+
+
+def check_split(items, locators: list[str]) -> None:
+    """Every sample in exactly one walk item, keys distinct."""
+    got = [r.locator for item in items for r in item.probe()]
+    assert got == locators, got
+    assert len({item.key for item in items}) == len(items)
+
+
+def test_walk_splits_shards_into_row_ranges(tmp_path, monkeypatch):
+    write_dataset(tmp_path, n=7, per_shard=5)
+    src = GbcSource(str(tmp_path))
+    whole = [r.locator for item in src.walk() for r in item.probe()]
+    assert len(whole) == 7
+    monkeypatch.setattr(gbc, "PROBE_ROWS", 2)
+    items = src.walk()
+    assert len(items) == 3 + 1, [i.key for i in items]
+    check_split(items, whole)
+    overlapping = [replace(i, probe=partial(_twice, i.probe)) for i in items]
+    must_fail(lambda: check_split(overlapping, whole), "a range probed twice")
+
+
+def _twice(probe):
+    return probe() * 2

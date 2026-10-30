@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from functools import partial
 
 from kohakumoss_data.catalog.text import PROMPT_CHARS
+from kohakumoss_data.images import KcIndex, KcStore
 from kohakumoss_data.registry import SOURCES
 from kohakumoss_data.scan.walk import WalkItem, rows_of
 from kohakumoss_data.types import CatalogRow
@@ -20,6 +21,7 @@ except ImportError:
     GbcDataset = read_info = None
 
 SHARD_FILES = ("manifest.parquet", "graphs.db", "meta.db", "images.zip")
+PROBE_ROWS = 4096  # samples per walk item
 NEEDS = (
     "the gbc source needs kohakugbc-data (pip install 'kohakumoss[gbc]', Python 3.11+)"
 )
@@ -64,17 +66,33 @@ def shard_stamp(root: str, name: str) -> tuple:
     return tuple(out)
 
 
-def probe_shard(root: str, name: str) -> list[CatalogRow]:
-    """Every sample of shard `name` as a row: size from the manifest, the prompt bound
-    from its graph and metadata (`extra["prompt_chars"]`)."""
+def probe_shard(
+    root: str,
+    name: str,
+    images: dict | None = None,
+    start: int = 0,
+    stop: int | None = None,
+) -> list[CatalogRow]:
+    """Samples [start, stop) of shard `name` as rows (stop None: to the end): size from
+    the manifest, the prompt bound from its graph and metadata (`extra["prompt_chars"]`);
+    with `images` (a KohakuClip image store, see GbcSource) the size is the store's
+    image's and a sample the store lacks is left out."""
     ds = GbcDataset(root, shards=[name], image=None)
     sizes = ds.manifest.column("image_bytes").to_pylist()
+    index = KcIndex(images["index"]) if images else None
     rows = []
-    for i in range(len(ds)):
+    for i in range(start, len(ds) if stop is None else min(stop, len(ds))):
         s = ds.sample(i)
-        row = CatalogRow(id=0, locator=f"{name}/{s.key}", w=int(s.w), h=int(s.h))
-        row.extra["hash"] = f"gbc:{s.key}:{s.codec}:{sizes[i]}"
-        row.extra[PROMPT_CHARS] = prompt_bound(s.graph, s.meta or {}, s.w, s.h)
+        w, h, stamp = int(s.w), int(s.h), f"gbc:{s.key}:{s.codec}:{sizes[i]}"
+        if index is not None:
+            row_at = index.find(int(s.key))
+            if row_at < 0:
+                continue
+            w, h = index.size_of(row_at)
+            stamp = f"kc:{s.key}:{int(index.cols['size'][row_at])}"
+        row = CatalogRow(id=0, locator=f"{name}/{s.key}", w=w, h=h)
+        row.extra["hash"] = stamp
+        row.extra[PROMPT_CHARS] = prompt_bound(s.graph, s.meta or {}, w, h)
         rows.append(row)
     ds.close()
     return rows
@@ -83,13 +101,20 @@ def probe_shard(root: str, name: str) -> list[CatalogRow]:
 @SOURCES.register("gbc")
 class GbcSource:
     """A GBC dataset at `path` (`shards`: only these shard names). Rows carry no caption
-    fields: the `gbc` caption template reads each sample's record."""
+    fields: the `gbc` caption template reads each sample's record. `images`
+    ({"index": a kohakumoss_data.images index directory, "root": the shard directory or
+    http(s) URL}) reads every image by its key from those KohakuClip shards instead of
+    the dataset's own `images.zip` (rows the index lacks are left out)."""
 
-    def __init__(self, path: str, shards: list[str] | None = None):
+    def __init__(
+        self, path: str, shards: list[str] | None = None, images: dict | None = None
+    ):
         if GbcDataset is None:
             raise ImportError(NEEDS)
         self.path = path
         self.shards = list(shards) if shards else None
+        self.images = dict(images) if images else None
+        self.store = KcStore(images["index"], images["root"]) if images else None
         self._ds = None
 
     @staticmethod
@@ -102,6 +127,15 @@ class GbcSource:
         path = str(entry.get("path", ""))
         if not os.path.isfile(os.path.join(path, "dataset.json")):
             return [f"gbc source {path!r}: no dataset.json (not a GBC dataset)"]
+        images = entry.get("images")
+        if images is None:
+            return []
+        if not isinstance(images, dict) or set(images) != {"index", "root"}:
+            return [
+                f"gbc source {path!r}: images must be {{'index': ..., 'root': ...}}"
+            ]
+        if not os.path.isfile(os.path.join(images["index"], "key.npy")):
+            return [f"gbc source {path!r}: no image index at {images['index']!r}"]
         return []
 
     def __getstate__(self):
@@ -112,28 +146,43 @@ class GbcSource:
     def _dataset(self):
         """The dataset reader, opened once per process (its files open on first use)."""
         if self._ds is None:
-            self._ds = GbcDataset(self.path, shards=self.shards, image="bytes")
+            image = None if self.store is not None else "bytes"
+            self._ds = GbcDataset(self.path, shards=self.shards, image=image)
         return self._ds
 
+    def shard_samples(self) -> list[tuple[str, int]]:
+        """(name, sample count) of every shard this source reads, in dataset order."""
+        shards = read_info(self.path)["shards"]
+        keep = [s for s in shards if self.shards is None or s["name"] in self.shards]
+        return [(s["name"], int(s["samples"])) for s in keep]
+
     def shard_names(self) -> list[str]:
-        names = [s["name"] for s in read_info(self.path)["shards"]]
-        return [n for n in names if self.shards is None or n in self.shards]
+        return [name for name, _ in self.shard_samples()]
 
     def walk(self) -> list[WalkItem]:
-        return [
-            WalkItem(
-                f"gbc:{os.path.abspath(self.path)}:{name}",
-                shard_stamp(self.path, name),
-                partial(probe_shard, self.path, name),
-            )
-            for name in self.shard_names()
-        ]
+        """One walk item per PROBE_ROWS samples of a shard (a scan probes them in
+        parallel), keyed by shard and first sample."""
+        store = f":{self.images['index']}" if self.images else ""
+        root = os.path.abspath(self.path)
+        items = []
+        for name, samples in self.shard_samples():
+            stamp = shard_stamp(self.path, name)
+            for start in range(0, max(samples, 1), PROBE_ROWS):
+                stop = start + PROBE_ROWS
+                probe = partial(probe_shard, self.path, name, self.images, start, stop)
+                items.append(
+                    WalkItem(f"gbc:{root}:{name}:{start}{store}", stamp, probe)
+                )
+        return items
 
     def scan(self) -> Iterator[CatalogRow]:
         return rows_of(self.walk())
 
     def open(self, locator: str) -> bytes:
-        return self._dataset().image(locator.partition("/")[2])
+        key = locator.partition("/")[2]
+        if self.store is not None:
+            return self.store.read(int(key))
+        return self._dataset().image(key)
 
     def record(self, locator: str) -> GbcRecord:
         """The graph and metadata of the row at `locator`."""

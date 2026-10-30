@@ -380,8 +380,10 @@ The `gbc` source reads a dataset in KohakuGBC's format through `kohakugbc-data`
   manifest.parquet                 key, index, w, h, codec, sizes, extra columns
 ```
 
-- One walk item per shard (the catalog cache keeps a shard's rows until one of its four
-  files changes); a row's locator is `<shard>/<key>`, its size the manifest's.
+- One walk item per `PROBE_ROWS` (4096) samples of a shard, so a dataset of few large
+  shards fills the `DATA_SCAN_WORKERS` process pool (the catalog cache keeps a range's
+  rows until one of its shard's four files changes); a row's locator is
+  `<shard>/<key>`, its size the manifest's.
 - The probe reads each sample's graph and metadata once to store `prompt_chars`: the
   graph's full-detail prompt text plus every top-level metadata string, a bound on any
   `gbc` caption of the sample (the planner's text estimate reads this column).
@@ -473,7 +475,7 @@ sample-major and row-major over each sample's latent grid.
 | `img_keep` | per sample, sorted kept grid indices after `drop_tokens`, or None (all kept) |
 | `latents` | cached packed latents [N_img, C], kept tokens only |
 | `text` | cached packed text embeddings, already cut to `text_limit` |
-| `pixels` | uint8 [H, W, 3] full images when latents are not cached; the consumer encodes, then gathers `img_keep` |
+| `pixels` | uint8 [H, W, 3] tensors, the full images when latents are not cached (tensors, so the loader's pin step pins them and the VAE upload is non-blocking); the consumer encodes, then gathers `img_keep` |
 | `prompts` | captions when text is not cached; the consumer keeps the first `text_limit` rows after encoding |
 | `text_limit` | per sample, > 0 caps the text tokens (`truncate_text`) |
 | `latent_keys` / `text_keys` | each sample's cache keys (empty when that cache is off), used by online write-back |

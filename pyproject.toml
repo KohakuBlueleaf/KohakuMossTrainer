@@ -16,6 +16,8 @@ dependencies = [
     "numpy",
     "packaging",
     "pillow>=9.4",
+    # ranged reads of KohakuClip image shards behind an http(s) root (kohakumoss_data.images)
+    "requests",
     "safetensors",
     "tqdm",
     "kohaku-engine",
