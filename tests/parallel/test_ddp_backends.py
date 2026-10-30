@@ -81,7 +81,7 @@ def test_async_reducer_sums_in_fp32(group):
     check_async(AsyncReducer("cpu"))
     must_fail(lambda: check_async(AsyncReducer("cpu", reduce_dtype=None)), "16-bit")
     with pytest.raises(ValueError):
-        reduce_dtype("bf16")
+        reduce_dtype("fp16")
 
 
 class _Holder(nn.Module):

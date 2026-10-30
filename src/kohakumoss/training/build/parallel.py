@@ -44,12 +44,13 @@ class ParallelHooks:
     forward: object = None
 
 
-REDUCE_DTYPES = {"fp32": torch.float32, "param": None}
+REDUCE_DTYPES = {"fp32": torch.float32, "param": None, "bf16": torch.bfloat16}
 DDP_BACKENDS = ("kohakumoss", "torch")
 
 
 def reduce_dtype(name: str) -> torch.dtype | None:
-    """DDP_REDUCE_DTYPE: 'fp32' sums every gradient in fp32, 'param' in its own dtype."""
+    """DDP_REDUCE_DTYPE: 'fp32' sums every gradient in fp32, 'param' in its own dtype,
+    'bf16' in bf16 (half the bytes of fp32 gradients on the wire)."""
     if name not in REDUCE_DTYPES:
         raise ValueError(f"DDP_REDUCE_DTYPE={name!r} not in {tuple(REDUCE_DTYPES)}")
     return REDUCE_DTYPES[name]

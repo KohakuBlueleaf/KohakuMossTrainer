@@ -37,6 +37,9 @@ class _Bucket:
         )
         wide = reduce_dtype is not None and reduce_dtype != p0.dtype
         self.reduce_dtype = reduce_dtype if wide else None
+        self.narrow = wide and (
+            torch.empty((), dtype=reduce_dtype).element_size() < p0.element_size()
+        )
         self.wide: Tensor | None = None
         self.views = []
         offset = 0
@@ -94,9 +97,11 @@ class GradReducer:
 
     Gradients are views into the bucket buffers (no copy in or out); a bucket of a
     dtype other than `reduce_dtype` (default fp32) is summed on a copy in it (None:
-    in the parameters' dtype), and at most WIDE_AHEAD such copies are alive: launching
-    one more lands the oldest. `finish` makes the compute stream wait for the
-    reductions and its device time is the exposed communication (`metrics`)."""
+    in the parameters' dtype), and at most WIDE_AHEAD wider copies are alive: launching
+    one more lands the oldest. Narrower copies (fp32 gradients summed in bf16) are not
+    capped: together they hold at most half the gradient bytes. `finish` makes the
+    compute stream wait for the reductions and its device time is the exposed
+    communication (`metrics`)."""
 
     def __init__(
         self,
@@ -167,7 +172,7 @@ class GradReducer:
         bucket.gather()
         buf = bucket.reduced_buffer()
         bucket.work = dist.all_reduce(buf, group=self.group, async_op=True)
-        if bucket.reduce_dtype is not None:
+        if bucket.reduce_dtype is not None and not bucket.narrow:
             self.widened.append(bucket)
             while len(self.widened) > WIDE_AHEAD:
                 self._wait_bucket(self.widened.pop(0))
