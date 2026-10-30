@@ -235,7 +235,6 @@ class QwenTextEncoder:
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.device = compute
-        self.output_device = torch.device(output_device or device)
         self.dtype = dtype or text.norm.weight.dtype
         if placed is None:
             choose = auto_memory or partial(default_auto_memory, plan=plan)
@@ -245,6 +244,7 @@ class QwenTextEncoder:
             )
         self.placement, self.quant, plan = placed
         self.plan = plan
+        self.output_to(output_device or device)
         self.layout = layout
         self.encoder_spec = text_spec(plan, self.dtype, layout)
         self.pad_id = getattr(tokenizer, "pad_token_id", None) or 0
@@ -264,6 +264,17 @@ class QwenTextEncoder:
         self.before_pass = self.after_pass = nothing
         self.progress = False
         self._run = QwenTextEncoder._encode
+
+    def output_to(self, device: torch.device | str) -> None:
+        """Land embeddings on `device`. A pass ends with a synchronize of the devices it
+        touched unless the weights stay resident and the embeddings stay on the compute
+        device: then the pass is queued like any other device work (no host wait)."""
+        self.output_device = torch.device(device)
+        same = self.output_device == self.device and self.device.type != "cpu"
+        if self.plan.memory == "resident" and same:
+            self.sync_devices = ()
+        else:
+            self.sync_devices = tuple({self.device, self.output_device})
 
     def set_timeline(self, timeline) -> None:
         """Mark `step` (the work since the last pass) before and `te` after each pass."""
@@ -349,8 +360,8 @@ class QwenTextEncoder:
         return out
 
     def _pass(self, texts: list[str], limits=None) -> list[Tensor]:
-        """One text-encoder pass over `texts` (packed, placed, synchronised), text i
-        cut to its first `limits[i]` tokens when given."""
+        """One text-encoder pass over `texts` (packed, placed; synchronised on
+        `sync_devices`), text i cut to its first `limits[i]` tokens when given."""
         start = time.perf_counter()
         rows = cut_rows(self.token_ids(texts), limits)
         lengths = [len(r) for r in rows]
@@ -363,7 +374,7 @@ class QwenTextEncoder:
         with on_device(torch.device(self.device)):
             out = self._placed_pass(texts, groups, packs, lengths)
         self.after_pass()
-        for dev in {self.device, self.output_device}:
+        for dev in self.sync_devices:
             synchronize(dev)
         self.stats["passes"] += 1
         self.stats["tokens"] += sum(lengths)

@@ -430,6 +430,8 @@ def build_encoders(
             auto_w4a8=w4a8,
             run_device=device,
         )
+        if plan.ahead_device == "auto":
+            text.output_to(ahead_device(text, device))
         rule = encoder_rule(k, "text", mem_plan)
         log.info(f"text encoder placement: {hl(text.plan.memory)} ({rule})")
         if sampling:
@@ -437,6 +439,13 @@ def build_encoders(
         if not online_text:
             text = None
     return vae, text, embeds
+
+
+def ahead_device(text, device: torch.device) -> torch.device:
+    """Where TEXT_ENCODE ahead_device 'auto' holds the embeddings: the training device
+    when the placed encoder is resident on it, else the host."""
+    resident = text.plan.memory == "resident" and text.device == torch.device(device)
+    return torch.device(device) if resident else torch.device("cpu")
 
 
 def training_vae(k: dict, device, reserve: int, mem_plan, vae_path: str):

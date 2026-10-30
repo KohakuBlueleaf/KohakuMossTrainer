@@ -78,7 +78,8 @@ class TextEncoderPlan:
     tokens per kernel call, `layout`
     single | padded | packed, `forward` kernels (kohakumoss_kernels ops) | hf (the
     transformers modules' own forward; single / padded only). `ahead` host batches
-    encoded per pass by the online text cache, held on `ahead_device` host | device.
+    encoded per pass by the online text cache, held on `ahead_device` host | device |
+    auto (device when the placed encoder is resident on the training device, else host).
     `kernels` maps a text op to a backend. `stored` is a pre-quantized text-encoder
     file (scripts/export/text_quant.py) of the same precision: its quantized linears
     are attached instead of quantizing at load. `host`: the host form of the weights
@@ -104,7 +105,7 @@ class TextEncoderPlan:
     layout: str = "packed"
     forward: str = "kernels"
     ahead: int = 1
-    ahead_device: str = "host"
+    ahead_device: str = "auto"
     kernels: dict = field(default_factory=dict)
 
 

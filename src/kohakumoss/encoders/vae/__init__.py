@@ -117,9 +117,12 @@ def vae_encoder(
     return SpecEncoder(placed.encode_images, vae_encoder_spec(path, device, resolved))
 
 
-def to_pixels(image: np.ndarray, device, dtype) -> Tensor:
-    """uint8 HWC (RGB) -> [1, 3, H, W] in [-1, 1]."""
-    x = torch.from_numpy(np.ascontiguousarray(image)).to(device)
+def to_pixels(image: Tensor | np.ndarray, device, dtype) -> Tensor:
+    """uint8 HWC (RGB) -> [1, 3, H, W] in [-1, 1]; a pinned host tensor uploads without a
+    host wait."""
+    if not isinstance(image, Tensor):
+        image = torch.from_numpy(np.ascontiguousarray(image))
+    x = image.to(device, non_blocking=True)
     return x.permute(2, 0, 1).unsqueeze(0).to(dtype) / 127.5 - 1.0
 
 

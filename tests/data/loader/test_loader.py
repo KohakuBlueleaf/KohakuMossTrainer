@@ -30,7 +30,9 @@ def cfg(**kw) -> DataConfig:
 
 
 def fingerprint(batch) -> tuple:
-    pixels = hashlib.blake2b(b"".join(p.tobytes() for p in batch.pixels)).hexdigest()
+    pixels = hashlib.blake2b(
+        b"".join(p.numpy().tobytes() for p in batch.pixels)
+    ).hexdigest()
     return (
         batch.index,
         tuple(batch.ids.tolist()),

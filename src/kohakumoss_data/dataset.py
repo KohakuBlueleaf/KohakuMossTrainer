@@ -379,7 +379,7 @@ class MossDataset:
         return [self.latents.get(k) for k in keys]
 
     def _latents_decode(self, batch: HostBatch, items) -> None:
-        batch.pixels = [self.pixels(it) for it in items]
+        batch.pixels = [torch.from_numpy(self.pixels(it)) for it in items]
 
     def _latents_offline(self, batch: HostBatch, items) -> None:
         found = self._latent_lookup(batch, items)

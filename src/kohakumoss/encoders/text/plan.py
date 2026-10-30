@@ -21,7 +21,7 @@ W4A8 = ("auto", "int8", "packed")
 LAYOUT = ("single", "padded", "packed")
 FORWARD = ("kernels", "hf")
 DTYPES = {name: BY_NAME[name] for name in ("bf16", "fp16")}
-AHEAD_DEVICE = ("host", "device")
+AHEAD_DEVICE = ("host", "device", "auto")
 HOST_FORMS = ("auto", "copy", "file")
 
 

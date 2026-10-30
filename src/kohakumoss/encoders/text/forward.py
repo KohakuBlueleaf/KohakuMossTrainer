@@ -46,6 +46,14 @@ class Pack:
     take: Tensor | None = None
 
 
+def to_device(t: Tensor, device) -> Tensor:
+    """`t` on `device` without a stream sync: through pinned memory onto CUDA."""
+    device = torch.device(device)
+    if device.type != "cuda":
+        return t.to(device)
+    return t.pin_memory().to(device, non_blocking=True)
+
+
 def make_pack(rows: list[list[int]], device, pad_id: int, padded: bool) -> Pack:
     """Pack token rows: concatenated (`padded=False`) or right-padded to the longest."""
     lengths = [len(r) for r in rows]
@@ -53,9 +61,10 @@ def make_pack(rows: list[list[int]], device, pad_id: int, padded: bool) -> Pack:
     if padded:
         flat = [t for r in rows for t in r + [pad_id] * (width - len(r))]
         seg = [width] * len(rows)
-        take = torch.cat(
-            [torch.arange(n) + i * width for i, n in enumerate(lengths)]
-        ).to(device)
+        take = to_device(
+            torch.cat([torch.arange(n) + i * width for i, n in enumerate(lengths)]),
+            device,
+        )
     else:
         flat = [t for r in rows for t in r]
         seg = lengths
@@ -64,8 +73,8 @@ def make_pack(rows: list[list[int]], device, pad_id: int, padded: bool) -> Pack:
     pos = torch.cat([torch.arange(n) for n in seg])
     return Pack(
         torch.tensor(flat, dtype=torch.int64),
-        cu.to(device),
-        pos.to(device),
+        to_device(cu, device),
+        to_device(pos, device),
         width,
         lengths,
         take,

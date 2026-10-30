@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from torch import Tensor
 
-EncodeImages = Callable[[Sequence[np.ndarray], Tensor], Tensor]
+EncodeImages = Callable[[Sequence[Tensor | np.ndarray], Tensor], Tensor]
 """uint8 HWC images + target hw [B, 2] (latent grid) -> packed latents [N_img, C]."""
 
 EncodeText = Callable[[Sequence[str]], list[Tensor]]
@@ -89,7 +89,7 @@ class HostBatch:
     img_keep: list[Tensor | None] | None = None
     latents: Tensor | None = None
     text: Tensor | None = None
-    pixels: list[np.ndarray] | None = None
+    pixels: list[Tensor] | None = None
     prompts: list[str] | None = None
     loss_mask: Tensor | None = None
     index: int = -1
