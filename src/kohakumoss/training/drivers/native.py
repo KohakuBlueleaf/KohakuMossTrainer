@@ -53,6 +53,7 @@ class NativeDriver:
     def run(self, step, loader, bundle, ema, state: TrainState) -> TrainState:
         groups = grouped(loader, self.grad_acc)
         self.runner.reset(state.step)
+        self.runner.start(state)
         out = None
         while state.step < self.steps:
             group = next(groups)

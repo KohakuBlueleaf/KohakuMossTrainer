@@ -3,7 +3,8 @@
 Callbacks with `every == 1` run every step; periodic ones run when the step reaches the
 precomputed next firing step; a callback with `edges = True` also fires at the run's
 first step and at `last`. Firing order is the order the callbacks were given. A
-callback whose `on_step_end` returns True has finished: it is dropped from the run.
+callback whose `on_step_end` returns True has finished: it is dropped from the run; a
+callback with `at_start = True` also fires once before a fresh run's first step.
 """
 
 import math
@@ -50,6 +51,14 @@ class CallbackRunner:
             if step % cb.every == 0 or (edge and id(cb) in self.edged)
         ]
 
+    def start(self, state: TrainState) -> None:
+        """Before a fresh run's first step (`state.step` 0): fire the callbacks with
+        `at_start = True` (`out` None), in given order."""
+        if state.step == 0:
+            for cb in self.ordered:
+                if getattr(cb, "at_start", False):
+                    cb.on_step_end(state, None)
+
     def run(self, state: TrainState, out) -> None:
         if state.step == self.next_fire:
             done = [cb for cb in self.due(state.step) if cb.on_step_end(state, out)]
@@ -84,10 +93,13 @@ class MeetRanks:
     every rank calls `meet(what)` (a store barrier, `launch.ranks_meet`), so the peers
     wait there, not in the next step's collective."""
 
-    def __init__(self, every: int, what: str, meet: Callable[[str], None]):
+    def __init__(
+        self, every: int, what: str, meet: Callable[[str], None], at_start=False
+    ):
         self.every = every
         self.what = what
         self.meet = meet
+        self.at_start = at_start
 
     def on_step_end(self, state: TrainState, out) -> None:
         self.meet(self.what)

@@ -76,7 +76,7 @@ write and check the config for you: `scripts\examples\train.ps1` (Windows) or
    | `config.json` | the knobs |
    | `log.txt` | every console log line: the plan, kernel decisions, warnings, errors |
    | `metrics.jsonl` | per-step metrics |
-   | `samples/step_XXXXXXXX/` | training-time samples |
+   | `samples/step_XXXXXXXX/` | training-time samples every `SAMPLE_EVERY` steps (and at step 0 with `SAMPLE_AT_START`), `SAMPLE_BATCH` prompts per packed varlen forward of their own sizes (0 = all); with `SAMPLE_COLUMNS` > 0 also `sheet.png`, the images `SAMPLE_COLUMNS` per row, which the logger gets in their place |
    | `checkpoints/step_XXXXXXXX/` | checkpoints, each with its `export/` (`CHECKPOINT_EXPORT`) |
    | `export/<RUN_NAME>-comfy.safetensors`, `export/<RUN_NAME>-lycoris.safetensors` | the adapter (`SAVE_FORMAT`: the base config writes `both`), written at the end of the run |
 

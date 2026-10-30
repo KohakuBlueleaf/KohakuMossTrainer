@@ -91,7 +91,7 @@ CFG = 3.0
 SHIFT = 5.0
 SKIP_LAYERS = "default"  # negative-branch skipped blocks: "default" | "none" | "22,23"
 CFG_MODE = "packed"  # "packed" | "two_pass"
-BATCH = 4  # prompts per generate batch
+BATCH = 4  # prompts per packed varlen forward (mixed sizes); 0 = all prompts
 
 # ===================== OUTPUT =====================
 OUT = ""  # output directory
@@ -150,7 +150,7 @@ def main() -> None:
         vae_dtype=resolve_vae_dtype(k["VAE_DTYPE"], k["DEVICE"]),
         forward_tokens=forward_tokens(
             [it["size"] for it in items],
-            min(k["BATCH"], len(items)),
+            min(k["BATCH"] or len(items), len(items)),
             k["CFG"],
             k["CFG_MODE"],
         ),

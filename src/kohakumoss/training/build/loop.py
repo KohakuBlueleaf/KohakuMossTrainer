@@ -290,6 +290,7 @@ def sample_settings(k: dict, embeds: list | None = None) -> dict:
         "shift": k["SAMPLE_SHIFT"],
         "skip_layers": list(k["SAMPLE_SKIP_LAYERS"]),
         "seeds": [seeds[i % len(seeds)] for i in range(len(prompts))],
+        "batch": k.get("SAMPLE_BATCH", 4),
     }
 
 
@@ -425,10 +426,13 @@ def build_callbacks(
                 logger,
                 built.backbone,
                 modes,
+                k.get("SAMPLE_COLUMNS", 0),
+                k.get("SAMPLE_AT_START", False),
             )
         )
     if k["SAMPLE_EVERY"] > 0 and dist_rank()[1] > 1:
-        cbs.append(MeetRanks(k["SAMPLE_EVERY"], "sampled", ranks_meet))
+        start = k.get("SAMPLE_AT_START", False)
+        cbs.append(MeetRanks(k["SAMPLE_EVERY"], "sampled", ranks_meet, start))
     if k["VALIDATE_EVERY"] > 0:
         cbs.append(
             Validation(

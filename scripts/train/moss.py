@@ -235,6 +235,9 @@ SAMPLE_SHIFT = 5.0
 SAMPLE_SKIP_LAYERS = (22,)
 SAMPLE_SIZE = (1024, 1024)
 SAMPLE_SEEDS = (0,)
+SAMPLE_BATCH = 4  # prompts per packed varlen sampling forward (mixed sizes); 0 = all
+SAMPLE_COLUMNS = 0  # images per row of each step's sample sheet; 0 = no sheet
+SAMPLE_AT_START = False  # also sample before a fresh run's first step (step 0)
 VALIDATE_EVERY = 0  # steps; 0 = off
 VALIDATION = {}  # {"datasets": [...], "sigmas": [...], "seed": 0}
 

@@ -94,6 +94,12 @@ def _step_report(pbar, sigmas: list[float], user, clock, i: int, x: Tensor) -> N
         user(i, x)
 
 
+def batch_slices(n: int, batch: int) -> list[slice]:
+    """`n` prompts in consecutive packed batches of `batch` (0: one batch of all)."""
+    step = batch if batch > 0 else max(n, 1)
+    return [slice(s, s + step) for s in range(0, n, step)]
+
+
 def _decode_bar(progress: bool, n: int):
     """Latent-iteration wrapper of the VAE decode: a bar over more than one image."""
     if not progress or n < 2:
@@ -333,7 +339,8 @@ class MossPipeline:
         step_callback: Callable[[int, Tensor], None] | None = None,
         progress: bool = True,
     ) -> GenerateResult:
-        """One image per prompt. Sample i's noise and conditioning depend only on its
+        """One image per prompt, `batch` prompts (0: all) per packed varlen forward of
+        their own sizes. Sample i's noise and conditioning depend only on its
         prompt, size and seed (no other sample's content reaches it, its slot does
         not matter); bitwise it also depends on the batch's shapes, which set the
         kernels' problem shapes. `progress` shows tqdm bars (sampler steps per batch,
@@ -351,7 +358,7 @@ class MossPipeline:
         n = len(pos)
         seeds = list(seeds) if seeds is not None else list(range(n))
         size_list = [sizes] * n if isinstance(sizes[0], int) else list(sizes)
-        chunks = [slice(s, s + batch) for s in range(0, n, batch)]
+        chunks = batch_slices(n, batch)
         negs = [None] * len(chunks) if neg is None else [neg[c] for c in chunks]
         batch_max = self._largest_batch(pos, neg, size_list, chunks, cfg_mode)
         est = self._log_estimate(batch_max, max(h * w for h, w in size_list))

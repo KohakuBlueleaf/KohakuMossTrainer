@@ -110,7 +110,7 @@ BROKEN = {
     "WEIGHTS is empty": dict(WEIGHTS=""),
     "OUT is empty": dict(OUT=""),
     "STEPS": dict(STEPS=0),
-    "BATCH": dict(BATCH=0),
+    "BATCH": dict(BATCH=-1),
     "CFG must": dict(CFG=-1.0),
     "needs FP16_FIX_KWARGS": dict(FP16_FIX="online"),
     "PRECISION='fp16' needs": dict(PRECISION="fp16"),
@@ -147,7 +147,7 @@ def test_missing_paths_reported(tmp_path):
 
 def test_check_raises_once_with_every_problem():
     with pytest.raises(SystemExit) as err:
-        check(knobs(STEPS=0, BATCH=0, STEPZ=1))
+        check(knobs(STEPS=0, BATCH=-1, STEPZ=1))
     msg = str(err.value)
     for needle in ("STEPS", "BATCH", "did you mean STEPS"):
         assert needle in msg, needle

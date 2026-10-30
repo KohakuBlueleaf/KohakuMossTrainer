@@ -48,6 +48,15 @@ def io_problems(k: dict) -> list[str]:
     p = export_problems(k)
     if k["SAMPLE_EVERY"] > 0 and not k["SAMPLE_PROMPTS"]:
         p.append("SAMPLE_EVERY > 0 needs SAMPLE_PROMPTS")
+    for name, default, zero in (
+        ("SAMPLE_COLUMNS", 0, "no sheet"),
+        ("SAMPLE_BATCH", 4, "all prompts in one batch"),
+    ):
+        v = k.get(name, default)
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            p.append(f"{name} must be an int >= 0 (0 = {zero}), got {v!r}")
+    if not isinstance(k.get("SAMPLE_AT_START", False), bool):
+        p.append(f"SAMPLE_AT_START must be a bool, got {k['SAMPLE_AT_START']!r}")
     if k["VALIDATE_EVERY"] > 0 and not k["VALIDATION"].get("datasets"):
         p.append("VALIDATE_EVERY > 0 needs VALIDATION['datasets']")
     if k["SAVE_EVERY"] < 0 or k["KEEP_LAST"] < 0:

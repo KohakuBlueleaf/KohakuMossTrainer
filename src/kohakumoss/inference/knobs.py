@@ -264,8 +264,10 @@ def validate(k: dict) -> list[str]:
         p.append("OUT is empty (output directory)")
     if k["STEPS"] <= 0:
         p.append(f"STEPS must be > 0, got {k['STEPS']}")
-    if k["BATCH"] < 1:
-        p.append(f"BATCH must be >= 1, got {k['BATCH']}")
+    if k["BATCH"] < 0:
+        p.append(
+            f"BATCH must be >= 0 (0 = every prompt in one batch), got {k['BATCH']}"
+        )
     if k["CFG"] < 0:
         p.append(f"CFG must be >= 0, got {k['CFG']}")
     fp16 = k["PRECISION"] == "fp16" or (

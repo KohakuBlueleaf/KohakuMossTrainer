@@ -33,15 +33,43 @@ def _plain(value) -> bool:
     return True
 
 
+LOG_SIDE = 512
+
+
+def thumb(image: Image.Image, side: int) -> Image.Image:
+    """`image` scaled down to at most `side` pixels on its long edge."""
+    scale = side / max(image.size)
+    if scale >= 1.0:
+        return image
+    size = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
+    return image.resize(size, Image.LANCZOS)
+
+
+def step_sheet(images: list, prompts: list, columns: int, side: int = 0):
+    """`images` laid out `columns` per row, each scaled to at most `side` pixels (0:
+    full size); the first row's prompts head the columns."""
+    cols = columns
+    cells = [thumb(im, side) if side else im for im in images]
+    rows = [cells[i : i + cols] for i in range(0, len(cells), cols)]
+    rows[-1] = rows[-1] + [Image.new("RGB", (1, 1))] * (cols - len(rows[-1]))
+    labels = [
+        f"{i * cols + 1}-{min((i + 1) * cols, len(cells))}" for i in range(len(rows))
+    ]
+    heads = [str(p) for p in prompts[:cols]] + [""] * (cols - len(prompts[:cols]))
+    return grid.compose(rows, labels, heads, max_lines=3)
+
+
 class SampleGrid:
     """Every `every` steps: run the inference pipeline on the live training model.
 
     `pipeline(**settings) -> list[PIL.Image]` is `MossPipeline.from_components(...)`
     over the training backbone (the loaded modules, adapters at the training
     multiplier). The model is put in eval mode and restored to train mode after; images
-    and `settings.json` go to
-    `<output>/samples/step_X/` and through the logger, and `<output>/samples/grid.png`
-    is recomposed from every sampled step: prompts on the columns, steps on the rows.
+    and `settings.json` go to `<output>/samples/step_X/` and through the logger; with
+    `columns` > 0 the step's images laid out `columns` per row also go there as
+    `sheet.png`, and the logger gets that sheet (each image at most LOG_SIDE pixels) in
+    place of the images. `<output>/samples/grid.png` is recomposed from every sampled
+    step: prompts on the columns, steps on the rows.
     """
 
     def __init__(
@@ -53,7 +81,10 @@ class SampleGrid:
         logger,
         model: torch.nn.Module,
         modes: tuple[Callable, Callable],
+        columns: int = 0,
+        at_start: bool = False,
     ):
+        self.at_start = at_start
         self.every = every
         self.pipeline = pipeline
         self.settings = settings
@@ -61,6 +92,7 @@ class SampleGrid:
         self.logger = logger
         self.model = model
         self.eval_mode, self.train_mode = modes
+        self.columns = columns
 
     @torch.no_grad()
     def on_step_end(self, state: TrainState, out) -> None:
@@ -81,6 +113,10 @@ class SampleGrid:
         (folder / "settings.json").write_text(
             json.dumps(record, indent=2, default=str), encoding="utf-8"
         )
+        if self.columns:
+            prompts = list(self.settings.get("prompts") or [])
+            step_sheet(images, prompts, self.columns).save(folder / "sheet.png")
+            images = [step_sheet(images, prompts, self.columns, LOG_SIDE)]
         self.logger.log_images("samples", images, state.step)
         self.compose()
 
