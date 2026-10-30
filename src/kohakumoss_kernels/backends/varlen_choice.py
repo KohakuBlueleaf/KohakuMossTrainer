@@ -103,7 +103,8 @@ class VarlenChoice:
     problem key `key(q, segments, max_seqlen)` plus the mean-segment-length bucket
     (`-M<tokens>`) and whether a backward runs (`-g0` / `-g1`), timed by wall time
     over varying shapes (host launches and per-shape planning included, which a device
-    timer does not see); the tuning table is `attn_varlen_shapes_<backend>`."""
+    timer does not see); the tuning table is `attn_varlen_shapes_<backend>`. Inside
+    torch.compile it runs the kernel (no per-shape key, so no shape specialisation)."""
 
     def __init__(self, backend: str, kernel: Callable, key: Callable):
         self.backend = backend
@@ -155,14 +156,13 @@ class VarlenChoice:
         max_seqlen: int,
         scale: float,
     ) -> Tensor:
+        if torch.compiler.is_compiling():
+            return self.kernel(q, k, v, cu_seqlens, max_seqlen, scale)
+
         max_seqlen, scale = int(max_seqlen), float(scale)
         backward = needs_backward(q, k, v)
         key = self.problem(q, cu_seqlens.shape[0] - 1, max_seqlen, backward)
         ident = (q.device, key)
-        if torch.compiler.is_compiling():
-            fn = self.bound.get(ident, self.kernel)
-            fn = self.kernel if fn is sdpa_loop else fn
-            return fn(q, k, v, cu_seqlens, max_seqlen, scale)
         try:
             fn = self.bound.get(ident)
             if fn is None:

@@ -4,6 +4,7 @@ from collections.abc import Callable
 
 from torch import Tensor, nn
 
+from kohakumoss.model.compile import compiled_block
 from kohakumoss.model.components.norm import RMSNorm
 from kohakumoss.model.linear import MossLinear
 from kohakumoss.model.opset import OpSet
@@ -61,6 +62,7 @@ class JointBlock(nn.Module):
         """(attention part, FFN part), each (x, ctx) -> x; forward is their composition."""
         return self.attn_part, self.ffn_part
 
+    @compiled_block
     def forward(self, x: Tensor, ctx: BlockCtx) -> Tensor:
         return self.ffn_part(self.attn_part(x, ctx), ctx)
 

@@ -20,6 +20,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from kohakumoss.model.compile import compiled_glue
+
 KNOB = "STREAM_LOSS"
 LEGACY = "CONCENTRATION_LOSS"
 PROBE = "STREAM_LOSS_PROBE"
@@ -82,6 +84,17 @@ def sample_rms(r: Tensor, seg: Tensor, samples: int) -> Tensor:
     sums = r.new_zeros(shape).index_add(-1, seg, r.square())
     counts = r.new_zeros(samples).index_add(0, seg, torch.ones_like(seg, dtype=r.dtype))
     return (sums / counts.clamp_min(1.0)).clamp_min(TINY).sqrt()
+
+
+@compiled_glue
+def block_stats(
+    outs: list[Tensor], scales: tuple[float, ...], energy: bool, rms: bool
+) -> tuple[Tensor | None, Tensor | None]:
+    """(channel energies [L, D] when `energy`, token RMS in original units [L, T] when
+    `rms`) of the block outputs `outs`, one graph for every block under COMPILE."""
+    e = torch.stack([channel_energy(h) for h in outs]) if energy else None
+    r = torch.stack([token_rms(h, s) for h, s in zip(outs, scales)]) if rms else None
+    return e, r
 
 
 def sigma_weight(sigma: Tensor, mode: str) -> Tensor:
@@ -173,13 +186,12 @@ class StreamPenalty:
         w = sigma_weight(p.sigma, term["sigma"]).to(per_sample.device)
         return (w * per_sample).mean(), torch.stack(largest).max()
 
-    def _rms(self, p, term: dict) -> tuple[Tensor, dict[str, Tensor]]:
+    def _rms(self, p, term: dict, r: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
         """(the sigma-weighted mean over samples of the per-block (R / target - 1)^2,
         the metrics: geometric-mean token RMS over every block and its largest
         per-block value, the whole-stream RMS over every block and its largest per-block
-        value), RMS in original units."""
+        value), from the token RMS `r` [L, T] in original units."""
         target = float(term["target"])
-        r = torch.stack([token_rms(h, s) for h, s in zip(self.outs, self.scales)])
         rd = r.detach()
         geo = rd.clamp_min(TINY).log().mean(-1)
         quad = rd.square().mean(-1).sqrt()
@@ -202,9 +214,12 @@ class StreamPenalty:
                 "directly)"
             )
         terms, parts = {}, {}
+        energy, r = block_stats(
+            self.outs, self.scales, "concentration" in self.spec, "rms" in self.spec
+        )
+
         if "concentration" in self.spec:
             k = int(self.spec["concentration"]["k"])
-            energy = torch.stack([channel_energy(h) for h in self.outs])
             conc = top_shares(energy, k).mean()
             terms["concentration"] = conc
             parts["concentration"] = conc.detach()
@@ -214,7 +229,7 @@ class StreamPenalty:
             parts["peak_loss"] = hinge.detach()
             parts["stream_peak"] = largest
         if "rms" in self.spec:
-            value, metrics = self._rms(p, self.spec["rms"])
+            value, metrics = self._rms(p, self.spec["rms"], r)
             terms["rms"] = value
             parts["rms_loss"] = value.detach()
             parts.update(metrics)

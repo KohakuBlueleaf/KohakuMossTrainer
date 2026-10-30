@@ -25,6 +25,7 @@ from kohakumoss.logging.log import (
 from kohakumoss.memory.device_use import build_device_use
 from kohakumoss.memory.timeline import build_timeline
 from kohakumoss.model import resolve_config
+from kohakumoss.model.compile import compile_model
 from kohakumoss.offload.accel import configure_allocator, release_cache
 from kohakumoss.parallel.fsdp import shard_like
 from kohakumoss.parallel.launch import (
@@ -200,16 +201,6 @@ def _device(k: dict, rank: int) -> torch.device:
             return torch.device("cpu")
 
 
-def _compile(backbone, mode: str) -> None:
-    compile_setup.apply()
-    match mode:
-        case "block":
-            for block in backbone.layers:
-                block.compile(dynamic=True)
-        case "model":
-            backbone.compile(dynamic=True)
-
-
 def _snapshot(k: dict) -> dict:
     return json.loads(json.dumps(k, default=str))
 
@@ -353,7 +344,7 @@ def worker(
     torch.manual_seed(k["SEED"] + rank)  # per-rank stream for everything after build
     hooks = layout.hooks(ctx)
     init_weights(k, built, output_dir)
-    _compile(built.backbone, built.plan.compile)
+    compile_model(built.backbone, built.plan.compile)
     normalizer = TokenNormalizer(hooks.reduce, hooks.world_factor)
     autocast = autocast_factory(prec, device)
     stage_devices = [torch.device(device.type, i) for i in k["DEVICES"]]

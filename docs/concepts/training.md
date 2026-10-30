@@ -390,6 +390,21 @@ records it; the pipelines do not.
 - Free cached device memory stays with the allocator between steps unless
   `STEP_RELEASE` asks otherwise ([profiles.md](profiles.md#releasing-cached-memory)).
 
+## Compile
+
+`COMPILE` (`kohakumoss/model/compile.py`):
+
+| value | what compiles |
+| --- | --- |
+| `off` | nothing |
+| `block` | `JointBlock.forward`, once for the class (`@compiled_block`): every block of the model runs the same graph, its weights graph inputs |
+| `model` | the whole backbone forward, the block forwards inlined into it |
+
+Inside a compiled region the varlen attention runs its kernel (no per-shape tuning key,
+so new pack sizes do not specialise the graph) and the fused linears their custom ops.
+`tests/model/test_compile_mode.py` checks one compile per block class (negative: a
+compile per instance).
+
 ## Pipeline layouts (Linux)
 
 | `PARALLEL` | layout | `PIPELINE_SCHEDULE` |
