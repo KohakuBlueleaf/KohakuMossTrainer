@@ -186,9 +186,8 @@ MICROBATCHES = 4
 FSDP_REDUCE = "step"  # fsdp with GRAD_ACC > 1: "step" (one reduce-scatter per step; unsharded gradients held over the micro-batches) | "micro" (reduce-scatter every micro-batch; sharded gradients only)
 FSDP_RESHARD = "forward"  # fsdp block parameters: "forward" (ZeRO-3: freed after each block's forward, gathered again in backward) | "backward" (ZeRO-2: held unsharded from the forward gather through backward; one gather per micro-batch)
 DDP_BACKEND = "kohakumoss"  # ddp: "kohakumoss" (the project's reducers, every memory plan) | "torch" (stock torch DDP, the A / B baseline; plans that keep gradients on the device until the step)
-DDP_REDUCE_DTYPE = (
-    "fp32"  # ddp gradient sums: "fp32" | "param" (each parameter's own dtype)
-)
+DDP_REDUCE_DTYPE = "fp32"  # ddp gradient sums: "fp32" | "param" | "bf16"
+DDP_BUCKET_MB = 25  # ddp (kohakumoss reducers): MiB per all-reduce bucket
 DIST_TIMEOUT = (
     600  # seconds a collective of the step loop / the build waits for every rank
 )

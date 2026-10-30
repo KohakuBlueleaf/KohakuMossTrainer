@@ -70,7 +70,12 @@ def _ddp_hooks(ctx: RunContext) -> ParallelHooks:
     k = ctx.k
     match k["DDP_BACKEND"]:
         case "kohakumoss":
-            return ddp_hooks(ctx.built, ctx.device, k["DDP_REDUCE_DTYPE"])
+            return ddp_hooks(
+                ctx.built,
+                ctx.device,
+                k["DDP_REDUCE_DTYPE"],
+                k.get("DDP_BUCKET_MB", 25),
+            )
         case "torch":
             return torch_ddp_hooks(ctx.built, ctx.device, k["DDP_REDUCE_DTYPE"])
     raise SystemExit(f"DDP_BACKEND={k['DDP_BACKEND']!r} not in {DDP_BACKENDS}")

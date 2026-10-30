@@ -70,7 +70,7 @@ KNOWN = frozenset(
     FP16_FIX_KWARGS
     MEMORY_PROFILE MEMORY_AUTO_FORCE MEMORY_OVERRIDES STEP_RELEASE PARALLEL DIST_BACKEND DEVICES
     PIPELINE_SCHEDULE PIPELINE_SPLIT TRACE_STEPS PROFILE_STEPS FSDP_REDUCE FSDP_RESHARD
-    DDP_BACKEND DDP_REDUCE_DTYPE DIST_TIMEOUT DIST_GATE_TIMEOUT DIST_BIND
+    DDP_BACKEND DDP_REDUCE_DTYPE DDP_BUCKET_MB DIST_TIMEOUT DIST_GATE_TIMEOUT DIST_BIND
     CHECKPOINT STREAM STREAM_RESIDENT PINNED ACT_OFFLOAD OPTIM_STATE GRAD_OFFLOAD
     FUSED_STEP BASE_PRECISION FP8_RECIPE FP8_DGRAD INT8_COMPUTE INT8_DGRAD
     MICROBATCHES KERNELS TUNE RETUNE_STEPS COMPILE DRIVER STEPS GRAD_ACC OUTPUT_DIR RUN_NAME LOGGER
@@ -244,6 +244,9 @@ def _value_problems(k: dict) -> list[str]:
     retune = k.get("RETUNE_STEPS", 0)
     if isinstance(retune, bool) or not isinstance(retune, int) or retune < 0:
         p.append(f"RETUNE_STEPS must be an int >= 0, got {retune!r}")
+    bucket = k.get("DDP_BUCKET_MB", 25)
+    if isinstance(bucket, bool) or not isinstance(bucket, int) or bucket < 1:
+        p.append(f"DDP_BUCKET_MB must be an int >= 1, got {bucket!r}")
     p += release_problems(k.get("STEP_RELEASE", "none"))
     init = k.get("INIT_FROM") or ""
     if init and not os.path.isfile(os.path.join(init, "trainable.safetensors")):

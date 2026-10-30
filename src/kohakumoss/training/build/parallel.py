@@ -25,6 +25,7 @@ from kohakumoss.training.optim.bundle.base import (
     local_grad_norm,
 )
 from kohakumoss_common.calls import identity
+from kohakumoss_common.units import MIB
 
 
 @dataclass
@@ -79,14 +80,17 @@ class _Started:
         return contextlib.nullcontext()
 
 
-def ddp_hooks(built, device: torch.device, reduce: str = "fp32") -> ParallelHooks:
+def ddp_hooks(
+    built, device: torch.device, reduce: str = "fp32", bucket_mb: int = 25
+) -> ParallelHooks:
     """SUM reduce of every trainable gradient on the last micro-batch (in fp32, or the
     parameters' dtype: DDP_REDUCE_DTYPE): device gradients in place in GradReducer
-    buckets when the plan keeps them until the step, otherwise through the
-    AsyncReducer (`ddp`) that the memory wiring hands them to (in-backward steps,
-    gradient offload, streamed blocks). Rank 0's trainable device parameters are
-    broadcast; streamed masters are one shared host copy already."""
+    buckets of `bucket_mb` MiB (DDP_BUCKET_MB) when the plan keeps them until the step,
+    otherwise through the AsyncReducer (`ddp`) that the memory wiring hands them to
+    (in-backward steps, gradient offload, streamed blocks). Rank 0's trainable device
+    parameters are broadcast; streamed masters are one shared host copy already."""
     dtype = reduce_dtype(reduce)
+    size = bucket_mb * MIB
     params = list(built.trainable.trainable_params())
     host = {id(p) for p in built.engines.host_params()}
     local = [p for p in params if id(p) not in host]
@@ -94,11 +98,11 @@ def ddp_hooks(built, device: torch.device, reduce: str = "fp32") -> ParallelHook
     plan = built.plan
     plain = not (plan.fused_step or plan.grad_offload)
     inner = (
-        GradReducer(local, average=False, reduce_dtype=dtype)
+        GradReducer(local, bucket_bytes=size, average=False, reduce_dtype=dtype)
         if plain and local
         else None
     )
-    reducer = AsyncReducer(device, inner=inner, reduce_dtype=dtype)
+    reducer = AsyncReducer(device, bucket_bytes=size, inner=inner, reduce_dtype=dtype)
     return ParallelHooks(
         reduce=all_reduce_sum,
         world_factor=1,

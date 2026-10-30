@@ -160,6 +160,14 @@ fp32 range (no overflow of loss-scaled sums) and loses mantissa: each sum is rou
 communication accepts. These narrower copies are not capped by `WIDE_AHEAD` (together
 they hold at most half the gradient bytes), so no launch waits for an earlier reduction.
 
+### Bucket size
+
+`DDP_BUCKET_MB` (default 25) is the size of one all-reduce bucket of the project's
+reducers. A step's gradients go out in about (gradient bytes / bucket size) collectives,
+each with a fixed launch and latency cost: a 5B full finetune's 18.5 GB of fp32
+gradients is about 740 collectives at 25 MiB. Larger buckets mean fewer collectives and
+less overlap with the backward (a bucket launches when its last gradient lands).
+
 ### Step end
 
 `finish` (before the step):
