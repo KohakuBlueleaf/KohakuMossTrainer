@@ -188,6 +188,7 @@ def real_knobs(weights_root: Path, dataset: Path, out: Path, **overrides) -> dic
         KEEP_LAST=0,
         SAMPLE_EVERY=0,
         LOG_EVERY=1,
+        METRICS_LEVEL="debug",
         PROGRESS=False,
         TUNE="table",
         NUM_WORKERS=2,

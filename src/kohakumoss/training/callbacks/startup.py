@@ -106,9 +106,7 @@ class StepOneBreakdown:
             "alloc_segments": _segments(self.device),
         }
 
-    def on_step_end(self, state, out) -> None:
-        if self.done:
-            return
+    def on_step_end(self, state, out) -> bool:
         self.done = True
         end = self._snapshot()
         delta = {k: end[k] - self.start[k] for k in end}
@@ -132,3 +130,4 @@ class StepOneBreakdown:
         (self.root / "step1_breakdown.json").write_text(
             json.dumps(record, indent=2), encoding="utf-8"
         )
+        return True

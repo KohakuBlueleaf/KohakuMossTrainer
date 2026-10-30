@@ -71,12 +71,11 @@ def test_cross_knob_conflicts():
     problems = validate(
         runnable(
             MEMORY_OVERRIDES={"fused_step": True},
-            DRIVER="lightning",
             PARALLEL="fsdp",
             DEVICES=(0, 1),
         )
     )
     joined = "\n".join(problems)
-    assert "fused_step" in joined and "DRIVER='lightning'" in joined
+    assert "fused_step" in joined
     profile_fused = validate(runnable(MEMORY_PROFILE="low", OPTIMIZER="muon"))
     assert any("muon" in p for p in profile_fused)

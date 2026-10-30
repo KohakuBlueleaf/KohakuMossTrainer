@@ -151,6 +151,7 @@ peaks bring the stream near the fp16 maximum.
 | --- | --- | --- |
 | `concentration` | `weight`, `k` (32) | `weight` × the mean over blocks of the share of the block output's energy (all tokens of the micro-batch) in its `k` largest channels |
 | `peak` | `weight`, `cap` (32768), `top` (1e-4), `tau` (0.25), `sigma` ("sigma") | `weight` × the mean over samples, each weighted by `sigma` (σ, 1 − σ or 1), of the mean over blocks of `softplus((log m − log cap) / tau)`; `m` is the mean of the sample's largest `top` fraction of \|x\| in that block's output, in original units |
+| `rms` | `weight`, `target` (1.0), `sigma` ("none") | `weight` × the mean over samples, each weighted by `sigma`, of the mean over blocks of `(R / target − 1)²`; `R` is the sample's whole-stream RMS in that block's output (over all its tokens and channels), in original units |
 
 `CONCENTRATION_LOSS = {"weight": w, "k": k}` is the `concentration` term alone; set one
 of the two knobs.
@@ -164,11 +165,56 @@ of the two knobs.
   it holds for every resolution. `m` is divided by the stream scale of the fp16 fix the
   model carries (the weight fold, or `FP16_FIX="online"`'s factors), so `cap` means the
   same with or without a fix (the fp16 maximum is 65504).
+- **RMS.** A pull of the whole stream level to `target`, from both sides, always on (no
+  hinge). Both other terms leave the level alone: concentration is scale-free and the
+  peak hinge is zero below its cap. On MOSS the base stream's whole-sample RMS is 39 (the
+  mean over the joint blocks at 1024², original units) and 60 at 512², where the text
+  tokens are a larger share. A full finetune carrying concentration 0.01 and a per-token
+  log-RMS pull at 1e-3 cut the largest values by about 5x in 7.5k steps while the
+  whole-sample RMS of the late blocks rose about 3x and the typical token's RMS stayed
+  flat ([massive-channels.md](massive-channels.md)).
+  - The measure is the level of the whole stream, not of each token: `R² = mean over the
+    sample's tokens of r²`, `r` the token's RMS. Tokens keep their own sizes relative to
+    one another; only the level moves, so no token is forced to the target.
+  - The gradient on a token row is `2 (R / target − 1) · h / (target · T · D · R)`: every
+    row moves by the same fraction of itself, inward above the target and outward below,
+    zero at the target. Its size grows with `|R − target|` on both sides, so a stream far
+    above the target gets the strongest pull, and the largest tokens move the most in
+    absolute terms. A log-space pull, `(log(R / target))²`, does the opposite above the
+    target: its gradient `2 log(R / target) / R` falls as `R` grows.
+  - Each block reads `RMSNorm(h)`, so the radial direction is nearly invisible to the
+    next block: the term moves a direction the task loss is close to flat in. Lowering
+    the level means scaling every write into the stream (the embedders and each block's
+    output projections) together.
+  - The value scales with `(R / target)²`: at a stream RMS of about 100 and `target` 1 it
+    is about 10⁴ per block, so its weight is set from the gradient probe, not by
+    analogy with the other terms.
+  - Cost: one fp32 norm per token per block, read from the block output autograd keeps
+    anyway (no fp32 copy of the stream).
 - Each micro-batch adds its penalty weighted by its share of the step's loss tokens, so
   the step total is the token-weighted mean, as for the loss itself.
 - The training step only: validation reports the plain loss. Logged metrics:
-  `concentration`, `peak_loss` (the unweighted hinge) and `stream_peak` (the largest `m`
-  of the micro-batch, original units).
+  `concentration`, `peak_loss` (the unweighted hinge), `stream_peak` (the largest `m`
+  of the micro-batch, original units), `rms_loss` (the unweighted term), `stream_rms`
+  (the geometric mean token RMS over every block: the typical token),
+  `stream_rms_block_max` (the largest per-block geometric mean), `stream_rms_q` (the
+  whole-stream RMS of the micro-batch, mean over blocks: the level the term pulls) and
+  `stream_rms_q_block_max` (its largest block).
+- **Gradient probe.** `STREAM_LOSS_PROBE = N` (`PARALLEL="none"`) measures, every N
+  steps, the gradient of the task loss and of each term (unweighted, at the micro-batch's
+  share) over the trainable parameters: `grad_<name>` (norm), `grad_<name>_<group>` (per
+  parameter group: embed, attn_out, ffn_out, in_proj, norm, cond, head, other) and
+  `grad_cos_<term>` (cosine with the task gradient). A term's push at weight `w` is
+  `w · grad_<term>`; set the weight from its ratio to `grad_task` on the groups the term
+  should move. Each gradient is a separate `autograd.grad` over the retained graph (one
+  backward per term on probe steps), taken at a 2^16 scale stepped down 256-fold while
+  any element overflows, so fp16 parameters keep their small gradients. Probes start at
+  step 1: step 0 runs every kernel op on its guarded path, whose backward runs once and
+  releases its saved inputs, so a second gradient over that graph is not possible. With
+  the probe on, `torch.compile`d backwards are built without donated buffers
+  (`torch._functorch.config.donated_buffer = False`): a donated buffer is freed by the
+  first backward, which forbids the retained graph the probe needs. This costs some memory
+  in the compiled backward of probe runs only.
 - The block outputs are read by forward hooks, so the runner must call whole blocks:
   `CHECKPOINT="sub-block"` is rejected, and the layouts are `PARALLEL` `none` and `ddp`.
 
@@ -239,6 +285,32 @@ A bad step is skipped (the fp16 scale backs off by 0.5, floored at 1) and counte
 (`skipped_steps` and `nonfinite_steps`); clipping multiplies the gradients by an
 on-device coefficient.
 
+### Deferred step
+
+`STEP_SYNC = "deferred"` removes that host sync (`DeferredBundle`). The step's
+non-finite flag stays on the device and gates everything the host decision did:
+
+- the optimiser update (torch's fused AdamW `found_inf`, which also keeps its step count;
+  a KohakuMoss optimiser's `step_masked`); an optimiser with neither is refused;
+- the decay-to-one (`p -= lr * coef * (1 - bad) * (p - 1)`);
+- the fp16 scale (`DeviceScaler`: backoff floored at 1, growth after `growth_interval`
+  clean steps, the same scale sequence as the host scaler);
+- the skip count and the run of consecutive non-finite steps.
+
+Loss, norm, the flag, the counts and the scale come to the host in one transfer every
+gcd(`LOG_EVERY`, `METRICS_EVERY`) steps, at the process's first step, the last step and
+on every checkpoint (`state_dict`). Between those steps the host values are the previous
+sync's (`TrainState.synced` False) and per-step callbacks that read them wait for the
+next sync. Without the per-step sync the host runs ahead of the device by up to a step,
+so a launch-bound step overlaps the next step's launches with this step's kernels.
+
+- `NONFINITE_PATIENCE` reads the device's consecutive non-finite count at sync steps;
+  the per-parameter report and the same-parameters rule are not available (no host
+  gradient scan).
+- Runs with `EMA = 0` (the EMA update reads the host flag), the native driver and
+  `PARALLEL` `none` / `ddp`; a memory plan with the in-backward step (`fused_step`) is
+  refused at build.
+
 ### Fused step
 
 With `fused_step` in the memory plan (the `low` / `minimal` profiles) each parameter
@@ -283,8 +355,8 @@ step to `<output>/instability/repro_step.pt` (`training/callbacks/repro.py`, a
 | `adapters` | every trainable tensor by name, its values after the step (a skipped step leaves them as its forward saw them) |
 
 The error message names the file; `KOHAKUMOSS_REPRO_STEP=<file>` replays it in
-`tests/training/checkpoint/test_repro_step_nan.py`. The native and Lightning loops
-record it; the pipelines do not.
+`tests/training/checkpoint/test_repro_step_nan.py`. The native loop
+records it; the pipelines do not.
 
 ## Precision
 
@@ -383,17 +455,25 @@ reconstructs an average of any width afterwards.
 
 ### Drivers
 
-`DRIVER="native"` (default) and `"lightning"` (manual optimisation) run the same
-TrainStep and bundle, start every micro-batch the same way (fused steps, gradient
-offload, the DDP reducer) and reach identical parameters.
+Every run uses the native loop (`training/drivers/native.py`; the pipeline layouts its
+threaded / process-group variants): KohakuMoss owns the processes, gradient sync,
+precision and placement (host fp32 masters under `swap`, streamed weights, host
+optimiser state, the DDP shared host region), which a framework that moves and wraps
+the model would fight. `DRIVER` is deprecated: `"lightning"` logs a warning and runs the
+native loop.
 
-Lightning drives the loop on this process's one device; processes, gradient sync and
-placement are KohakuMoss's. The LightningModule holds the backbone outside its module
-tree (a plain attribute), so it has no parameter of its own: Lightning's move of the
-module to the device at fit start and back to the CPU at teardown moves nothing, and
-every memory profile (host fp32 masters under `swap`, streamed weights, host optimiser
-state, the DDP shared host region) keeps its placement; the export after training reads
-the same placed model as under the native driver.
+What the loop gives a run:
+
+- **One optimiser step per call**: GRAD_ACC host batches, each micro-batch's backward
+  scaled by its share of the step's global loss-token count; the step's metrics are the
+  mean over its micro-batches, kept on the device.
+- **Callbacks** (`training/callbacks`): `on_step_end(state, out)` with an `every`
+  cadence (plus the run's first and last step with `edges`); a callback returns True when
+  it has finished and leaves the run (one-shot reports: the step-1 breakdown, the startup
+  speed, the kernel retune window, the profiled windows), so an idle callback costs
+  nothing per step.
+- **Checkpoints and resume** (below), the progress bar or the console step line, metric
+  rows to the loggers ([logging.md](../guides/logging.md)).
 
 ### Checkpoints
 

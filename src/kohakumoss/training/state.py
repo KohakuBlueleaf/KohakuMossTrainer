@@ -23,3 +23,5 @@ class TrainState:
     nonfinite_names: list = field(default_factory=list)  # their first names this step
     batch_ids: list = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
+    synced: bool = True  # the values above are this step's (deferred: sync steps)
+    bad_run: int | None = None  # consecutive non-finite steps (deferred step)

@@ -110,14 +110,16 @@ class CacheReleaseStats:
             self._clear()
 
 
-def release_callbacks(device, rows: int, release=DEFAULT) -> list:
+def release_callbacks(device, rows: int, release=DEFAULT, stats: bool = True) -> list:
     """On an accelerator: the STEP_RELEASE callback (resolved once; none for "none")
     ahead of the accounting of what the allocator returned (metric rows every `rows`
-    steps); nothing on the host."""
+    steps; `stats` False leaves the accounting out); nothing on the host."""
     device = torch.device(device)
     if device.type not in ("cuda", "xpu"):
         return []
     every = release_every(release)
     releasing = [StepRelease(device, every)] if every else []
+    if not stats:
+        return releasing
     source = releasing[0] if releasing else None
     return releasing + [CacheReleaseStats(device, rows, source)]

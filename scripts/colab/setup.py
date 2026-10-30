@@ -122,7 +122,7 @@ def main():
         "--torch", default=torch_requirement(), help="torch requirement (pyproject's)"
     )
     ap.add_argument("--torch-index", default="", help="wheel index; '' = by driver")
-    ap.add_argument("--extras", default="kernels,lightning,quant,dev,bench")
+    ap.add_argument("--extras", default="kernels,quant,dev,bench")
     ap.add_argument("--lycoris", default="", help="LyCORIS checkout to install -e")
     ap.add_argument("--doctor-json", default="", help="also write the doctor report")
     args = ap.parse_args()

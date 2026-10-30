@@ -2,7 +2,8 @@
 
 Callbacks with `every == 1` run every step; periodic ones run when the step reaches the
 precomputed next firing step; a callback with `edges = True` also fires at the run's
-first step and at `last`. Firing order is the order the callbacks were given.
+first step and at `last`. Firing order is the order the callbacks were given. A
+callback whose `on_step_end` returns True has finished: it is dropped from the run.
 """
 
 import math
@@ -51,12 +52,19 @@ class CallbackRunner:
 
     def run(self, state: TrainState, out) -> None:
         if state.step == self.next_fire:
-            for cb in self.due(state.step):
-                cb.on_step_end(state, out)
+            done = [cb for cb in self.due(state.step) if cb.on_step_end(state, out)]
             self.next_fire = self._next_after(state.step)
-            return
-        for cb in self.always:
-            cb.on_step_end(state, out)
+        else:
+            done = [cb for cb in self.always if cb.on_step_end(state, out)]
+        if done:
+            self._drop(done)
+
+    def _drop(self, done: list) -> None:
+        """Remove finished callbacks from every list the runner fires from."""
+        gone = {id(cb) for cb in done}
+        self.ordered = [cb for cb in self.ordered if id(cb) not in gone]
+        self.always = [cb for cb in self.always if id(cb) not in gone]
+        self.edged -= gone
 
 
 class SaveCheckpoint:

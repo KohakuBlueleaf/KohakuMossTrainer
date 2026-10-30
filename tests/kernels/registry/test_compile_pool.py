@@ -16,6 +16,7 @@ from tests._util.negative import must_fail
 
 pytestmark = [
     pytest.mark.cpu,
+    pytest.mark.budget(60),
     pytest.mark.skipif(
         sys.platform == "win32",
         reason="inductor compiles in-process on Windows (compile_threads=1): no pool",

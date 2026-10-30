@@ -196,8 +196,10 @@ def build_memory_optim(
     prec: PrecisionConfig,
     grad_clip: float,
     hooks=None,
+    sync_every: int = 0,
 ):
-    """(bundle, accumulate-context factory) over `groups` under `plan`.
+    """(bundle, accumulate-context factory) over `groups` under `plan`; `sync_every` > 0
+    builds the deferred bundle (STEP_SYNC 'deferred').
 
     `swap` blocks with a GPU optim_state step per block in backward (StreamedAdamW;
     device states for `gpu`); with `cpu` they join the host AdamW after
@@ -243,6 +245,7 @@ def build_memory_optim(
         fused_step=w.fused,
         grad_norm=grad_norm,
         agree=getattr(hooks, "agree", identity),
+        sync_every=sync_every,
         before=_chain(
             extra.get("finish_unhooked"),
             before,

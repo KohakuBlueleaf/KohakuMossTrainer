@@ -34,7 +34,7 @@ from kohakumoss.training.checks.parallel import (
     threaded_problems,
 )
 from kohakumoss.training.context import RunContext
-from kohakumoss.training.drivers import DRIVERS, Parts
+from kohakumoss.training.drivers import NativeDriver, Parts
 from kohakumoss.training.drivers.common import ShardedOptimParts
 from kohakumoss.training.drivers.fsdp import FsdpParts
 from kohakumoss.training.drivers.pipeline import (
@@ -104,7 +104,7 @@ def _pipeline_parts(ctx: RunContext, args: tuple, names, extra) -> Parts:
 
 
 def _loop_driver(ctx: RunContext, common: dict, accumulate, engine):
-    return DRIVERS.get(ctx.k["DRIVER"])(**common, accumulate=accumulate)
+    return NativeDriver(**common, accumulate=accumulate)
 
 
 def _threaded_driver(ctx: RunContext, common: dict, accumulate, engine):

@@ -116,7 +116,6 @@ FEATURES: list[tuple[str, str, object]] = [
         "export LyCORIS + ComfyUI",
         lambda r: r.get("kind") in ("quality", "export"),
     ),
-    ("training", "Lightning driver", named("cov-training-lightning")),
     (
         "training",
         "logging: colours, tables, progress bar, sinks",

@@ -158,11 +158,10 @@ shared drive):
 
 | extra | packages | needed for |
 | --- | --- | --- |
-| `cuda` | `kernels-cuda` + `lightning` + `quant` | the default set on NVIDIA GPUs |
-| `xpu` | `kernels-xpu` + `lightning` + `quant` | the default set on Intel Arc |
+| `cuda` | `kernels-cuda` + `quant` | the default set on NVIDIA GPUs |
+| `xpu` | `kernels-xpu` + `quant` | the default set on Intel Arc |
 | `kernels-cuda` (`kernels`) | `tilelang`, `triton-windows` (Windows) | TileLang kernels (sm70 / sm75), Triton on Windows |
 | `kernels-xpu` | none | Intel's Triton comes with the XPU torch |
-| `lightning` | `lightning` | `DRIVER="lightning"` |
 | `quant` | `bitsandbytes` | `OPTIMIZER="adamw8bit"` (bitsandbytes 8-bit AdamW) |
 | `optim` | `prodigyopt`, `schedulefree` | `OPTIMIZER="prodigy"` / `"schedule_free"` |
 | `parquet` | `pyarrow` | the `parquet` dataset source |

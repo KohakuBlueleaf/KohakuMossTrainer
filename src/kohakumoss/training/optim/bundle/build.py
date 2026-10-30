@@ -8,6 +8,7 @@ from torch import Tensor
 
 from kohakumoss.precision.scaler import DynamicScaler, NoScaler
 from kohakumoss.training.optim.bundle.base import Bundle, local_grad_norm
+from kohakumoss.training.optim.bundle.deferred import DeferredBundle
 from kohakumoss.training.optim.bundle.fused import FusedStepBundle
 from kohakumoss.training.optim.bundle.mirror import schedule_for
 from kohakumoss.training.optim.optimizers.factory import OPTIMIZERS
@@ -43,11 +44,19 @@ def build_bundle(
     fused_step: bool = False,
     grad_norm: Callable[[list[Tensor]], Tensor] = local_grad_norm,
     agree: Callable[[Tensor], Tensor] = identity,
+    sync_every: int = 0,
     **hooks,
 ):
-    """The bundle the drivers use; `fused_step` returns the per-parameter variant.
-    `hooks`: `before` / `after` (around the optimiser step) and `reduce_loss`."""
+    """The bundle the drivers use; `fused_step` returns the per-parameter variant,
+    `sync_every` > 0 the deferred one (STEP_SYNC 'deferred': a host sync every
+    `sync_every` steps). `hooks`: `before` / `after` (around the optimiser step) and
+    `reduce_loss`."""
     scaler = build_scaler(prec)
+    if sync_every and fused_step:
+        raise ValueError(
+            "STEP_SYNC='deferred' needs a memory plan without the in-backward step "
+            "(fused_step)"
+        )
     make = partial(build, optimizer, OPTIMIZERS, device=device, **hyper)
     if fused_step:
         shared = make(groups=groups) if optimizer in SHARED_STEP else None
@@ -67,7 +76,10 @@ def build_bundle(
     opt = make(groups=groups)
     train_mode, eval_mode = _mode_fns(opt)
     train_mode()
-    return Bundle(
+    kind = (
+        partial(DeferredBundle, every=sync_every, last=steps) if sync_every else Bundle
+    )
+    return kind(
         optimizer=opt,
         schedule=schedule_for(opt, schedule, steps),
         scaler=scaler,

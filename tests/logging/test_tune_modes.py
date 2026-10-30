@@ -165,9 +165,8 @@ def test_prewarm_log_lines(collect):
 def test_startup_speed_line(collect):
     ticks = iter([0.0, 5.0, 6.0, 7.0, 8.0])
     speed = step_kernels.StartupSpeed(last=4, clock=lambda: next(ticks))
-    for _ in range(4):
-        speed.on_step_end(None, None)
+    done = [speed.on_step_end(None, None) for _ in range(4)]
     expected = "step 1 5.000 s/step, steps 2-4 median 1.000 s/step (5.0x)"
     assert expected in collect.messages, collect.messages
-    speed.on_step_end(None, None)
+    assert done == [False, False, False, True]
     assert collect.messages.count(expected) == 1

@@ -9,6 +9,7 @@ from kohakumoss.diffusion.objective import LOSSES, WEIGHTINGS
 from kohakumoss.diffusion.timestep import TIMESTEPS
 from kohakumoss.encoders.knob_names import ENCODER_FIELDS, RENAMED_SAMPLE, SAMPLE_NAMES
 from kohakumoss.logging import LOGGERS
+from kohakumoss.logging.log import get_logger
 from kohakumoss.memory.knob_map import mixing_problems, plan_fields, primary_names
 from kohakumoss.memory.profiles import KNOB_FIELDS, ORDER, PROFILES, resolve
 from kohakumoss.memory.release import release_problems
@@ -30,6 +31,7 @@ from kohakumoss.training.checks.parallel import (
 )
 from kohakumoss.training.exports import with_export_formats
 from kohakumoss.training.layouts import LAYOUTS
+from kohakumoss.training.optim.bundle.deferred import step_sync_problems
 from kohakumoss.training.optim.optimizers.factory import OPTIMIZERS
 from kohakumoss.training.optim.optimizers.kwargs import optimizer_problems
 from kohakumoss.training.stream_loss import spec_of as stream_spec
@@ -78,7 +80,8 @@ KNOWN = frozenset(
     CROP PLANNER_KWARGS LATENT_ENCODER_ID LATENT_DRAW
     TEXT_ENCODER_ID BACKGROUND RESAMPLE TEXT_CHARS_PER_TOKEN TEXT_OVERHEAD_TOKENS
     MAX_TEXT_TOKENS PREFETCH PIN_MEMORY NONFINITE_PATIENCE DATA_RESCAN
-    DATA_SCAN_WORKERS DATA_WAIT CONCENTRATION_LOSS STREAM_LOSS""".split()
+    DATA_SCAN_WORKERS DATA_WAIT CONCENTRATION_LOSS STREAM_LOSS STREAM_LOSS_PROBE
+    METRICS_LEVEL STEP_SYNC""".split()
 )
 CHOICES = {
     "ADAPTER_MODE": ("bypass", "merge"),
@@ -92,8 +95,10 @@ CHOICES = {
     "FSDP_REDUCE": ("step", "micro"),
     "FSDP_RESHARD": ("forward", "backward"),
     "DDP_BACKEND": ("kohakumoss", "torch"),
-    "DDP_REDUCE_DTYPE": ("fp32", "param"),
+    "DDP_REDUCE_DTYPE": ("fp32", "param", "bf16"),
     "DIST_BIND": ("lazy", "device"),
+    "METRICS_LEVEL": ("train", "bench", "debug"),
+    "STEP_SYNC": ("step", "deferred"),
 }
 ALGOS = (
     "lora",
@@ -118,6 +123,7 @@ RENAMED = {
     "SIZE": "the train script's name is SAMPLE_SIZE",
 }
 default_device_type = default_type
+log = get_logger(__name__)
 
 
 def run_name(k: dict) -> str:
@@ -255,6 +261,7 @@ def validate(k: dict) -> list[str]:
     p += optimizer_problems(k)
     p += io_problems(k)
     p += stream_loss_problems(k)
+    p += step_sync_problems(k)
     return list(dict.fromkeys(p))
 
 
@@ -364,11 +371,21 @@ def _memory_problems(k: dict) -> list[str]:
     return p
 
 
+def deprecations(k: dict) -> list[str]:
+    """The deprecated knob values `k` sets (they still run, as the message says)."""
+    if k.get("DRIVER", "native") == "lightning":
+        return ["DRIVER='lightning' is deprecated: every run uses the native loop"]
+    return []
+
+
 def check(g: dict) -> dict:
     """Knobs from globals (PRECISION resolved, a set EXPORT_FORMATS mapped onto
-    SAVE_FORMAT / SAVE_MERGED); raises one SystemExit listing every problem."""
+    SAVE_FORMAT / SAVE_MERGED); raises one SystemExit listing every problem and warns
+    on every deprecated value."""
     k = with_export_formats(with_precision(collect(g)))
     problems = validate(k)
     if problems:
         raise SystemExit("invalid configuration:\n  - " + "\n  - ".join(problems))
+    for message in deprecations(k):
+        log.warning(message)
     return k

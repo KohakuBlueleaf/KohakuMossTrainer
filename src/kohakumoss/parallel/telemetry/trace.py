@@ -40,12 +40,13 @@ class StepTrace:
         self.prof = None
         self.t0 = 0.0
 
-    def on_step_end(self, state, out) -> None:
+    def on_step_end(self, state, out) -> bool:
         if state.step == self.first:
             self._open()
         elif state.step == self.last and self.prof is not None:
             state.metrics.update(self._close())
-            self.on_step_end = _done
+            return True
+        return False
 
     def _open(self) -> None:
         activities = [ProfilerActivity.CPU]
@@ -98,19 +99,16 @@ class ProfilerWindow:
         self.first, self.last = first, last
         self.device = torch.device(device)
 
-    def on_step_end(self, state, out) -> None:
+    def on_step_end(self, state, out) -> bool:
         if state.step == self.first:
             synchronize(self.device)
             torch.cuda.profiler.start()
         elif state.step == self.last:
             synchronize(self.device)
             torch.cuda.profiler.stop()
-            self.on_step_end = _done
+            return True
+        return False
 
 
 def _index(device: torch.device) -> int:
     return device.index if device.index is not None else 0
-
-
-def _done(state, out) -> None:
-    return None

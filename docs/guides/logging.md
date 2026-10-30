@@ -29,6 +29,7 @@ Training knobs:
 | --- | --- | --- |
 | `LOG_EVERY` | 10 | the console step line (bar off only); the default `METRICS_EVERY` |
 | `METRICS_EVERY` | None (= `LOG_EVERY`) | metric rows to the sinks (`metrics.jsonl`, wandb) and the throughput, VRAM and encoder-share monitors that fill them; 1 = every step |
+| `METRICS_LEVEL` | `train` | which monitors fill a row ([Metric levels](#metric-levels)) |
 | `PROGRESS` | True | the bar |
 | `LOGGER` | `console` | the sink next to `metrics.jsonl` ([Sinks](#sinks)) |
 
@@ -62,9 +63,46 @@ other.
   a resume: the first resumed step) and at its last (a callback with `edges = True`).
 - The cadence is resolved once at build into each callback's `every`; the per-step cost
   is the runner's one integer compare.
-- Each emitted metric row costs one host sync (the step's device metrics are read to
-  floats) plus the monitors' host work, so `METRICS_EVERY=1` adds one sync per step; the
+- Each emitted metric row costs one host read of the step's device metrics (one stacked
+  transfer) and, with several data ranks, one int64 all-reduce of the token and sample
+  counts; between rows nothing is read, so `METRICS_EVERY=1` adds that per step. The
   bar itself reads host values only.
+- A step's device metrics (the STREAM_LOSS terms, `loss/flow`) are the mean over its
+  micro-batches.
+
+### Metric names
+
+`metrics.jsonl` keeps each metric's plain name; wandb shows it under its group
+(`kohakumoss.logging.keys`), one panel section per group:
+
+| wandb name | `metrics.jsonl` name | what it is |
+| --- | --- | --- |
+| `loss/total` | `loss` | the step's loss, penalties included |
+| `loss/flow` | `loss_task` | the flow-matching loss alone (a micro-batch's own token mean) |
+| `loss/concentration`, `loss/rms`, `loss/peak` | `concentration`, `rms_loss`, `peak_loss` | the unweighted STREAM_LOSS terms |
+| `stream/rms`, `stream/rms_block_max` | `stream_rms_q`, `stream_rms_q_block_max` | whole-stream RMS: mean over blocks, largest block |
+| `stream/rms_token`, `stream/rms_token_block_max` | `stream_rms`, `stream_rms_block_max` | geometric-mean token RMS |
+| `stream/peak` | `stream_peak` | the peak term's largest top-fraction mean |
+| `opt/lr`, `opt/grad_norm` | `lr`, `grad_norm` | |
+| `amp/scale`, `amp/skipped` | `loss_scale`, `skipped_steps` | the loss scale, steps not applied so far |
+| `speed/step_time`, `speed/img_per_s`, `speed/tokens_per_s` | `step_time`, `samples_per_s`, `tokens_per_s` | per-rank step time; the whole job's samples and image tokens per second |
+| `probe/...` | `grad_...` | the gradient probe (`STREAM_LOSS_PROBE`) |
+| `detail/...` | the rest | every other metric (bench / debug rows) |
+
+### Metric levels
+
+`METRICS_LEVEL` picks the monitors attached at build and what a row keeps (a selection,
+not a per-step check):
+
+| level | a metric row holds |
+| --- | --- |
+| `train` | the training metrics above, nothing else |
+| `bench` | + the weight-transfer, text-encoder, VAE and encode-feed shares (`te_*`, `vae_*`, `feed_*`), the VRAM peaks per phase, the allocator release accounting, sigma mean, non-finite counts, TFLOP/s, and the per-rank report (`<output>/ranks/`) |
+| `debug` | + the device-use breakdown (`vram_device`, `vram_context`, `vram_non_torch`, `vram_fragmented`, `vram_cached`, `vram_allocated`, `vram_other`) and its step-1 log |
+
+The benchmark scripts, the bench matrix and the memory / integration tests set `debug`:
+they read the VRAM and encoder rows. A profiled window (`TRACE_STEPS`,
+`PROFILE_STEPS`) attaches the per-rank report at every level.
 
 ### Sinks
 

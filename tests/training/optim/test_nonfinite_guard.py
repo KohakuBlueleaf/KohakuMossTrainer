@@ -89,7 +89,7 @@ def test_metric_row_carries_nonfinite_params():
     record(state, bundle)
     assert state.nonfinite_params == 1 and state.nonfinite_names == ["b"]
     sink = _Rows()
-    LogMetrics(1, sink).on_step_end(state, _Out())
+    LogMetrics(1, sink, "bench").on_step_end(state, _Out())
     assert sink.rows[0]["nonfinite_params"] == 1.0
     assert math.isnan(sink.rows[0]["grad_norm"])
 

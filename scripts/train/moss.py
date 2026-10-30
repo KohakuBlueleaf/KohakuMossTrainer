@@ -117,8 +117,11 @@ WEIGHTING = "none"  # "none" | "x0" | "eps"
 #   "peak": {"weight": 0.02, "cap": 32768, "top": 1e-4, "tau": 0.25, "sigma": "sigma"}
 #     (soft hinge on each sample's top-`top` |x| per block, original units, weighted by
 #     "sigma" | "one_minus_sigma" | "none")
+#   "rms": {"weight": 1e-3, "target": 1.0, "sigma": "none"}
+#     ((R / target - 1)^2 per block, R the sample's whole-stream RMS, original units)
 STREAM_LOSS = {}
 CONCENTRATION_LOSS = {}  # the "concentration" term alone (set one of the two)
+STREAM_LOSS_PROBE = 0  # every N steps: per-term gradient norms + cosines; 0 = off
 
 # ===================== OPTIM =====================
 OPTIMIZER = "adamw"  # "adamw" | "adamw16" | "adamw8bit" (bitsandbytes) | "adamw8bit_kernel" (KohakuMoss 8-bit kernel) | "muon" | "prodigy" | "schedule_free"
@@ -130,6 +133,7 @@ WEIGHT_DECAY = 0.01
 WD_RULES = "moss"  # "moss" (wd on 2-D weights only, decay-to-one on last q/k norm) | "none" | "all"
 SCHEDULE = {"mode": "cosine", "warmup": 100, "end": -1}  # AnySchedule config
 GRAD_CLIP = 1.0
+STEP_SYNC = "step"  # "step" (host sync every step) | "deferred" (skip decided on the device; host values every gcd(LOG_EVERY, METRICS_EVERY) steps; EMA = 0)
 EMA = 0.0  # 0 = off; e.g. 0.9999
 
 # ===================== PRECISION =====================
@@ -200,7 +204,7 @@ RETUNE_STEPS = 3  # TUNE="table": the kernel-vs-compile retune runs after each o
 COMPILE = "off"  # "off" | "block" | "model"
 
 # ===================== RUNTIME =====================
-DRIVER = "native"  # "native" | "lightning"
+DRIVER = "native"  # deprecated: every run uses the native loop ("lightning" warns)
 STEPS = 1000
 GRAD_ACC = 1
 OUTPUT_DIR = "runs/moss"
@@ -213,6 +217,7 @@ LOG_EVERY = 10  # console step line every N steps (and the first / last)
 METRICS_EVERY: int | None = (
     None  # sink rows every N steps (+ first / last); None = LOG_EVERY
 )
+METRICS_LEVEL = "train"  # "train" (loss, lr, norms, throughput, stream terms) | "bench" (+ encoder / transfer / feed shares, VRAM peaks) | "debug" (+ device-use breakdown)
 PROGRESS = True  # tqdm bar over STEPS on a TTY (or FORCE_COLOR=1), at INFO
 NONFINITE_PATIENCE = 8  # stop after N non-finite steps at the loss-scale floor, or N steps with the same non-finite parameters; 0 = off
 TRACE_STEPS = ()  # (first, last): torch.profiler over steps first+1..last on every rank -> <output>/ranks/

@@ -66,15 +66,6 @@ def _windows_problems(k: dict) -> list[str]:
     ]
 
 
-def _native_driver(k: dict) -> list[str]:
-    if k["DRIVER"] == "native":
-        return []
-    return [
-        f"PARALLEL={k['PARALLEL']!r} runs on DRIVER='native' (DRIVER='lightning' "
-        "supports PARALLEL 'none' | 'ddp')"
-    ]
-
-
 def _no_loop_sampling(k: dict) -> list[str]:
     if k["SAMPLE_EVERY"] <= 0 and k["VALIDATE_EVERY"] <= 0:
         return []
@@ -101,7 +92,7 @@ def ddp_problems(k: dict) -> list[str]:
 def fsdp_problems(k: dict) -> list[str]:
     """PARALLEL='fsdp': whole-matrix optimizers, fp32 parameters next to 16-bit ones in
     one unit, the gloo backend and rank-0 sampling cannot run on shards."""
-    p = _windows_problems(k) + _native_driver(k)
+    p = _windows_problems(k)
     if k["OPTIMIZER"] == "muon":
         p.append(
             "OPTIMIZER='muon' orthogonalises whole matrices; under PARALLEL='fsdp' it "
@@ -128,16 +119,16 @@ def fsdp_problems(k: dict) -> list[str]:
 
 
 def pipeline_layout_problems(k: dict) -> list[str]:
-    """PARALLEL='pipeline': the schedule over the stages, the pipeline's data plan, the
-    native driver, no in-loop sampling."""
-    p = _windows_problems(k) + _native_driver(k) + _no_loop_sampling(k)
+    """PARALLEL='pipeline': the schedule over the stages, the pipeline's data plan, no
+    in-loop sampling."""
+    p = _windows_problems(k) + _no_loop_sampling(k)
     p += schedule_problems(k["PIPELINE_SCHEDULE"], len(k["DEVICES"]), k["MICROBATCHES"])
     return p + pipeline_problems(DataConfig.from_knobs(k))
 
 
 def threaded_problems(k: dict) -> list[str]:
-    """PARALLEL='threaded': its schedules, the native driver, no in-loop sampling."""
-    p = _windows_problems(k) + _native_driver(k) + _no_loop_sampling(k)
+    """PARALLEL='threaded': its schedules, no in-loop sampling."""
+    p = _windows_problems(k) + _no_loop_sampling(k)
     if k["PIPELINE_SCHEDULE"] not in THREADED_SCHEDULES:
         p.append(
             f"PARALLEL='threaded' runs PIPELINE_SCHEDULE in {THREADED_SCHEDULES}, "

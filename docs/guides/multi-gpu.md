@@ -152,6 +152,14 @@ have none).
 `DDP_REDUCE_DTYPE="param"` sums in each parameter's dtype. Every collective runs on the
 device (NCCL).
 
+`DDP_REDUCE_DTYPE="bf16"` sums in bf16: an fp32 bucket (a full finetune's fp32 master
+gradients) is copied to bf16 at its launch and the sum copied back, so half the bytes
+cross the wire (a 5B full finetune: 9.2 GB per step instead of 18.5 GB). bf16 keeps the
+fp32 range (no overflow of loss-scaled sums) and loses mantissa: each sum is rounded to
+8 bits, the precision of the sum of a few ranks' gradients that standard bf16 gradient
+communication accepts. These narrower copies are not capped by `WIDE_AHEAD` (together
+they hold at most half the gradient bytes), so no launch waits for an earlier reduction.
+
 ### Step end
 
 `finish` (before the step):
@@ -472,7 +480,7 @@ A mixed 3090 + 2080 Ti job runs fp16, since the 2080 Ti has no bf16.
 | `hooks` | the loop's reduce / agree / norm / accumulate hooks (`training.build.parallel`) |
 | `stages` | the pipeline engine, its objective and this rank's trainable names and parameters |
 | `parts` | the checkpoint parts (FSDP2 full state dicts, per-stage pipeline parts, sharded host optimizer state) |
-| `driver` | the train loop: `DRIVER` (native / lightning) or the threaded / pipeline drivers |
+| `driver` | the train loop: the native loop or the threaded / pipeline drivers |
 | `full_weights` | the context in which every rank holds full weights for export (FSDP2: unsharded) |
 | `problems` | the layout's knob problems (`problems(k)`), reported by knob validation |
 | `plan_problems` | the layout's memory-plan problems (`plan_problems(k, plan)`), reported by knob validation |

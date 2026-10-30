@@ -77,6 +77,7 @@ def knobs(args, profile: str, out_dir: str) -> dict:
         NUM_WORKERS=0,
         STEPS=args.iters + 1,
         LOG_EVERY=1,
+        METRICS_LEVEL="debug",
         SAVE_EVERY=0,
         SAMPLE_EVERY=0,
         VALIDATE_EVERY=0,

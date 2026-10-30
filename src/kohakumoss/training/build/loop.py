@@ -38,6 +38,7 @@ from kohakumoss.training.callbacks.kernels import (
     speed_callbacks,
     vram_callbacks,
 )
+from kohakumoss.training.callbacks.monitor import job_counts
 from kohakumoss.training.callbacks.progress import ProgressBar
 from kohakumoss.training.callbacks.repro import StepRecorder
 from kohakumoss.training.callbacks.runner import MeetRanks, rank0_decision
@@ -48,8 +49,10 @@ from kohakumoss.training.context import RunContext
 from kohakumoss.training.drivers import Parts
 from kohakumoss.training.ema import build_ema, ema_is_power
 from kohakumoss.training.ema.averagers import BackgroundEMA, NoEMA, host_averaged
+from kohakumoss.training.grad_probe import build_probe
 from kohakumoss.training.knobs import is_full
 from kohakumoss.training.memory.optimizers import build_memory_optim
+from kohakumoss.training.optim.bundle.deferred import sync_cadence
 from kohakumoss.training.step import (
     DeviceBatcher,
     OnlineLatents,
@@ -105,6 +108,7 @@ def build_step(
         rank=data_rank,
         keep=None if recorder is None else recorder.keep,
         penalty=build_penalty(k, built.backbone) if penalty else None,
+        probe=build_probe(k, built.backbone) if penalty else None,
     )
 
 
@@ -227,7 +231,16 @@ def build_optim(k: dict, built, device, prec, hooks, keep: set[int] | None = Non
         prec,
         k["GRAD_CLIP"],
         hooks,
+        sync_every=step_sync_every(k),
     )
+
+
+def step_sync_every(k: dict) -> int:
+    """STEP_SYNC 'deferred': the steps between the optimiser's host syncs (every step the
+    console line or a metric row reads); 'step': 0 (a sync every step)."""
+    if k.get("STEP_SYNC", "step") != "deferred":
+        return 0
+    return sync_cadence(k["LOG_EVERY"], metrics_every(k))
 
 
 def build_ema_for(k: dict, built, bundle, names: set[str] | None = None, rank: int = 0):
@@ -325,6 +338,35 @@ def bar_shown(k: dict) -> bool:
     return bool(k.get("PROGRESS", True)) and interactive() and progress_enabled()
 
 
+def detail_callbacks(k: dict, built, bundle, rows: int, text, vae, device) -> list:
+    """METRICS_LEVEL 'bench' / 'debug': the weight-transfer, text-encoder, VAE and
+    encode-feed shares of each metric row; 'train': none."""
+    if k["METRICS_LEVEL"] == "train":
+        return []
+    cbs = []
+    sources = transfer_sources(built.engines, bundle)
+    if sources:
+        cbs.append(TransferStats(rows, sources))
+    if hasattr(text, "stats"):
+        cbs.append(TextEncodeStats(rows, text, device))
+    if hasattr(vae, "stats"):
+        cbs.append(VaeEncodeStats(rows, vae))
+    if built.feed is not None:
+        cbs.append(FeedWait(rows, built.feed))
+    return cbs
+
+
+def vram_metric_callbacks(level: str, rows: int, timeline, device_use) -> list:
+    """The VRAM metric rows of METRICS_LEVEL: 'train' none, 'bench' the peaks and the
+    per-phase timeline, 'debug' also the device-use breakdown (and its step-1 log)."""
+    match level:
+        case "train":
+            return []
+        case "bench":
+            return [Vram(rows, timeline, NoDeviceUse())]
+    return [Vram(rows, timeline, device_use), VramAtStepOne(device_use)]
+
+
 def build_callbacks(
     ctx: RunContext,
     bundle,
@@ -358,21 +400,14 @@ def build_callbacks(
     recompute = getattr(built.plan, "checkpoint", "none") != "none"
     cbs = retune_callbacks(k) + [DecisionsLive()] + speed_callbacks(k)
     text, vae = encode_stats(built)
+    level = k["METRICS_LEVEL"]
     cbs.append(StepOneBreakdown(text, vae, output_dir, device))
-    cbs.append(Throughput(rows, built.backbone.cfg, mode, recompute, device))
-    sources = transfer_sources(built.engines, bundle)
-    if sources:
-        cbs.append(TransferStats(rows, sources))
-    if hasattr(text, "stats"):
-        cbs.append(TextEncodeStats(rows, text, device))
-    if hasattr(vae, "stats"):
-        cbs.append(VaeEncodeStats(rows, vae))
-    if built.feed is not None:
-        cbs.append(FeedWait(rows, built.feed))
+    job = job_counts(device, ctx.data_world)
+    cbs.append(Throughput(rows, built.backbone.cfg, mode, recompute, device, job))
+    cbs += detail_callbacks(k, built, bundle, rows, text, vae, device)
     cbs += vram_callbacks(k, device)
-    cbs += release_callbacks(device, rows, k["STEP_RELEASE"])
-    cbs.append(Vram(rows, timeline, device_use))
-    cbs.append(VramAtStepOne(device_use))
+    cbs += release_callbacks(device, rows, k["STEP_RELEASE"], level != "train")
+    cbs += vram_metric_callbacks(level, rows, timeline, device_use)
     if k["SAMPLE_EVERY"] > 0 and is_main:
         pipe = MossPipeline.from_components(
             built.backbone,
@@ -408,12 +443,13 @@ def build_callbacks(
                 end_step=built.trainable.end_step,
             )
         )
-    cbs.append(InstabilityDump(output_dir, bundle=bundle))
+    synced_every = step_sync_every(k) or 1
+    cbs.append(InstabilityDump(output_dir, bundle=bundle, every=synced_every))
     shown = bar_shown(k)
     if is_main and not shown:
         cbs.append(StepLine(every))
     cbs += list(rank_callbacks)
-    cbs.append(LogMetrics(rows, logger))
+    cbs.append(LogMetrics(rows, logger, level))
     if k["NONFINITE_PATIENCE"] > 0:
         floor = getattr(bundle.scaler, "floor", bundle.scaler.scale)
         dump = str(Path(output_dir) / "instability")

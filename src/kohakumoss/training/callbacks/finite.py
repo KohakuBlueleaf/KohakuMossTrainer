@@ -12,7 +12,8 @@ class NonFiniteGuard:
     scaler is always there), or the same non-finite parameters `patience` steps in a
     row. The message names the parameters (the step's non-finite report) and the file
     `record(dump_dir, step, names)` wrote the failing step to (StepRecorder.write);
-    `forget()` runs after every finite step (StepRecorder.drop)."""
+    `forget()` runs after every finite step (StepRecorder.drop). Under the deferred step
+    it reads the sync steps only, the consecutive count from the device (`bad_run`)."""
 
     every = 1
 
@@ -34,11 +35,13 @@ class NonFiniteGuard:
         self.last: tuple[str, ...] = ()
 
     def on_step_end(self, state: TrainState, out) -> None:
+        if not state.synced:
+            return
         if state.ok and state.nonfinite_params == 0:
             self.run, self.same, self.last = 0, 0, ()
             self.forget()
             return
-        self.run += 1
+        self.run = state.bad_run if state.bad_run is not None else self.run + 1
         names = tuple(state.nonfinite_names)
         repeated = bool(names) and names == self.last
         self.same = self.same + 1 if repeated else int(bool(names))

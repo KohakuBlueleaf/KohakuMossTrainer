@@ -83,13 +83,28 @@ def check_caller_released(prelude: str = "") -> None:
     assert out.returncode == 0 and "ok" in out.stdout, out.stderr[-2000:]
 
 
-NO_PASS = """
+CYCLE = """
 import types
+import importlib
 import kohakumoss_kernels.registry as registry
+
+
+def cyclic_import(name):
+    held = [sys._getframe()]
+    held.append(held)
+    return importlib.import_module(name)
+
+
+registry.importlib = types.SimpleNamespace(import_module=cyclic_import)
+"""
+NO_PASS = """
 registry.gc = types.SimpleNamespace(collect=lambda: 0)
 """
 
 
 def test_first_build_releases_its_caller():
     check_caller_released()
-    must_fail(lambda: check_caller_released(NO_PASS), "no gc pass after the import")
+    check_caller_released(CYCLE)
+    must_fail(
+        lambda: check_caller_released(CYCLE + NO_PASS), "no gc pass after the import"
+    )

@@ -59,6 +59,7 @@ def _knobs(weights_root, dataset, out: Path, **kw) -> dict:
     base = dict(
         MEMORY_PROFILE="ckpt-resident",
         METRICS_EVERY=1,
+        METRICS_LEVEL="debug",
         TRACE_STEPS=(),
         PIPELINE_SPLIT="even",
         **LORA,

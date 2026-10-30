@@ -154,6 +154,7 @@ def knobs(args, out_dir: str) -> dict:
         NUM_WORKERS=0,
         STEPS=args.steps,
         LOG_EVERY=1,
+        METRICS_LEVEL="debug",
         SAVE_EVERY=0,
         SAMPLE_EVERY=args.sample_every,
         SAMPLE_STEPS=2,

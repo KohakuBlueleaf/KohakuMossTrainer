@@ -48,6 +48,7 @@ def knobs(profile: str, out: Path, dataset: Path, tag: str) -> dict:
         EXPORT_FORMATS=(),
         LOG_EVERY=1,
         METRICS_EVERY=1,
+        METRICS_LEVEL="debug",
         PROGRESS=False,
         NUM_WORKERS=0,
         OUTPUT_DIR=str(out),

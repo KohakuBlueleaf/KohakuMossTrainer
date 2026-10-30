@@ -34,6 +34,7 @@ from kohakumoss.logging.log import get_logger, setup
 from kohakumoss.training.build.loop import build_step
 from kohakumoss.training.callbacks.evaluate import FixedSigma
 from kohakumoss.training.optim.optimizers.adamw16 import AdamW16
+from kohakumoss_kernels.hardware.memory import close_window, open_window
 
 log = get_logger("heal")
 
@@ -290,6 +291,7 @@ def run(env, c: HealConfig, k: dict, k_t: dict) -> None:
     start eval and gradient map, train, the final parts, the end gradient map."""
     setup()
     out = Path(c.out)
+    peak = open_window(env.device)
     heal = Heal(c, k, k_t, env.device, env.rank, env.world)
     lead = env.rank == 0
     grads = {}
@@ -306,8 +308,7 @@ def run(env, c: HealConfig, k: dict, k_t: dict) -> None:
         if c.grad_map:
             grads["end"] = gradient_map(heal, "end")
         (out / "grads.json").write_text(json.dumps(grads), encoding="utf-8")
-    log.info(
-        f"rank {env.rank}: peak memory {torch.cuda.max_memory_allocated(env.device) / 2**30:.2f} GiB"
-    )
+    allocated_peak, _ = close_window(peak)
+    log.info(f"rank {env.rank}: peak memory {allocated_peak / 2**30:.2f} GiB")
     if env.world > 1:
         dist.barrier()

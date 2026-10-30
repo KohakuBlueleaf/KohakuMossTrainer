@@ -59,6 +59,7 @@ def knobs(args, case: dict, out_dir: str) -> dict:
         STEPS=args.warmup + args.iters,
         LOG_EVERY=1,
         METRICS_EVERY=1,
+        METRICS_LEVEL="debug",
         PROGRESS=False,
         SAVE_EVERY=0,
         SAMPLE_EVERY=0,

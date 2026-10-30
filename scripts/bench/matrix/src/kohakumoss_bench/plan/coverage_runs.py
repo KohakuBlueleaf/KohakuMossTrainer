@@ -36,7 +36,6 @@ TRAINING_CASES = {
     "loss-huber": {"LOSS": "huber"},
     "weighting-x0": {"WEIGHTING": "x0"},
     "cosine-schedule": {"SCHEDULE": {"mode": "cosine", "warmup": 5, "end": -1}},
-    "lightning": {"DRIVER": "lightning"},
     "compile-block": {"COMPILE": "block"},
     "lycoris-torch": {"KERNELS": {"lycoris": "torch"}},
     "export-formats": {"EXPORT_FORMATS": ("comfy", "lycoris")},

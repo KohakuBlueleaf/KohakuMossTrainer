@@ -106,7 +106,7 @@ See [kernel-dev.md](../internals/kernel-dev.md#fallback).
 | --- | --- | --- |
 | model, loaders, savers, fp16 fix | works | |
 | inference (MossPipeline, sample CLI) | works | 512^2, 20 steps, bf16 on an RTX 4090: 6.1 s, 15.7 GiB peak allocated |
-| training: native and Lightning drivers, resume, sampling, validation, loggers | works | |
+| training: the native loop, resume, sampling, validation, loggers | works | |
 | LyCORIS adapters, every algorithm, fused kernels | works | |
 | export to ComfyUI / LyCORIS / merged / diffusers | works | |
 | dataset package, caches, loader workers | works | workers use spawn (Linux: forkserver); each worker imports its modules in turn before the first batch ([data.md](../concepts/data.md#loader)) |

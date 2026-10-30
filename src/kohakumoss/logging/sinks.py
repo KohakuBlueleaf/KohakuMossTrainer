@@ -6,6 +6,7 @@ import json
 import time
 from pathlib import Path
 
+from kohakumoss.logging.keys import named_row
 from kohakumoss.logging.log import get_logger
 
 METRICS = "metrics.jsonl"
@@ -115,7 +116,8 @@ class ConsoleLogger:
 
 
 class WandbLogger(ConsoleLogger):
-    """wandb run, plus the console/jsonl sink. `mode` None is wandb's own default
+    """wandb run, plus the console/jsonl sink; wandb gets every metric under its
+    grouped name (`logging.keys.named_row`). `mode` None is wandb's own default
     (WANDB_MODE when set, else online). The console shows what it shows under
     LOGGER='console': wandb runs silent and captures no console output."""
 
@@ -141,7 +143,7 @@ class WandbLogger(ConsoleLogger):
 
     def log(self, metrics: dict, step: int) -> None:
         super().log(metrics, step)
-        self.run.log(metrics, step=step)
+        self.run.log(named_row(metrics), step=step)
 
     def log_images(self, key: str, images: list, step: int) -> None:
         self.run.log({key: [wandb.Image(im) for im in images]}, step=step)

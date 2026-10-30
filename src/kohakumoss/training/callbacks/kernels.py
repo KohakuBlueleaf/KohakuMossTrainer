@@ -55,9 +55,7 @@ class PrewarmVram:
             close_window(self.window)
             self.window = open_window(self.device)
 
-    def on_step_end(self, state, out) -> None:
-        if self.done:
-            return
+    def on_step_end(self, state, out) -> bool:
         self.done = True
         alloc, held = PREWARM_PEAK.get(str(self.device), (0, 0))
         step_alloc, step_held = close_window(self.window)
@@ -69,6 +67,7 @@ class PrewarmVram:
             f"{hl(f'{held / GIB:.2f}')} reserved; step 1 "
             f"{hl(f'{step_alloc / GIB:.2f}')} / {hl(f'{step_held / GIB:.2f}')}"
         )
+        return True
 
 
 class RetuneKernels:
@@ -91,14 +90,16 @@ class RetuneKernels:
         self.steps = steps
         self.seen = 0
 
-    def on_step_end(self, state, out) -> None:
+    def on_step_end(self, state, out) -> bool:
         self.seen += 1
         if self.seen <= self.steps and self.anywhere(self.pending()):
             self.retune()
             self.meet("retuned")
         self.agree()
-        if self.seen >= self.steps:
-            self.close()
+        if self.seen < self.steps:
+            return False
+        self.close()
+        return True
 
     def close(self) -> None:
         left = drop_pending()
@@ -134,19 +135,19 @@ class StartupSpeed:
         if len(self.marks) == 1:
             self.marks[0] += secs
 
-    def on_step_end(self, state, out) -> None:
-        if len(self.marks) > self.last:
-            return
+    def on_step_end(self, state, out) -> bool:
         self.marks.append(self.clock())
-        if len(self.marks) - 1 == self.last:
-            gaps = [b - a for a, b in zip(self.marks, self.marks[1:])]
-            rest = statistics.median(gaps[1:])
-            first, median = f"{gaps[0]:.3f} s/step", f"{rest:.3f} s/step"
-            ratio = f"{gaps[0] / max(rest, 1e-9):.1f}x"
-            log.info(
-                f"step 1 {hl(first)}, steps 2-{self.last} median {hl(median)} "
-                f"({hl(ratio)})"
-            )
+        if len(self.marks) - 1 < self.last:
+            return False
+        gaps = [b - a for a, b in zip(self.marks, self.marks[1:])]
+        rest = statistics.median(gaps[1:])
+        first, median = f"{gaps[0]:.3f} s/step", f"{rest:.3f} s/step"
+        ratio = f"{gaps[0] / max(rest, 1e-9):.1f}x"
+        log.info(
+            f"step 1 {hl(first)}, steps 2-{self.last} median {hl(median)} "
+            f"({hl(ratio)})"
+        )
+        return True
 
 
 class DecisionsLive:
@@ -156,9 +157,9 @@ class DecisionsLive:
 
     every = 1
 
-    def on_step_end(self, state, out) -> None:
+    def on_step_end(self, state, out) -> bool:
         decisions.go_live()
-        self.on_step_end = nothing
+        return True
 
 
 def retune_callbacks(k: dict) -> list:

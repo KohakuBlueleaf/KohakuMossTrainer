@@ -20,13 +20,13 @@ def names(reqs) -> set[str]:
 
 def test_default_extras_expand():
     cuda = names(missing.requirements("cuda"))
-    assert {"lightning", "bitsandbytes", "tilelang"} <= cuda, cuda
+    assert {"bitsandbytes", "tilelang"} <= cuda, cuda
     assert "kohakumoss" not in cuda
     xpu = names(missing.requirements("xpu"))
-    assert {"lightning", "bitsandbytes"} <= xpu and "tilelang" not in xpu, xpu
+    assert "bitsandbytes" in xpu and "tilelang" not in xpu, xpu
     base = names(missing.requirements(None))
     assert {"torch", "kohaku-engine", "lycoris-lora"} <= base, base
-    assert not base & {"lightning", "tilelang"}, base
+    assert "tilelang" not in base, base
 
 
 @pytest.mark.parametrize(

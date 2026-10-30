@@ -39,7 +39,6 @@ kernels-cuda = [
 # Intel's Triton (pytorch-triton-xpu) comes with the XPU torch wheel
 kernels-xpu = []
 kernels = ["kohakumoss[kernels-cuda]"]
-lightning = ["lightning>=2.5"]
 baselines = ["flash-linear-attention", "causal-conv1d; sys_platform != 'win32'"]
 quant = ["bitsandbytes"]
 optim = ["prodigyopt", "schedulefree"]
@@ -50,8 +49,8 @@ wandb = ["wandb"]
 dev = ["pytest", "ruff", "black", "lpips", "kohakumoss[bench]"]
 bench = ["matplotlib", "pandas"]
 # default sets per accelerator (docs/guides/install.md)
-cuda = ["kohakumoss[kernels-cuda,lightning,quant]"]
-xpu = ["kohakumoss[kernels-xpu,lightning,quant]"]
+cuda = ["kohakumoss[kernels-cuda,quant]"]
+xpu = ["kohakumoss[kernels-xpu,quant]"]
 
 [project.scripts]
 kohakumoss-doctor = "kohakumoss.cli.doctor:main"

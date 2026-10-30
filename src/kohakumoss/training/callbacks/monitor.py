@@ -4,28 +4,54 @@ instability dumps."""
 import json
 import math
 import time
+from functools import partial
 from pathlib import Path
 
+import torch
+import torch.distributed as dist
+
+from kohakumoss.logging.keys import train_row
 from kohakumoss.logging.log import get_logger, hl
 from kohakumoss.memory.device_use import NoDeviceUse
 from kohakumoss.model.flops import forward_flops, peak_tflops, step_flops
 from kohakumoss.training.state import TrainState
-from kohakumoss_common.calls import nothing
 
 log = get_logger(__name__)
 
 
+def _own(tokens: int, samples: int) -> tuple[int, int]:
+    return tokens, samples
+
+
+def _summed(device, tokens: int, samples: int) -> tuple[int, int]:
+    counts = torch.tensor([tokens, samples], dtype=torch.int64, device=device)
+    dist.all_reduce(counts)
+    total_tokens, total_samples = counts.tolist()
+    return total_tokens, total_samples
+
+
+def job_counts(device, data_world: int):
+    """`job(tokens, samples)` of Throughput: one int64 SUM all-reduce over the ranks
+    when `data_world` ranks draw distinct data, else this rank's own counts."""
+    if data_world <= 1 or not dist.is_initialized():
+        return _own
+    return partial(_summed, torch.device(device))
+
+
 class Throughput:
-    """tokens/s, samples/s, step time and MFU between two log points."""
+    """Job tokens/s and samples/s (`job(tokens, samples)`: this rank's counts summed
+    over the data ranks), step time and this rank's TFLOP/s and MFU between two log
+    points."""
 
     edges = True
 
-    def __init__(self, every: int, arch, mode: str, recompute: bool, device):
+    def __init__(self, every: int, arch, mode: str, recompute: bool, device, job=_own):
         self.every = every
         self.arch = arch
         self.mode = mode
         self.recompute = recompute
         self.peak = peak_tflops(device)
+        self.job = job
         self.t0 = time.perf_counter()
         self.mark = (0, 0, 0, 0, 0)
 
@@ -44,9 +70,10 @@ class Throughput:
             + 4 * self.arch.dim * self.arch.depth * sq
         )
         flops = step_flops(fwd, self.mode, self.recompute)
+        job_tok, job_smp = self.job(tok, smp)
         state.metrics.update(
-            tokens_per_s=tok / dt,
-            samples_per_s=smp / dt,
+            tokens_per_s=job_tok / dt,
+            samples_per_s=job_smp / dt,
             step_time=dt / max(step, 1),
             tflops=flops / dt / 1e12,
         )
@@ -90,9 +117,9 @@ class VramAtStepOne:
     def __init__(self, device_use):
         self.device_use = device_use
 
-    def on_step_end(self, state: TrainState, out) -> None:
+    def on_step_end(self, state: TrainState, out) -> bool:
         self.device_use.log(log, "after step 1")
-        self.on_step_end = nothing
+        return True
 
 
 class TextEncodeStats:
@@ -207,15 +234,28 @@ class StepLine:
         )
 
 
+def host_values(metrics: dict) -> dict[str, float]:
+    """`metrics` as host floats; every device tensor comes back in one transfer."""
+    tensors = [k for k, v in metrics.items() if isinstance(v, torch.Tensor)]
+    out = {k: float(v) for k, v in metrics.items() if k not in tensors}
+    if tensors:
+        stacked = torch.stack([metrics[k].reshape(()).float() for k in tensors])
+        out.update(zip(tensors, stacked.tolist()))
+    return out
+
+
 class LogMetrics:
-    """Pushes host metrics to the logger sinks every `every` steps (METRICS_EVERY) and at
-    the run's first and last step (one host sync per row: the step's device metrics)."""
+    """Pushes one metric row to the logger sinks every `every` steps (METRICS_EVERY) and
+    at the run's first and last step: the step's state, its device metrics (one
+    transfer) and what the callbacks added; at `level` 'train' the training metrics only
+    (`logging.keys.train_row`)."""
 
     edges = True
 
-    def __init__(self, every: int, logger):
+    def __init__(self, every: int, logger, level: str = "train"):
         self.every = every
         self.logger = logger
+        self.keep = train_row if level == "train" else dict
 
     def on_step_end(self, state: TrainState, out) -> None:
         metrics = {
@@ -227,17 +267,16 @@ class LogMetrics:
             "nonfinite_steps": float(state.nonfinite),
             "nonfinite_params": float(state.nonfinite_params),
         }
-        for k, v in out.metrics.items():
-            metrics[k] = float(v)
+        metrics.update(host_values(out.metrics))
         metrics.update(state.metrics)
-        self.logger.log(metrics, state.step)
+        self.logger.log(self.keep(metrics), state.step)
         state.metrics.clear()
 
 
 class InstabilityDump:
-    """Writes `<output>/instability/step_X.json` on a skipped step or a loss spike."""
-
-    every = 1
+    """Writes `<output>/instability/step_X.json` on a skipped step or a loss spike, read
+    every `every` steps (the steps the host holds the step's values: every step, or
+    the deferred step's sync steps)."""
 
     def __init__(
         self,
@@ -246,7 +285,9 @@ class InstabilityDump:
         beta: float = 0.98,
         warmup: int = 20,
         bundle=None,
+        every: int = 1,
     ):
+        self.every = every
         self.bundle = bundle
         self.root = Path(output_dir) / "instability"
         self.factor = factor

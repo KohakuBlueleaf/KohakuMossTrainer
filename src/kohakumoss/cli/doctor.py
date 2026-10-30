@@ -36,7 +36,6 @@ PACKAGES = (
     "kohaku-engine",
     "anyschedule",
     "kohakuvault",
-    "lightning",
     "diffusers",
     "transformers",
     "bitsandbytes",

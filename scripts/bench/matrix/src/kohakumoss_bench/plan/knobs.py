@@ -112,6 +112,7 @@ def train_knobs(host: Host, opts: Options, precision: str, algo: str) -> dict:
         "PROGRESS": False,
         "LOG_EVERY": 10,
         "METRICS_EVERY": 1,
+        "METRICS_LEVEL": "debug",
         "SAVE_EVERY": 0,
         "KEEP_LAST": 0,
         "SAMPLE_EVERY": 0,

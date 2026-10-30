@@ -205,7 +205,7 @@ how the tensor-pipe % relates to it per arch, are in
 The coverage runs exercise what the matrix does not: the other LyCORIS algorithms
 (LoCon, decomposed LoKr, BOFT, GLoRA, IA3, DyLoRA, T-LoRA, dropouts), the optimisers
 (8-bit AdamW, Prodigy, schedule-free, Muon), EMA, timestep samplers, huber loss, x0
-weighting, schedules, the Lightning driver, block compile, the LyCORIS torch backend,
+weighting, schedules, block compile, the LyCORIS torch backend,
 exports, samples and validation during training, the resolution planners and
 batchings, flip / random crop, manual memory knobs, streaming without checkpointing,
 pageable host memory, the fp8 weight-only base, online caches with offloaded / streamed
