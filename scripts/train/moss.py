@@ -83,6 +83,7 @@ NUM_WORKERS = 4
 DATA_RESCAN = False  # catalog cache: False (re-probe changed / new files) | True (re-probe all) | "never" (the cached catalog as is)
 DATA_SCAN_WORKERS = 8  # worker processes probing image headers on a (re)scan
 DATA_WAIT = 3600.0  # seconds a non-writer rank waits for the catalog writer
+DATA_BALANCE = False  # deal each step's batches to ranks by estimated cost (multi-rank)
 SEED = 0
 
 # ===================== ADAPTER =====================

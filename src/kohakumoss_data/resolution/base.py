@@ -1,6 +1,7 @@
 """Planner base: target size per row x batching function x over-long fit; epoch `e` is a
-pure function of the seed and the catalog, global batch `g = index * world + rank`.
-See docs/concepts/data.md#resolution-batching-over-long-samples."""
+pure function of the seed and the catalog, global batch `g = index * world + rank`, or
+with `balance` the rank's share of a cost-balanced step block. See
+docs/concepts/data.md#resolution-batching-over-long-samples."""
 
 from collections.abc import Callable
 
@@ -85,6 +86,8 @@ class Planner:
         window: int = 256,
         max_samples: int = 0,
         drop_last: bool = True,
+        balance: int = 0,
+        attn_tokens: int = 18432,
     ):
         if batching not in BATCHINGS:
             raise ValueError(f"batching must be one of {sorted(BATCHINGS)}")
@@ -105,6 +108,9 @@ class Planner:
         self._arrange = (
             shuffled if self.grouped or batching == "tokens_ffd" else in_order
         )
+        self.balance = balance
+        self.attn_tokens = attn_tokens
+        self._blocks: dict[tuple[int, int], list[list[int]]] = {}
         self.targets = [self.target(i) for i in range(len(catalog))]
         self._epochs: dict[int, list[list[PlanItem]]] = {}
         self._counts: list[int] = []
@@ -115,6 +121,7 @@ class Planner:
         state = dict(self.__dict__)
         state["_epochs"] = {}
         state["_counts"] = []
+        state["_blocks"] = {}
         return state
 
     def target(self, row_id: int) -> tuple[int, int]:
@@ -193,10 +200,49 @@ class Planner:
             g -= n
             e += 1
 
+    def batch_items(self, g: int) -> list[PlanItem]:
+        """The items of global batch `g`."""
+        e, local = self.locate(g)
+        return self.epoch(e)[local]
+
+    def cost(self, g: int) -> float:
+        """Estimated compute of global batch `g`: per sample its joint tokens L plus
+        the attention term L^2 / attn_tokens."""
+        lengths = [self.tokens(it) for it in self.batch_items(g)]
+        return float(sum(n + n * n / self.attn_tokens for n in lengths))
+
+    def balanced(self, block: int, world: int) -> list[list[int]]:
+        """Global batch ids of step block `block` per rank: the block's `world x
+        balance` batches dealt longest-cost first to the rank with the least cost so
+        far (each rank `balance` batches), each rank's ids in ascending order."""
+        key = (block, world)
+        if key not in self._blocks:
+            if len(self._blocks) >= 4 * EPOCH_CACHE:
+                self._blocks.pop(min(self._blocks))
+            per = self.balance
+            ids = range(block * world * per, (block + 1) * world * per)
+            costs = sorted(((self.cost(g), g) for g in ids), reverse=True)
+            loads = [0.0] * world
+            dealt: list[list[int]] = [[] for _ in range(world)]
+            for c, g in costs:
+                open_ranks = [r for r in range(world) if len(dealt[r]) < per]
+                r = min(open_ranks, key=loads.__getitem__)
+                loads[r] += c
+                dealt[r].append(g)
+            self._blocks[key] = [sorted(d) for d in dealt]
+        return self._blocks[key]
+
+    def global_batch(self, index: int, rank: int, world: int) -> int:
+        """The global batch id of batch `index` of `rank`: round robin, or with
+        `balance` > 1 the rank's share of its cost-balanced step block."""
+        if self.balance <= 1 or world <= 1:
+            return index * world + rank
+        block, slot = divmod(index, self.balance)
+        return self.balanced(block, world)[rank][slot]
+
     def plan(self, index: int, rank: int, world: int) -> BatchPlan:
         """Batch `index` of `rank` among `world` ranks."""
-        e, local = self.locate(index * world + rank)
-        items = self.epoch(e)[local]
+        items = self.batch_items(self.global_batch(index, rank, world))
         budget = sum(self.tokens(it) for it in items)
         return BatchPlan(index=index, items=list(items), token_budget=budget)
 

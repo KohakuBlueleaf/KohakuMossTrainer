@@ -256,6 +256,7 @@ class MossDataset:
             max_tokens=cfg.max_tokens,
             max_samples=cfg.max_samples,
             batch_size=cfg.batch_size,
+            balance=cfg.grad_acc if cfg.data_balance else 0,
         )
         kwargs.update(cfg.planner_kwargs)
         return PLANNERS.get(cfg.resolution_mode)(**kwargs)

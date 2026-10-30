@@ -366,6 +366,18 @@ dataset/
 `scripts/data/catalog_build.py` imports any source (`import_to`) or just writes its
 catalog (`catalog`) so later runs skip the scan.
 
+## Rank balance
+
+Round robin hands global batch `index * world + rank` to each rank; batches of
+different sizes and caption lengths then leave some ranks with more work per step and
+the others waiting in the gradient all-reduce. `DATA_BALANCE=True` plans a step at a
+time: the step's `world x GRAD_ACC` batches are dealt longest-cost first to the rank
+with the least cost so far, each rank `GRAD_ACC` of them (`Planner.balanced`); a batch's
+cost is per sample its joint tokens L plus `L^2 / attn_tokens` (attention; 18432 by
+default, `PLANNER_KWARGS` sets it). Every batch is still used exactly once per epoch
+and batch `index` of a rank stays a pure function of the seed (resume unchanged).
+`tests/data/resolution/test_rank_balance.py` checks it (negative: round robin).
+
 ## GBC datasets
 
 The `gbc` source reads a dataset in KohakuGBC's format through `kohakugbc-data`

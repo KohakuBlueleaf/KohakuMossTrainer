@@ -62,6 +62,8 @@ class DataConfig:
     data_rescan: bool | str = False
     data_scan_workers: int = 8
     data_wait: float = 3600.0
+    data_balance: bool = False
+    grad_acc: int = 1
 
     @classmethod
     def from_knobs(cls, knobs: dict) -> "DataConfig":
