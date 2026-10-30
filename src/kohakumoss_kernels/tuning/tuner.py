@@ -19,7 +19,6 @@ import torch
 import torch.distributed as dist
 
 from kohakumoss_common.log import get_logger
-from kohakumoss_kernels.dist import COLLECTIVE_DEVICE
 from kohakumoss_kernels.errors import (
     BUILD_ERRORS,
     ConfigsFailed,
@@ -29,7 +28,6 @@ from kohakumoss_kernels.errors import (
 from kohakumoss_kernels.hardware.current import (
     rng_kept,
     saved_tensor_hooks_active,
-    with_index,
 )
 from kohakumoss_kernels.hardware.device import (
     cache_dir,
@@ -41,7 +39,7 @@ from kohakumoss_kernels.hardware.device import (
 from kohakumoss_kernels.hardware.memory import release, trim, working
 from kohakumoss_kernels.hardware.toolchain import version
 from kohakumoss_kernels.tuning import decisions, window
-from kohakumoss_kernels.tuning.timing import best_ms, burst_ms, graph_ms
+from kohakumoss_kernels.tuning.timing import best_ms, burst_ms, graph_ms, wall_ms
 from kohakumoss_kernels.tuning.window import STATE as WINDOW
 
 MODES = ("table", "off")
@@ -52,6 +50,7 @@ TIMINGS = {
     "graph": graph_ms,
     "events": lambda fn, device: best_ms(fn, device, 10),
     "burst": burst_ms,
+    "wall": wall_ms,
 }
 TAGGED = (
     "kohakumoss",
@@ -231,8 +230,8 @@ def select(
     cap: int | None = None,
 ) -> dict:
     """The config for problem `key`: a stored winner that is still a candidate, else
-    the fastest of the shortlist (`timing`: events | graph | burst) within the working-memory
-    bound (`factor` x the leanest, default WORKING_FACTOR); the shortlist's config
+    the fastest of the shortlist (`timing`: events | graph | burst | wall) within the
+    working-memory bound (`factor` x the leanest, default WORKING_FACTOR); the shortlist's config
     `lean` is timed first, the first candidate stays the default. A config raising one
     of `errors` or exceeding the bound is skipped; one running out of memory otherwise
     binds the best that ran for this process only; when every config failed,
@@ -536,90 +535,3 @@ def decided(kernel: str, device: torch.device, key: str) -> bool:
     """Whether `select` has a settled choice for this problem (callers bind only then;
     a provisional pick made while tracing or in a recompute is not settled)."""
     return (str(device), kernel, key) in _CHOSEN
-
-
-def broadcast(src: int = 0, group=None) -> None:
-    """Copy rank `src`'s tuning tables to every rank (memory and disk), then `reset`
-    every rank so live calls bind from the shared tables."""
-    if not (dist.is_available() and dist.is_initialized()):
-        return
-    payload = [
-        (
-            {f"{k[0]}|{k[1]}": t.rows for k, t in _TABLES.items()}
-            if dist.get_rank(group) == src
-            else None
-        )
-    ]
-    dist.broadcast_object_list(payload, src=src, group=group)
-    for ident, rows in payload[0].items():
-        card, kernel = ident.split("|", 1)
-        _card_table(card, kernel).replace(rows)
-    _NEW.clear()
-    reset()
-
-
-def agreed(gathered: Sequence[Sequence[tuple]]) -> dict[tuple[str, str, str], dict]:
-    """The config every rank binds per (card, kernel, key) measured since the last
-    `agree`: the lowest rank's measurement (`gathered[r]`: rank r's rows)."""
-    out: dict[tuple[str, str, str], dict] = {}
-    for rows in gathered:
-        for card, kernel, key, config in rows:
-            out.setdefault((card, kernel, key), config)
-    return out
-
-
-def adopt(winners: dict[tuple[str, str, str], dict]) -> int:
-    """Settle every winner on this process's devices of its card and store it; drops
-    every binding when a winner replaces a different local choice. Returns how many
-    winners differed from this process's own choice or stored row."""
-    replaced, changed = False, 0
-    rows: dict[tuple[str, str], dict[str, dict]] = {}
-    for (card, kernel, key), config in winners.items():
-        devices = [d for d, c in _CARDS.items() if c == card]
-        if not devices:
-            continue
-        mine = [_CHOSEN.get((d, kernel, key)) for d in devices]
-        differs = any(m is not None and _canon(m) != _canon(config) for m in mine)
-        replaced = replaced or differs
-        for d in devices:
-            _CHOSEN[(d, kernel, key)] = config
-        row = _card_table(card, kernel).get(key)
-        new_row = row is None or _canon(row) != _canon(config)
-        if new_row:
-            rows.setdefault((card, kernel), {})[key] = config
-        changed += new_row or differs
-    for (card, kernel), configs in rows.items():
-        _card_table(card, kernel).put_configs(configs)
-    if replaced:
-        _rebind()
-    return changed
-
-
-def positive_anywhere(count: int, group=None) -> bool:
-    """Whether `count` is positive on any rank of `group` (one one-element all-reduce,
-    on the backend's device)."""
-    kind = COLLECTIVE_DEVICE.get(str(dist.get_backend(group)), "cpu")
-    total = torch.tensor([count], device=with_index(kind))
-    dist.all_reduce(total, group=group)
-    return int(total.item()) > 0
-
-
-def agree(group=None) -> int:
-    """Between steps, on every rank: make every rank bind the same config for each
-    problem some rank measured since the last call (the lowest rank's, `agreed`); a
-    no-op without a process group of two or more ranks. Returns the winners that
-    changed this rank's choices. See docs/internals/tuning.md#multi-process."""
-    alone = not (dist.is_available() and dist.is_initialized())
-    if alone or dist.get_world_size(group) < 2:
-        _NEW.clear()
-        return 0
-    if not positive_anywhere(len(_NEW), group):
-        return 0
-    gathered: list = [None] * dist.get_world_size(group)
-    mine = list(_NEW)
-    _NEW.clear()
-    dist.all_gather_object(gathered, mine, group=group)
-    changed = adopt(agreed(gathered))
-    if changed:
-        log.info(f"tuning: {changed} choices agreed across ranks")
-    return changed

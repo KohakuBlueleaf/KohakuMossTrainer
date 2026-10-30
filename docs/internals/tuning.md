@@ -678,7 +678,7 @@ cap bounds the rows (negative: no cap).
 
 ## Multi-process
 
-**Broadcast.** `tuning.broadcast(src=0)` replaces every rank's tables with rank `src`'s
+**Broadcast.** `ranks.broadcast(src=0)` replaces every rank's tables with rank `src`'s
 (memory and disk) over the initialised process group, then runs `tuner.reset()`: settled
 choices and every binding cache registered with `tuner.on_reset` (kernel-or-compile
 block ops, fused-linear runners, attention, text-encoder, optimizer and quant bindings)
@@ -693,7 +693,8 @@ are dropped, so live calls bind from the shared tables.
 - Problems timed after the prewarm (inside the tuning windows; the adapter and
   text-encoder prewarms run on every rank) are timed by the rank that meets them.
 
-**Agree.** After each retune step, on every rank, `RetuneKernels` runs `tuner.agree()`:
+**Agree.** After each retune step, on every rank, `RetuneKernels` runs `ranks.agree()`
+(`kohakumoss_kernels/tuning/ranks.py`, with `broadcast`):
 
 - each rank's measurements since the last step are counted with one one-element
   all-reduce (`positive_anywhere`, on the backend's device) and gathered

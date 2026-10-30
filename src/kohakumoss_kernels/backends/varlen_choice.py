@@ -1,9 +1,9 @@
 """Per-shape choice of `attention_varlen`: a backend's varlen kernel against torch's
-flash `varlen_attn` (where the build and card have it) and the per-segment SDPA loop
-(the eager reference; never used inside torch.compile). The tuner times, once per
+flash `varlen_attn` (where the build and card have it; else the per-segment SDPA loop,
+the eager reference, never used inside torch.compile). The tuner times, once per
 problem key, forward + backward on leaf copies where a backward will run (`-g1` keys),
-the forward alone where none will (`-g0`), and binds the winner; later calls only look
-it up. See docs/internals/tuning.md.
+the forward alone where none will (`-g0`), each call on a shape of its own, and binds
+the winner; later calls only look it up. See docs/internals/tuning.md.
 """
 
 from collections.abc import Callable
@@ -26,6 +26,7 @@ except ImportError:
 if _varlen_attn is not None:
     keep_named("torch_attn", "_varlen_attn")
     keep_named("aten", "_flash_attention_forward")
+JITTER = 64  # shape variants a timed problem cycles through (see `_variants`)
 
 
 def flash_varlen_usable(device: torch.device) -> bool:
@@ -44,24 +45,50 @@ def torch_varlen(q, k, v, cu, max_len, scale):
     return _varlen_attn(q, k, v, cu, cu, max_len, max_len, scale=scale)
 
 
+def _variants(q: Tensor, cu: Tensor) -> list[tuple[int, Tensor]]:
+    """(tokens, cu_seqlens) of the problem with its last segment cut by 0, 1, 2, ...
+    tokens (at most JITTER variants, the segment kept non-empty): every timed call runs
+    a shape of its own, as training does, so a backend that plans per shape (cuDNN)
+    pays its host planning cost in the measurement."""
+    bounds = cu.tolist()
+    room = max(min(JITTER, bounds[-1] - bounds[-2]), 1)
+    out = []
+    for cut in range(room):
+        shorter = cu.clone()
+        shorter[-1] -= cut
+        out.append((q.shape[0] - cut, shorter))
+    return out
+
+
 def _launch(fn, q, k, v, cu, max_len, scale, backward: bool) -> Callable[[], None]:
-    """A tuner launch of `fn` on copies of q, k, v: forward + backward on leaves with
-    `backward`, else the forward under no_grad."""
+    """A tuner launch of `fn` on copies of q, k, v, cycling through the problem's
+    shape variants (`_variants`): forward + backward on leaves with `backward`, else the
+    forward under no_grad."""
+    variants = _variants(q, cu)
+    turn = [0]
     if not backward:
         copies = [t.detach() for t in (q, k, v)]
 
         def forward():
+            n, c = variants[turn[0] % len(variants)]
+            turn[0] += 1
             with torch.no_grad():
-                fn(*copies, cu, max_len, scale)
+                fn(*(t[:n] for t in copies), c, max_len, scale)
 
         return forward
-    leaves = [t.detach().clone().requires_grad_() for t in (q, k, v)]
+    base = [t.detach().clone() for t in (q, k, v)]
     grad = torch.randn_like(q)
+    leaves = [
+        ([t[:n].detach().requires_grad_() for t in base], grad[:n], c)
+        for n, c in variants
+    ]
 
     def run():
-        for t in leaves:
+        inputs, g, c = leaves[turn[0] % len(leaves)]
+        turn[0] += 1
+        fn(*inputs, c, max_len, scale).backward(g)
+        for t in inputs:
             t.grad = None
-        fn(*leaves, cu, max_len, scale).backward(grad)
 
     return run
 
@@ -74,14 +101,15 @@ def needs_backward(*ts: Tensor) -> bool:
 class VarlenChoice:
     """`attention_varlen` through the fastest of `kernel` and the PyTorch paths per
     problem key `key(q, segments, max_seqlen)` plus the mean-segment-length bucket
-    (`-M<tokens>`) and whether a backward runs (`-g0` / `-g1`); the tuning table is
-    `attn_varlen_impl_<backend>`."""
+    (`-M<tokens>`) and whether a backward runs (`-g0` / `-g1`), timed by wall time
+    over varying shapes (host launches and per-shape planning included, which a device
+    timer does not see); the tuning table is `attn_varlen_shapes_<backend>`."""
 
     def __init__(self, backend: str, kernel: Callable, key: Callable):
         self.backend = backend
         self.kernel = kernel
         self.key = key
-        self.table = f"attn_varlen_impl_{backend}"
+        self.table = f"attn_varlen_shapes_{backend}"
         self.bound: dict[tuple, Callable] = {}
         self.__name__ = "attention_varlen"
         on_reset(self.bound.clear)
@@ -92,11 +120,14 @@ class VarlenChoice:
         return f"{self.key(q, segments, max_seqlen)}-M{mean}-g{int(backward)}"
 
     def impls(self, device: torch.device) -> dict[str, Callable]:
-        """The candidates on `device`: the kernel, torch varlen and the SDPA loop."""
+        """The candidates on `device`: the kernel and torch varlen; the SDPA loop (it
+        reads the segment bounds on the host: a stream sync per call) only where torch
+        varlen does not run."""
         impls = {self.backend: self.kernel}
         if flash_varlen_usable(device):
             impls["torch_varlen"] = torch_varlen
-        impls["sdpa"] = sdpa_loop
+        else:
+            impls["sdpa"] = sdpa_loop
         return impls
 
     def _build(self, q, k, v, cu, max_len, scale, key, backward: bool) -> Callable:
@@ -111,6 +142,7 @@ class VarlenChoice:
             shortlist=len(names),
             errors=BUILD_ERRORS,
             autograd=True,
+            timing="wall",
         )
         return impls[choice["impl"]]
 

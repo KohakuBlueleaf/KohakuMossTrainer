@@ -5,7 +5,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from kohakumoss_kernels.tuning import tuner, window
+from kohakumoss_kernels.tuning import ranks, tuner, window
 from tests._util.negative import must_fail
 
 pytestmark = pytest.mark.cpu
@@ -25,11 +25,11 @@ def check_merge(agreed) -> None:
 
 
 def test_lowest_rank_wins():
-    check_merge(tuner.agreed)
+    check_merge(ranks.agreed)
 
 
 def test_negative_highest_rank_wins():
-    must_fail(lambda: check_merge(lambda g: tuner.agreed(g[::-1])), "highest rank")
+    must_fail(lambda: check_merge(lambda g: ranks.agreed(g[::-1])), "highest rank")
 
 
 @pytest.fixture
@@ -47,7 +47,7 @@ def rank_state(tmp_path, monkeypatch):
 
 
 def check_adopted(bound, adopt) -> None:
-    changed = adopt(tuner.agreed(GATHERED))
+    changed = adopt(ranks.agreed(GATHERED))
     assert tuner._CHOSEN[("cpu", "k", "p1")] == {"t": 0}
     assert tuner._CHOSEN[("cpu", "k", "p3")] == {"t": 1}
     stored = tuner._card_table(CARD, "k")
@@ -57,12 +57,12 @@ def check_adopted(bound, adopt) -> None:
 
 
 def test_adopt_rebinds(rank_state):
-    check_adopted(rank_state, tuner.adopt)
+    check_adopted(rank_state, ranks.adopt)
 
 
 def test_negative_adopt_keeps_bindings(rank_state, monkeypatch):
     monkeypatch.setattr(tuner, "_rebind", lambda: None)
-    must_fail(lambda: check_adopted(rank_state, tuner.adopt), "bindings kept")
+    must_fail(lambda: check_adopted(rank_state, ranks.adopt), "bindings kept")
 
 
 def test_agree_alone_is_a_no_op(tmp_path, monkeypatch):
@@ -75,12 +75,12 @@ def test_agree_alone_is_a_no_op(tmp_path, monkeypatch):
         world_size=1,
     )
     try:
-        assert tuner.agree() == 0
+        assert ranks.agree() == 0
     finally:
         dist.destroy_process_group()
     assert tuner._NEW == []
     tuner._NEW.append((CARD, "k", "p", {"t": 0}))
-    assert tuner.agree() == 0 and tuner._NEW == [], "no process group"
+    assert ranks.agree() == 0 and tuner._NEW == [], "no process group"
 
 
 def test_measured_rows_are_queued(tmp_path, monkeypatch):
@@ -229,15 +229,15 @@ def check_gathers_only_when_measured(monkeypatch) -> None:
         (1, [], 1),
     ):
         fake = _TwoRanks(others)
-        monkeypatch.setattr(tuner, "dist", fake)
+        monkeypatch.setattr(ranks, "dist", fake)
         monkeypatch.setattr(tuner, "_NEW", list(mine))
-        tuner.agree()
+        ranks.agree()
         assert fake.gathers == want, (others, mine, fake.gathers)
 
 
 def test_agree_gathers_only_after_a_measurement(monkeypatch):
     check_gathers_only_when_measured(monkeypatch)
-    monkeypatch.setattr(tuner, "positive_anywhere", lambda count, group=None: True)
+    monkeypatch.setattr(ranks, "positive_anywhere", lambda count, group=None: True)
     must_fail(
         lambda: check_gathers_only_when_measured(monkeypatch), "a gather every step"
     )

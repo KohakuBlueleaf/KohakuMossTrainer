@@ -22,7 +22,7 @@ from kohakumoss_kernels.backends.compile.choice import (
 )
 from kohakumoss_kernels.hardware.memory import close_window, open_window
 from kohakumoss_kernels.tuning import decisions
-from kohakumoss_kernels.tuning.tuner import agree, positive_anywhere
+from kohakumoss_kernels.tuning.ranks import agree, positive_anywhere
 from kohakumoss_kernels.tuning.window import seal
 
 log = get_logger(__name__)
@@ -75,7 +75,7 @@ class RetuneKernels:
     """After each of the process's first `steps` steps, on every rank: when some rank
     has queued kernel-vs-compile problems (`anywhere(pending())`), time them
     (`retune_pending`) and meet on the store (`meet`); then bind the configs any rank
-    measured on every rank (`tuner.agree`). After the last of them (`close`): the
+    measured on every rank (`ranks.agree`). After the last of them (`close`): the
     queued problems are dropped and stay on the kernel, and `window.seal()` stops
     kernel-vs-compile queueing (the first sample grid's window can still time missing
     keys); a no-op on every later step."""

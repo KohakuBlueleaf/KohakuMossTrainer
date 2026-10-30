@@ -58,12 +58,44 @@ def test_tilelang_attention_choice_has_torch_candidate():
     assert "tilelang" in impls and "sdpa" in impls
 
 
-def test_varlen_choice_always_times_the_sdpa_reference():
-    mod = _module("kohakumoss_kernels.backends.varlen_choice")
+def _torch_path(mod, device) -> None:
+    """Exactly one PyTorch path: torch varlen where it runs, else the SDPA loop."""
     choice = mod.VarlenChoice("test", lambda *a: None, lambda q, s, n: "k")
+    impls = choice.impls(device)
+    if mod.flash_varlen_usable(device):
+        assert impls.get("torch_varlen") is mod.torch_varlen and "sdpa" not in impls
+    else:
+        assert impls.get("sdpa") is mod.sdpa_loop and "torch_varlen" not in impls
+
+
+def test_varlen_choice_has_one_torch_path():
+    mod = _module("kohakumoss_kernels.backends.varlen_choice")
     for device in ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",):
-        impls = choice.impls(torch.device(device))
-        assert impls["sdpa"] is mod.sdpa_loop, f"no sdpa reference on {device}"
+        _torch_path(mod, torch.device(device))
+
+
+def test_varlen_choice_has_one_torch_path_negative(monkeypatch):
+    mod = _module("kohakumoss_kernels.backends.varlen_choice")
+
+    def both(self, device):
+        return {self.backend: self.kernel, "sdpa": mod.sdpa_loop}
+
+    monkeypatch.setattr(mod, "flash_varlen_usable", lambda device: True)
+    monkeypatch.setattr(mod.VarlenChoice, "impls", both)
+    must_fail(lambda: _torch_path(mod, torch.device("cpu")), "the syncing SDPA loop")
+
+
+def test_varlen_variants_change_the_shape_every_call():
+    mod = _module("kohakumoss_kernels.backends.varlen_choice")
+    q = torch.zeros(300, 2, 8)
+    cu = torch.tensor([0, 100, 300], dtype=torch.int32)
+    variants = mod._variants(q, cu)
+    sizes = [n for n, _ in variants]
+    assert len(set(sizes)) == len(sizes) == mod.JITTER
+    for n, c in variants:
+        assert int(c[-1]) == n and int(c[1]) == 100 and int(c[-1]) > int(c[-2])
+    short = mod._variants(q[:103], torch.tensor([0, 100, 103], dtype=torch.int32))
+    assert [n for n, _ in short] == [103, 102, 101]
 
 
 def test_quant_linears_have_pytorch_paths():

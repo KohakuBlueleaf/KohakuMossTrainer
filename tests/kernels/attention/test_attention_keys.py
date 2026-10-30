@@ -57,7 +57,8 @@ def _kernel(q, k, v, cu, max_len, scale):
 def entry(tmp_path, monkeypatch):
     monkeypatch.setenv("KOHAKUMOSS_KERNEL_CACHE", str(tmp_path))
     monkeypatch.setattr(tuner, "_TABLES", {})
-    monkeypatch.setattr(tuner, "TIMINGS", {"events": lambda fn, dev: (fn(), 1.0)[1]})
+    timed = {kind: lambda fn, dev: (fn(), 1.0)[1] for kind in ("events", "wall")}
+    monkeypatch.setattr(tuner, "TIMINGS", timed)
     tuner.reset()
     tuner.set_mode("table")
     BACKWARDS.clear()

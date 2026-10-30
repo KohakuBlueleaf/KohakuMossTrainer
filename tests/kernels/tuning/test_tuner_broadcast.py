@@ -1,10 +1,10 @@
-"""`tuning.broadcast` replaces every rank's tables with rank 0's and drops every binding
+"""`ranks.broadcast` replaces every rank's tables with rank 0's and drops every binding
 built from a rank's own choices, so all ranks run the same kernels."""
 
 import pytest
 import torch.distributed as dist
 
-from kohakumoss_kernels.tuning import tuner
+from kohakumoss_kernels.tuning import ranks, tuner
 from tests._util.negative import must_fail
 
 
@@ -30,7 +30,7 @@ def check_bindings_dropped() -> None:
     tuner.on_reset(bound.clear)
     try:
         tuner._CHOSEN[("cpu", "k", "key")] = {"cfg": 1}
-        tuner.broadcast(0)
+        ranks.broadcast(0)
         assert not bound, "a binding cache survived the broadcast"
         assert not tuner._CHOSEN
     finally:

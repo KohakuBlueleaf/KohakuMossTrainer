@@ -288,8 +288,10 @@ once per process:
 
 `CompiledOp` also applies the settings before its first compile.
 `tests/kernels/registry/test_lazy_backends.py` checks it in a fresh process (negatives:
-backends loaded at import; the gc pass left out, which keeps an object held by the
-first build's caller alive with automatic gc off).
+backends loaded at import; the gc pass left out under an injected import-time frame
+cycle, which keeps an object held by the first build's caller alive with automatic gc
+off; the cycle is injected so the negative holds on every torch version, whether or not
+its `torch._dynamo` import leaves one).
 
 ## Current device
 
@@ -394,6 +396,18 @@ The problem keys are `<token bucket>-<K>-<N>-<dtype>-<flags>` for both backends
 the op has them). The qk entry passes the q / k norm weights as fp32 (one cast at the
 op boundary; the weight gradient comes back in the parameter's dtype), and the qk
 backward casts the norm-weight gradients to the saved weights' dtype, on both backends.
+
+Eagerly, a public function runs the forward body under a plain `torch.autograd.Function`
+(`_EagerFn`) with the same context setup and backward as the custom op; the custom op
+itself runs only inside `torch.compile` (`torch.compiler.is_compiling()`) and while a
+selective checkpoint needs to see it (`saved_ops.require_dispatch`, set by
+`CheckpointRunner("selective")`). The torch.library dispatch of a custom op with
+registered autograd costs about 0.4 ms of host time per backward call; the direct path
+skips it, with ~1.2k fused-linear calls per 1024² step on the production layout.
+`test_fused_linear.py::test_direct_path_equals_custom_op` checks the two routes bitwise
+on a GPU; `test_saved_ops.py` checks that selective checkpointing routes through the
+custom ops (negative: a runner that leaves them direct).
+
 `tests/kernels/blocks/test_fused_linear_host.py` checks that both backends run the same public
 functions and op bodies (negative: a backend keeping its own copy) and the fp32 norm
 weights (negative: the storage dtype passed through); `test_fused_linear.py` and
@@ -574,16 +588,24 @@ measured choices when a problem is first tuned.
 **Registry entry per backend** (`backends/triton/attention/entry.py` on sm80+ / XPU,
 `backends/tilelang/attention/entry.py`): a `VarlenChoice` (`backends/varlen_choice.py`)
 that times, per problem key, the backend's own kernels against torch's `varlen_attn`
-(when the torch build and card have flash) and the per-segment SDPA loop, and binds the
-winner (table `attn_varlen_impl_<backend>`).
+(when the torch build and card have flash; else the per-segment SDPA loop) and binds the
+winner (table `attn_varlen_shapes_<backend>`). The candidates are timed by wall time
+(`timing="wall"`: back-to-back calls ended by one synchronize, about max(host, device)
+per call), not device time, and every timed call runs a shape of its own (the last
+segment cut by 0, 1, 2, ... tokens, `_variants`): training packs a new set of segment
+lengths every micro-batch, so a backend that builds an execution plan per shape pays
+that host time in the step, and a timing that repeats one shape hides it.
 
+- cuDNN (torch 2.15's `varlen_attn` and SDPA on B300) builds one execution plan per new
+  segment length (about 75 ms forward + backward, cached for the process). At 1024^2
+  with captions of 50-800 tokens nearly every pack is new: in the profiled step (4 x B300,
+  2 samples x GRAD_ACC 8) the GPU idled 540 ms of 4.5 s while the host was inside the
+  cuDNN attention backward.
 - The SDPA loop is the eager reference: one `scaled_dot_product_attention` per segment
   over split views of q / k / v and one concatenation of the outputs, so its backward
   writes each input gradient once (slicing would build a zero-filled full-size gradient
-  per segment and sum them). On B300 its per-segment cuDNN kernels beat the Triton kernels
-  1.8x on 12 x 3k packs and 2x on 2 MP; cuDNN builds one execution plan per new segment
-  length (about 75 ms forward + backward, cached for the process), so a run's first
-  steps carry that build time ([training-b300.md](../performance/training-b300.md)).
+  per segment and sum them). It reads the segment bounds on the host (one stream sync per
+  call), so it is a candidate only where torch's `varlen_attn` does not run.
 - The choice key adds the mean-segment-length bucket (`-M<tokens>`,
   `tuning.buckets.mean_bucket`): one 4096 segment with seven 64-token ones and twelve
   3k segments share the longest-segment and segment-count buckets, and the per-segment

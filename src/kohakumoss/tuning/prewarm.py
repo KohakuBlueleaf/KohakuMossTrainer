@@ -33,9 +33,10 @@ from kohakumoss_kernels.recording import recording
 from kohakumoss_kernels.tuning import decisions, prewarm_attention
 from kohakumoss_kernels.tuning.manifest import Manifest, problem_key
 from kohakumoss_kernels.tuning.prewarm import attention_lengths
+from kohakumoss_kernels.tuning.ranks import broadcast
 from kohakumoss_kernels.tuning.replay import OpReport, replay, timed_kernels, unique
 from kohakumoss_kernels.tuning.replay import problem as replay_problem
-from kohakumoss_kernels.tuning.tuner import broadcast, set_cap
+from kohakumoss_kernels.tuning.tuner import set_cap
 from kohakumoss_kernels.tuning.window import freeze
 
 log = get_logger(__name__)

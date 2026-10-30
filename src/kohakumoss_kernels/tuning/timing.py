@@ -103,6 +103,25 @@ def burst_ms(
     return best
 
 
+def wall_ms(
+    fn: Callable[[], object], device: torch.device, calls: int = 8, iters: int = 5
+) -> float:
+    """Best-of-`iters` wall ms per call of `calls` back-to-back calls ended by one
+    synchronize: the host's launch time and the device time overlap as in a step, so a
+    call costs about max(host, device). For ops whose host side can bound the step
+    (many launches per call)."""
+    warm(fn, device)
+    best = float("inf")
+    for _ in range(iters):
+        synchronize(device)
+        began = time.perf_counter()
+        for _ in range(calls):
+            fn()
+        synchronize(device)
+        best = min(best, (time.perf_counter() - began) * 1e3 / calls)
+    return best
+
+
 def l2_flush(device: torch.device, l2_bytes: int) -> torch.Tensor:
     """A buffer larger than L2; zeroing it evicts the previous call's operands."""
     return torch.empty(
