@@ -252,8 +252,10 @@ class TrainStep:
         rank: int = 0,
         keep: Callable | None = None,
         penalty=None,
+        probe=None,
     ):
         self.penalty = penalty
+        self.probe = probe
         self.pre_forward = pre_forward or nothing
         self.keep = keep or nothing
         self.backbone = backbone
@@ -304,19 +306,27 @@ class TrainStep:
         p = self.prepare(batch, step)
         self.keep(p, denom)
         if self.penalty is not None:
-            return self._penalised(batch, p, denom)
+            return self._penalised(batch, p, denom, step)
         with self.autocast():
             pred = self.backbone(p.z, p.text, p.sigma, p.seq)
         return StepOut(self.loss(pred, p, denom), denom, {"sigma_mean": p.sigma.mean()})
 
-    def _penalised(self, batch: DeviceBatch, p: Prepared, denom: Tensor) -> StepOut:
+    def _penalised(
+        self, batch: DeviceBatch, p: Prepared, denom: Tensor, step: int
+    ) -> StepOut:
         """The step loss plus the stream penalty, weighted by this micro-batch's share
-        of the step's loss tokens (the step total is the token-weighted mean)."""
+        of the step's loss tokens (the step total is the token-weighted mean); on probe
+        steps, the per-term gradient metrics (STREAM_LOSS_PROBE)."""
         with self.penalty.collecting(), self.autocast():
             pred = self.backbone(p.z, p.text, p.sigma, p.seq)
-        penalty, parts = self.penalty.take(p)
+        penalty, parts, terms = self.penalty.take(p)
         share = self.count_of(batch) / denom
-        loss = self.loss(pred, p, denom) + penalty * share
+        task = self.loss(pred, p, denom)
+        if self.probe is not None and self.probe.due(step):
+            shared = {name: value * share for name, value in terms.items()}
+            parts.update(self.probe.measure({"task": task, **shared}))
+        loss = task + penalty * share
+        parts["loss_task"] = (task / share).detach()
         return StepOut(loss, denom, {"sigma_mean": p.sigma.mean(), **parts})
 
     def rng_state(self) -> dict:

@@ -6,7 +6,10 @@
 - `peak`: a soft hinge on each sample's largest stream values, the mean of its top
   `top` fraction of |x| per block in original units (the fp16 fix's stream scale
   undone), `softplus((log m - log cap) / tau)`, mean over blocks, weighted per sample by
-  its sigma.
+  its sigma;
+- `rms`: each sample's whole-stream RMS per block, R over all of its tokens and channels
+  in original units, pulled to `target` from both sides, `(R / target - 1)^2`, mean over
+  blocks, weighted per sample by its sigma.
 
 See docs/concepts/training.md#stream-penalties."""
 
@@ -19,19 +22,36 @@ from torch import Tensor, nn
 
 KNOB = "STREAM_LOSS"
 LEGACY = "CONCENTRATION_LOSS"
+PROBE = "STREAM_LOSS_PROBE"
 TERMS = {
     "concentration": {"weight", "k"},
     "peak": {"weight", "cap", "top", "tau", "sigma"},
+    "rms": {"weight", "target", "sigma"},
 }
 SIGMA_WEIGHTS = ("sigma", "one_minus_sigma", "none")
 PEAK = {"cap": 32768.0, "top": 1e-4, "tau": 0.25, "sigma": "sigma"}
+RMS = {"target": 1.0, "sigma": "none"}
+TINY = 1e-30
+
+
+def channel_energy(h: Tensor) -> Tensor:
+    """Each channel's energy of `h` [..., D] summed over every leading position, fp32
+    [D]; read in `h`'s own dtype with an fp32 result (no fp32 copy of `h`)."""
+    rows = h.reshape(-1, h.shape[-1])
+    return torch.linalg.vector_norm(rows, dim=0, dtype=torch.float32).square()
+
+
+def top_shares(e: Tensor, k: int) -> Tensor:
+    """Per row of the channel energies `e` [L, D], the share held by its `k` largest
+    channels, fp32 [L]."""
+    tiny = torch.finfo(torch.float32).tiny
+    return e.topk(k, dim=-1).values.sum(-1) / e.sum(-1).clamp_min(tiny)
 
 
 def top_share(h: Tensor, k: int) -> Tensor:
     """Share of the energy of `h` [..., D] (summed over every leading position) held by
     its `k` largest channels, in fp32."""
-    e = h.float().reshape(-1, h.shape[-1]).square().sum(0)
-    return e.topk(k).values.sum() / e.sum().clamp_min(torch.finfo(torch.float32).tiny)
+    return top_shares(channel_energy(h)[None], k)[0]
 
 
 def top_mean_abs(h: Tensor, frac: float) -> Tensor:
@@ -39,6 +59,29 @@ def top_mean_abs(h: Tensor, frac: float) -> Tensor:
     flat = h.reshape(-1)
     k = max(1, int(math.ceil(frac * flat.numel())))
     return flat.abs().topk(k).values.float().mean()
+
+
+def token_rms(h: Tensor, scale: float) -> Tensor:
+    """Each row's RMS of `h` [T, D] divided by `scale` (original units), fp32 [T]; the
+    norm reads `h` in its own dtype with an fp32 result (no fp32 copy of `h`)."""
+    norm = torch.linalg.vector_norm(h, dim=-1, dtype=torch.float32)
+    return norm / (math.sqrt(h.shape[-1]) * scale)
+
+
+def token_log_rms(h: Tensor, scale: float) -> Tensor:
+    """log of `token_rms`, fp32 [T]."""
+    return token_rms(h, scale).clamp_min(TINY).log()
+
+
+def sample_rms(r: Tensor, seg: Tensor, samples: int) -> Tensor:
+    """Per sample, the RMS over all its tokens and channels from the token RMS `r`
+    [..., T] (`seg` [T]: each row's sample): sqrt of the mean of r^2 over the sample's
+    rows, fp32 [..., samples]."""
+    seg = seg.long()
+    shape = (*r.shape[:-1], samples)
+    sums = r.new_zeros(shape).index_add(-1, seg, r.square())
+    counts = r.new_zeros(samples).index_add(0, seg, torch.ones_like(seg, dtype=r.dtype))
+    return (sums / counts.clamp_min(1.0)).clamp_min(TINY).sqrt()
 
 
 def sigma_weight(sigma: Tensor, mode: str) -> Tensor:
@@ -78,6 +121,8 @@ def spec_of(k: dict) -> dict:
     }
     if "peak" in out:
         out["peak"] = {**PEAK, **out["peak"]}
+    if "rms" in out:
+        out["rms"] = {**RMS, **out["rms"]}
     if "concentration" in out:
         out["concentration"] = {"k": 32, **out["concentration"]}
     return out
@@ -86,7 +131,8 @@ def spec_of(k: dict) -> dict:
 class StreamPenalty:
     """Forward hooks on the joint blocks keep each block's output while `collecting`
     (checkpoint recomputes in backward are not collected); `take(prepared)` returns
-    (the weighted penalty sum, its parts detached)."""
+    (the weighted penalty sum, its parts detached, each term unweighted and attached).
+    """
 
     def __init__(self, layers: nn.ModuleList, spec: dict, scales: tuple[float, ...]):
         self.spec = spec
@@ -127,27 +173,54 @@ class StreamPenalty:
         w = sigma_weight(p.sigma, term["sigma"]).to(per_sample.device)
         return (w * per_sample).mean(), torch.stack(largest).max()
 
-    def take(self, p) -> tuple[Tensor, dict[str, Tensor]]:
+    def _rms(self, p, term: dict) -> tuple[Tensor, dict[str, Tensor]]:
+        """(the sigma-weighted mean over samples of the per-block (R / target - 1)^2,
+        the metrics: geometric-mean token RMS over every block and its largest
+        per-block value, the whole-stream RMS over every block and its largest per-block
+        value), RMS in original units."""
+        target = float(term["target"])
+        r = torch.stack([token_rms(h, s) for h, s in zip(self.outs, self.scales)])
+        rd = r.detach()
+        geo = rd.clamp_min(TINY).log().mean(-1)
+        quad = rd.square().mean(-1).sqrt()
+        samples = len(p.seq.attn_joint.lengths)
+        per_block = (sample_rms(r, p.seq.seg_joint, samples) / target - 1.0).square()
+        per_sample = per_block.mean(0)
+        w = sigma_weight(p.sigma, term["sigma"]).to(per_sample.device)
+        metrics = {
+            "stream_rms": geo.mean().exp(),
+            "stream_rms_block_max": geo.max().exp(),
+            "stream_rms_q": quad.mean(),
+            "stream_rms_q_block_max": quad.max(),
+        }
+        return (w * per_sample).mean(), metrics
+
+    def take(self, p) -> tuple[Tensor, dict[str, Tensor], dict[str, Tensor]]:
         if not self.outs:
             raise RuntimeError(
                 f"{KNOB}: no joint block output was seen (the runner calls block parts "
                 "directly)"
             )
-        total, parts = None, {}
+        terms, parts = {}, {}
         if "concentration" in self.spec:
-            term = self.spec["concentration"]
-            conc = torch.stack([top_share(h, int(term["k"])) for h in self.outs]).mean()
-            total = float(term["weight"]) * conc
+            k = int(self.spec["concentration"]["k"])
+            energy = torch.stack([channel_energy(h) for h in self.outs])
+            conc = top_shares(energy, k).mean()
+            terms["concentration"] = conc
             parts["concentration"] = conc.detach()
         if "peak" in self.spec:
-            term = self.spec["peak"]
-            hinge, largest = self._peak(p, term)
-            weighted = float(term["weight"]) * hinge
-            total = weighted if total is None else total + weighted
+            hinge, largest = self._peak(p, self.spec["peak"])
+            terms["peak"] = hinge
             parts["peak_loss"] = hinge.detach()
             parts["stream_peak"] = largest
+        if "rms" in self.spec:
+            value, metrics = self._rms(p, self.spec["rms"])
+            terms["rms"] = value
+            parts["rms_loss"] = value.detach()
+            parts.update(metrics)
+        total = sum(float(self.spec[n]["weight"]) * t for n, t in terms.items())
         self.outs = []
-        return total, parts
+        return total, parts, terms
 
 
 def build_penalty(k: dict, backbone) -> StreamPenalty | None:
@@ -174,8 +247,9 @@ def _number(
 
 def stream_loss_problems(k: dict, dim: int | None = None) -> list[str]:
     """STREAM_LOSS: {term: {fields}} with known terms and fields, weights >= 0, an
-    integer k in [1, dim], cap / tau > 0, top in (0, 1], a known sigma weighting; not
-    both STREAM_LOSS and CONCENTRATION_LOSS; PARALLEL none / ddp."""
+    integer k in [1, dim], cap / tau / target > 0, top in (0, 1], a known sigma
+    weighting; not both STREAM_LOSS and CONCENTRATION_LOSS; PARALLEL none / ddp; the
+    STREAM_LOSS_PROBE knob."""
     p = []
     for knob in (KNOB, LEGACY):
         if not isinstance(k.get(knob) or {}, dict):
@@ -202,22 +276,44 @@ def stream_loss_problems(k: dict, dim: int | None = None) -> list[str]:
                 f"{where} has unknown fields {unknown}; valid: {sorted(TERMS[name])}"
             )
         p += _number(term, "weight", 0.0, where)
-        if name == "concentration":
-            top = term.get("k", 32)
-            if isinstance(top, bool) or not isinstance(top, int) or top < 1:
-                p.append(f"{where}['k'] must be an int >= 1, got {top!r}")
-            elif dim is not None and top > dim:
-                p.append(f"{where}['k']={top} exceeds the model width {dim}")
-        else:
-            p += _number(term, "cap", 0.0, where, strict=True)
-            p += _number(term, "tau", 0.0, where, strict=True)
-            p += _number(term, "top", 0.0, where, strict=True)
-            if isinstance(term.get("top"), (int, float)) and term["top"] > 1:
-                p.append(f"{where}['top'] must be <= 1, got {term['top']!r}")
-            if term.get("sigma", "sigma") not in SIGMA_WEIGHTS:
-                p.append(
-                    f"{where}['sigma'] must be one of {SIGMA_WEIGHTS}, got {term['sigma']!r}"
-                )
+        match name:
+            case "concentration":
+                top = term.get("k", 32)
+                if isinstance(top, bool) or not isinstance(top, int) or top < 1:
+                    p.append(f"{where}['k'] must be an int >= 1, got {top!r}")
+                elif dim is not None and top > dim:
+                    p.append(f"{where}['k']={top} exceeds the model width {dim}")
+            case "peak":
+                p += _number(term, "cap", 0.0, where, strict=True)
+                p += _number(term, "tau", 0.0, where, strict=True)
+                p += _number(term, "top", 0.0, where, strict=True)
+                if isinstance(term.get("top"), (int, float)) and term["top"] > 1:
+                    p.append(f"{where}['top'] must be <= 1, got {term['top']!r}")
+            case "rms":
+                p += _number(term, "target", 0.0, where, strict=True)
+        if name != "concentration" and term.get("sigma", "sigma") not in SIGMA_WEIGHTS:
+            p.append(
+                f"{where}['sigma'] must be one of {SIGMA_WEIGHTS}, got {term['sigma']!r}"
+            )
     if terms and k.get("PARALLEL", "none") not in ("none", "ddp"):
         p.append(f"{KNOB} runs with PARALLEL 'none' or 'ddp', not {k['PARALLEL']!r}")
+    p += probe_problems(k, bool(terms))
+    return p
+
+
+def probe_problems(k: dict, has_terms: bool) -> list[str]:
+    """STREAM_LOSS_PROBE: an int >= 0 (0 = off); on, it needs a STREAM_LOSS term and
+    PARALLEL 'none'."""
+    every = k.get(PROBE, 0)
+    if isinstance(every, bool) or not isinstance(every, int) or every < 0:
+        return [
+            f"{PROBE} must be an int >= 0 (steps between probes, 0 = off), got {every!r}"
+        ]
+    if every == 0:
+        return []
+    p = []
+    if not has_terms:
+        p.append(f"{PROBE} measures the {KNOB} terms: set at least one term")
+    if k.get("PARALLEL", "none") != "none":
+        p.append(f"{PROBE} runs with PARALLEL 'none', not {k['PARALLEL']!r}")
     return p
