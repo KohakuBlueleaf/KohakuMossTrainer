@@ -66,14 +66,14 @@ class JointBlock(nn.Module):
 
     def attn_part(self, x: Tensor, ctx: BlockCtx) -> Tensor:
         """Modulated norm, qk-norm + RoPE, attention, gated residual (with the fold's r)."""
-        ops, seq, mod = self.ops, ctx.seq, ctx.mod
+        ops, seq, mod = self.ops, ctx.seq, ctx.slots
         seg = seq.seg_joint
         y = self._cast(
             ops.rms_norm_mod(
                 x,
                 self.norm1.weight,
-                mod[:, SHIFT_ATTN],
-                mod[:, SCALE_ATTN],
+                mod[SHIFT_ATTN],
+                mod[SCALE_ATTN],
                 seg,
                 self.norm1.eps,
             )
@@ -89,20 +89,20 @@ class JointBlock(nn.Module):
         v = self.proj["v"](y).unflatten(-1, (self.heads, -1))
         o = ops.attention(q, k, v, seq.attn_joint).flatten(1)
         r = ctx.residual_scale[self.index]
-        return self._post(self._attn_out(o, x, mod[:, GATE_ATTN], seg, r))
+        return self._post(self._attn_out(o, x, mod[GATE_ATTN], seg, r))
 
     def ffn_part(self, x: Tensor, ctx: BlockCtx) -> Tensor:
         """Modulated norm, SiTU FFN, gated residual."""
-        ops, mod, seg = self.ops, ctx.mod, ctx.seq.seg_joint
+        ops, mod, seg = self.ops, ctx.slots, ctx.seq.seg_joint
         y = self._cast(
             ops.rms_norm_mod(
                 x,
                 self.norm2.weight,
-                mod[:, SHIFT_FFN],
-                mod[:, SCALE_FFN],
+                mod[SHIFT_FFN],
+                mod[SCALE_FFN],
                 seg,
                 self.norm2.eps,
             )
         )
-        out = self._ffn_out(self._situ(y), x, mod[:, GATE_FFN], seg, 1.0)
+        out = self._ffn_out(self._situ(y), x, mod[GATE_FFN], seg, 1.0)
         return self._post(out)

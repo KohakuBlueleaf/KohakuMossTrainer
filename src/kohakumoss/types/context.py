@@ -6,7 +6,7 @@ weights -> fold (fp16) -> base storage (quantize / stream) -> adapters -> bind_o
 parallel wrap -> compile. Every step after `load weights` is a one-time structural change.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from torch import Tensor
 
@@ -21,9 +21,14 @@ HEAD_SHIFT, HEAD_SCALE = range(2)
 @dataclass
 class BlockCtx:
     """Layout, per-sample fp32 modulation [B, 6, D] (slots SHIFT_ATTN .. GATE_FFN), RoPE
-    bands, and the residual scale `r` per block (fold)."""
+    bands, and the residual scale `r` per block (fold); `slots` is `mod` unbound once
+    into its six [B, D] views, shared by every block."""
 
     seq: SeqInfo
     mod: Tensor
     bands: Tensor
     residual_scale: tuple[float, ...]
+    slots: tuple[Tensor, ...] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.slots = self.mod.unbind(1)
