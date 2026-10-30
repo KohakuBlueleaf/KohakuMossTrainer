@@ -2,6 +2,7 @@
 
 import json
 import multiprocessing
+import os
 from functools import partial
 from pathlib import Path
 
@@ -297,6 +298,10 @@ def init_weights(k: dict, built, output_dir: str) -> bool:
     init = k.get("INIT_FROM")
     if not init or resumed_from(k, output_dir) is not None:
         return False
+    if not os.path.isfile(os.path.join(init, "trainable.safetensors")):
+        raise SystemExit(
+            f"INIT_FROM={init!r} is not a checkpoint dir (no trainable.safetensors)"
+        )
     log.info(f"weights from {init} (optimiser, schedule and data fresh)")
     live = built.trainable
     live.load_state_dict(shard_like(load_trainable(init), live.state_dict()))

@@ -1,7 +1,8 @@
 """INIT_FROM loads the checkpoint's trainable state before the optimiser and EMA copy
 their masters from the parameters: the first optimiser step starts from the loaded
 weights, not the build-time ones; a RESUME checkpoint in the run directory wins over
-INIT_FROM. Model-free: plain parameters and a hand-written checkpoint."""
+INIT_FROM, and a missing INIT_FROM fails a fresh run only (a resumed run never reads
+it). Model-free: plain parameters and a hand-written checkpoint."""
 
 import json
 from types import SimpleNamespace
@@ -82,3 +83,13 @@ def test_resume_wins_over_init_from(tmp_path):
     assert not init_weights(k, built, str(out))
     assert torch.equal(built.trainable.w, torch.zeros(4, 4))
     assert init_weights({**k, "RESUME": ""}, built, str(out))
+
+
+def test_missing_init_from_fails_only_on_a_fresh_run(tmp_path):
+    k = {"INIT_FROM": str(tmp_path / "rotated_out"), "RESUME": "latest"}
+    out = tmp_path / "run"
+    step = _ckpt(out / "checkpoints" / "step_00000010", 5.0)
+    (step / "state.json").write_text(json.dumps({"step": 10}), encoding="utf-8")
+    assert not init_weights(k, _built(), str(out))
+    with pytest.raises(SystemExit):
+        init_weights({**k, "RESUME": ""}, _built(), str(out))

@@ -2,8 +2,6 @@
 area checks live in `training.checks`; this module holds the knob set, the choices,
 the precision and memory-plan checks and `check`."""
 
-import os
-
 import torch
 
 from kohakumoss.adapters.build.config import config_from_knobs
@@ -248,11 +246,8 @@ def _value_problems(k: dict) -> list[str]:
     if isinstance(bucket, bool) or not isinstance(bucket, int) or bucket < 1:
         p.append(f"DDP_BUCKET_MB must be an int >= 1, got {bucket!r}")
     p += release_problems(k.get("STEP_RELEASE", "none"))
-    init = k.get("INIT_FROM") or ""
-    if init and not os.path.isfile(os.path.join(init, "trainable.safetensors")):
-        p.append(
-            f"INIT_FROM={init!r} is not a checkpoint dir (no trainable.safetensors)"
-        )
+    if not isinstance(k.get("INIT_FROM") or "", str):
+        p.append(f"INIT_FROM must be a checkpoint dir path, got {k['INIT_FROM']!r}")
     return p
 
 
