@@ -6,6 +6,7 @@ docs/guides/logging.md#metric-names."""
 GROUPED = {
     "loss": "loss/total",
     "loss_task": "loss/flow",
+    "loss_distill": "loss/distill",
     "concentration": "loss/concentration",
     "rms_loss": "loss/rms",
     "peak_loss": "loss/peak",

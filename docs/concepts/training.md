@@ -138,6 +138,41 @@ which in a training process is this same setting.
   no dataset source produces a loss mask.
 - **`WEIGHTING`** multiplies a σ-dependent weight into the data weight (`none` is the
   MOSS recipe; `x0` and `eps` reproduce x0- / noise-space MSE).
+- **`HARD_WEIGHT`** (1.0) multiplies the data loss in the training step's total.
+
+### Distillation
+
+`TEACHER` adds a second target: a frozen DiT's velocity at the student's own inputs (the
+same `z_σ`, σ and text embedding, captions included). The training step's loss is
+
+`HARD_WEIGHT · L(v, ε − z0) + DISTILL_WEIGHT · L(v, v_teacher) + penalties`
+
+with `L` the run's `LOSS` over image tokens and the step's global token denominator,
+the teacher term weighted per sample by `DISTILL_WEIGHTING` (a `WEIGHTING` spec; empty
+= `WEIGHTING`). It anchors the student's function at the teacher's while the data loss
+moves it.
+
+- **`TEACHER`**: `""` off, `"weights"` the run's own DiT file, or a DiT path (a single
+  file or a transformer folder). Validation and sampling run without it.
+- **Teacher numerics.** bf16 compute, resident on the training device (memory profile
+  `speed`, nothing streamed), forward only under `no_grad`: no activations or
+  gradients are kept, so its cost is one forward per micro-batch (about a quarter of a
+  checkpointed full-finetune step) and its weights. `TEACHER_PRECISION` is the teacher's
+  base precision (`auto` as stored, or a quantized one such as `mxfp8`: e4m3 weights
+  and activations with 32-element e8m0 scales, block-scaled MMA on sm100+, half the
+  weight bytes). `TEACHER_STREAM="fp32"` keeps the teacher's residual streams in fp32
+  (`FP16_FIX="fp32_residual"`: the modulated norms read the fp32 stream, their outputs
+  are cast to bf16 for the matmuls, the gated residual adds are fp32); it needs a
+  teacher file without a weight fold. A weight-folded teacher computes the same
+  velocity as the original weights (the fold is exact), so `"weights"` on an fp16-fix
+  file is a teacher of the base.
+- **Kernels.** The teacher's ops are prewarmed forward-only after the student's prewarm
+  over the same batch plan, so no op tunes inside the loop.
+- **Metrics.** `loss_task` (`loss/flow`) and `loss_distill` (`loss/distill`) are the
+  micro-batch's own unweighted means; `loss` is the weighted total. With
+  `STREAM_LOSS_PROBE`, `grad_distill` and `grad_cos_distill` measure the teacher term's
+  gradient against the data loss's.
+- Layouts: `PARALLEL` `none` and `ddp` (each rank holds its own teacher).
 
 ### Stream penalties
 
@@ -264,6 +299,17 @@ within 1e-6 absolute (3e-4 relative) of the fp64 table.
 - **`WD_RULES="moss"`** disables weight decay for biases, norms, 1-D tensors and the
   embedders, and applies decay-to-one (`p -= lr·wd·(p-1)`) to the last joint block's q/k
   norm weights in full finetunes.
+- **Weight decay target.** `WD_TARGET="zero"` is the stock decoupled decay
+  (`p -= lr·wd·p`), which shrinks the pretrained weights every step. `"start"` decays
+  every decayed parameter towards the weights the run started from instead
+  (`p -= lr·wd·(p − a)`): after the optimiser's own decay the step adds `lr·wd·a`, gated
+  by the step's non-finite flag like the update. The anchors `a` are a bf16 copy of each
+  decayed parameter on its device, taken from the live weights before a resume restores
+  them (WEIGHTS, after INIT_FROM on a fresh run), or read from INIT_FROM on a resumed
+  run; bf16 holds a bf16 weights file exactly (a weight fold's power-of-two factors
+  included). Cost: 2 bytes per decayed parameter and one add per step. Full finetune
+  only, with OPTIMIZER `adamw`, `adamw16`, `adamw8bit`, `adamw8bit_kernel` or `muon`
+  and device-stepped weights (`optim_state="gpu"`, no `stream="swap"`).
 - **`SCHEDULE`** is an AnySchedule config; `end: -1` means `STEPS`. Loading a checkpoint
   writes the restored step's scheduled values (lr and any other scheduled key) into the
   optimiser groups the schedule drives, including the lr holders of the per-parameter

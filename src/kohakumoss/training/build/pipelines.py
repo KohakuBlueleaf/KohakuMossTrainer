@@ -112,7 +112,7 @@ def filter_groups(groups: list[dict], keep: set[int]) -> list[dict]:
         if not idx:
             continue
         ng = dict(g)
-        for key in ("params", "names", "splits"):
+        for key in ("params", "names", "splits", "anchor"):
             if key in g:
                 ng[key] = [g[key][i] for i in idx]
         out.append(ng)

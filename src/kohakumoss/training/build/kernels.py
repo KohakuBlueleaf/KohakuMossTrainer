@@ -1,10 +1,12 @@
 """The run's kernel prewarm actions, bound at build time under TUNE="table" ("off"
 binds none, nothing is timed): the backbone prewarm before step 0 (`ModelPrewarm` over
 the run's weightless twin), the adapter autotuned-op prewarm, and the online text
-encoder's prewarm right before its first pass (`TextPrewarm`). The step callbacks live
+encoder's prewarm right before its first pass (`TextPrewarm`), the TEACHER's
+forward-only prewarm. The step callbacks live
 in `training.callbacks.kernels`. See docs/internals/tuning.md#prewarm.
 """
 
+import contextlib
 import time
 
 import torch
@@ -40,26 +42,50 @@ def build_prewarm(k: dict, built, prec, device: torch.device, dataset=None):
     if not tunes(k):
         return nothing
     reset_peaks()
+    return ModelPrewarm(
+        run_shapes(k, prec, built.plan, device, built.backbone),
+        build_loss(k, built),
+        autocast_factory(prec, device),
+        prec.compute,
+        **planned_shapes(k, dataset),
+        masked=is_masked(k),
+    )
+
+
+def planned_shapes(k: dict, dataset=None) -> dict:
+    """ModelPrewarm's token and segment bounds of the run's batch plan: the longest
+    sample and batch, the attention segment counts from `dataset`'s smallest planned
+    grid, its shortest and longest caption estimates (None: the area target's grid,
+    the caption-free template and MAX_TEXT_TOKENS)."""
     cfg = DataConfig.from_knobs(k)
     sample, batch = planned_lengths(cfg)
     text_min = 0 if dataset is None else dataset.text_tokens_min()
     text_max = cfg.max_text_tokens if dataset is None else dataset.text_tokens_max()
     image_min = 0 if dataset is None else dataset.image_tokens_min()
     shortest, segments = planned_segments(cfg, text_min, image_min)
-    warm = ModelPrewarm(
-        run_shapes(k, prec, built.plan, device, built.backbone),
-        build_loss(k, built),
-        autocast_factory(prec, device),
-        prec.compute,
-        sample,
-        batch,
-        segments=segments,
-        shortest=shortest,
-        text_max=max(text_max, cfg.text_overhead_tokens),
-        text_shortest=max(text_min, cfg.text_overhead_tokens),
-        masked=is_masked(k),
+    return {
+        "sample_max": sample,
+        "batch_max": batch,
+        "segments": segments,
+        "shortest": shortest,
+        "text_max": max(text_max, cfg.text_overhead_tokens),
+        "text_shortest": max(text_min, cfg.text_overhead_tokens),
+    }
+
+
+def build_teacher_prewarm(k: dict, teacher, dataset=None):
+    """The TEACHER's forward-only prewarm over the run's batch plan (a no-op without a
+    teacher or unless TUNE times kernels)."""
+    if teacher is None or not tunes(k):
+        return nothing
+    return ModelPrewarm(
+        teacher.model,
+        None,
+        contextlib.nullcontext,
+        torch.bfloat16,
+        backward=False,
+        **planned_shapes(k, dataset),
     )
-    return warm
 
 
 class TextPrewarm:

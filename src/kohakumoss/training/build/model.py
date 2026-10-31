@@ -36,6 +36,7 @@ from kohakumoss.offload.encoders.vae import place_vae
 from kohakumoss.parallel.launch import dist_rank, gate_name, rank0_value
 from kohakumoss.precision import apply_param_dtypes
 from kohakumoss.training.build.text_estimate import pass_tokens, planned_text_sizes
+from kohakumoss.training.distill import build_teacher
 from kohakumoss.training.ema.averagers import decay_count
 from kohakumoss.training.exports import export_files, fused_qkv, write_exports
 from kohakumoss.training.full import FullTrainable
@@ -66,6 +67,7 @@ class Built:
     text_encoder: object | None
     sample_embeds: list | None = None
     feed: object | None = None
+    teacher: object | None = None
 
 
 def build_backbone(k: dict, device: torch.device, prec: PrecisionConfig, defer=None):
@@ -249,9 +251,10 @@ def build_model(
     memory plan -> load on the host (the weights the plan quantizes left unread, read
     from the checkpoint by the quantizer) -> FP16_FIX -> the plan applied (quantize,
     place or stream onto `device`, offload, runner) -> trainable -> parameter dtypes
-    -> bind_ops -> encoders -> the C heap's freed pages returned. `text_tokens`: the
-    dataset's longest caption, for the `auto` plan; `feed`: the rank's StreamedLoader
-    under the encode feed (the encoders run in the encoder processes).
+    -> bind_ops -> encoders -> TEACHER -> the C heap's freed pages returned.
+    `text_tokens`: the dataset's longest caption, for the `auto` plan; `feed`: the
+    rank's StreamedLoader under the encode feed (the encoders run in the encoder
+    processes).
     """
     plan, auto_rows = resolve_memory(k, device, prec.compute, world, text_tokens)
     full = is_full(k)
@@ -280,8 +283,9 @@ def build_model(
         vae, text, embeds = build_encoders(k, device, prec, reserve, plan)
     else:
         vae, text, embeds = fed_encoders(k, device, reserve, plan, feed)
+    teacher = build_teacher(k, device)
     trim_heap()
-    return Built(backbone, trainable, plan, engines, vae, text, embeds, feed)
+    return Built(backbone, trainable, plan, engines, vae, text, embeds, feed, teacher)
 
 
 def component_path(k: dict, which: str) -> str:

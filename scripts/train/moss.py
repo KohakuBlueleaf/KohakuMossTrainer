@@ -123,6 +123,13 @@ WEIGHTING = "none"  # "none" | "x0" | "eps"
 STREAM_LOSS = {}
 CONCENTRATION_LOSS = {}  # the "concentration" term alone (set one of the two)
 STREAM_LOSS_PROBE = 0  # every N steps: per-term gradient norms + cosines; 0 = off
+HARD_WEIGHT = 1.0  # weight of the data loss
+# distillation towards a frozen teacher DiT (docs/concepts/training.md#distillation)
+TEACHER = ""  # "" = off | "weights" (the run's own DiT file) | a DiT path
+DISTILL_WEIGHT = 0.0  # weight of the teacher loss (> 0 with a TEACHER)
+DISTILL_WEIGHTING = ""  # sigma weighting of the teacher loss; "" = WEIGHTING
+TEACHER_PRECISION = "auto"  # teacher base: "auto" | "mxfp8" | "fp8_compute" | ...
+TEACHER_STREAM = "compute"  # teacher residual streams: "compute" | "fp32"
 
 # ===================== OPTIM =====================
 OPTIMIZER = "adamw"  # "adamw" | "adamw16" | "adamw8bit" (bitsandbytes) | "adamw8bit_kernel" (KohakuMoss 8-bit kernel) | "muon" | "prodigy" | "schedule_free"
@@ -132,6 +139,7 @@ BETAS = (0.9, 0.95)
 EPS = 1e-8
 WEIGHT_DECAY = 0.01
 WD_RULES = "moss"  # "moss" (wd on 2-D weights only, decay-to-one on last q/k norm) | "none" | "all"
+WD_TARGET = "zero"  # decay to "zero" | "start" (the run's start weights; full FT)
 SCHEDULE = {"mode": "cosine", "warmup": 100, "end": -1}  # AnySchedule config
 GRAD_CLIP = 1.0
 STEP_SYNC = "step"  # "step" (host sync every step) | "deferred" (skip decided on the device; host values every gcd(LOG_EVERY, METRICS_EVERY) steps; EMA = 0)

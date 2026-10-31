@@ -45,6 +45,7 @@ from kohakumoss.training.build.kernels import (
     attach_text_prewarm,
     build_adapter_prewarm,
     build_prewarm,
+    build_teacher_prewarm,
 )
 from kohakumoss.training.build.loop import (
     build_ahead,
@@ -281,6 +282,9 @@ def _prewarm(k: dict, built, prec, device, dataset, device_use) -> list:
         return warm
     with timed(log, f"kernel prewarm on {warm} (fwd + bwd, {prec.compute})"):
         build_prewarm(k, built, prec, device, dataset)(warm)
+    if built.teacher is not None:
+        with timed(log, f"teacher kernel prewarm on {warm} (fwd)"):
+            build_teacher_prewarm(k, built.teacher, dataset)(warm)
     decisions.flush("after the kernel prewarm")
     release_workspaces(warm)
     adapters = adapter_prewarm_devices(k, device)
@@ -367,7 +371,8 @@ def worker(
         forward=hooks.forward,
         recorder=recorder,
     )
-    bundle, accumulate = build_optim(k, built, device, prec, hooks, keep)
+    resumed = resumed_from(k, output_dir) is not None
+    bundle, accumulate = build_optim(k, built, device, prec, hooks, keep, resumed)
     if objective is not None:
         objective.scaler = bundle.scaler
     ema = build_ema_for(k, built, bundle, names, rank)

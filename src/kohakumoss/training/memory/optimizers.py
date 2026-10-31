@@ -31,7 +31,7 @@ ADAMW_BY_STATE = {
     "stream": "host_state_adamw",
 }
 HOST_BUFFER_OPTIMIZERS = ("cpu_adamw", "host_state_adamw")
-GROUP_LIST_KEYS = ("params", "names", "splits")
+GROUP_LIST_KEYS = ("params", "names", "splits", "anchor")
 
 
 def optimizer_for(optimizer: str, plan: MemoryPlan) -> str:

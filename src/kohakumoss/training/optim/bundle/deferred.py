@@ -12,7 +12,7 @@ from torch import Tensor
 from torch.optim import Optimizer
 
 from kohakumoss.precision.scaler import DeviceScaler, DynamicScaler
-from kohakumoss.training.optim.bundle.base import Bundle
+from kohakumoss.training.optim.bundle.base import Bundle, anchor_pull
 
 KNOB = "STEP_SYNC"
 MODES = ("step", "deferred")
@@ -84,6 +84,7 @@ class DeferredBundle(Bundle):
         self.every = max(int(every), 1)
         self.last = int(last)
         self.decay = gated_decay_to_one(groups, self.optimizer)
+        self.pull = anchor_pull(groups, self.optimizer, gated=True)
         dev = self.device
         self._skipped = torch.zeros((), device=dev)
         self._bad_run = torch.zeros((), device=dev)
@@ -111,6 +112,8 @@ class DeferredBundle(Bundle):
         self._step_masked(bad)
         if self.decay is not None:
             self.decay(bad)
+        if self.pull is not None:
+            self.pull(bad)
         self.after()
         self.schedule.step()
         self.scaler.update_device(bad)

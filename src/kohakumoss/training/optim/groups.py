@@ -1,9 +1,10 @@
-"""Parameter grouping: weight-decay rules, decay-to-one targets, Muon eligibility."""
+"""Parameter grouping: weight-decay rules, decay-to-one targets, decay-to-start anchors,
+Muon eligibility."""
 
 import re
 from collections.abc import Iterable
 
-from torch import nn
+from torch import Tensor, nn
 
 EMBEDDING_PREFIXES = ("video_embedder", "text_embedder.proj", "time_embedding")
 HEAD_PREFIXES = ("final_linear_video",)
@@ -43,11 +44,14 @@ def build_param_groups(
     rules: str = "moss",
     decay_to_one: str | None = None,
     use_muon: bool = False,
+    anchors: dict[str, Tensor] | None = None,
 ) -> list[dict]:
     """Groups for the optimiser. `rules`: "moss" | "none" | "all".
 
     Each group carries `names` (for diagnostics), `use_muon`, `splits` (per-param chunk
-    counts for Muon) and `decay_to_one` (bool).
+    counts for Muon) and `decay_to_one` (bool). With `anchors` (name -> start value),
+    every decayed parameter decays towards its anchor instead of zero: its group
+    carries `anchor`, the anchors in `params` order (`anchor_pull`).
     """
     buckets: dict[tuple, dict] = {}
     for name, p in named:
@@ -64,7 +68,8 @@ def build_param_groups(
                 raise ValueError(f"unknown WD_RULES {rules!r}")
         to_one = bool(decay_to_one and re.match(decay_to_one, name))
         muon = use_muon and muon_eligible(name, p)
-        key = (wd, to_one, muon)
+        anchored = anchors is not None and wd > 0 and not to_one
+        key = (wd, to_one, muon, anchored)
         group = buckets.setdefault(
             key,
             {
@@ -81,4 +86,6 @@ def build_param_groups(
         group["params"].append(p)
         group["names"].append(name)
         group["splits"].append(muon_splits(name))
+        if anchored:
+            group.setdefault("anchor", []).append(anchors[name])
     return list(buckets.values())

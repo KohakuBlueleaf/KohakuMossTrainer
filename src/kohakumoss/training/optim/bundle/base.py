@@ -102,6 +102,55 @@ def decay_to_one(groups: list[dict], optimizer: Optimizer) -> Callable[[], None]
     return apply
 
 
+def anchor_targets(groups: list[dict], optimizer: Optimizer) -> list[tuple]:
+    """(live group, weight decay, params, anchors) of every anchored group."""
+    return [
+        (optimizer.param_groups[i], g["weight_decay"], g["params"], g["anchor"])
+        for i, g in enumerate(groups)
+        if g.get("anchor")
+    ]
+
+
+def anchor_pull(
+    groups: list[dict], optimizer: Optimizer, gated: bool = False
+) -> Callable | None:
+    """p += lr * wd * a on anchored groups after the optimiser's decoupled decay
+    (p -= lr * wd * p): together a decay towards the anchor `a`. `gated`: `apply(bad)`
+    skips it where the device flag `bad` is set. None when no group is anchored."""
+    targets = anchor_targets(groups, optimizer)
+    if not targets:
+        return None
+
+    @torch.no_grad()
+    def ungated() -> None:
+        for live, wd, params, anchors in targets:
+            torch._foreach_add_(params, anchors, alpha=live["lr"] * wd)
+
+    @torch.no_grad()
+    def masked(bad: Tensor) -> None:
+        keep = 1.0 - bad.float()
+        for live, wd, params, anchors in targets:
+            k = keep * (live["lr"] * wd)
+            for p, a in zip(params, anchors):
+                p.addcmul_(a, k.to(p.device))
+
+    return masked if gated else ungated
+
+
+def _chain(*fns) -> Callable[[], None]:
+    live = [f for f in fns if f is not None and f is not nothing]
+    if not live:
+        return nothing
+    if len(live) == 1:
+        return live[0]
+
+    def run() -> None:
+        for f in live:
+            f()
+
+    return run
+
+
 def _given(grads: Callable[[], list[Tensor]], bundle) -> list[Tensor]:
     return grads()
 
@@ -156,10 +205,13 @@ class Bundle:
         self.reduce = step_reducer(reduce_loss, agree, reduce_step)
         self.before = before
         self.after = after
-        self.post_step = (
-            nothing
-            if getattr(optimizer, "handles_decay_to_one", False)
-            else decay_to_one(groups, optimizer)
+        self.post_step = _chain(
+            (
+                nothing
+                if getattr(optimizer, "handles_decay_to_one", False)
+                else decay_to_one(groups, optimizer)
+            ),
+            anchor_pull(groups, optimizer),
         )
         self.train_mode = train_mode
         self.eval_mode = eval_mode

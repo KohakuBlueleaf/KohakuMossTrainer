@@ -13,6 +13,7 @@ from kohakumoss.memory.device_use import NoDeviceUse
 from kohakumoss.memory.release import release_callbacks
 from kohakumoss.memory.timeline import NoTimeline
 from kohakumoss.parallel.launch import dist_rank, ranks_meet
+from kohakumoss.training.build.anchors import start_anchors
 from kohakumoss.training.build.objective import build_loss, is_masked
 from kohakumoss.training.build.pipelines import filter_groups
 from kohakumoss.training.callbacks import (
@@ -88,16 +89,28 @@ def build_step(
     noise streams are those of `data_rank`; `recorder` (a StepRecorder) keeps each
     prepared micro-batch; `forward` is the module the step calls instead of the
     backbone (the backbone under torch DDP); `penalty` adds STREAM_LOSS (the
-    training step; validation steps report the plain loss)."""
+    training step; validation steps report the plain loss), and with it the teacher
+    term and HARD_WEIGHT."""
     masked = is_masked(k)
     loss = build_loss(k, built)
     sampler = sampler or build(
         {"name": k["TIMESTEP"], **k["TIMESTEP_KWARGS"]}, TIMESTEPS
     )
+    weighting = k.get("WEIGHTING", "none")
+    extra = {}
+    if penalty:
+        extra = {
+            "teacher": built.teacher,
+            "hard_weight": k.get("HARD_WEIGHT", 1.0),
+            "distill_weight": k.get("DISTILL_WEIGHT", 0.0),
+            "distill_weighting": build(
+                k.get("DISTILL_WEIGHTING") or weighting, WEIGHTINGS
+            ),
+        }
     return TrainStep(
         backbone=built.backbone if forward is None else forward,
         loss_fn=loss,
-        weighting=build(k.get("WEIGHTING", "none"), WEIGHTINGS),
+        weighting=build(weighting, WEIGHTINGS),
         sampler=sampler,
         normalizer=normalizer,
         autocast=autocast,
@@ -109,6 +122,7 @@ def build_step(
         keep=None if recorder is None else recorder.keep,
         penalty=build_penalty(k, built.backbone) if penalty else None,
         probe=build_probe(k, built.backbone) if penalty else None,
+        **extra,
     )
 
 
@@ -202,9 +216,19 @@ def build_writer(k: dict, loader, writes: bool, rank: int = 0):
     return CacheWriter(loader.dataset, rank=rank)
 
 
-def build_optim(k: dict, built, device, prec, hooks, keep: set[int] | None = None):
+def build_optim(
+    k: dict,
+    built,
+    device,
+    prec,
+    hooks,
+    keep: set[int] | None = None,
+    resumed: bool = False,
+):
     """(bundle, accumulate-context) over the trainable groups (restricted to the
-    parameter ids in `keep` for pipeline stages) under the memory plan's wiring."""
+    parameter ids in `keep` for pipeline stages) under the memory plan's wiring;
+    WD_TARGET 'start' anchors the decay at the run's start weights (`resumed`: the
+    live weights are not yet restored)."""
     hyper = {
         "lr": k["LR"],
         "betas": tuple(k["BETAS"]),
@@ -216,6 +240,7 @@ def build_optim(k: dict, built, device, prec, hooks, keep: set[int] | None = Non
         weight_decay=k["WEIGHT_DECAY"],
         rules=k["WD_RULES"],
         use_muon=k["OPTIMIZER"] == "muon",
+        anchors=start_anchors(k, built.trainable, resumed),
     )
     if keep is not None:
         groups = filter_groups(groups, keep)

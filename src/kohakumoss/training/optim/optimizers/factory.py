@@ -25,7 +25,13 @@ except ImportError:
     schedulefree = None
 
 OPTIMIZERS = Registry("optimizer")
-OPTIMIZER_SPECIAL_KEYS = ("names", "splits", "decay_to_one", "decay_to_one_coef")
+OPTIMIZER_SPECIAL_KEYS = (
+    "names",
+    "splits",
+    "decay_to_one",
+    "decay_to_one_coef",
+    "anchor",
+)
 INTERNAL = {"cpu_adamw": "cpu", "host_state_adamw": "stream", "master_adamw": "gpu"}
 STATE_BYTES = {
     "adamw": 8,
@@ -47,7 +53,13 @@ def _plain_groups(groups: list[dict]) -> list[dict]:
 
 
 def master_groups(groups: list[dict]) -> list[dict]:
-    """Groups for the offload AdamWs, which apply `decay_to_one` themselves."""
+    """Groups for the offload AdamWs, which apply `decay_to_one` themselves (they step
+    host masters, so decay-to-start anchors are refused)."""
+    if any(g.get("anchor") for g in groups):
+        raise ValueError(
+            "WD_TARGET='start' needs a device-stepped optimiser (no host-master AdamW: "
+            "a memory plan with optim_state 'gpu' and no block streaming)"
+        )
     return [
         {k: v for k, v in g.items() if k not in ("names", "splits", "use_muon")}
         for g in groups
@@ -98,6 +110,7 @@ def build_muon(groups, device, lr, betas, eps, momentum=0.95, ns_steps=5, **_):
     for g in keep:
         g.pop("decay_to_one", None)
         g.pop("decay_to_one_coef", None)
+        g.pop("anchor", None)
     return MuonHybrid(
         keep, lr=lr, betas=betas, eps=eps, momentum=momentum, ns_steps=ns_steps
     )

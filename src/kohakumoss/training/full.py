@@ -50,6 +50,7 @@ class FullTrainable:
             rules.get("rules", "moss"),
             decay_to_one=self.decay_to_one,
             use_muon=rules.get("use_muon", False),
+            anchors=rules.get("anchors"),
         )
 
     def state_dict(self) -> dict[str, Tensor]:

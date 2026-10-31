@@ -40,6 +40,20 @@ def _decay_to_one(coef: float, p: Tensor, lr: float, found: Tensor) -> None:
     p.sub_((p - 1.0) * ((1.0 - found) * (lr * coef)).to(p.dtype))
 
 
+def _decay_to_anchor(wd: float, anchor: Tensor, p: Tensor, lr: float, found: Tensor):
+    p.addcmul_(anchor, ((1.0 - found) * (lr * wd)).to(p.device))
+
+
+def _post_of(g: dict, index: int) -> Callable:
+    """The per-parameter post-step of parameter `index` of group `g`: decay-to-one,
+    the decay-to-start pull, or nothing."""
+    if g.get("decay_to_one"):
+        return partial(_decay_to_one, g["decay_to_one_coef"])
+    if g.get("anchor"):
+        return partial(_decay_to_anchor, g["weight_decay"], g["anchor"][index])
+    return nothing
+
+
 def _step_plain(opt: Optimizer) -> None:
     opt.step()
 
@@ -159,16 +173,11 @@ class FusedStepBundle:
             self.schedule = schedule_factory(self.lr_source)
             self.opts: dict[int, tuple] = {}
             for gi, g in enumerate(groups):
-                post = (
-                    partial(_decay_to_one, g["decay_to_one_coef"])
-                    if g.get("decay_to_one")
-                    else nothing
-                )
-                for p in g["params"]:
-                    one = {k: v for k, v in g.items() if k != "params"}
+                for i, p in enumerate(g["params"]):
+                    one = {k: v for k, v in g.items() if k not in ("params", "anchor")}
                     one["params"] = [p]
                     opt = build_one([one])
-                    self.opts[id(p)] = (opt, gi, _step_runner(opt), post)
+                    self.opts[id(p)] = (opt, gi, _step_runner(opt), _post_of(g, i))
             self._update = FusedStepBundle._own_update
         self.device = device if device is not None else self.params[0].device
         self._clip = torch.ones(1, dtype=torch.float32, device=self.device)

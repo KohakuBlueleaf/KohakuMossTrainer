@@ -15,6 +15,7 @@ from kohakumoss.memory.profiles import KNOB_FIELDS, ORDER, PROFILES, resolve
 from kohakumoss.memory.release import release_problems
 from kohakumoss.offload.accel import default_type
 from kohakumoss.precision import COMPUTE
+from kohakumoss.training.build.anchors import wd_target_problems
 from kohakumoss.training.checks.encode import encode_problems
 from kohakumoss.training.checks.encoders import text_problems, vae_problems
 from kohakumoss.training.checks.objective import (
@@ -29,6 +30,7 @@ from kohakumoss.training.checks.parallel import (
     dist_backend,
     parallel_problems,
 )
+from kohakumoss.training.distill import distill_problems
 from kohakumoss.training.exports import with_export_formats
 from kohakumoss.training.layouts import LAYOUTS
 from kohakumoss.training.optim.bundle.deferred import step_sync_problems
@@ -85,7 +87,8 @@ KNOWN = frozenset(
     DATA_SCAN_WORKERS DATA_WAIT DATA_BALANCE CONCENTRATION_LOSS STREAM_LOSS STREAM_LOSS_PROBE
     METRICS_LEVEL STEP_SYNC
     SAMPLE_BATCH SAMPLE_COLUMNS SAMPLE_AT_START
-    INIT_FROM""".split()
+    INIT_FROM WD_TARGET TEACHER TEACHER_PRECISION TEACHER_STREAM DISTILL_WEIGHT
+    DISTILL_WEIGHTING HARD_WEIGHT""".split()
 )
 CHOICES = {
     "ADAPTER_MODE": ("bypass", "merge"),
@@ -217,9 +220,10 @@ def _value_problems(k: dict) -> list[str]:
     ):
         if not _registry_ok(k[name], reg):
             p.append(f"{name}={k[name]!r} not in {reg.names()}")
-    weighting = k.get("WEIGHTING", "none")
-    if not _registry_ok(weighting, WEIGHTINGS):
-        p.append(f"WEIGHTING={weighting!r} not in {WEIGHTINGS.names()}")
+    for name in ("WEIGHTING", "DISTILL_WEIGHTING"):
+        weighting = k.get(name) or "none"
+        if not _registry_ok(weighting, WEIGHTINGS):
+            p.append(f"{name}={weighting!r} not in {WEIGHTINGS.names()}")
     if k["LR"] <= 0:
         p.append(f"LR must be positive, got {k['LR']}")
     if k["STEPS"] <= 0 or k["GRAD_ACC"] < 1:
@@ -277,6 +281,8 @@ def validate(k: dict) -> list[str]:
     p += io_problems(k)
     p += stream_loss_problems(k)
     p += step_sync_problems(k)
+    p += wd_target_problems(k, is_full(k))
+    p += distill_problems(k)
     return list(dict.fromkeys(p))
 
 
@@ -318,6 +324,13 @@ def plan_problems(k: dict, plan: MemoryPlan) -> list[str]:
             "checkpoint='sub-block' calls block parts directly: STREAM_LOSS / "
             "CONCENTRATION_LOSS need whole-block forwards (CHECKPOINT 'block', "
             "'partial:...' or 'none')"
+        )
+    host_masters = plan.optim_state != "gpu" or plan.stream == "swap"
+    if k.get("WD_TARGET", "zero") == "start" and host_masters:
+        p.append(
+            "WD_TARGET='start' decays device-stepped weights: optim_state 'gpu' and no "
+            f"stream='swap' (plan: optim_state={plan.optim_state!r}, "
+            f"stream={plan.stream!r})"
         )
     if plan.checkpoint == "sub-block" and plan.compile == "block":
         p.append(
