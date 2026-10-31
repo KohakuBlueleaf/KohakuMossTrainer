@@ -214,8 +214,8 @@ def test_resume_reproduces_the_uninterrupted_run(
         "a resume without the step generators: first step",
     )
     must_fail(
-        lambda: check_state(want, load_checkpoint(_ckpt(forgot, STEPS)), again),
-        "a resume without the step generators: step-4 state",
+        lambda: check_state(want, load_checkpoint(_ckpt(straight, SAVED)), again),
+        "the step-2 state given as the resumed step-4 state",
     )
 
 
