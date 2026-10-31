@@ -5,8 +5,8 @@ Knobs: TEACHER ("" off, "weights" the run's own DiT file, else a DiT path),
 DISTILL_WEIGHT, HARD_WEIGHT (the data loss), DISTILL_WEIGHTING (a WEIGHTINGS spec over
 sigma, default the run's WEIGHTING), TEACHER_PRECISION (the teacher's base precision:
 "auto" = as stored, or a quantized one such as "mxfp8"), TEACHER_STREAM ("compute" or
-"fp32" residual streams). The teacher computes in bf16. See
-docs/concepts/training.md#distillation."""
+"fp32" residual streams). The teacher computes in bf16, or in fp16 with the run's
+FP16_FIX on a CUDA card without bf16. See docs/concepts/training.md#distillation."""
 
 from pathlib import Path
 
@@ -17,26 +17,47 @@ from kohakumoss.inference.loading import load_dit
 from kohakumoss.logging.log import get_logger, hl, timed
 from kohakumoss.memory.profiles import resolve as resolve_memory
 from kohakumoss.model.io.load import read_fp16_fix
+from kohakumoss.model.numerics.fp16fix import fix_problems
 from kohakumoss.offload.accel import default_type
 from kohakumoss.training.weights import component
 from kohakumoss.weights import DIT
+from kohakumoss_kernels.hardware.arch import arch_of
 
 log = get_logger(__name__)
 STREAMS = {"compute": "none", "fp32": "fp32_residual"}
-TEACHER_DTYPE = torch.bfloat16
 TEACHER_PROFILE = "speed"
 OWN_WEIGHTS = "weights"
 
 
 class Teacher:
-    """`teacher(prepared)` -> the frozen model's velocity at the prepared inputs."""
+    """`teacher(prepared)` -> the frozen model's velocity at the prepared inputs;
+    `dtype` is its compute dtype."""
 
-    def __init__(self, model: torch.nn.Module):
+    def __init__(self, model: torch.nn.Module, dtype: torch.dtype):
         self.model = model
+        self.dtype = dtype
 
     @torch.no_grad()
     def __call__(self, p) -> Tensor:
         return self.model(p.z, p.text, p.sigma, p.seq)
+
+
+def teacher_dtype(device: torch.device | str) -> torch.dtype:
+    """bf16, or fp16 on a CUDA card without bf16 (sm70 / sm75)."""
+    device = torch.device(device)
+    if device.type == "cuda" and not arch_of(device).has_bf16:
+        return torch.float16
+    return torch.bfloat16
+
+
+def teacher_fix(k: dict, dtype: torch.dtype) -> tuple[str, dict]:
+    """(FP16_FIX mode, kwargs) of the teacher: fp32 residual streams for TEACHER_STREAM
+    'fp32', the run's FP16_FIX for an fp16 teacher, else none."""
+    if k.get("TEACHER_STREAM", "compute") == "fp32":
+        return STREAMS["fp32"], {}
+    if dtype == torch.float16:
+        return k.get("FP16_FIX", "none"), dict(k.get("FP16_FIX_KWARGS") or {})
+    return "none", {}
 
 
 def teacher_path(k: dict) -> str:
@@ -75,6 +96,10 @@ def distill_problems(k: dict) -> list[str]:
             "TEACHER_STREAM='fp32' needs a teacher file without an fp16-fix fold "
             "(the original weights)"
         )
+    elif teacher_dtype(default_type()) == torch.float16:
+        fix, kwargs = teacher_fix(k, torch.float16)
+        carried = read_fp16_fix(path) is not None
+        p += fix_problems(fix, kwargs, True, carried, "an fp16 teacher", "TEACHER")
     if k.get("PARALLEL", "none") not in ("none", "ddp"):
         p.append("TEACHER runs with PARALLEL 'none' or 'ddp'")
     precision = k.get("TEACHER_PRECISION", "auto")
@@ -91,26 +116,28 @@ def distill_problems(k: dict) -> list[str]:
 
 
 def build_teacher(k: dict, device: torch.device) -> Teacher | None:
-    """The frozen teacher on `device` (None without TEACHER): resident, bf16 compute,
-    its base at TEACHER_PRECISION, residual streams per TEACHER_STREAM."""
+    """The frozen teacher on `device` (None without TEACHER): resident, computing in
+    `teacher_dtype`, its base at TEACHER_PRECISION, residual streams per TEACHER_STREAM
+    (`teacher_fix`)."""
     if not k.get("TEACHER"):
         return None
     path = teacher_path(k)
     precision = k.get("TEACHER_PRECISION", "auto")
-    stream = k.get("TEACHER_STREAM", "compute")
-    what = f"teacher {hl(path, 'path')} ({precision} base, {stream} stream)"
+    dtype = teacher_dtype(device)
+    fix, fix_kwargs = teacher_fix(k, dtype)
+    what = f"teacher {hl(path, 'path')} ({precision} base, {dtype}, FP16_FIX {fix})"
     with timed(log, what):
         loaded = load_dit(
             Path(path),
-            TEACHER_DTYPE,
+            dtype,
             device,
             (),
             "merge",
-            STREAMS[stream],
-            {},
+            fix,
+            fix_kwargs,
             k["KERNELS"],
             TEACHER_PROFILE,
             {"base_precision": precision},
         )
     model = loaded.backbone.eval().requires_grad_(False)
-    return Teacher(model)
+    return Teacher(model, dtype)

@@ -1,5 +1,6 @@
 """Distillation on real training runs: LoRA (zero-initialised up factors) with the run's
-own DiT as TEACHER, 3 steps. Every loss is finite and `loss_distill` is logged each
+own DiT as TEACHER, 3 steps, a bf16 student (teacher bf16 or mxfp8) and an fp16 student
+on the fp16-fix file (teacher bf16, or fp16 on a card without bf16). Every loss is finite and `loss_distill` is logged each
 step. At step 1 the student is the teacher's function, so `loss_distill` is only the
 two paths' numeric difference: below DISTILL_FLOOR x `loss_task` for a bf16 teacher;
 an mxfp8 teacher (block-scaled e4m3, quantized activations) logs its own step-1 gap,
@@ -14,7 +15,7 @@ import pytest
 from kohakumoss.training.entry import run
 from kohakumoss_kernels.hardware.arch import arch_of
 from tests._util.negative import must_fail
-from tests.integration.conftest import needs_precision, real_knobs
+from tests.integration.conftest import fp16_fix_knobs, needs_precision, real_knobs
 
 pytestmark = [pytest.mark.real_weights, pytest.mark.cuda, pytest.mark.slow]
 
@@ -41,35 +42,52 @@ def check_distilled(rows: list[dict], ceiling: float) -> None:
     assert first["loss_distill"] < ceiling * first["loss_task"], first
 
 
-def _knobs(weights_root, dataset, out, precision: str) -> dict:
+def _student(compute: str, weights_root: Path, fix_file) -> dict:
+    """The student's precision knobs: bf16, or fp16 on the fp16-fix file (the teacher
+    is then that folded file too)."""
+    if compute == "bf16":
+        needs_precision("bf16")
+        return {"PRECISION": "bf16"}
+    if fix_file is None:
+        pytest.skip("no fp16-fix file")
+    return fp16_fix_knobs(weights_root, fix_file)
+
+
+def _knobs(weights_root, dataset, out, precision: str, student: dict) -> dict:
     return real_knobs(
         weights_root,
         dataset,
         out,
         MEMORY_PROFILE="low",
         MAX_TOKENS=TOKENS,
-        PRECISION="bf16",
         TEACHER="weights",
         DISTILL_WEIGHT=1.0,
         TEACHER_PRECISION=precision,
         **LORA,
+        **student,
     )
 
 
 @pytest.mark.parametrize(
-    ("precision", "ceiling"), [("auto", DISTILL_FLOOR), ("mxfp8", MX_CEILING)]
+    ("compute", "precision", "ceiling"),
+    [
+        ("bf16", "auto", DISTILL_FLOOR),
+        ("bf16", "mxfp8", MX_CEILING),
+        ("fp16", "auto", DISTILL_FLOOR),
+    ],
 )
 def test_teacher_matches_the_untrained_student(
-    precision, ceiling, weights_root, dataset_slice, tmp_path
+    compute, precision, ceiling, weights_root, fix_file, dataset_slice, tmp_path
 ):
-    needs_precision("bf16")
+    student = _student(compute, weights_root, fix_file)
     if precision == "mxfp8" and not arch_of("cuda").has_fp8:
         pytest.skip("mxfp8 needs fp8 GEMMs (sm89+)")
-    state = run(_knobs(weights_root, dataset_slice, tmp_path, precision))
+    state = run(_knobs(weights_root, dataset_slice, tmp_path, precision, student))
     assert state.step == STEPS
     rows = _rows(tmp_path)
     print(
-        f"teacher {precision}: step-1 loss_distill {rows[0]['loss_distill']:.3e} "
+        f"{compute} student, teacher {precision}: step-1 loss_distill "
+        f"{rows[0]['loss_distill']:.3e} "
         f"loss_task {rows[0]['loss_task']:.3e}"
     )
     check_distilled(rows, ceiling)

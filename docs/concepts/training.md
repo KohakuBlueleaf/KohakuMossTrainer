@@ -154,7 +154,9 @@ moves it.
 
 - **`TEACHER`**: `""` off, `"weights"` the run's own DiT file, or a DiT path (a single
   file or a transformer folder). Validation and sampling run without it.
-- **Teacher numerics.** bf16 compute, resident on the training device (memory profile
+- **Teacher numerics.** bf16 compute (fp16 on a CUDA card without bf16, sm70 / sm75,
+  with the run's `FP16_FIX`: a weight-folded teacher file or `online` /
+  `fp32_residual`), resident on the training device (memory profile
   `speed`, nothing streamed), forward only under `no_grad`: no activations or
   gradients are kept, so its cost is one forward per micro-batch (about a quarter of a
   checkpointed full-finetune step) and its weights. `TEACHER_PRECISION` is the teacher's

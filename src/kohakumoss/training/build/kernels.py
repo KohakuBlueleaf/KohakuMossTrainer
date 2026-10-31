@@ -82,7 +82,7 @@ def build_teacher_prewarm(k: dict, teacher, dataset=None):
         teacher.model,
         None,
         contextlib.nullcontext,
-        torch.bfloat16,
+        teacher.dtype,
         backward=False,
         **planned_shapes(k, dataset),
     )
