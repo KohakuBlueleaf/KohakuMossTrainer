@@ -18,7 +18,7 @@ def fake_wandb(monkeypatch):
 
     def init(**kw):
         seen.update(kw)
-        return SimpleNamespace(log=lambda *a, **k: None, finish=lambda: None)
+        return SimpleNamespace(id="run0", log=lambda *a, **k: None, finish=lambda: None)
 
     monkeypatch.setattr(
         sinks, "wandb", SimpleNamespace(init=init, Settings=lambda **kw: kw)
