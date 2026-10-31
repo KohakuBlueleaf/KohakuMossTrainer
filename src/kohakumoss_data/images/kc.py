@@ -9,11 +9,18 @@ import struct
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 import requests
 
+from kohakumoss_common.retry import retrying
+
+TIMEOUT = (10.0, 60.0)
+READ_DEADLINE = 240.0
+BACKOFF = 2.0
+BACKOFF_MAX = 30.0
 MAGIC = b"KCIMG1\0\0"
 INDEX_NAME = b"__index__.bin"
 RECORD = np.dtype(
@@ -35,6 +42,33 @@ _U32 = 0xFFFFFFFF
 TAIL = 22 + 65535 + 20
 
 
+class ShortRead(OSError):
+    """A ranged read returned fewer bytes than asked (a cut transfer)."""
+
+
+TRANSIENT = (
+    requests.ConnectionError,
+    requests.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+    requests.HTTPError,
+    ShortRead,
+)
+
+
+def _transient(err: BaseException) -> bool:
+    """Every TRANSIENT failure except an HTTP status below 500."""
+    if isinstance(err, requests.HTTPError):
+        return err.response is not None and err.response.status_code >= 500
+    return True
+
+
+def _checked(call, *args, **kw):
+    """`call(*args, **kw)` raising for an HTTP error status."""
+    got = call(*args, **kw)
+    got.raise_for_status()
+    return got
+
+
 class LocalShard:
     """Ranged reads of one local shard file (thread-safe: one handle, one lock)."""
 
@@ -53,25 +87,50 @@ class LocalShard:
 
 
 class HttpShard:
-    """Ranged reads of one shard behind an HTTP URL (one GET with a Range header)."""
+    """Ranged reads of one shard behind an HTTP URL (one GET with a Range header). A
+    failed read (connection error, timeout, 5xx, cut transfer) is retried with backoff
+    while the next attempt starts within `deadline` seconds of the first (READ_DEADLINE:
+    the read stays well inside DIST_TIMEOUT); a 4xx or a server without ranged reads
+    raises at once. `attempts` also caps the count (None: the deadline alone)."""
 
-    def __init__(self, url: str, session: requests.Session):
+    def __init__(
+        self,
+        url: str,
+        session: requests.Session,
+        deadline: float = READ_DEADLINE,
+        attempts: int | None = None,
+        backoff: float = BACKOFF,
+    ):
         self.url = url
         self.session = session
-        head = session.head(url, timeout=60)
-        head.raise_for_status()
+        self.retry = partial(
+            retrying,
+            transient=TRANSIENT,
+            what=url,
+            deadline=deadline,
+            attempts=attempts,
+            backoff=backoff,
+            backoff_max=BACKOFF_MAX,
+            is_transient=_transient,
+        )
+        head = self.retry(partial(_checked, session.head, url, timeout=TIMEOUT))
         self.size = int(head.headers["Content-Length"])
 
-    def read(self, offset: int, length: int) -> bytes:
-        rng = {"Range": f"bytes={offset}-{offset + length - 1}"}
-        with self.session.get(self.url, headers=rng, timeout=120, stream=True) as got:
+    def _get(self, rng: dict, length: int) -> bytes:
+        with self.session.get(
+            self.url, headers=rng, timeout=TIMEOUT, stream=True
+        ) as got:
             got.raise_for_status()
             if got.status_code != 206:
                 raise OSError(f"{self.url}: no ranged read (HTTP {got.status_code})")
             data = got.content
         if len(data) != length:
-            raise OSError(f"{self.url}: {len(data)} bytes for {length} asked")
+            raise ShortRead(f"{self.url}: {len(data)} bytes for {length} asked")
         return data
+
+    def read(self, offset: int, length: int) -> bytes:
+        rng = {"Range": f"bytes={offset}-{offset + length - 1}"}
+        return self.retry(partial(self._get, rng, length))
 
     def close(self) -> None:
         """Nothing to release (the session is shared)."""

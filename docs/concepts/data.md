@@ -401,6 +401,18 @@ The `gbc` source reads a dataset in KohakuGBC's format through `kohakugbc-data`
   `gbc` caption of the sample (the planner's text estimate reads this column).
 - `open(locator)` is the stored image bytes; `record(locator)` the graph and metadata.
   The reader opens its files on first use in each process.
+
+### KohakuClip image shards
+
+`KcStore` (`kohakumoss_data.images.kc`) reads one image's bytes by key with one ranged
+read, from a local shard directory or an HTTP root (e.g. `rclone serve http` over an
+object-store bucket). Each HTTP attempt has a 10 s connect and a 60 s read timeout. An
+attempt that fails transiently (connection error, timeout, cut transfer, 5xx) is retried
+with backoff 2, 4, 8, ... s capped at 30 s while the next attempt starts within 240 s of
+the first (`READ_DEADLINE`), so one read ends within about 300 s; then the loader worker
+raises. A 4xx or a server without ranged reads raises at once. Each retry logs one
+warning. See [training.md](training.md#transient-failures) for how this bounds
+`DIST_TIMEOUT`.
 - GBC boxes are fractions of the stored image. Captions follow the row's centre crop and
   target size (see below), so a `gbc` caption refuses `CROP="random"`,
   `RESOLUTION_MODE="shifted_square"` and `FLIP`.

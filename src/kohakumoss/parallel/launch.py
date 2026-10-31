@@ -195,6 +195,26 @@ def ranks_meet(what: str) -> None:
         startup_barrier(gate_name(what), dist.get_world_size())
 
 
+def store_agree(
+    name: str, ok: bool, world: int, store=None, timeout_s: float | None = None
+) -> bool:
+    """Every rank: whether `ok` holds on all `world` ranks at gate `name` (the store's
+    failure count after a `startup_barrier`)."""
+    s = _store(store)
+    key = f"kohakumoss/{name}/failed"
+    s.add(key, 0 if ok else 1)
+    startup_barrier(name, world, s, timeout_s)
+    return s.add(key, 0) == 0
+
+
+def ranks_agree(what: str, ok: bool) -> bool:
+    """`store_agree` over the default process group (`ok` itself without one or with
+    one rank); a distinct gate per call."""
+    if not grouped():
+        return ok
+    return store_agree(gate_name(what), ok, dist.get_world_size())
+
+
 def gate_name(what: str) -> str:
     """A name for one rank-0-first gate, distinct per call in the run."""
     return f"{what}-{next(_GATES)}"

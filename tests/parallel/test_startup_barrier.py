@@ -1,7 +1,8 @@
 """The store gates (rank-0-first waits and the all-ranks barrier) wait for
-DIST_GATE_TIMEOUT, not DIST_TIMEOUT, the barrier waits until every rank arrived, and
-the rank-0-only phases (checkpoint write, sample grid) end in a store gate, not a
-collective (model-free: a recording store; three threads over one FileStore)."""
+DIST_GATE_TIMEOUT, not DIST_TIMEOUT, the barrier waits until every rank arrived, the
+rank-0-only phases (checkpoint write, sample grid) end in a store gate, not a
+collective, and `ranks_agree` is the AND of every rank's flag (model-free: a recording
+store; three threads over one FileStore)."""
 
 import threading
 import time
@@ -24,13 +25,14 @@ WORLD = 3
 def check_save_gates(monkeypatch, tmp_path, barrier) -> None:
     met: list[str] = []
     monkeypatch.setattr(manager, "ranks_meet", met.append)
+    monkeypatch.setattr(manager, "ranks_agree", lambda what, ok: met.append(what) or ok)
     monkeypatch.setattr(manager, "_barrier", barrier)
     monkeypatch.setattr(manager, "capture_rng", lambda *a: {})
     monkeypatch.setattr(manager, "save_rng", lambda *a: None)
     ckpt = manager.CheckpointManager(tmp_path, keep_last=1)
     monkeypatch.setattr(ckpt, "_save", lambda mgr, step, parts: None)
     ckpt.save(5, {"step_rng": None})
-    assert met == ["checkpoint"] * 3, met
+    assert met == ["checkpoint", "checkpoint-ranks", "checkpoint-main"], met
 
 
 def _collective_barrier() -> None:
@@ -150,6 +152,37 @@ def test_startup_gates_use_the_startup_timeout(monkeypatch):
     )
     with pytest.raises(ValueError):
         launch.set_gate_timeout(0)
+
+
+def _agreements(flags: tuple[bool, ...], agree) -> list[bool]:
+    """Each flag's rank (a thread) agreeing over one in-process store."""
+    store = dist.HashStore()
+    got: list[bool] = []
+
+    def rank(ok: bool) -> None:
+        got.append(agree("ckpt-0", ok, WORLD, store, 10.0))
+
+    threads = [threading.Thread(target=rank, args=(f,)) for f in flags]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(15.0)
+    return got
+
+
+def check_agree(agree) -> None:
+    assert _agreements((True,) * WORLD, agree) == [True] * WORLD
+    one_bad = _agreements((True, False, True), agree)
+    assert one_bad == [False] * WORLD, one_bad
+
+
+def _own_flag(name, ok, world, store, timeout_s):
+    return ok
+
+
+def test_ranks_agree_is_the_and_of_every_flag():
+    check_agree(launch.store_agree)
+    must_fail(lambda: check_agree(_own_flag), "own flag only")
 
 
 def test_barrier_waits_for_every_rank(tmp_path):

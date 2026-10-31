@@ -523,6 +523,31 @@ RNG, the CUDA state of that rank's devices, the σ and noise generators).
 | validation | fixed-noise validation loss per σ (the global per-token mean over every rank's validation batches, all conditional: no text dropout) |
 | instability dumps | `instability/step_X.json` on a non-finite step or a loss above 5× its running average |
 
+## Transient failures
+
+Shared storage stalls (an NFS volume, an object store behind `rclone serve`) are
+absorbed where they happen; anything longer ends the process with a checkpoint to resume
+from.
+
+- **Image reads.** `KcStore` over HTTP retries a failed ranged read within a 240 s budget
+  ([data.md](data.md#kohakuclip-image-shards)). The prefetched batches cover part of the
+  wait; the other ranks wait in the next collective, so validation asks
+  `DIST_TIMEOUT >= 2 x (240 + 60)` s on more than one device (the default is 900 s).
+- **Checkpoints.** Every file write of a save (each rank's RNG and optimiser shard, rank
+  0's trainable / EMA / optimiser state and the rename) is retried on an `OSError` within
+  600 s (`SAVE_DEADLINE`, backoff from 5 s). The ranks agree through the store whether
+  every write succeeded (`ranks_agree`, no collective); if one did not, the checkpoint
+  is skipped with an error naming the newest complete checkpoint, its partial directory
+  is removed, and training goes on.
+- **Exports, samples, metrics.** A failed checkpoint export or sample-image write logs
+  an error and the run goes on (the wandb images are still logged). A failed
+  `metrics.jsonl` write keeps its rows and writes them with the next row (one warning
+  per failing streak).
+- **Longer outages.** A process that still fails exits; a resubmitted run with
+  `RESUME="latest"` continues from the newest complete checkpoint into the same wandb
+  run (`<output>/WANDB_ID`). A job script can loop that relaunch (bounded attempts) to
+  ride out an outage without a person.
+
 ## Shutdown
 
 `training.shutdown.install` (the first thing `entry.run` does; also the bench matrix's

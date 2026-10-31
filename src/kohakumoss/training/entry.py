@@ -521,8 +521,11 @@ def export_into(
     with layout.full_weights(built.backbone):
         if is_main:
             meta = {"kohakumoss_step": str(step), "kohakumoss_algo": str(k["ALGO"])}
-            for path in export(k, built, root, meta):
-                log.info(f"exported {path}")
+            try:
+                for path in export(k, built, root, meta):
+                    log.info(f"exported {path}")
+            except OSError as err:
+                log.error(f"export of step {step} into {root} failed: {err}")
 
 
 def _export(

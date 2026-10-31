@@ -11,7 +11,8 @@ import re
 import shutil
 from pathlib import Path
 
-from kohakumoss.parallel.launch import ranks_meet
+from kohakumoss.logging.log import get_logger
+from kohakumoss.parallel.launch import ranks_agree, ranks_meet
 from kohakumoss.training.checkpoint.io import (
     capture_rng,
     is_complete,
@@ -25,7 +26,11 @@ from kohakumoss.training.checkpoint.io import (
 )
 from kohakumoss.training.checkpoint.stream import save_stream
 from kohakumoss_common.calls import nothing
+from kohakumoss_common.retry import retrying
 
+log = get_logger(__name__)
+SAVE_DEADLINE = 600.0
+_BACKOFF = 5.0
 STEP_DIR = "step_{:08d}"
 STEP_NAME = re.compile(r"step_\d{8}")
 PARTIAL = ".partial"
@@ -34,6 +39,18 @@ PARTIAL = ".partial"
 def _barrier() -> None:
     """Every rank meets on the store (`ranks_meet`: DIST_GATE_TIMEOUT)."""
     ranks_meet("checkpoint")
+
+
+def _written(what: str, write, *args):
+    """`write(*args)` retried on an OSError within SAVE_DEADLINE; False (logged) when
+    it still fails."""
+    try:
+        return retrying(
+            lambda: write(*args), (OSError,), what, SAVE_DEADLINE, backoff=_BACKOFF
+        )
+    except OSError as err:
+        log.error(f"{what}: not written: {err}")
+        return False
 
 
 class CheckpointManager:
@@ -82,20 +99,38 @@ class CheckpointManager:
 
     def save(self, step: int, parts: dict) -> Path | None:
         """Every rank: its RNG file (and its optimiser shard, `parts["optim_rank"]`);
-        rank 0: the shared parts, then the rename."""
+        rank 0: the shared parts, then the rename. Each file write is retried on an
+        OSError within SAVE_DEADLINE; a write that still fails is logged and the
+        checkpoint skipped (the run goes on, the previous checkpoints kept)."""
         self.before_save()
         partial = self.root / (STEP_DIR.format(step) + PARTIAL)
         self._clear(partial)
         _barrier()
-        save_rng(partial, self.rank, capture_rng(parts["step_rng"], self.devices))
-        if "optim_rank" in parts:
-            save_optim_rank(partial, self.rank, parts["optim_rank"])
-        _barrier()
-        path = self._save(self, step, parts)
-        _barrier()
+        rng = capture_rng(parts["step_rng"], self.devices)
+        own = f"rank {self.rank}'s files of step {step}"
+        ok = _written(own, self._rank_files, partial, rng, parts.get("optim_rank"))
+        if not ranks_agree("checkpoint-ranks", ok):
+            return self._skipped(step, partial, "a rank could not write its files")
+        path = _written(f"checkpoint of step {step}", self._save, self, step, parts)
+        if not ranks_agree("checkpoint-main", path is not False):
+            return self._skipped(step, partial, "rank 0 could not write it")
         self.last_saved = step
         self.after_save(step, path)
         return path
+
+    def _rank_files(self, partial: Path, rng: dict, optim: dict | None) -> bool:
+        save_rng(partial, self.rank, rng)
+        if optim is not None:
+            save_optim_rank(partial, self.rank, optim)
+        return True
+
+    def _skipped(self, step: int, partial: Path, why: str) -> None:
+        log.error(
+            f"checkpoint of step {step} skipped ({why}); training goes on, the newest "
+            f"complete checkpoint is {self.latest()}"
+        )
+        self._clear(partial)
+        return None
 
     def _write(self, step: int, parts: dict) -> Path:
         """`parts`: trainable, ema, optim, step_rng, state (dicts) and the trainable

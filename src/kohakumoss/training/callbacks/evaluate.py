@@ -9,8 +9,11 @@ from PIL import Image
 from torch import Tensor
 
 from kohakumoss.inference import grid
+from kohakumoss.logging.log import get_logger
 from kohakumoss.training.state import TrainState
 from kohakumoss_common.calls import nothing
+
+log = get_logger(__name__)
 
 
 class FixedSigma:
@@ -104,20 +107,30 @@ class SampleGrid:
         finally:
             self.model.train(was_training)
             self.train_mode()
-        folder = self.root / f"step_{state.step:08d}"
+        try:
+            self.write(state.step, images)
+        except OSError as err:
+            log.error(f"sample files of step {state.step} not written: {err}")
+        if self.columns:
+            prompts = list(self.settings.get("prompts") or [])
+            images = [step_sheet(images, prompts, self.columns, LOG_SIDE)]
+        self.logger.log_images("samples", images, state.step)
+
+    def write(self, step: int, images: list) -> None:
+        """`samples/step_XXXXXXXX/`: the images, settings.json, the step sheet; then
+        `samples/grid.png`."""
+        folder = self.root / f"step_{step:08d}"
         folder.mkdir(parents=True, exist_ok=True)
         for i, image in enumerate(images):
             image.save(folder / f"{i:03d}.png")
         plain = {k: v for k, v in self.settings.items() if _plain(v)}
-        record = {"step": state.step, **plain}
+        record = {"step": step, **plain}
         (folder / "settings.json").write_text(
             json.dumps(record, indent=2, default=str), encoding="utf-8"
         )
         if self.columns:
             prompts = list(self.settings.get("prompts") or [])
             step_sheet(images, prompts, self.columns).save(folder / "sheet.png")
-            images = [step_sheet(images, prompts, self.columns, LOG_SIDE)]
-        self.logger.log_images("samples", images, state.step)
         self.compose()
 
     def compose(self) -> None:

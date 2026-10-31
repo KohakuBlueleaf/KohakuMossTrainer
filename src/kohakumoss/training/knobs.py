@@ -40,6 +40,8 @@ from kohakumoss.types.arch import PRESETS
 from kohakumoss.types.plans import MemoryPlan
 from kohakumoss_common.knobs import choice_problems, unknown_problems
 from kohakumoss_data import DataConfig, data_problems
+from kohakumoss_data.images.kc import READ_DEADLINE
+from kohakumoss_data.images.kc import TIMEOUT as READ_TIMEOUT
 from kohakumoss_kernels import ops as kernel_ops
 from kohakumoss_kernels.hardware.arch import arch_of
 from kohakumoss_kernels.tuning.tuner import MODES as TUNE_MODES
@@ -246,6 +248,12 @@ def _value_problems(k: dict) -> list[str]:
     if isinstance(bucket, bool) or not isinstance(bucket, int) or bucket < 1:
         p.append(f"DDP_BUCKET_MB must be an int >= 1, got {bucket!r}")
     p += release_problems(k.get("STEP_RELEASE", "none"))
+    stall = 2 * (READ_DEADLINE + READ_TIMEOUT[1])
+    if len(k["DEVICES"]) > 1 and float(k["DIST_TIMEOUT"]) < stall:
+        p.append(
+            f"DIST_TIMEOUT={k['DIST_TIMEOUT']} s is shorter than {stall:.0f} s: a rank "
+            "whose image read is being retried would time the collectives out"
+        )
     if not isinstance(k.get("INIT_FROM") or "", str):
         p.append(f"INIT_FROM must be a checkpoint dir path, got {k['INIT_FROM']!r}")
     return p

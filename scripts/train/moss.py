@@ -189,9 +189,7 @@ FSDP_RESHARD = "forward"  # fsdp block parameters: "forward" (ZeRO-3: freed afte
 DDP_BACKEND = "kohakumoss"  # ddp: "kohakumoss" (the project's reducers, every memory plan) | "torch" (stock torch DDP, the A / B baseline; plans that keep gradients on the device until the step)
 DDP_REDUCE_DTYPE = "fp32"  # ddp gradient sums: "fp32" | "param" | "bf16"
 DDP_BUCKET_MB = 25  # ddp (kohakumoss reducers): MiB per all-reduce bucket
-DIST_TIMEOUT = (
-    600  # seconds a collective of the step loop / the build waits for every rank
-)
+DIST_TIMEOUT = 900  # seconds a collective of the step loop / the build waits for every rank (>= 2x the image-read retry budget)
 DIST_GATE_TIMEOUT = 7200  # seconds a store gate waits for rank-0-only or per-rank work (catalog scan, kernel tuning, the auto plan, the data / prewarm barriers, checkpoint saves, the sample grid)
 DIST_BIND = "lazy"  # nccl / xccl process group: "lazy" (communicators on first use) | "device" (bound to the rank's device at init; the pipeline stays lazy)
 

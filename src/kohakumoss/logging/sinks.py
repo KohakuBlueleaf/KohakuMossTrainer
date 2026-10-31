@@ -85,6 +85,8 @@ class ConsoleLogger:
         self.path = Path(output_dir) / METRICS
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.file = self.path.open("a", encoding="utf-8")
+        self.pending: list[str] = []
+        self.failing = False
 
     def resume_at(self, step: int) -> None:
         """A run resumed at `step`: rows past it (an attempt that went on after that
@@ -104,10 +106,20 @@ class ConsoleLogger:
         self.file = self.path.open("a", encoding="utf-8")
 
     def log(self, metrics: dict, step: int) -> None:
-        self.file.write(
-            json.dumps({"step": step, "time": time.time(), **metrics}) + "\n"
-        )
-        self.file.flush()
+        """Append the row; rows a failed write (OSError) left behind are kept and
+        written first on the next call (one warning per failing streak)."""
+        row = json.dumps({"step": step, "time": time.time(), **metrics}) + "\n"
+        self.pending.append(row)
+        try:
+            self.file.write("".join(self.pending))
+            self.file.flush()
+        except OSError as err:
+            if not self.failing:
+                log.warning(f"{self.path}: write failed ({err}); rows kept for later")
+            self.failing = True
+            return
+        self.pending.clear()
+        self.failing = False
 
     def log_images(self, key: str, images: list, step: int) -> None:
         return None
