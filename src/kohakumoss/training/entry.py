@@ -386,6 +386,7 @@ def worker(
         k.get("PROJECT", "kohakumoss"),
         _snapshot(k),
         is_main,
+        resume=resumed_from(k, output_dir) is not None,
     )
 
     def make_step(sampler: FixedSigma):

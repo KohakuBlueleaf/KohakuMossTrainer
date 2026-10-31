@@ -11,6 +11,7 @@ from kohakumoss.logging.log import get_logger
 
 METRICS = "metrics.jsonl"
 RUN_FILES = (METRICS, "log.txt")
+WANDB_ID = "WANDB_ID"
 log = get_logger(__name__)
 
 try:
@@ -119,7 +120,9 @@ class WandbLogger(ConsoleLogger):
     """wandb run, plus the console/jsonl sink; wandb gets every metric under its
     grouped name (`logging.keys.named_row`). `mode` None is wandb's own default
     (WANDB_MODE when set, else online). The console shows what it shows under
-    LOGGER='console': wandb runs silent and captures no console output."""
+    LOGGER='console': wandb runs silent and captures no console output. The run id
+    is kept in `<output>/WANDB_ID`; a resumed run (`resume`) continues that wandb
+    run, a fresh run starts a new one."""
 
     def __init__(
         self,
@@ -128,18 +131,27 @@ class WandbLogger(ConsoleLogger):
         project: str,
         config: dict,
         mode: str | None = None,
+        resume: bool = False,
     ):
         super().__init__(output_dir)
         if wandb is None:
             raise SystemExit("LOGGER='wandb' needs the `wandb` package installed")
+        id_file = Path(output_dir) / WANDB_ID
+        stored = resume and id_file.is_file()
+        run_id = id_file.read_text(encoding="utf-8").strip() if stored else ""
+        if resume and not run_id:
+            log.warning(f"resumed run without {id_file}: a new wandb run starts")
         self.run = wandb.init(
             project=project,
             name=name,
             config=config,
             dir=output_dir,
             mode=mode,
+            id=run_id or None,
+            resume="allow" if run_id else None,
             settings=wandb.Settings(silent=True, console="off"),
         )
+        id_file.write_text(self.run.id, encoding="utf-8")
 
     def log(self, metrics: dict, step: int) -> None:
         super().log(metrics, step)

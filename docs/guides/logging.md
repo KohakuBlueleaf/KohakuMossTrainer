@@ -126,6 +126,11 @@ wandb runs silent and captures no console output.
   attempt that went on after that checkpoint) move to `metrics.<n>.jsonl` first
   (`resumed at step <s>: <n> later rows of <path> moved to <path>`), so the file holds
   one row per step.
+- `LOGGER="wandb"` keeps the wandb run id in `<output>/WANDB_ID`. A resumed run continues
+  that wandb run (`wandb.init(id=..., resume="allow")`); a fresh run starts a new one and
+  overwrites the file. wandb keeps steps monotonic, so rows at or below the run's last
+  logged step (an attempt that went on after the resumed checkpoint) are not logged
+  again there; `metrics.jsonl` still has them.
 
 ### Other training lines
 
