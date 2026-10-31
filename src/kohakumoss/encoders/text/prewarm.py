@@ -9,7 +9,7 @@ import copy
 from types import MethodType
 
 import torch
-from torch import nn
+from torch import Tensor, nn
 
 from kohakumoss.encoders.text.forward import KernelForward, make_pack
 from kohakumoss.model.build import materialize
@@ -178,17 +178,25 @@ def mirror_quantized(twin: nn.Module, model: nn.Module) -> int:
     return count
 
 
+def _computed(t: Tensor, dtype: torch.dtype) -> Tensor:
+    """`t`, or a meta stand-in in `dtype` when `t` is a 16-bit float held in another
+    16-bit dtype (a host embedding kept as stored, cast to `dtype` on lookup)."""
+    if t.is_floating_point() and t.element_size() == 2 and t.dtype != dtype:
+        return torch.empty(t.shape, dtype=dtype, device="meta")
+    return t
+
+
 def text_shapes(te) -> nn.Module:
     """A weightless twin of `te`'s text model: its class built on the meta device,
     `te`'s quantized modules mirrored (`mirror_quantized`), every tensor in the dtype
-    of `te`'s tensor of the same name as a stride-0 view on `te.device`, quantized
-    GEMMs bound there."""
+    it computes in (`_computed` of `te`'s tensor of the same name) as a stride-0 view
+    on `te.device`, quantized GEMMs bound there."""
     with torch.device("meta"):
         twin = type(te.model)(te.model.config)
     twin.eval().requires_grad_(False)
     mirror_quantized(twin, te.model)
     like = {**dict(te.model.named_parameters()), **dict(te.model.named_buffers())}
-    materialize(twin, te.device, like)
+    materialize(twin, te.device, {n: _computed(t, te.dtype) for n, t in like.items()})
     rebind_quant(twin, te.device, te.dtype, autograd=False)
     return twin
 
