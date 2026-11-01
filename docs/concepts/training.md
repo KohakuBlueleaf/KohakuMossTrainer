@@ -186,9 +186,10 @@ peaks bring the stream near the fp16 maximum.
 
 | term | fields (default) | adds |
 | --- | --- | --- |
-| `concentration` | `weight`, `k` (32) | `weight` × the mean over blocks of the share of the block output's energy (all tokens of the micro-batch) in its `k` largest channels |
+| `concentration` | `weight`, `k` (32), `dilute` (True) | `weight` × the mean over blocks of the share of the block output's energy (all tokens of the micro-batch) in its `k` largest channels |
 | `peak` | `weight`, `cap` (32768), `top` (1e-4), `tau` (0.25), `sigma` ("sigma") | `weight` × the mean over samples, each weighted by `sigma` (σ, 1 − σ or 1), of the mean over blocks of `softplus((log m − log cap) / tau)`; `m` is the mean of the sample's largest `top` fraction of \|x\| in that block's output, in original units |
 | `rms` | `weight`, `target` (1.0), `sigma` ("none") | `weight` × the mean over samples, each weighted by `sigma`, of the mean over blocks of `(R / target − 1)²`; `R` is the sample's whole-stream RMS in that block's output (over all its tokens and channels), in original units |
+| `write` | `weight`, `target` (required), `k` (32), `parts` ("both"), `anneal` (0), `start` (0), `dilute` (False) | `weight` × the mean over the tapped sublayers (`parts`: "attn", "ffn" or "both", every joint block) of `relu(c − τ(step))²`; `c` is the share of the sublayer write's energy (all tokens of the micro-batch) in its `k` largest channels, `τ` is 1 before `start` and falls linearly to `target` over `anneal` steps |
 
 `CONCENTRATION_LOSS = {"weight": w, "k": k}` is the `concentration` term alone; set one
 of the two knobs.
@@ -228,6 +229,35 @@ of the two knobs.
     analogy with the other terms.
   - Cost: one fp32 norm per token per block, read from the block output autograd keeps
     anyway (no fp32 copy of the stream).
+- **Dilution.** A share `top / total` has two ways down: shrink the top channels, or
+  grow every other channel (the total). `dilute=False` detaches the total, so the
+  gradient only shrinks the top channels. `concentration` keeps the full total by default;
+  `write` detaches it by default.
+- **Write.** The concentration of what each sublayer adds to the stream, not of the
+  stream itself. The attention part's write is `out − x · r` (its residual scale `r`), the
+  FFN part's `out − x`, both read where the block forms them.
+  - A state term (`concentration` on block outputs) is met as well by later blocks writing
+    the negative of the inherited massive channels, which keeps every write concentrated:
+    on MOSS, a finetune carrying concentration 0.01 for 10k steps raised the inherited
+    top-32 mass that blocks 14–39's FFN writes cancel from 7–11% to 45–102% per block,
+    while their attention writes added it back at the same rate, and left every weight
+    tensor's max / rms as it was. A write term prices both the creating and the
+    cancelling write.
+  - Base MOSS writes are concentrated: the top-32 share is 0.83–0.95 for attention and
+    0.78–0.90 for the FFN in blocks 1–35, about 0.99 in block 0, nearly flat over σ. A
+    target near 0 fights every block from the first step; the anneal starts the hinge at
+    1 (no loss, no gradient) and lowers it, so each sublayer is engaged once `τ` passes
+    its share.
+  - The share is scale-free: scaling a whole write (a gate, the modulation) does not
+    lower it; the gradient moves the write's channel mix.
+  - Gradient size: on MOSS base the term with `dilute=False` has about 22–25× the task
+    loss's gradient norm at weight 1 (each part), against 1.4× for `concentration`; a
+    weight near 0.004 puts it at a tenth of the task gradient. Its cosine with the task
+    gradient is about −0.05.
+  - Cost: one fp32 channel-energy vector per tapped sublayer per block, from the write in
+    the stream dtype; autograd keeps that write ([T, D]) for the norm's backward, which a
+    block checkpoint recomputes instead. The tap runs in every grad-enabled forward (so a
+    checkpoint recompute matches its forward) and is skipped under no_grad.
 - Each micro-batch adds its penalty weighted by its share of the step's loss tokens, so
   the step total is the token-weighted mean, as for the loss itself.
 - The training step only: validation reports the plain loss. Logged metrics:
@@ -235,8 +265,10 @@ of the two knobs.
   of the micro-batch, original units), `rms_loss` (the unweighted term), `stream_rms`
   (the geometric mean token RMS over every block: the typical token),
   `stream_rms_block_max` (the largest per-block geometric mean), `stream_rms_q` (the
-  whole-stream RMS of the micro-batch, mean over blocks: the level the term pulls) and
-  `stream_rms_q_block_max` (its largest block).
+  whole-stream RMS of the micro-batch, mean over blocks: the level the term pulls),
+  `stream_rms_q_block_max` (its largest block), `write_loss` (the unweighted write
+  hinge), `write_share_attn` / `write_share_ffn` (the mean write share of each tapped
+  part) and `write_target` (`τ` at the step).
 - **Gradient probe.** `STREAM_LOSS_PROBE = N` (`PARALLEL="none"`) measures, every N
   steps, the gradient of the task loss and of each term (unweighted, at the micro-batch's
   share) over the trainable parameters: `grad_<name>` (norm), `grad_<name>_<group>` (per

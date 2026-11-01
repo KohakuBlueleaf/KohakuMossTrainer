@@ -286,7 +286,18 @@ def test_stream_scales():
 def test_spec():
     assert spec_of({}) == {}
     assert spec_of({"CONCENTRATION_LOSS": {"weight": 0.01}}) == {
-        "concentration": {"k": 32, "weight": 0.01}
+        "concentration": {"k": 32, "dilute": True, "weight": 0.01}
+    }
+    assert spec_of({"STREAM_LOSS": {"write": {"weight": 0.004, "target": 0.5}}}) == {
+        "write": {
+            "weight": 0.004,
+            "target": 0.5,
+            "k": 32,
+            "parts": "both",
+            "anneal": 0,
+            "start": 0,
+            "dilute": False,
+        }
     }
     got = spec_of(
         {
@@ -321,6 +332,21 @@ def test_knob_problems():
     assert stream_loss_problems(rms) == []
     assert stream_loss_problems({**rms, "STREAM_LOSS_PROBE": 5}) == []
     assert stream_loss_problems({"STREAM_LOSS_PROBE": 0}) == []
+    write = {
+        "weight": 0.004,
+        "target": 0.5,
+        "parts": "ffn",
+        "anneal": 1000,
+        "start": 200,
+        "dilute": True,
+    }
+    assert stream_loss_problems({"STREAM_LOSS": {"write": write}}, dim=3072) == []
+    assert (
+        stream_loss_problems(
+            {"STREAM_LOSS": {"concentration": {"weight": 0.01, "dilute": False}}}
+        )
+        == []
+    )
     bad = [
         {"STREAM_LOSS": {"concentration": {"weight": -1.0}}},
         {"STREAM_LOSS": {"concentration": {"weight": 0.01, "k": 0}}},
@@ -339,6 +365,15 @@ def test_knob_problems():
         {"STREAM_LOSS": {"rms": {"weight": 1e-3, "target": 0.0}}},
         {"STREAM_LOSS": {"rms": {"weight": 1e-3, "sigma": "sqrt"}}},
         {"STREAM_LOSS": {"rms": {"weight": 1e-3, "cap": 1.0}}},
+        {"STREAM_LOSS": {"write": {"weight": 0.01}}},
+        {"STREAM_LOSS": {"write": {"weight": 0.01, "target": 0.0}}},
+        {"STREAM_LOSS": {"write": {"weight": 0.01, "target": 1.5}}},
+        {"STREAM_LOSS": {"write": {"weight": 0.01, "target": 0.5, "parts": "o"}}},
+        {"STREAM_LOSS": {"write": {"weight": 0.01, "target": 0.5, "anneal": -1}}},
+        {"STREAM_LOSS": {"write": {"weight": 0.01, "target": 0.5, "start": 1.5}}},
+        {"STREAM_LOSS": {"write": {"weight": 0.01, "target": 0.5, "dilute": 1}}},
+        {"STREAM_LOSS": {"write": {"weight": 0.01, "target": 0.5, "sigma": "sigma"}}},
+        {"STREAM_LOSS": {"concentration": {"weight": 0.01, "dilute": "no"}}},
         {"STREAM_LOSS_PROBE": 5},
         {"STREAM_LOSS_PROBE": -1},
         {"STREAM_LOSS_PROBE": True},

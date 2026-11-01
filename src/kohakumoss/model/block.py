@@ -19,6 +19,7 @@ from kohakumoss.types.context import (
     SHIFT_FFN,
     BlockCtx,
 )
+from kohakumoss_common.calls import nothing
 
 PROJ = ("q", "k", "v", "o")
 
@@ -40,6 +41,13 @@ class JointBlock(nn.Module):
         proj["ffn_up_gate"] = MossLinear(dim, 2 * ffn, bias=False, **kw)
         proj["ffn_down"] = MossLinear(ffn, dim, bias=False, **kw)
         self.proj = nn.ModuleDict(proj)
+        self._tap_attn = nothing
+        self._tap_ffn = nothing
+
+    def bind_write_taps(self, attn: Callable, ffn: Callable) -> None:
+        """Callables `(out, x, r)` seeing each sublayer's output and input (its write is
+        `out - x * r`); `nothing` for none."""
+        self._tap_attn, self._tap_ffn = attn, ffn
 
     def bind(self, ops: OpSet, stream: BlockConfig = BlockConfig()) -> None:
         """Resolve this block's callables once: fused or composed ops, the stream
@@ -91,7 +99,9 @@ class JointBlock(nn.Module):
         v = self.proj["v"](y).unflatten(-1, (self.heads, -1))
         o = ops.attention(q, k, v, seq.attn_joint).flatten(1)
         r = ctx.residual_scale[self.index]
-        return self._post(self._attn_out(o, x, mod[GATE_ATTN], seg, r))
+        out = self._post(self._attn_out(o, x, mod[GATE_ATTN], seg, r))
+        self._tap_attn(out, x, r)
+        return out
 
     def ffn_part(self, x: Tensor, ctx: BlockCtx) -> Tensor:
         """Modulated norm, SiTU FFN, gated residual."""
@@ -106,5 +116,6 @@ class JointBlock(nn.Module):
                 self.norm2.eps,
             )
         )
-        out = self._ffn_out(self._situ(y), x, mod[GATE_FFN], seg, 1.0)
-        return self._post(out)
+        out = self._post(self._ffn_out(self._situ(y), x, mod[GATE_FFN], seg, 1.0))
+        self._tap_ffn(out, x, 1.0)
+        return out

@@ -120,6 +120,8 @@ WEIGHTING = "none"  # "none" | "x0" | "eps"
 #     "sigma" | "one_minus_sigma" | "none")
 #   "rms": {"weight": 1e-3, "target": 1.0, "sigma": "none"}
 #     ((R / target - 1)^2 per block, R the sample's whole-stream RMS, original units)
+#   "write": {"weight": 5e-3, "target": 0.5, "parts": "both", "anneal": 2000, "start": 0}
+#     (relu(share - tau)^2 of each attention / FFN write's top-k share, tau 1 -> target)
 STREAM_LOSS = {}
 CONCENTRATION_LOSS = {}  # the "concentration" term alone (set one of the two)
 STREAM_LOSS_PROBE = 0  # every N steps: per-term gradient norms + cosines; 0 = off

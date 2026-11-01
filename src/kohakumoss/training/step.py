@@ -354,7 +354,7 @@ class TrainStep:
             probed["distill"] = distill
             parts["loss_distill"] = (distill / share).detach()
         if self.penalty is not None:
-            penalty, stream, terms = self.penalty.take(p)
+            penalty, stream, terms = self.penalty.take(p, step)
             loss = loss + penalty * share
             probed.update({name: value * share for name, value in terms.items()})
             parts.update(stream)
