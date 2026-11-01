@@ -90,6 +90,7 @@ def finish_step(state: TrainState, group: list, bundle, ema, runner, out) -> Non
     account(state, group)
     with phase(OPTIMIZER):
         ok = bundle.step()
+    out.metrics.update(bundle.extra_metrics())
     if ok:
         ema.update(state.step)
     settle_guards()

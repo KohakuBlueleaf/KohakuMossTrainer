@@ -137,6 +137,11 @@ def anchor_pull(
     return masked if gated else ungated
 
 
+def no_metrics() -> dict[str, Tensor]:
+    """The step metrics of a bundle with none (`extra_metrics`)."""
+    return {}
+
+
 def _chain(*fns) -> Callable[[], None]:
     live = [f for f in fns if f is not None and f is not nothing]
     if not live:
@@ -213,6 +218,7 @@ class Bundle:
             ),
             anchor_pull(groups, optimizer),
         )
+        self.extra_metrics = no_metrics
         self.train_mode = train_mode
         self.eval_mode = eval_mode
         self.device = device if device is not None else self.params[0].device

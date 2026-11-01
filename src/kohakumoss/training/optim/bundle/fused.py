@@ -9,7 +9,11 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from kohakumoss.training.optim.bundle.base import close_optimizers, step_reducer
+from kohakumoss.training.optim.bundle.base import (
+    close_optimizers,
+    no_metrics,
+    step_reducer,
+)
 from kohakumoss.training.optim.bundle.mirror import LRHolder
 from kohakumoss.training.optim.bundle.nonfinite import flag_report, param_names
 from kohakumoss.training.optim.optimizers.skip import (
@@ -158,6 +162,7 @@ class FusedStepBundle:
         self.shared = shared
         self.optimizer = None
         self.finishers: list[Callable[[], None]] = []
+        self.extra_metrics = no_metrics
         self.reduce_block_stats: Callable[[Tensor, Tensor], None] = nothing
         self._lr0 = float(groups[0]["lr"]) if groups else 1.0
         self._block_lr: list[tuple[dict, float]] = []

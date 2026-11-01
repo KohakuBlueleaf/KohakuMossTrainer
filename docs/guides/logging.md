@@ -80,6 +80,7 @@ other.
 | `loss/total` | `loss` | the step's loss, penalties included |
 | `loss/flow` | `loss_task` | the flow-matching loss alone (a micro-batch's own token mean) |
 | `loss/concentration`, `loss/rms`, `loss/peak`, `loss/write` | `concentration`, `rms_loss`, `peak_loss`, `write_loss` | the unweighted STREAM_LOSS terms |
+| `opt/outlier_over`, `opt/outlier_max` | `outlier_over`, `outlier_max` | OUTLIER_DECAY: weight elements above the cap at the step, the largest `|p| / (cap · r0)` among them |
 | `stream/write_attn`, `stream/write_ffn`, `stream/write_target` | `write_share_attn`, `write_share_ffn`, `write_target` | the write term's mean top-k share of the attention / FFN writes and its hinge share at the step |
 | `stream/rms`, `stream/rms_block_max` | `stream_rms_q`, `stream_rms_q_block_max` | whole-stream RMS: mean over blocks, largest block |
 | `stream/rms_token`, `stream/rms_token_block_max` | `stream_rms`, `stream_rms_block_max` | geometric-mean token RMS |

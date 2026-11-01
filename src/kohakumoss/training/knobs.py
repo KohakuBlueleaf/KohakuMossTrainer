@@ -36,6 +36,8 @@ from kohakumoss.training.layouts import LAYOUTS
 from kohakumoss.training.optim.bundle.deferred import step_sync_problems
 from kohakumoss.training.optim.optimizers.factory import OPTIMIZERS
 from kohakumoss.training.optim.optimizers.kwargs import optimizer_problems
+from kohakumoss.training.optim.outlier import outlier_problems
+from kohakumoss.training.optim.outlier import spec_of as outlier_spec
 from kohakumoss.training.stream_loss import spec_of as stream_spec
 from kohakumoss.training.stream_loss import stream_loss_problems
 from kohakumoss.types.arch import PRESETS
@@ -88,7 +90,7 @@ KNOWN = frozenset(
     METRICS_LEVEL STEP_SYNC
     SAMPLE_BATCH SAMPLE_COLUMNS SAMPLE_AT_START
     INIT_FROM WD_TARGET TEACHER TEACHER_PRECISION TEACHER_STREAM DISTILL_WEIGHT
-    DISTILL_WEIGHTING HARD_WEIGHT""".split()
+    DISTILL_WEIGHTING HARD_WEIGHT OUTLIER_DECAY""".split()
 )
 CHOICES = {
     "ADAPTER_MODE": ("bypass", "merge"),
@@ -282,6 +284,7 @@ def validate(k: dict) -> list[str]:
     p += stream_loss_problems(k)
     p += step_sync_problems(k)
     p += wd_target_problems(k, is_full(k))
+    p += outlier_problems(k, is_full(k))
     p += distill_problems(k)
     return list(dict.fromkeys(p))
 
@@ -329,6 +332,12 @@ def plan_problems(k: dict, plan: MemoryPlan) -> list[str]:
     if k.get("WD_TARGET", "zero") == "start" and host_masters:
         p.append(
             "WD_TARGET='start' decays device-stepped weights: optim_state 'gpu' and no "
+            f"stream='swap' (plan: optim_state={plan.optim_state!r}, "
+            f"stream={plan.stream!r})"
+        )
+    if outlier_spec(k) is not None and host_masters:
+        p.append(
+            "OUTLIER_DECAY decays device-stepped weights: optim_state 'gpu' and no "
             f"stream='swap' (plan: optim_state={plan.optim_state!r}, "
             f"stream={plan.stream!r})"
         )

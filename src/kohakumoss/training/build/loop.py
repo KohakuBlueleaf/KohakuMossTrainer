@@ -54,6 +54,8 @@ from kohakumoss.training.grad_probe import build_probe
 from kohakumoss.training.knobs import is_full
 from kohakumoss.training.memory.optimizers import build_memory_optim
 from kohakumoss.training.optim.bundle.deferred import sync_cadence
+from kohakumoss.training.optim.bundle.nonfinite import param_names
+from kohakumoss.training.optim.outlier import attach_outlier_decay, start_refs
 from kohakumoss.training.step import (
     DeviceBatcher,
     OnlineLatents,
@@ -227,8 +229,8 @@ def build_optim(
 ):
     """(bundle, accumulate-context) over the trainable groups (restricted to the
     parameter ids in `keep` for pipeline stages) under the memory plan's wiring;
-    WD_TARGET 'start' anchors the decay at the run's start weights (`resumed`: the
-    live weights are not yet restored)."""
+    WD_TARGET 'start' anchors the decay at the run's start weights and OUTLIER_DECAY
+    takes their RMS (`resumed`: the live weights are not yet restored)."""
     hyper = {
         "lr": k["LR"],
         "betas": tuple(k["BETAS"]),
@@ -244,7 +246,8 @@ def build_optim(
     )
     if keep is not None:
         groups = filter_groups(groups, keep)
-    return build_memory_optim(
+    refs = start_refs(k, built.trainable, resumed)
+    bundle, accumulate = build_memory_optim(
         groups,
         built.plan,
         built.engines,
@@ -258,6 +261,8 @@ def build_optim(
         hooks,
         sync_every=step_sync_every(k),
     )
+    attach_outlier_decay(bundle, k, refs, param_names(groups))
+    return bundle, accumulate
 
 
 def step_sync_every(k: dict) -> int:

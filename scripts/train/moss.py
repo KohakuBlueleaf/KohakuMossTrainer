@@ -142,6 +142,9 @@ EPS = 1e-8
 WEIGHT_DECAY = 0.01
 WD_RULES = "moss"  # "moss" (wd on 2-D weights only, decay-to-one on last q/k norm) | "none" | "all"
 WD_TARGET = "zero"  # decay to "zero" | "start" (the run's start weights; full FT)
+OUTLIER_DECAY = (
+    {}
+)  # full FT: p -= lr * rate * sign(p) * relu(|p| - cap * r0); e.g. {"rate": 5.0, "cap": 16.0, "cap_start": 64.0, "cap_anneal": 5000, "warmup": 1000}
 SCHEDULE = {"mode": "cosine", "warmup": 100, "end": -1}  # AnySchedule config
 GRAD_CLIP = 1.0
 STEP_SYNC = "step"  # "step" (host sync every step) | "deferred" (skip decided on the device; host values every gcd(LOG_EVERY, METRICS_EVERY) steps; EMA = 0)

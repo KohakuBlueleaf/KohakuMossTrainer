@@ -85,6 +85,7 @@ class DeferredBundle(Bundle):
         self.last = int(last)
         self.decay = gated_decay_to_one(groups, self.optimizer)
         self.pull = anchor_pull(groups, self.optimizer, gated=True)
+        self.gated_posts: list = []
         dev = self.device
         self._skipped = torch.zeros((), device=dev)
         self._bad_run = torch.zeros((), device=dev)
@@ -114,6 +115,8 @@ class DeferredBundle(Bundle):
             self.decay(bad)
         if self.pull is not None:
             self.pull(bad)
+        for post in self.gated_posts:
+            post(bad)
         self.after()
         self.schedule.step()
         self.scaler.update_device(bad)

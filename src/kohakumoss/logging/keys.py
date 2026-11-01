@@ -21,6 +21,8 @@ GROUPED = {
     "stream_peak": "stream/peak",
     "lr": "opt/lr",
     "grad_norm": "opt/grad_norm",
+    "outlier_over": "opt/outlier_over",
+    "outlier_max": "opt/outlier_max",
     "loss_scale": "amp/scale",
     "skipped_steps": "amp/skipped",
     "step_time": "speed/step_time",

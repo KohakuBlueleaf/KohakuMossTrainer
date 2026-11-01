@@ -344,10 +344,56 @@ within 1e-6 absolute (3e-4 relative) of the fp64 table.
   included). Cost: 2 bytes per decayed parameter and one add per step. Full finetune
   only, with OPTIMIZER `adamw`, `adamw16`, `adamw8bit`, `adamw8bit_kernel` or `muon`
   and device-stepped weights (`optim_state="gpu"`, no `stream="swap"`).
+- **Outlier decay.** `OUTLIER_DECAY = {"rate": λ, "cap": c, ...}` decays each weight
+  element's excess over `c` times its tensor's start RMS `r0`, after the optimiser step:
+  `p -= lr·λ(t)·sign(p)·relu(|p| − c(t)·r0)`. See [Outlier decay](#outlier-decay).
 - **`SCHEDULE`** is an AnySchedule config; `end: -1` means `STEPS`. Loading a checkpoint
   writes the restored step's scheduled values (lr and any other scheduled key) into the
   optimiser groups the schedule drives, including the lr holders of the per-parameter
   and offload optimisers, so the first resumed step runs at the scheduled lr.
+
+### Outlier decay
+
+A decoupled decay of the excess of each weight element over a cap, on every trained
+weight it targets, applied after the optimiser step like AdamW's own decay:
+
+    p -= lr_t · λ(t) · sign(p) · relu(|p| − c(t) · r0)
+
+| field (default) | meaning |
+| --- | --- |
+| `rate` (0 = off) | λ; an excess shrinks with time constant `1 / (λ · lr)` steps |
+| `cap` (16) | `c`, in units of the tensor's start RMS `r0` |
+| `cap_start` (0 = `cap`), `cap_anneal` (0) | `c(t)` falls geometrically from `cap_start` to `cap` over `cap_anneal` steps |
+| `warmup` (0) | λ ramps linearly from 0 over this many steps (on top of the lr schedule) |
+| `targets` ("" = all), `exclude` ("") | regexes over the trainable parameter names |
+| `include_1d` (False) | also 1-D tensors (gains, biases) |
+
+- **Why decoupled.** The same penalty `λ/2 · relu(|p| − c r0)²` added to the loss goes
+  through Adam, whose normalised update moves an element by about `lr` per step whatever
+  the penalty's size: it removes `lr × steps` at most (2e-5 × 10k = 0.2 against an
+  element of 5.1 in MOSS's block 0 `ffn_down`). The decoupled form is proportional to the
+  excess and follows the lr schedule; it never moves an element by more than
+  `lr · λ · excess` in a step.
+- **Against the task.** Where the task keeps an element large, Adam moves it back by
+  about `lr` per step, so it settles at an excess of about `1 / λ` (absolute) over the
+  cap rather than at the cap.
+- **Reference.** `r0` is each targeted tensor's RMS at the run start (the live weights
+  before a resume restores them, or INIT_FROM's trainable state on a resumed run), in the
+  run's own fold space, fixed for the run: a reference that followed the live RMS could
+  be met by growing every element.
+- **Footprint on MOSS base.** Elements above 16 / 32 times their tensor's RMS in the
+  joint blocks: about 2400 / 120 of 5e9 (largest: `layers.41` `ffn_up_gate` 113,
+  `layers.0` `ffn_down` 103, `layers.41` `k` 63); the default targets also cover the
+  embedders, the conditioning and the final linear.
+- **Metrics.** `outlier_over` (elements above the cap at the step) and `outlier_max`
+  (the largest `|p| / (c r0)` among them, 1 when none).
+- **Cost.** One elementwise pass over the targeted tensors per step and a temporary of
+  the largest one.
+- Full finetune only, with OPTIMIZER `adamw`, `adamw8bit`, `adamw8bit_kernel` or `muon`
+  (fp32 device weights: a decay of `lr · λ` of an element is below a 16-bit weight's
+  resolution), device-stepped weights (`optim_state="gpu"`, no `stream="swap"`), and
+  PARALLEL other than `fsdp`. The plain, deferred (gated by the device flag) and fused
+  (per parameter, after its update) steps all apply it.
 
 ## The optimiser step
 
