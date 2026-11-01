@@ -197,6 +197,11 @@ share at 0.21–0.23 over 2,700 steps, down from 0.32 at the start.
 The heal takes the same penalty as `CONC_WEIGHT` / `CONC_K` (below), on the student's
 block outputs next to the distillation loss.
 
+In a full finetune, a penalty on the block outputs is also met by later blocks
+cancelling the channels, with the weight outliers left in place;
+[stream-healing.md](stream-healing.md) measures this and describes the per-sublayer
+`write` term and the `OUTLIER_DECAY` that heal the writes and the weights.
+
 ## Running the heal
 
 `kohakumoss.heal` implements every step above; five scripts under `scripts/heal/` run
