@@ -22,6 +22,7 @@ from kohakumoss.training.checks.objective import (
     REAL_VARIANTS,
     carries_fp16_fix,
     objective_problems,
+    objective_warnings,
     schedule_problems,
 )
 from kohakumoss.training.checks.outputs import EXPORTS, io_problems
@@ -30,7 +31,7 @@ from kohakumoss.training.checks.parallel import (
     dist_backend,
     parallel_problems,
 )
-from kohakumoss.training.distill import distill_problems
+from kohakumoss.training.distill import distill_problems, distill_warnings
 from kohakumoss.training.exports import with_export_formats
 from kohakumoss.training.layouts import LAYOUTS
 from kohakumoss.training.optim.bundle.deferred import step_sync_problems
@@ -61,6 +62,7 @@ __all__ = [
     "dist_backend",
     "plan_problems",
     "validate",
+    "knob_warnings",
 ]
 
 KNOWN = frozenset(
@@ -415,14 +417,21 @@ def deprecations(k: dict) -> list[str]:
     return []
 
 
+def knob_warnings(k: dict) -> list[str]:
+    """The knob combinations that run but are logged: deprecated values, and fp16
+    compute on an unfixed DiT or teacher; PRECISION="auto" is resolved first."""
+    k = with_precision(k)
+    return deprecations(k) + objective_warnings(k) + distill_warnings(k)
+
+
 def check(g: dict) -> dict:
     """Knobs from globals (PRECISION resolved, a set EXPORT_FORMATS mapped onto
-    SAVE_FORMAT / SAVE_MERGED); raises one SystemExit listing every problem and warns
-    on every deprecated value."""
+    SAVE_FORMAT / SAVE_MERGED); raises one SystemExit listing every problem and logs
+    every warning."""
     k = with_export_formats(with_precision(collect(g)))
     problems = validate(k)
     if problems:
         raise SystemExit("invalid configuration:\n  - " + "\n  - ".join(problems))
-    for message in deprecations(k):
+    for message in knob_warnings(k):
         log.warning(message)
     return k

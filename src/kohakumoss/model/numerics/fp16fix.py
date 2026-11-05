@@ -170,24 +170,28 @@ def carry_fold(model: MossBackbone, record: dict | None) -> None:
     model.fp16_fix = "weights"
 
 
-def fix_problems(
-    fix: str, kwargs: dict, fp16: bool, carried: bool, subject: str, file_knob: str
-) -> list[str]:
-    """The FP16_FIX knob problems every script shares: 'online' needs `c`; fp16 compute
-    (`subject`, the knob text naming it) needs a fix unless the weights file
-    (`file_knob`) carries one (`carried`)."""
-    p = []
+def fix_problems(fix: str, kwargs: dict) -> list[str]:
+    """The FP16_FIX knob problems every script shares: 'online' needs `c`."""
     if fix == "online" and "c" not in kwargs:
-        p.append(
-            "FP16_FIX='online' needs FP16_FIX_KWARGS['c'] (e.g. 1/16 for the base)"
-        )
-    if fp16 and fix == "none" and not carried:
-        p.append(
-            f"{subject} needs FP16_FIX ('online' with FP16_FIX_KWARGS={{'c': 1/16}} or "
-            f"'fp32_residual') or an fp16-fix {file_knob} file: the residual stream "
-            "exceeds the fp16 range"
-        )
-    return p
+        return ["FP16_FIX='online' needs FP16_FIX_KWARGS['c'] (e.g. 1/16 for the base)"]
+    return []
+
+
+def fix_warnings(
+    fix: str, fp16: bool, carried: bool, subject: str, file_knob: str
+) -> list[str]:
+    """The FP16_FIX warning every script shares: fp16 compute (`subject`, the knob text
+    naming it) with FP16_FIX='none' on a weights file (`file_knob`) that carries no
+    fold (`carried`) runs as is."""
+    if not (fp16 and fix == "none" and not carried):
+        return []
+    return [
+        f"{subject} with FP16_FIX='none' and a {file_knob} without an fp16-fix fold: "
+        "the DiT computes in fp16 as stored, which stays finite for weights whose "
+        "residual stream fits the fp16 range (a healed model such as MOSS-Image-heal); "
+        "the base and SFT weights need FP16_FIX ('online' with "
+        "FP16_FIX_KWARGS={'c': 1/16} or 'fp32_residual') or an fp16-fix file"
+    ]
 
 
 def clamp_counts(model: MossBackbone) -> dict[int, int]:

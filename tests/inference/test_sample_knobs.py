@@ -13,6 +13,7 @@ from kohakumoss.inference.knobs import (
     KNOWN,
     carries_fix,
     check,
+    knob_warnings,
     parse_adapter,
     parse_size,
     skip_layers,
@@ -65,14 +66,23 @@ def transformer(path: Path, fold: bool) -> str:
     return str(path)
 
 
+def assert_no_warning(k: dict) -> None:
+    assert knob_warnings(k) == [], knob_warnings(k)
+
+
 def test_an_fp16_fix_file_is_known_by_its_metadata(tmp_path):
     fixed = transformer(tmp_path / "fix.safetensors", True)
     assert_valid(knobs(PRECISION="fp16", TRANSFORMER=fixed))
+    assert_no_warning(knobs(PRECISION="fp16", TRANSFORMER=fixed))
     plain = transformer(tmp_path / "plain.safetensors", False)
-    assert any("FP16_FIX" in p for p in real_problems(knobs(PRECISION="fp16")))
+    assert_valid(knobs(PRECISION="fp16", TRANSFORMER=plain))
+    assert any("FP16_FIX='none'" in w for w in knob_warnings(knobs(PRECISION="fp16")))
     must_fail(
-        lambda: assert_valid(knobs(PRECISION="fp16", TRANSFORMER=plain)),
+        lambda: assert_no_warning(knobs(PRECISION="fp16", TRANSFORMER=plain)),
         "a TRANSFORMER file without a recorded fold",
+    )
+    assert_no_warning(
+        knobs(PRECISION="fp16", FP16_FIX="online", FP16_FIX_KWARGS={"c": 1 / 16})
     )
     broken = tmp_path / "broken.safetensors"
     broken.write_text("x")
@@ -113,7 +123,6 @@ BROKEN = {
     "BATCH": dict(BATCH=-1),
     "CFG must": dict(CFG=-1.0),
     "needs FP16_FIX_KWARGS": dict(FP16_FIX="online"),
-    "PRECISION='fp16' needs": dict(PRECISION="fp16"),
     "multiples of 16": dict(SIZES=[(1000, 1024)]),
     "not 'HxW'": dict(SIZES=["big"]),
     "SKIP_LAYERS": dict(SKIP_LAYERS="all"),

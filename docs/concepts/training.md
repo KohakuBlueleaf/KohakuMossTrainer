@@ -497,8 +497,12 @@ records it; the pipelines do not.
 - An fp16-fix checkpoint (the fold baked into the weights) trains with
   `FP16_FIX="none"` and that file as `WEIGHTS`; `FP16_FIX="weights"` is not a training
   value (inference loads either).
-- Validation rejects `PRECISION="fp16"` on `VARIANT="base"` / `"sft"` with
-  `FP16_FIX="none"`, and `PRECISION="bf16"` when any entry of `DEVICES` has no bf16.
+- `PRECISION="fp16"` on `VARIANT="base"` / `"sft"` with `FP16_FIX="none"` and a
+  `WEIGHTS` file without an fp16-fix fold runs in fp16 as stored, with a warning at
+  start. That fits weights whose residual stream stays in the fp16 range (a healed
+  model such as MOSS-Image-heal). The base and SFT weights overflow it and need a fix.
+  The same warning covers an fp16 distillation teacher.
+- Validation rejects `PRECISION="bf16"` when any entry of `DEVICES` has no bf16.
 
 ## Memory plan in the loop
 

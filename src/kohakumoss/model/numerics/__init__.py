@@ -19,6 +19,7 @@ from kohakumoss.model.numerics.fp16fix import (
     clamp_counts,
     clear_fp16_fix,
     fix_problems,
+    fix_warnings,
 )
 from kohakumoss.model.numerics.keep_fp32 import cast_params
 from kohakumoss.model.numerics.saturation import SaturationCounters
@@ -37,6 +38,7 @@ __all__ = [
     "clamp_counts",
     "clear_fp16_fix",
     "fix_problems",
+    "fix_warnings",
     "fold",
     "output_row_scales",
     "unfold",

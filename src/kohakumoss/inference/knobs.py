@@ -10,6 +10,7 @@ from kohakumoss.encoders.knob_names import ENCODER_FIELDS, RENAMED_SAMPLE, SAMPL
 from kohakumoss.encoders.text.plan import plan_problems as text_problems
 from kohakumoss.encoders.text.plan import text_plan
 from kohakumoss.encoders.vae import vae_dtype_problems
+from kohakumoss.logging.log import get_logger
 from kohakumoss.memory.knob_map import (
     MANUAL,
     MEMORY_KNOBS,
@@ -20,7 +21,7 @@ from kohakumoss.memory.knob_map import (
 )
 from kohakumoss.memory.profiles import PROFILES
 from kohakumoss.model.io.load import read_fp16_fix
-from kohakumoss.model.numerics import fix_problems
+from kohakumoss.model.numerics import fix_problems, fix_warnings
 from kohakumoss.offload.encoders.vae import plan_problems as vae_problems
 from kohakumoss.offload.encoders.vae import vae_plan
 from kohakumoss.types.arch import PRESETS
@@ -31,6 +32,7 @@ from kohakumoss_kernels.dtypes import BY_NAME
 from kohakumoss_kernels.hardware.arch import arch_of
 from kohakumoss_kernels.tuning.tuner import MODES as TUNE_MODES
 
+log = get_logger(__name__)
 INFERENCE_KNOBS = {name: MEMORY_KNOBS[name] for name in PLACEMENT_KNOBS}
 KNOWN = frozenset(
     """WEIGHTS VARIANT TRANSFORMER TEXT_ENCODER VAE PROMPT PROMPTS PROMPTS_FILE NEGATIVE SIZES SEEDS
@@ -270,17 +272,7 @@ def validate(k: dict) -> list[str]:
         )
     if k["CFG"] < 0:
         p.append(f"CFG must be >= 0, got {k['CFG']}")
-    fp16 = k["PRECISION"] == "fp16" or (
-        k["PRECISION"] == "auto" and compute_dtype("auto", k["DEVICE"]) == torch.float16
-    )
-    p += fix_problems(
-        k["FP16_FIX"],
-        k["FP16_FIX_KWARGS"],
-        fp16,
-        carries_fix(k["TRANSFORMER"]),
-        "PRECISION='fp16'",
-        "TRANSFORMER",
-    )
+    p += fix_problems(k["FP16_FIX"], k["FP16_FIX_KWARGS"])
     try:
         p += skip_problems(skip_layers(k["SKIP_LAYERS"]))
     except (TypeError, ValueError):
@@ -293,9 +285,25 @@ def validate(k: dict) -> list[str]:
     return list(dict.fromkeys(p))
 
 
+def knob_warnings(k: dict) -> list[str]:
+    """The knob combinations that run but are logged: fp16 compute on an unfixed DiT."""
+    fp16 = k["PRECISION"] == "fp16" or (
+        k["PRECISION"] == "auto" and compute_dtype("auto", k["DEVICE"]) == torch.float16
+    )
+    return fix_warnings(
+        k["FP16_FIX"],
+        fp16,
+        carries_fix(k["TRANSFORMER"]),
+        "PRECISION='fp16'",
+        "TRANSFORMER",
+    )
+
+
 def check(g: dict) -> dict:
     """Knobs from globals (MEMORY_PROFILE in its primary spelling); raises one
-    SystemExit listing every problem."""
+    SystemExit listing every problem and logs every warning."""
     k = primary_names(collect(g))
     exit_on(validate(k))
+    for message in knob_warnings(k):
+        log.warning(message)
     return k

@@ -17,7 +17,7 @@ from kohakumoss.inference.loading import load_dit
 from kohakumoss.logging.log import get_logger, hl, timed
 from kohakumoss.memory.profiles import resolve as resolve_memory
 from kohakumoss.model.io.load import read_fp16_fix
-from kohakumoss.model.numerics.fp16fix import fix_problems
+from kohakumoss.model.numerics.fp16fix import fix_problems, fix_warnings
 from kohakumoss.offload.accel import default_type
 from kohakumoss.training.weights import component
 from kohakumoss.weights import DIT
@@ -97,9 +97,7 @@ def distill_problems(k: dict) -> list[str]:
             "(the original weights)"
         )
     elif teacher_dtype(default_type()) == torch.float16:
-        fix, kwargs = teacher_fix(k, torch.float16)
-        carried = read_fp16_fix(path) is not None
-        p += fix_problems(fix, kwargs, True, carried, "an fp16 teacher", "TEACHER")
+        p += fix_problems(*teacher_fix(k, torch.float16))
     if k.get("PARALLEL", "none") not in ("none", "ddp"):
         p.append("TEACHER runs with PARALLEL 'none' or 'ddp'")
     precision = k.get("TEACHER_PRECISION", "auto")
@@ -113,6 +111,21 @@ def distill_problems(k: dict) -> list[str]:
     except ValueError as err:
         p.append(f"TEACHER_PRECISION={precision!r}: {err}")
     return p
+
+
+def distill_warnings(k: dict) -> list[str]:
+    """An fp16 teacher with FP16_FIX='none' on a file without a fold (it runs as is)."""
+    if not k.get("TEACHER") or teacher_dtype(default_type()) != torch.float16:
+        return []
+    try:
+        path = teacher_path(k)
+    except FileNotFoundError:
+        return []
+    if not Path(path).exists():
+        return []
+    fix, _ = teacher_fix(k, torch.float16)
+    carried = read_fp16_fix(path) is not None
+    return fix_warnings(fix, True, carried, "an fp16 teacher", "TEACHER")
 
 
 def build_teacher(k: dict, device: torch.device) -> Teacher | None:

@@ -20,7 +20,7 @@ from kohakumoss.inference import MossPipeline, grid, knobs
 from kohakumoss.inference.placement_report import forward_tokens
 from kohakumoss.logging.log import get_logger, hl, setup
 from kohakumoss.memory.knob_map import mixing_problems, primary_names
-from kohakumoss.model.numerics import fix_problems
+from kohakumoss.model.numerics import fix_problems, fix_warnings
 from kohakumoss_common.knobs import check_script, choice_problems, prompt_list
 
 log = get_logger("scripts.compare_grid")
@@ -116,16 +116,7 @@ def problems(k: dict) -> list[str]:
         for c, _ in checkpoints_of(k)
         if not Path(c).exists()
     ]
-    valid = k["PRECISION"] in knobs.DTYPE_NAMES
-    fp16 = valid and knobs.compute_dtype(k["PRECISION"], k["DEVICE"]) == torch.float16
-    p += fix_problems(
-        k["FP16_FIX"],
-        k["FP16_FIX_KWARGS"],
-        fp16,
-        knobs.carries_fix(k["TRANSFORMER"]),
-        "PRECISION='fp16'",
-        "TRANSFORMER",
-    )
+    p += fix_problems(k["FP16_FIX"], k["FP16_FIX_KWARGS"])
     p += choice_problems(k, {n: knobs.CHOICES[n] for n in GRID_CHOICES})
     p += mixing_problems(
         k, k["MEMORY_PROFILE"], "MEMORY_PROFILE", knobs.INFERENCE_KNOBS
@@ -137,12 +128,27 @@ def problems(k: dict) -> list[str]:
     return p + knobs.size_problems(k) + knobs.encoder_problems(k)
 
 
+def knob_warnings(k: dict) -> list[str]:
+    """The grid knob combinations that run but are logged."""
+    valid = k["PRECISION"] in knobs.DTYPE_NAMES
+    fp16 = valid and knobs.compute_dtype(k["PRECISION"], k["DEVICE"]) == torch.float16
+    return fix_warnings(
+        k["FP16_FIX"],
+        fp16,
+        knobs.carries_fix(k["TRANSFORMER"]),
+        "PRECISION='fp16'",
+        "TRANSFORMER",
+    )
+
+
 def main() -> None:
     setup()
     k = primary_names(check_script(globals(), knobs.RENAMED))
     found = problems(k)
     if found:
         raise SystemExit("invalid configuration:\n  - " + "\n  - ".join(found))
+    for message in knob_warnings(k):
+        log.warning(message)
     memory, overrides = knobs.memory_of(k)
     pipe = MossPipeline.from_pretrained(
         k["WEIGHTS"],

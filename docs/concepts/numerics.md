@@ -53,6 +53,11 @@ Autocast and dtype per part:
 fp16-fix checkpoint; a run trains or samples that file with `FP16_FIX="none"`, and the
 fold comes from its metadata.
 
+fp16 compute with `FP16_FIX="none"` on weights without a recorded fold runs as stored,
+and the train, sample and grid scripts log a warning at start. This is how a healed model
+(stream peak far below 65504, such as MOSS-Image-heal) runs in fp16. The base and SFT
+weights peak near 62k and need `online`, `fp32_residual` or an fp16-fix file.
+
 | mode | what changes | per-block factors |
 | --- | --- | --- |
 | `none` | nothing at load or run time; a fold the loaded weights already carry (an fp16-fix checkpoint's `kohakumoss_fp16_fix` metadata) stays applied | — |

@@ -22,6 +22,7 @@ from kohakumoss.cli.config.validate import (
     config_problems,
     load_knobs,
     problems,
+    warnings_of,
 )
 from kohakumoss_data import DataConfig, resolved_cache_dir
 from tests._util.negative import must_fail
@@ -269,7 +270,8 @@ def test_sample(tmp_path, vram, precision):
     expected = "" if layer == "auto" else train["MEMORY_PROFILE"]
     assert k["MEMORY_PROFILE"] == expected
     assert not k["TEXT_ENCODE"] and not k["VAE_ENCODE"] and not k["TEXT_DEVICE"]
-    assert problems(SAMPLE, {**k, "PRECISION": "fp16", "FP16_FIX": "none"})
+    unfixed = {**k, "PRECISION": "fp16", "FP16_FIX": "none"}
+    assert warnings_of(SAMPLE, unfixed) and not blocking(problems(SAMPLE, unfixed))
 
 
 def test_check_command(tmp_path, capsys):

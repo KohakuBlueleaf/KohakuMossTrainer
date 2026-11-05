@@ -122,6 +122,15 @@ def problems(script: str, k: dict) -> list[str]:
     return []
 
 
+def warnings_of(script: str, k: dict) -> list[str]:
+    """The knob combinations the script runs but logs a warning for."""
+    if script == TRAIN:
+        return train_knobs.knob_warnings(k)
+    if script == SAMPLE:
+        return sample_knobs.knob_warnings(k)
+    return []
+
+
 def config_knobs(config: Path, root: Path | None = None) -> tuple[str, dict]:
     """(target script, composed knobs) of one config file."""
     root = root or repo_root()

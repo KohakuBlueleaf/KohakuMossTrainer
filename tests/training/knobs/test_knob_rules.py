@@ -59,15 +59,18 @@ def test_warmup_past_steps_names_the_fix_and_keeps_the_schedule():
 
 
 @pytest.mark.parametrize("variant", ["base", "sft"])
-def test_fp16_on_a_real_variant_needs_a_fix(variant):
+def test_fp16_on_a_real_variant_without_a_fix_warns(variant):
     k = runnable(VARIANT=variant, PRECISION="fp16", FP16_FIX="none", FP16_FIX_KWARGS={})
-    _has(validate(k), "FP16_FIX")
+    assert not any("FP16_FIX" in p for p in validate(k))
+    _has(knobs.knob_warnings(k), "FP16_FIX='none'")
     for fix, kwargs in (("online", {"c": 1 / 16}), ("fp32_residual", {})):
         fixed = runnable(
             VARIANT=variant, PRECISION="fp16", FP16_FIX=fix, FP16_FIX_KWARGS=kwargs
         )
         assert not any("FP16_FIX" in p for p in validate(fixed))
-    assert not any("FP16_FIX" in p for p in validate(runnable(PRECISION="fp16")))
+        assert not any("FP16_FIX" in w for w in knobs.knob_warnings(fixed))
+    bf16 = runnable(VARIANT=variant, PRECISION="bf16", FP16_FIX="none")
+    assert not any("FP16_FIX" in w for w in knobs.knob_warnings(bf16))
 
 
 @pytest.fixture

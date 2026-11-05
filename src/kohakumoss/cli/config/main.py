@@ -36,12 +36,13 @@ from kohakumoss.cli.config.validate import (
     USER_DIR,
     blocking,
     compose,
-    config_problems,
+    config_knobs,
     is_checkout,
     problems,
     repo_root,
     script_ref,
     target_script,
+    warnings_of,
 )
 from kohakumoss.logging.log import get_logger, setup
 from kohakumoss.memory.catalog_table import markdown as profile_table
@@ -163,7 +164,7 @@ def _check(root: Path, st: Starter) -> dict:
     bad = blocking(found)
     if bad:
         raise SystemExit("the composed config is invalid:\n  - " + "\n  - ".join(bad))
-    for p in found:
+    for p in found + warnings_of(st.script, knobs):
         log.warning(p)
     return knobs
 
@@ -353,13 +354,17 @@ def list_presets(root: Path, everything: bool = False) -> None:
 
 
 def check_configs(root: Path, paths: list[str]) -> int:
-    """Print every problem per config; returns the number of configs with problems."""
+    """Print every problem and warning per config; returns the number of configs with
+    problems."""
     bad = 0
     for path in paths:
-        found = config_problems(Path(path), root)
+        script, knobs = config_knobs(Path(path), root)
+        found = problems(script, knobs)
         print(f"{path}: {'ok' if not found else 'invalid'}")
         for p in found:
             print(f"  - {p}" + ("  (path)" if MISSING in p else ""))
+        for w in warnings_of(script, knobs):
+            print(f"  - {w}  (warning)")
         bad += bool(found)
     return bad
 

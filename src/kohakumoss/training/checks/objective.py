@@ -3,6 +3,7 @@
 import os
 
 from kohakumoss.model.io.load import read_fp16_fix
+from kohakumoss.model.numerics.fp16fix import fix_warnings
 from kohakumoss.training.weights import component
 from kohakumoss.weights import DIT
 
@@ -24,25 +25,27 @@ def dit_file(k: dict) -> str:
         return ""
 
 
+def objective_warnings(k: dict) -> list[str]:
+    """PRECISION='fp16' on a real VARIANT with FP16_FIX='none' and WEIGHTS without a
+    fold: the run computes in fp16 as stored."""
+    if k["VARIANT"] not in REAL_VARIANTS:
+        return []
+    return fix_warnings(
+        k["FP16_FIX"],
+        k["PRECISION"] == "fp16",
+        carries_fp16_fix(dit_file(k)),
+        f"PRECISION='fp16' on VARIANT={k['VARIANT']!r}",
+        "WEIGHTS",
+    )
+
+
 def objective_problems(k: dict) -> list[str]:
-    """LOSS, FP16_FIX against PRECISION / VARIANT / WEIGHTS, and the components a
-    single-file WEIGHTS needs."""
+    """LOSS, FP16_FIX='weights', and the components a single-file WEIGHTS needs."""
     p = []
     if k["LOSS"] == "masked_mse":
         p.append(
             "LOSS='masked_mse' needs a per-token loss mask, and no dataset source "
             "produces one: use LOSS='mse' | 'huber' | 'l1'"
-        )
-    if (
-        k["PRECISION"] == "fp16"
-        and k["VARIANT"] in REAL_VARIANTS
-        and k["FP16_FIX"] == "none"
-        and not carries_fp16_fix(dit_file(k))
-    ):
-        p.append(
-            f"PRECISION='fp16' on VARIANT={k['VARIANT']!r} needs FP16_FIX ('online' "
-            "with FP16_FIX_KWARGS={'c': 1/16}, or 'fp32_residual') or an fp16-fix "
-            "WEIGHTS file (FP16_FIX='none'): the residual stream exceeds the fp16 range"
         )
     if k["FP16_FIX"] == "weights":
         p.append(
