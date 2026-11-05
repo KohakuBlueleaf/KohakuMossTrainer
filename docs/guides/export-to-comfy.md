@@ -56,6 +56,40 @@ kogine run scripts/export/merge.py --config <file with WEIGHTS / ADAPTERS / OUT>
 - `SAVE_DTYPE` (`bf16` default, `fp16`, `fp32`) is the dtype of the written tensors in
   `export.py` and `merge.py`, as in the other export scripts.
 
+## int8 ConvRot files
+
+`scripts/export/comfy_int8.py` writes a transformer in the layout of the Comfy-Org
+`moss_image_{base,sft}_int8_convrot.safetensors` files, from any transformer
+`load_backbone` reads (HF dir, single file, an fp16-fix file: its fold is undone):
+
+```bash
+kogine run scripts/export/comfy_int8.py --set WEIGHTS=merged_fp32.safetensors \
+    --set OUT=moss_image_int8_convrot.safetensors
+```
+
+| tensor | content |
+| --- | --- |
+| `<n>.weight` | int8 [N, K]: round(W R / s), R = blockdiag of the normalised regular Hadamard of `GROUP` over K, rotated in fp32 |
+| `<n>.weight_scale` | fp32 [N, 1]: s = max\|row of W R\| / 127 |
+| `<n>.comfy_quant` | uint8 JSON `{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": GROUP}` |
+| `layers.<i>.comfy_attention.config` | uint8 JSON `{"attention": ATTENTION_HINT}` (none for `""`) |
+| every other tensor | `SAVE_DTYPE`; `rope.bands` fp32 |
+
+| knob | default |
+| --- | --- |
+| `LAYERS` | `layers\.\d+\.proj\.[a-z_]+`: the joint blocks' fused `qkv`, `o`, `ffn_up_gate`, `ffn_down` |
+| `GROUP` | 256 |
+| `SAVE_DTYPE` | `bf16` (`fp16`) |
+| `ATTENTION_HINT` | `comfy_kitchen_int8` |
+| `DEVICE` | `cuda`: where the weights are rotated and quantized |
+
+- An fp32 source (the training state exported with `SAVE_DTYPE=fp32`) quantizes the
+  trained values themselves.
+- The report next to `OUT` gives each layer's relative L2 error of the dequantized
+  weight against the source.
+- KohakuMoss loads the file as it loads the Comfy-Org one
+  ([weights.md](weights.md#quantized-files)).
+
 ## Loading the file
 
 - With a ComfyUI MOSS-Image loader, load the adapter with a LoRA loader node. On the

@@ -21,6 +21,7 @@ Each script's docstring (or header) holds its full usage.
 | `scripts/export/merge.py` | kogine | merge LyCORIS, ComfyUI or training-state adapter files into a base transformer |
 | `scripts/export/fp16_fix.py` | kogine | the fp16-fix checkpoint: the residual fold written into the weights ([numerics.md](../concepts/numerics.md#the-fp16-fix-checkpoint)) |
 | `scripts/export/fp8_quant.py` | kogine | a pre-quantized fp8 / MXFP8 transformer (`TRANSFORMER=<file>` in training and sampling) |
+| `scripts/export/comfy_int8.py` | kogine | a ComfyUI int8 ConvRot transformer, the layout of the Comfy-Org `int8_convrot` files ([export-to-comfy.md](export-to-comfy.md#int8-convrot-files)) |
 | `scripts/export/text_quant.py` | kogine | a pre-quantized text encoder (`stored` in `TEXT_ENCODE`) |
 
 ## Examples
